@@ -1,0 +1,61 @@
+[code]
+patterns = ["*.py", "*.sh", "*.el"]
+shebangs = ["sh", "bash", "python*"]
+
+[hygiene]
+max_bytes = 10485760
+
+[clones]
+classes = ["python", "test"]
+min_tokens = 50
+baseline = "quality-gate-clones.toml"
+
+[classes.python]
+code = true
+description = "Python programs: the gate command itself"
+
+[classes.test]
+code = true
+description = "Python tests that execute the gate on fixture repositories"
+
+[classes.config]
+code = false
+description = "Configuration, lock files and ignore rules"
+
+[classes.build]
+code = false
+description = "Self-check orchestration"
+
+[classes.doc]
+code = false
+description = "Documentation and plans"
+
+[[rule]]
+pattern = "qg.py"
+class = "python"
+reason = "the single gate command"
+
+[[rule]]
+pattern = "tests/*.py"
+class = "test"
+reason = "tests execute the gate against disposable fixture repositories"
+
+[[rule]]
+pattern = "Makefile"
+class = "build"
+reason = "runs Ruff, py_compile, the tests and the gate itself"
+
+[[rule]]
+pattern = "*.toml"
+class = "config"
+reason = "gate configuration and pinned tool data"
+
+[[rule]]
+pattern = "*.md"
+class = "doc"
+reason = "documentation and plans"
+
+[[rule]]
+pattern = ".gitignore"
+class = "config"
+reason = "repository ignore rules"
