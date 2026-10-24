@@ -59,3 +59,8 @@ reason = "documentation and plans"
 pattern = ".gitignore"
 class = "config"
 reason = "repository ignore rules"
+
+[[rule]]
+pattern = "LICENSE"
+class = "doc"
+reason = "AGPL-3.0 licence text"
