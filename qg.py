@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""quality-gate: inventory, hygiene, clone ratchet and pinned tools.
+"""code-quality-gate: inventory, hygiene, clone ratchet and pinned tools.
 
 Run as 'python3 -I qg.py [--repo DIR] COMMAND'.  DIR is the top level of
 a git work tree and its configuration is 'quality-gate.toml'.
@@ -553,7 +553,7 @@ def _tools_dir() -> Path:
     configured = os.environ.get("QG_TOOLS_DIR")
     if configured:
         return Path(configured).expanduser()
-    return Path.home() / ".local" / "share" / "quality-gate" / "tools"
+    return Path.home() / ".local" / "share" / "code-quality-gate" / "tools"
 
 
 def _tool_error(lock: Path, key: str, expected: str, actual: str) -> UsageError:

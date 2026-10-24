@@ -1,4 +1,4 @@
-# quality-gate - Agent Guide
+# code-quality-gate - Agent Guide
 
 A reusable, offline code-quality gate any repository can run, built to keep AI-written code high
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
@@ -21,4 +21,4 @@ configuration (`quality-gate.toml`); this repository gates itself with the same 
 * Standard-library Python 3.12 only, run as `python3 -I`.
 * `make -k check` passes before committing.
 * Never commit binaries or downloaded tools; they live in the external tools cache
-  (`QG_TOOLS_DIR`, default `~/.local/share/quality-gate/tools`).
+  (`QG_TOOLS_DIR`, default `~/.local/share/code-quality-gate/tools`).

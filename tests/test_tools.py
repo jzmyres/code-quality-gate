@@ -216,7 +216,7 @@ class ToolsTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         binary = (
             self.home
-            / ".local/share/quality-gate/tools"
+            / ".local/share/code-quality-gate/tools"
             / f"jscpd-{VERSION}/jscpd"
         )
         self.assertTrue(binary.is_file(), output(result))

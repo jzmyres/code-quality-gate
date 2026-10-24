@@ -1,4 +1,4 @@
-"""Shared helpers for the quality-gate tests."""
+"""Shared helpers for the code-quality-gate tests."""
 from __future__ import annotations
 
 import json

@@ -1,4 +1,4 @@
-# quality-gate
+# code-quality-gate
 
 A reusable, offline code-quality gate for repositories that want every file classified, every
 reason recorded, and every duplicate-code exception explicit and ratcheted. It is one standard-library
@@ -27,16 +27,16 @@ the consuming repository's modules cannot leak into it.
 
 ## Quick start in a consuming repository
 
-Add the gate as a submodule at `quality-gate/`, fetch the pinned tool once, write the configuration,
+Add the gate as a submodule at `code-quality-gate/`, fetch the pinned tool once, write the configuration,
 and run the gate:
 
-    git submodule add https://example.invalid/quality-gate.git quality-gate
-    python3 -I quality-gate/qg.py tools fetch
+    git submodule add https://github.com/jzmyres/code-quality-gate.git code-quality-gate
+    python3 -I code-quality-gate/qg.py tools fetch
     $EDITOR quality-gate.toml
-    python3 -I quality-gate/qg.py check
+    python3 -I code-quality-gate/qg.py check
 
 `check` never downloads a tool. If a configured check needs jscpd and it is missing, it fails and tells you to run
-`python3 -I quality-gate/qg.py tools fetch`.
+`python3 -I code-quality-gate/qg.py tools fetch`.
 
 ## Commands
 
@@ -107,7 +107,7 @@ of written, so the file may be absent when there is nothing to accept.
     python3 -I qg.py tools path jscpd
 
 `tools fetch` reads the gate's `tools.lock.toml` (or `--lock FILE`) and installs every pinned tool under
-`QG_TOOLS_DIR`, which defaults to `~/.local/share/quality-gate/tools`, as `NAME-VERSION/`. It downloads
+`QG_TOOLS_DIR`, which defaults to `~/.local/share/code-quality-gate/tools`, as `NAME-VERSION/`. It downloads
 with `urllib`, verifies the SHA-256 before extracting, and refuses a mismatch or an unsafe archive
 member (absolute path, `..`, link, or non-regular file) without installing anything. An existing install
 whose binary is present is kept and not downloaded again. Extraction is staged in the tools directory and
