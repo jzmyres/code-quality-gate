@@ -56,6 +56,7 @@ def import_coverage() -> ModuleType:
     """Import the pinned coverage module after putting its install on sys.path."""
     installation = coverage_installation()
     location = str(installation)
+    sys.dont_write_bytecode = True
     if location not in sys.path:
         sys.path.insert(0, location)
     try:

@@ -16,7 +16,8 @@ The gate is deliberately narrow. It owns the orchestration no maintained tool ow
 * **checks** - checks are declared in policy and run in policy order; adapters measure, the core decides;
 * **one reasoned ratchet** - measured checks fail by default, and a baseline entry can accept a
   measured subject above its threshold only with a non-empty reason and an optional expiry;
-* **tools** - external tools are pinned by version, URL and SHA-256, and fetched explicitly;
+* **tools** - external tools are pinned by version, URL, archive SHA-256 and payload SHA-256,
+  and fetched explicitly;
 * **result** - `check --json` writes one machine-readable schema-2 result that separates execution,
   the adapter's raw outcome and policy satisfaction, and carries diagnostics, obligations and prune
   reporting.
@@ -278,17 +279,28 @@ excluded by `# pragma: no cover` inside the measured span). An added pragma is t
 
 `tools fetch` reads the gate's `tools.lock.toml` (or `--lock FILE`) and installs every pinned tool under
 `QG_TOOLS_DIR`, which defaults to `~/.local/share/code-quality-gate/tools`, as `NAME-VERSION/`. It
-downloads with `urllib`, verifies the SHA-256 before extracting, and refuses a mismatch or an unsafe
-archive member (absolute path, `..`, link, or non-regular file) without installing anything. Tool names
-and versions must match `[A-Za-z0-9][A-Za-z0-9._-]*`, the install destination must resolve inside the
-tools directory, and a lock table accepts only `version`, `url`, `sha256`, `binary` and `format`;
-other keys are configuration errors. An existing install whose binary is present is kept and not
-downloaded again. Extraction is staged in the tools directory and moved into place atomically.
+downloads with `urllib`, verifies the archive SHA-256, extracts into a temporary directory inside the
+tools directory, and computes the install tree's payload digest before moving it into place. It refuses
+an archive hash or payload digest mismatch, or an unsafe archive member (absolute path, `..`, link, or
+non-regular file), without installing anything. Tool names and versions must match
+`[A-Za-z0-9][A-Za-z0-9._-]*`, the install destination must resolve inside the tools directory, and a
+lock table accepts only `version`, `url`, `sha256`, `payload_sha256`, `binary` and `format`;
+other keys are configuration errors and a missing `payload_sha256` is a lock error. An existing install
+is kept only when its payload digest matches the lock; otherwise `tools fetch` replaces it.
+
+Every later use of a tool recomputes the install's payload digest before the tool runs or is imported:
+Ruff and jscpd binaries, and the coverage package for collection and analysis. A mismatch or an invalid
+tree makes the check `unsupported`; the message names the tool, the install directory, and the expected
+and actual digests, and nothing from that install runs. Reinstall the pinned tools with `tools fetch`
+after upgrading the gate. Existing installs made before payload pinning, or with a `__pycache__`
+directory, fail this verification and must be reinstalled with `tools fetch`.
+Imports of the installed coverage package run with bytecode writing disabled in the gate process,
+`covrun.py` and the children it starts, so a verified install stays byte-identical after use.
 
 An archive without `format` is a tar archive. `format = "wheel"` marks a Python wheel: it is a zip, so
 it is extracted with `zipfile` under the same safety rules. The wheel's install directory is what the
 Python adapters put on `sys.path`; for coverage that is `coverage-7.16.2/`, and its `binary` entry
-`coverage/__init__.py` is the file that proves the install.
+`coverage/__init__.py` is looked up inside the verified tree.
 
 `tools path NAME` prints the expected binary path, whether or not the tool is installed, so scripts can
 locate the cache. An unknown tool name exits 2.
@@ -542,7 +554,8 @@ human accepts it.
 ## Pinned tools and this repository
 
 `tools.lock.toml` in the gate repository is the only place tool versions live. It pins jscpd 5.4.1,
-ruff 0.17.0 and coverage 7.16.2, including the archive URL, SHA-256, archive format and binary path.
+ruff 0.17.0 and coverage 7.16.2, including the archive URL, SHA-256, payload SHA-256, archive format and
+binary path.
 `tools fetch` accepts `--lock FILE` for testing or for a private mirror; `file://` URLs exercise
 installation without a network.
 
@@ -570,7 +583,9 @@ not installed. Command-check tests use the real command; the real ruff test runs
 ruff binary exists and proves enforcement: an unused import is rejected with F401, then the repaired
 fixture is accepted, including files whose names contain a space and begin with `-`. `tools fetch`
 tests use fixture tarballs and wheels with `file://` URLs, including wrong hashes, unknown keys, unsafe
-archive members and destinations outside the tools directory. Contract tests cover schema-2 typing,
+archive members, payload mismatches and destinations outside the tools directory, and prove that a
+tampered Ruff or coverage install is `unsupported` before it runs and that a full run leaves the coverage
+install unchanged. Contract tests cover schema-2 typing,
 obligations and exemptions, diagnostics, baseline identity and domain rules, prune reporting and
 round-trips, the bounded runner's group kill and output cap, and JSON usage errors.
 

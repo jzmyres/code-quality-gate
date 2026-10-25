@@ -2,17 +2,20 @@
 version = "5.4.1"
 url = "https://github.com/kucherenko/jscpd/releases/download/v5.4.1/jscpd-linux-x64-gnu.tar.gz"
 sha256 = "f2017a17de2a8d5708f8354c6e7223f82da3dc6489675bce543ba00d9d529468"
+payload_sha256 = "b44982df629d97a4c8fc703ff27f73437e1bc1e683fb11862b56d486e6857ff8"
 binary = "jscpd"
 
 [ruff]
 version = "0.17.0"
 url = "https://github.com/astral-sh/ruff/releases/download/0.17.0/ruff-x86_64-unknown-linux-gnu.tar.gz"
 sha256 = "c94fc1dc71f054d06d9f1149442dcb471516aa2b7d4b7e8124e05d082d4c91d3"
+payload_sha256 = "720b5c33ea890631d66ca66568d65e180ef0d14bdf0e7026d13115570636cacb"
 binary = "ruff-x86_64-unknown-linux-gnu/ruff"
 
 [coverage]
 version = "7.16.2"
 url = "https://files.pythonhosted.org/packages/3f/0c/7a64e1ac90541a8edf50daef0914848011fb057a5bf55284a4811e21939a/coverage-7.16.2-py3-none-any.whl"
 sha256 = "11d28e9123a9156cb405d8d27b44256c9a58fb5decc2073a8f17862057e3aa0f"
+payload_sha256 = "b56d7f388b537710d20cd81e71cc65d6c5dbe9097d6625a730beb2bb5c518527"
 format = "wheel"
 binary = "coverage/__init__.py"

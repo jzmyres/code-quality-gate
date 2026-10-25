@@ -4,13 +4,18 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import stat
+import sys
 import tarfile
+import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
-from support import RUFF_VERSION, FixtureCase, output
+from support import BASE_CONFIG, GATE, RUFF_VERSION, FixtureCase, output
+
+from quality_gate.tools import PayloadError, payload_digest
 
 VERSION = "9.9.9"
 
@@ -99,6 +104,8 @@ class ToolsTests(FixtureCase):
         binary: str = "jscpd",
         archive_format: str | None = None,
         path: Path | None = None,
+        payload: str | None = None,
+        include_payload: bool = True,
     ) -> Path:
         lock = path or (self.base / "lock.toml")
         lines = [
@@ -107,11 +114,46 @@ class ToolsTests(FixtureCase):
             f"url = {json.dumps(url)}",
             f'sha256 = "{digest}"',
         ]
+        if include_payload:
+            lines.append(
+                f'payload_sha256 = "{payload or "0" * 64}"'
+            )
         if archive_format is not None:
             lines.append(f'format = "{archive_format}"')
         lines.append(f'binary = "{binary}"')
         lock.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return lock
+
+    def archive_payload(
+        self,
+        archive: Path,
+        *,
+        binary: str = "jscpd",
+        archive_format: str = "tar",
+    ) -> str:
+        from quality_gate.tools import Tool, _extract_archive
+
+        if str(GATE) not in sys.path:
+            sys.path.insert(0, str(GATE))
+        with tempfile.TemporaryDirectory(dir=self.base) as temporary:
+            build = Path(temporary) / "build"
+            build.mkdir()
+            tool = Tool(
+                name="jscpd",
+                version=VERSION,
+                url=archive.as_uri(),
+                sha256="0" * 64,
+                payload_sha256="0" * 64,
+                binary=binary,
+                format=archive_format,
+            )
+            _extract_archive(archive, build, tool)
+            installed = build / binary
+            if installed.is_file():
+                mode = installed.stat().st_mode & 0o777
+                if not mode & 0o111:
+                    os.chmod(installed, mode | 0o111)
+            return payload_digest(build)
 
     def fetch(
         self, lock: Path, tools: Path, *extra: str
@@ -152,7 +194,11 @@ class ToolsTests(FixtureCase):
         self.assert_not_installed(tools)
 
     def fetch_ok(self, archive: Path) -> tuple[Path, object]:
-        lock = self.write_lock(archive.as_uri(), self.sha256(archive))
+        lock = self.write_lock(
+            archive.as_uri(),
+            self.sha256(archive),
+            payload=self.archive_payload(archive),
+        )
         tools = self.base / "tools"
         result = self.fetch(lock, tools)
         self.assertEqual(result.returncode, 0, output(result))
@@ -224,17 +270,24 @@ class ToolsTests(FixtureCase):
         self.assert_not_installed(tools)
 
     def test_fetch_keeps_an_existing_install(self) -> None:
+        archive = self.make_tarball()
         tools = self.base / "tools"
         destination = tools / f"jscpd-{VERSION}"
         destination.mkdir(parents=True)
         binary = destination / "jscpd"
-        binary.write_text("existing binary\n", encoding="utf-8")
+        binary.write_text("#!/bin/sh\necho fake\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (destination / "LICENSE").write_text("MIT\n", encoding="utf-8")
         lock = self.write_lock(
-            (self.base / "missing.tar.gz").as_uri(), "0" * 64
+            (self.base / "missing.tar.gz").as_uri(),
+            "0" * 64,
+            payload=self.archive_payload(archive),
         )
         result = self.fetch(lock, tools)
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(binary.read_text(encoding="utf-8"), "existing binary\n")
+        self.assertEqual(
+            binary.read_text(encoding="utf-8"), "#!/bin/sh\necho fake\n"
+        )
         self.assertIn("already installed", result.stdout)
 
     def test_fetch_replaces_an_existing_broken_install(self) -> None:
@@ -244,11 +297,20 @@ class ToolsTests(FixtureCase):
         destination.mkdir(parents=True)
         stale = destination / "stale.txt"
         stale.write_text("stale\n", encoding="utf-8")
-        lock = self.write_lock(archive.as_uri(), self.sha256(archive))
+        stale_binary = destination / "jscpd"
+        stale_binary.write_text("stale binary\n", encoding="utf-8")
+        lock = self.write_lock(
+            archive.as_uri(),
+            self.sha256(archive),
+            payload=self.archive_payload(archive),
+        )
         result = self.fetch(lock, tools)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertFalse(stale.exists())
-        self.assertTrue((destination / "jscpd").is_file())
+        self.assertEqual(
+            stale_binary.read_text(encoding="utf-8"),
+            "#!/bin/sh\necho fake\n",
+        )
 
     def test_fetch_allows_directory_members_and_nested_binary(self) -> None:
         archive = self.make_tarball(
@@ -259,6 +321,7 @@ class ToolsTests(FixtureCase):
             archive.as_uri(),
             self.sha256(archive),
             binary="pkg/jscpd",
+            payload=self.archive_payload(archive, binary="pkg/jscpd"),
         )
         tools = self.base / "tools"
         result = self.fetch(lock, tools)
@@ -268,7 +331,11 @@ class ToolsTests(FixtureCase):
 
     def test_fetch_uses_the_default_tools_directory(self) -> None:
         archive = self.make_tarball()
-        lock = self.write_lock(archive.as_uri(), self.sha256(archive))
+        lock = self.write_lock(
+            archive.as_uri(),
+            self.sha256(archive),
+            payload=self.archive_payload(archive),
+        )
         result = self.run_qg(
             "tools", "fetch", "--lock", str(lock), env={}
         )
@@ -390,6 +457,7 @@ class ToolsTests(FixtureCase):
             "version": '"9.9.9"',
             "url": '"file:///tmp/x.tar.gz"',
             "sha256": '"' + "0" * 64 + '"',
+            "payload_sha256": '"' + "0" * 64 + '"',
             "binary": '"jscpd"',
         }
         lock = self.base / "lock.toml"
@@ -413,6 +481,31 @@ class ToolsTests(FixtureCase):
         tools = self.fetch_refused(archive, "does not contain 'jscpd'")
         self.assert_not_installed(tools)
 
+    def test_fetch_lock_without_payload_digest_exits_2(self) -> None:
+        lock = self.write_lock(
+            "file:///tmp/x.tar.gz", "0" * 64, include_payload=False
+        )
+        result = self.fetch(lock, self.base / "tools")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("jscpd.payload_sha256", text)
+        self.assertIn("missing", text)
+
+    def test_fetch_refuses_payload_mismatch_and_installs_nothing(self) -> None:
+        archive = self.make_tarball()
+        lock = self.write_lock(
+            archive.as_uri(), self.sha256(archive), payload="0" * 64
+        )
+        tools = self.base / "tools"
+        result = self.fetch(lock, tools)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("payload sha256 mismatch", text)
+        self.assertIn("0" * 64, text)
+        self.assertIn("nothing installed", text)
+        self.assert_not_installed(tools)
+        self.assertEqual(list(tools.iterdir()), [])
+
     def test_fetch_bad_sha_format_exits_2(self) -> None:
         lock = self.write_lock("file:///tmp/x.tar.gz", "abc")
         result = self.fetch(lock, self.base / "tools")
@@ -428,6 +521,9 @@ class ToolsTests(FixtureCase):
             self.sha256(wheel),
             binary="pkg/__init__.py",
             archive_format="wheel",
+            payload=self.archive_payload(
+                wheel, binary="pkg/__init__.py", archive_format="wheel"
+            ),
         )
         tools = self.base / "tools"
         result = self.fetch(lock, tools)
@@ -534,6 +630,179 @@ class ToolsTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
         self.assertIn("unknown tool 'mystery'", text)
+
+
+class ToolUseVerificationTests(FixtureCase):
+    def unsupported_check(
+        self, result: object, document: dict, *needles: str
+    ) -> dict:
+        self.assertEqual(result.returncode, 1, output(result))
+        check = self.check_by_id(document, "smoke")
+        self.assertEqual(check["outcome"], "unsupported")
+        for needle in needles:
+            self.assertIn(needle, check["reason"])
+        return check
+
+    def ruff_tool(self) -> tuple[Path, Path, Path, Path, str]:
+        tools = self.base / "tools"
+        installation = tools / f"ruff-{RUFF_VERSION}"
+        destination = installation / "ruff-x86_64-unknown-linux-gnu"
+        destination.mkdir(parents=True)
+        sentinel = self.base / "ruff-ran"
+        binary = destination / "ruff"
+        binary.write_text(
+            f"#!/bin/sh\necho ran > {sentinel}\necho 1\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        self.fixture_gate()
+        expected = self.payload_digest(installation)
+        self.set_lock_field("ruff", "payload_sha256", expected)
+        self.write_config(
+            BASE_CONFIG.replace(
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["{tool:ruff}", "--version"]',
+            )
+        )
+        return tools, installation, binary, sentinel, expected
+
+    def test_tampered_ruff_is_unsupported_before_it_runs(self) -> None:
+        tools, installation, binary, sentinel, expected = self.ruff_tool()
+        binary.write_text(binary.read_text() + "# tampered\n", encoding="utf-8")
+        actual = self.payload_digest(installation)
+        result, document = self.run_json(
+            env={"QG_TOOLS_DIR": str(tools)}
+        )
+        self.unsupported_check(
+            result,
+            document,
+            f"ruff {RUFF_VERSION}",
+            str(installation),
+            expected,
+            actual,
+        )
+        self.assertFalse(sentinel.exists())
+
+    @unittest.skipIf(
+        os.geteuid() == 0, "root can stat chmod 000 entries"
+    )
+    def test_unreadable_tool_entry_is_unsupported_before_it_runs(self) -> None:
+        tools, installation, binary, sentinel, expected = self.ruff_tool()
+        destination = binary.parent
+        mode = destination.stat().st_mode & 0o777
+        destination.chmod(0o000)
+        self.addCleanup(destination.chmod, mode)
+        result, document = self.run_json(
+            env={"QG_TOOLS_DIR": str(tools)}
+        )
+        self.unsupported_check(
+            result,
+            document,
+            f"ruff {RUFF_VERSION}",
+            str(installation),
+            str(binary),
+            expected,
+            "Permission denied",
+            "nothing from this install runs",
+        )
+        self.assertFalse(sentinel.exists())
+
+    def test_modified_coverage_is_unsupported_before_it_runs(self) -> None:
+        version = "7.16.2"
+        tools = self.base / "tools"
+        destination = tools / f"coverage-{version}"
+        package = destination / "coverage"
+        package.mkdir(parents=True)
+        sentinel = self.base / "coverage-imported"
+        init = package / "__init__.py"
+        init.write_text(
+            f"open({str(sentinel)!r}, 'w').write('imported\\n')\n",
+            encoding="utf-8",
+        )
+        self.fixture_gate()
+        expected = self.payload_digest(destination)
+        self.set_lock_field("coverage", "payload_sha256", expected)
+        init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
+        actual = self.payload_digest(destination)
+        probe = self.add_file(
+            "tests/probe.py",
+            f"open({str(sentinel)!r}, 'w').write('ran\\n')\n",
+        )
+        self.write_config(
+            BASE_CONFIG.replace(
+                'adapter = "command"', 'adapter = "python_tests"'
+            )
+            .replace(
+                'run = ["python3", "-c", "print(1)"]',
+                f"run = {json.dumps(['{python}', 'tests/probe.py'])}",
+            )
+            .replace(
+                "tests_pattern = '(\\d+)'",
+                f"tests_pattern = {json.dumps(r'^Ran (\\d+) tests?')}",
+            )
+        )
+        result, document = self.run_json(
+            env={"QG_TOOLS_DIR": str(tools)}
+        )
+        self.unsupported_check(
+            result,
+            document,
+            "coverage 7.16.2",
+            str(destination),
+            expected,
+            actual,
+        )
+        self.assertFalse(sentinel.exists())
+        self.assertTrue(probe.is_file())
+
+
+class PayloadDigestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="qg-payload-")
+        self.addCleanup(self._temporary.cleanup)
+        self.base = Path(self._temporary.name)
+        self.root = self.base / "tree"
+        (self.root / "pkg").mkdir(parents=True)
+        (self.root / "pkg" / "tool").write_text("one\n", encoding="utf-8")
+        (self.root / "pkg" / "tool").chmod(0o644)
+        (self.root / "README").write_text("readme\n", encoding="utf-8")
+        os.symlink("pkg/tool", self.root / "link")
+
+    def test_digest_is_stable_across_runs(self) -> None:
+        self.assertEqual(payload_digest(self.root), payload_digest(self.root))
+
+    def test_one_changed_byte_changes_the_digest(self) -> None:
+        before = payload_digest(self.root)
+        (self.root / "pkg" / "tool").write_text("two\n", encoding="utf-8")
+        self.assertNotEqual(before, payload_digest(self.root))
+
+    def test_a_flipped_executable_bit_changes_the_digest(self) -> None:
+        before = payload_digest(self.root)
+        (self.root / "pkg" / "tool").chmod(0o755)
+        self.assertNotEqual(before, payload_digest(self.root))
+
+    def test_an_added_file_changes_the_digest(self) -> None:
+        before = payload_digest(self.root)
+        (self.root / "pkg" / "extra").write_text("extra\n", encoding="utf-8")
+        self.assertNotEqual(before, payload_digest(self.root))
+
+    def test_a_removed_file_changes_the_digest(self) -> None:
+        before = payload_digest(self.root)
+        (self.root / "README").unlink()
+        self.assertNotEqual(before, payload_digest(self.root))
+
+    def test_a_retargeted_symlink_changes_the_digest(self) -> None:
+        before = payload_digest(self.root)
+        (self.root / "link").unlink()
+        os.symlink("README", self.root / "link")
+        self.assertNotEqual(before, payload_digest(self.root))
+
+    def test_a_fifo_makes_the_tree_invalid(self) -> None:
+        os.mkfifo(self.root / "pipe")
+        with self.assertRaises(PayloadError) as raised:
+            payload_digest(self.root)
+        self.assertIn("pipe", str(raised.exception))
+        self.assertIn("regular file, directory or symlink", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quality_gate.coverage_tool import coverage_config_path, registry_dir
+from quality_gate.policy import UnsupportedError
+from quality_gate.tools import verify_tool_directory
+
+sys.dont_write_bytecode = True
 
 
 def _fail(message: str) -> int:
@@ -61,6 +65,7 @@ def _register(data_dir: Path, dataset: str, program: str) -> None:
 
 
 def _coverage_main(coverage_dir: Path):
+    sys.dont_write_bytecode = True
     try:
         from coverage.cmdline import main as coverage_main
     except ImportError as error:
@@ -92,30 +97,44 @@ def _run_dataset(
     )
 
 
-def _run(argv: list[str]) -> int:
-    if len(argv) < 5:
-        return _usage()
+def _prepared(
+    argv: list[str],
+) -> tuple[Path, Path, Path, Path, list[str]]:
     data_dir = Path(argv[1])
     source_root = Path(argv[2])
     coverage_dir = Path(argv[3])
     command = argv[4:]
     if not coverage_dir.is_dir():
-        return _fail(
+        raise UnsupportedError(
             f"coverage is not installed at {coverage_dir}; "
             "run 'python3 -I qg.py tools fetch'"
         )
+    verify_tool_directory("coverage", coverage_dir)
     config_file = coverage_config_path(data_dir)
     if not config_file.is_file():
-        return _fail(
+        raise UnsupportedError(
             f"coverage configuration is missing at {config_file}; "
             "the python_tests adapter creates it"
         )
+    return data_dir, source_root, coverage_dir, config_file, command
+
+
+def _run(argv: list[str]) -> int:
+    if len(argv) < 5:
+        return _usage()
+    try:
+        data_dir, source_root, coverage_dir, config_file, command = _prepared(
+            argv
+        )
+    except UnsupportedError as error:
+        return _fail(str(error))
 
     sys.path.insert(0, str(coverage_dir))
     # A consumer's coverage configuration must not change this metric: line
     # coverage only, with no branch measurement or omit rules of its own.
     _remove_overrides()
     os.environ["COVERAGE_CORE"] = "sysmon"
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
     coverage_main, error = _coverage_main(coverage_dir)
     if error is not None:

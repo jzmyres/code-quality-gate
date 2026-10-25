@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import json
 import os
 import re
 import shutil
@@ -22,7 +23,18 @@ from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
 TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-LOCK_KEYS = ("version", "url", "sha256", "binary", "format")
+LOCK_KEYS = (
+    "version",
+    "url",
+    "sha256",
+    "payload_sha256",
+    "binary",
+    "format",
+)
+
+
+class PayloadError(GateError):
+    """An install tree contains an entry that has no payload representation."""
 
 
 @dataclass(frozen=True)
@@ -31,6 +43,7 @@ class Tool:
     version: str
     url: str
     sha256: str
+    payload_sha256: str
     binary: str
     format: str = "tar"
 
@@ -67,18 +80,28 @@ def _lock_version(lock: Path, name: str, raw: dict[str, Any]) -> str:
     return version
 
 
-def _lock_digest(lock: Path, name: str, raw: dict[str, Any]) -> str:
-    digest = _string(raw, "sha256", lock, f"{name}.sha256")
+def _lock_hex_digest(
+    lock: Path, name: str, raw: dict[str, Any], key: str
+) -> str:
+    digest = _string(raw, key, lock, f"{name}.{key}")
     if len(digest) != 64 or any(
         character not in "0123456789abcdefABCDEF" for character in digest
     ):
         raise _tool_error(
             lock,
-            f"{name}.sha256",
+            f"{name}.{key}",
             "a 64-character hexadecimal SHA-256",
             _describe(digest),
         )
     return digest
+
+
+def _lock_digest(lock: Path, name: str, raw: dict[str, Any]) -> str:
+    return _lock_hex_digest(lock, name, raw, "sha256")
+
+
+def _lock_payload_digest(lock: Path, name: str, raw: dict[str, Any]) -> str:
+    return _lock_hex_digest(lock, name, raw, "payload_sha256")
 
 
 def _lock_binary(lock: Path, name: str, raw: dict[str, Any]) -> str:
@@ -122,6 +145,7 @@ def _parse_tool(lock: Path, name: str, raw: Any) -> Tool:
         version=_lock_version(lock, name, raw),
         url=_string(raw, "url", lock, f"{name}.url"),
         sha256=_lock_digest(lock, name, raw).lower(),
+        payload_sha256=_lock_payload_digest(lock, name, raw).lower(),
         binary=_lock_binary(lock, name, raw),
         format=_lock_format(lock, name, raw),
     )
@@ -155,6 +179,117 @@ def load_tools(lock: Path) -> dict[str, Tool]:
 
 def _tool_binary(tool: Tool, tools_root: Path) -> Path:
     return tools_root / f"{tool.name}-{tool.version}" / tool.binary
+
+
+def _content_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise PayloadError(f"cannot read {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def _payload_mode(path: Path) -> int:
+    try:
+        return path.lstat().st_mode
+    except OSError as error:
+        raise PayloadError(f"cannot inspect {path}: {error}") from error
+
+
+def _payload_link(path: Path, relative: str) -> list[str]:
+    try:
+        target = os.readlink(path)
+    except OSError as error:
+        raise PayloadError(f"cannot read link {path}: {error}") from error
+    return ["symlink", relative, target]
+
+
+def _payload_record(path: Path, relative: str) -> list[str]:
+    mode = _payload_mode(path)
+    if stat.S_ISLNK(mode):
+        return _payload_link(path, relative)
+    if stat.S_ISDIR(mode):
+        return ["directory", relative]
+    if stat.S_ISREG(mode):
+        executable = "1" if mode & 0o111 else "0"
+        return ["file", relative, executable, _content_sha256(path)]
+    raise PayloadError(
+        f"{relative!r} is not a regular file, directory or symlink"
+    )
+
+
+def _payload_entries(root: Path) -> list[tuple[str, list[str]]]:
+    entries: list[tuple[str, list[str]]] = []
+    pending: list[tuple[Path, PurePosixPath]] = [(root, PurePosixPath())]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            children = list(os.scandir(directory))
+        except OSError as error:
+            raise PayloadError(f"cannot list {directory}: {error}") from error
+        for child in children:
+            relative = prefix / child.name
+            record = _payload_record(Path(child.path), str(relative))
+            entries.append((str(relative), record))
+            if record[0] == "directory":
+                pending.append((Path(child.path), relative))
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def payload_digest(directory: Path) -> str:
+    """The canonical SHA-256 of every entry under an install directory."""
+    digest = hashlib.sha256()
+    for _relative, record in _payload_entries(directory):
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        digest.update(line.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _payload_mismatch(
+    tool: Tool, directory: Path, actual: str
+) -> UnsupportedError:
+    return UnsupportedError(
+        f"{tool.name} {tool.version}: payload digest mismatch at {directory}: "
+        f"expected {tool.payload_sha256}, got {actual}; nothing from this "
+        f"install runs; run '{TOOLS_FETCH}'"
+    )
+
+
+def _verify_tool_payload(tool: Tool, directory: Path) -> Path:
+    binary = directory / tool.binary
+    try:
+        if not binary.is_file():
+            raise UnsupportedError(
+                f"{tool.name} {tool.version} is not installed at {binary}; "
+                f"run '{TOOLS_FETCH}'"
+            )
+        actual = payload_digest(directory)
+    except (OSError, PayloadError) as error:
+        raise UnsupportedError(
+            f"{tool.name} {tool.version}: payload tree at {directory} is "
+            f"invalid: {error}; expected {tool.payload_sha256}, got invalid; "
+            f"nothing from this install runs; run '{TOOLS_FETCH}'"
+        ) from error
+    if actual != tool.payload_sha256:
+        raise _payload_mismatch(tool, directory, actual)
+    return directory
+
+
+def verify_tool_directory(name: str, directory: Path) -> Path:
+    """Verify an install directory against its pinned payload digest."""
+    _lock, tool = _pinned_tool(name)
+    return _verify_tool_payload(tool, directory)
+
+
+def _installed_tool(name: str) -> tuple[Tool, Path]:
+    _lock, tool = _pinned_tool(name)
+    directory = _tools_dir() / f"{tool.name}-{tool.version}"
+    _verify_tool_payload(tool, directory)
+    return tool, directory
 
 
 def _download(tool: Tool, target: Path) -> None:
@@ -325,10 +460,45 @@ def _replace_destination(build: Path, destination: Path) -> None:
     os.replace(build, destination)
 
 
+def _existing_payload_matches(tool: Tool, destination: Path) -> bool:
+    if not destination.is_dir():
+        return False
+    try:
+        return payload_digest(destination) == tool.payload_sha256
+    except PayloadError:
+        return False
+
+
+def _build_install(tool: Tool, temporary_path: Path) -> Path:
+    archive = temporary_path / "archive"
+    _download(tool, archive)
+    _verify_sha256(tool, archive)
+    build = temporary_path / "build"
+    build.mkdir()
+    _extract_archive(archive, build, tool)
+    installed_binary = build / tool.binary
+    if not installed_binary.is_file():
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: archive does not contain "
+            f"{tool.binary!r}; nothing installed"
+        )
+    mode = installed_binary.stat().st_mode & 0o777
+    if not mode & 0o111:
+        os.chmod(installed_binary, mode | 0o111)
+    actual = payload_digest(build)
+    if actual != tool.payload_sha256:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: payload sha256 "
+            f"mismatch: expected {tool.payload_sha256}, got {actual}; "
+            "nothing installed"
+        )
+    return build
+
+
 def _fetch_tool(tool: Tool, tools_root: Path) -> None:
     destination = _install_target(tool, tools_root)
     binary = _tool_binary(tool, tools_root)
-    if binary.is_file():
+    if _existing_payload_matches(tool, destination):
         print(
             f"tools: {tool.name} {tool.version} already installed at {binary}"
         )
@@ -337,22 +507,7 @@ def _fetch_tool(tool: Tool, tools_root: Path) -> None:
         with tempfile.TemporaryDirectory(
             prefix=f".{tool.name}-{tool.version}-", dir=tools_root
         ) as temporary:
-            temporary_path = Path(temporary)
-            archive = temporary_path / "archive"
-            _download(tool, archive)
-            _verify_sha256(tool, archive)
-            build = temporary_path / "build"
-            build.mkdir()
-            _extract_archive(archive, build, tool)
-            installed_binary = build / tool.binary
-            if not installed_binary.is_file():
-                raise GateError(
-                    f"tools: {tool.name} {tool.version}: archive does not contain "
-                    f"{tool.binary!r}; nothing installed"
-                )
-            mode = installed_binary.stat().st_mode & 0o777
-            if not mode & 0o111:
-                os.chmod(installed_binary, mode | 0o111)
+            build = _build_install(tool, Path(temporary))
             _replace_destination(build, destination)
     except OSError as error:
         raise GateError(
@@ -412,26 +567,13 @@ def _pinned_tool(name: str) -> tuple[Path, Tool]:
 
 
 def tool_binary(name: str) -> Path:
-    _lock, tool = _pinned_tool(name)
-    binary = _tool_binary(tool, _tools_dir())
-    if not binary.is_file():
-        raise UnsupportedError(
-            f"{name} {tool.version} is not installed at {binary}; "
-            f"run '{TOOLS_FETCH}'"
-        )
-    return binary
+    tool, directory = _installed_tool(name)
+    return directory / tool.binary
 
 
 def installed_tool_dir(name: str) -> Path:
-    """The install directory of a pinned tool, proven by its binary file."""
-    _lock, tool = _pinned_tool(name)
-    directory = _tools_dir() / f"{tool.name}-{tool.version}"
-    binary = directory / tool.binary
-    if not binary.is_file():
-        raise UnsupportedError(
-            f"{name} {tool.version} is not installed at {binary}; "
-            f"run '{TOOLS_FETCH}'"
-        )
+    """The verified install directory of a pinned tool."""
+    _tool, directory = _installed_tool(name)
     return directory
 
 

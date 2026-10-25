@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -314,6 +315,43 @@ class PythonTestsTests(FixtureCase):
         )
         self.assertIn("not installed", check["reason"])
 
+    def test_full_gate_leaves_the_coverage_install_byte_identical(self) -> None:
+        source = coverage_tool.coverage_installation()
+        tools = self.base / "tools"
+        destination = tools / source.name
+        shutil.copytree(source, destination, symlinks=True)
+        self.fixture_gate()
+        self.set_lock_field(
+            "coverage",
+            "payload_sha256",
+            self.payload_digest(destination),
+        )
+        self.add_test(
+            "test_sample",
+            "    def test_one(self):\n        self.assertTrue(True)\n",
+        )
+        config = tests_config().replace(
+            'checks = ["tests"]', 'checks = ["tests", "crap"]'
+        )
+        config += (
+            "\n[checks.crap]\n"
+            'adapter = "python_crap"\n'
+            "tier = 1\n"
+            'enforcement = "enforced"\n'
+            'requires = "tests"\n'
+            "threshold = 6\n"
+            'baseline = "quality-gate-crap.toml"\n'
+        )
+        self.write_config(config)
+        before = self.payload_digest(destination)
+        result, document = self.run_json(
+            env={"QG_TOOLS_DIR": str(tools)}
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.payload_digest(destination), before)
+        self.assertEqual(list(destination.rglob("__pycache__")), [])
+        self.assertEqual(list(destination.rglob("*.pyc")), [])
+
 
 class CovrunTests(unittest.TestCase):
     def test_usage_and_missing_coverage_are_reported(self) -> None:
@@ -499,6 +537,60 @@ class CovrunTests(unittest.TestCase):
         self.assertIn(record.stem, message)
         self.assertIn(str(script), message)
         self.assertIn(document["dataset"], message)
+
+    def test_run_refuses_tampered_coverage_before_it_is_imported(self) -> None:
+        destination = self.base / "tampered-run" / self.coverage_dir.name
+        shutil.copytree(self.coverage_dir, destination, symlinks=True)
+        init = destination / "coverage" / "__init__.py"
+        init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
+        sentinel = self.base / "ran-in-process"
+        script = self.script(
+            "probe.py",
+            f"open({str(sentinel)!r}, 'w').write('ran\\n')\n",
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = covrun._run(
+                [
+                    "covrun.py",
+                    str(self.data_dir),
+                    str(self.source_root),
+                    str(destination),
+                    str(script),
+                ]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("payload digest mismatch", stderr.getvalue())
+        self.assertIn(str(destination), stderr.getvalue())
+        self.assertFalse(sentinel.exists())
+
+    def test_tampered_coverage_is_refused_before_it_is_imported(self) -> None:
+        destination = self.base / "tampered-tools" / self.coverage_dir.name
+        shutil.copytree(self.coverage_dir, destination, symlinks=True)
+        init = destination / "coverage" / "__init__.py"
+        init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
+        sentinel = self.base / "ran"
+        script = self.script(
+            "probe.py",
+            f"open({str(sentinel)!r}, 'w').write('ran\\n')\n",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(self.runner),
+                str(self.data_dir),
+                str(self.source_root),
+                str(destination),
+                str(script),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("payload digest mismatch", result.stderr)
+        self.assertIn(str(destination), result.stderr)
+        self.assertFalse(sentinel.exists())
 
     def test_registration_names_the_program_without_its_arguments(
         self,

@@ -127,6 +127,50 @@ evidence do not satisfy it, and a policy with only a lint check rejects. Tiers
 produces them, so a required tier 2, 3 or 4 must be exempted until its adapter
 exists. An unsatisfied obligation rejects the gate.
 
+## Tool lock: `tools.lock.toml`
+
+Each top-level table names a pinned tool:
+
+```toml
+[jscpd]
+version = "5.4.1"
+url = "https://example.invalid/jscpd.tar.gz"
+sha256 = "f2017a17..."          # archive SHA-256
+payload_sha256 = "b44982df..."  # install-tree payload digest
+binary = "jscpd"                # safe relative path inside the tree
+format = "tar"                  # optional; tar or wheel
+```
+
+`version`, `url`, `sha256`, `payload_sha256` and `binary` are required;
+`format` defaults to `tar`. Unknown keys are configuration errors, as is a
+missing, non-string or non-hexadecimal `payload_sha256`. `sha256` is the
+SHA-256 of the downloaded archive; `payload_sha256` is the digest of the
+installed tree, computed from a fresh install of that archive.
+
+### Payload digest encoding
+
+The payload digest is the SHA-256 of a byte string built from every entry
+under the install directory, excluding the directory itself. Relative paths
+are POSIX paths relative to the install directory; there is no leading slash
+and no `.` component. Entries are sorted by relative-path string (Unicode code
+point order), independent of directory traversal order. Symbolic links are
+recorded, never followed.
+
+For each entry, in sorted order, append one line: the compact JSON encoding of
+an array (separators `,` and `:`, standard JSON escaping) followed by one
+line feed. The arrays are:
+
+* regular file: `["file", PATH, EXECUTABLE, CONTENT_SHA256]`
+* directory: `["directory", PATH]`
+* symbolic link: `["symlink", PATH, TARGET]`
+
+`EXECUTABLE` is the string `"1"` when any execute bit (mode `0o111`) is set
+and `"0"` otherwise. `CONTENT_SHA256` is the lowercase hexadecimal SHA-256 of
+the file's bytes. `TARGET` is the link target text exactly as stored on the
+filesystem. The resulting digest is lowercase hexadecimal. A tree containing
+any other entry type (for example a FIFO, socket or device) is invalid and has
+no payload digest.
+
 ## Baseline files
 
 A baseline is a TOML file with an identity header and zero or more entries:

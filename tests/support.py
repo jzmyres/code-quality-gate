@@ -16,6 +16,9 @@ GATE = Path(__file__).resolve().parent.parent
 QG = GATE / "qg.py"
 JSCPD_VERSION = "5.4.1"
 RUFF_VERSION = "0.17.0"
+TOOLS_LOCK = GATE / "tools.lock.toml"
+if str(GATE) not in sys.path:
+    sys.path.insert(0, str(GATE))
 
 BASE_CONFIG = """\
 schema = 2
@@ -277,6 +280,7 @@ class FixtureCase(unittest.TestCase):
         self.home.mkdir()
         self.repo = self.base / "repo"
         self.repo.mkdir()
+        self.gate = GATE
         self.git("init", "-q", "-b", "main")
         for name, content in BASE_FILES.items():
             self.add_file(name, content)
@@ -382,6 +386,66 @@ class FixtureCase(unittest.TestCase):
             return json.loads(configured)
         return [sys.executable, "-I"]
 
+    def fixture_gate(self) -> Path:
+        """A disposable copy of the gate, so a test may pin fixture tools."""
+        if self.gate != GATE:
+            return self.gate
+        destination = self.base / "gate"
+        shutil.copytree(
+            GATE / "quality_gate",
+            destination / "quality_gate",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        shutil.copy2(QG, destination / "qg.py")
+        shutil.copy2(TOOLS_LOCK, destination / "tools.lock.toml")
+        self.gate = destination
+        return destination
+
+    def payload_digest(self, directory: Path) -> str:
+        if str(GATE) not in sys.path:
+            sys.path.insert(0, str(GATE))
+        from quality_gate.tools import payload_digest
+
+        return payload_digest(directory)
+
+    def set_lock_field(self, name: str, key: str, value: str) -> None:
+        lock = self.fixture_gate() / "tools.lock.toml"
+        text = lock.read_text(encoding="utf-8")
+        start = text.index(f"[{name}]\n")
+        following = re.search(r"\n\[", text[start + len(name) + 3 :])
+        end = (
+            start + len(name) + 3 + following.start()
+            if following
+            else len(text)
+        )
+        block = text[start:end]
+        updated, count = re.subn(
+            rf'(?m)^{re.escape(key)} = ".*"$',
+            f'{key} = "{value}"',
+            block,
+            count=1,
+        )
+        if count != 1:
+            raise AssertionError(f"missing {key} for {name} in {lock}")
+        lock.write_text(text[:start] + updated + text[end:], encoding="utf-8")
+
+    def fixture_runner(self) -> Path:
+        """A runner that pins a disposable gate's own lock for its checks."""
+        runner = self.base / "fixture-runner.py"
+        runner.write_text(
+            "import importlib\n"
+            "import runpy\n"
+            "import sys\n"
+            f"sys.path.insert(0, {str(self.gate)!r})\n"
+            "tools = importlib.import_module('quality_gate.tools')\n"
+            f"tools._default_lock_path = lambda: __import__('pathlib').Path("
+            f"{str(self.gate / 'tools.lock.toml')!r})\n"
+            f"runpy.run_path({str(self.gate / 'qg.py')!r}, "
+            "run_name='__main__')\n",
+            encoding="utf-8",
+        )
+        return runner
+
     def run_qg(
         self,
         *args: str,
@@ -391,7 +455,12 @@ class FixtureCase(unittest.TestCase):
         include_repo: bool = True,
         timeout: int = 120,
     ) -> subprocess.CompletedProcess[str]:
-        command = [*self.python_prefix(), str(QG)]
+        program = (
+            str(self.gate / "qg.py")
+            if self.gate == GATE
+            else str(self.fixture_runner())
+        )
+        command = [*self.python_prefix(), program]
         if include_repo:
             command.extend(["--repo", str(repo or self.repo)])
         command.extend(args)
@@ -425,6 +494,9 @@ class FixtureCase(unittest.TestCase):
             FAKE_JSCPD.replace("@PYTHON@", sys.executable), encoding="utf-8"
         )
         binary.chmod(0o755)
+        self.set_lock_field(
+            "jscpd", "payload_sha256", self.payload_digest(destination)
+        )
         sarif_path = self.base / "sarif.json"
         sarif_path.write_text(
             json.dumps(sarif if sarif is not None else sarif_report([])),

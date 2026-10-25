@@ -870,6 +870,7 @@ def _test_environment(python_prefix: list[str]) -> dict[str, str]:
         if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
             del environment[name]
     environment["QG_PYTHON"] = json.dumps(python_prefix)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 
