@@ -1,4 +1,4 @@
-schema = 1
+schema = 2
 
 [code]
 patterns = ["*.py", "*.sh", "*.el"]
@@ -13,7 +13,7 @@ required_tiers = [1]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "crap"]
+checks = ["ruff", "clones", "tests", "crap"]
 
 [classes.test]
 code = true

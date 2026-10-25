@@ -4,18 +4,22 @@ A reusable, offline code-quality gate for repositories that want every file clas
 reason recorded, every check declared by policy, and every metric exception explicit and ratcheted.
 Its core is one standard-library Python 3.12 command plus pinned external tools; the Python adapters
 also load the pinned coverage wheel from the tools cache. A consuming repository pins it as a git
-submodule and keeps its own `quality-gate.toml` and baselines.
+submodule and keeps its own `quality-gate.toml` and baselines. The authoritative policy, baseline and
+result contract is [`docs/SCHEMA.md`](docs/SCHEMA.md); this README explains how to use it.
 
 The gate is deliberately narrow. It owns the orchestration no maintained tool owns end to end:
 
-* **inventory** - every tracked or stageable file matches exactly one class rule, with a reason, and
-  every code class has the checks its tier requires;
+* **inventory** - every tracked or stageable file matches exactly one class rule, with a reason;
+* **obligations** - every code class is checked against the evidence its required tiers demand, with
+  reasoned exemptions reported rather than hidden;
 * **hygiene** - no tracked file is ignored, no file is oversized, enumeration never lies;
 * **checks** - checks are declared in policy and run in policy order; adapters measure, the core decides;
 * **one reasoned ratchet** - measured checks fail by default, and a baseline entry can accept a
   measured subject above its threshold only with a non-empty reason and an optional expiry;
 * **tools** - external tools are pinned by version, URL and SHA-256, and fetched explicitly;
-* **result** - `check --json` writes one machine-readable result that agents and CI can consume.
+* **result** - `check --json` writes one machine-readable schema-2 result that separates execution,
+  the adapter's raw outcome and policy satisfaction, and carries diagnostics, obligations and prune
+  reporting.
 
 Tier 1 now includes Python tests and per-function CRAP scores; the next metric layer is an Emacs Lisp
 CRAP adapter.
@@ -37,9 +41,9 @@ the configuration, `files.py` resolves the repository and runs inventory and hyg
 pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning, `clones.py` measures
 jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage, `python_crap.py` joins
 coverage with `ast` complexity, `coverage_tool.py` loads and combines the pinned wheel's data,
-`checks.py` runs every adapter and assembles the result, `gate_result.py` computes gate and consumer
-identity and the decision, and `cli.py` holds the argument parser and dispatch. `qg.py` is only the
-entry point.
+`runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
+result, `gate_result.py` computes identity, obligations and the decision, and `cli.py` holds the
+argument parser and dispatch. `qg.py` is only the entry point.
 
 ## Quick start in a consuming repository
 
@@ -100,10 +104,10 @@ Inventory fails (exit 1) and prints every violation when a file matches no rule,
 than one rule, a rule matches no file, a rule has an empty reason, a rule names a class that does not
 exist, or a code file (by pattern or shebang) is placed in a class whose `code` is not true.
 
-Inventory also fails when a code class lists no check, lists an id with no `[checks.ID]` table, has no
-enforced check of a required tier, and has no matching `[[not_applicable]]` entry. A code file is
-detected by fnmatch against `[code].patterns` or by the basename of its shebang interpreter after `env`
-matching `[code].shebangs`.
+Inventory also fails when a code class lists no check or lists an id with no `[checks.ID]` table.
+Whether a class has the evidence a required tier demands is reported by `check` as obligations, so
+`inventory` alone does not decide assurance. A code file is detected by fnmatch against
+`[code].patterns` or by the basename of its shebang interpreter after `env` matching `[code].shebangs`.
 
 ### hygiene
 
@@ -171,7 +175,7 @@ the adapter combines with the test process's data.
 `skipped_pattern` is optional and also has exactly one capture group: the number of skipped tests (for
 example `skipped=(\d+)` for unittest). Both patterns are searched with `re.MULTILINE` over the
 combined stdout and stderr. Executed tests are `ran - skipped`; the outcome is `fail` when the command
-exits non-zero, times out (`termination = "budget"`) or executes no tests, with
+exits non-zero, times out (`execution = "budget"`) or executes no tests, with
 `no test executed: N ran, N skipped`. It is `unsupported` when `tests_pattern` does not match, matches
 more than once (`ambiguous test summary`), a captured count is not an integer, or coverage is not
 installed; the message names `qg.py tools fetch`. On `pass` the adapter combines the parallel data
@@ -267,39 +271,64 @@ as skipped and the combined check still fails; hygiene still runs. Configuration
 any check starts.
 
 `check --json` writes exactly one JSON result to stdout and sends all human-readable lines to stderr.
-The result has:
+The result schema is `2`. Its top-level keys are `schema`, `gate_version`, `revision`, `dirty`,
+`policy_sha256`, `decision`, `checks`, `obligations` and `prune`; a `decision = "error"` document also
+has `error`.
 
-* `schema` - always `1`;
-* `gate_version` - the gate's own git revision, or `unknown: ...` with the reason it is unavailable;
-* `revision` and `dirty` - the consumer's HEAD (or null when there is no commit) and whether its tree
-  has changes;
-* `policy_sha256` - the SHA-256 of the policy file;
-* `decision` - `accepted`, `accepted_with_exceptions`, `rejected` or `error`;
-* `checks` - one object per configured check with `id`, `tier`, `enforcement`, `adapter`,
-  `metric_version`, `outcome` (`pass`, `fail`, `unsupported` or `error`), `duration_seconds`,
-  `budget_seconds`, `termination` (`exit`, `budget` or `signal`), `findings` and
-  `resolved_baseline_entries`; a measuring check may also carry a `measurement` object (for example
-  `{"tests": 12}`).
+`checks` contains inventory, hygiene and every configured check, in that order. Each check has `id`,
+`kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
+`evidence` (the evidence names the adapter produces), `metric_version`, `execution`, `outcome`,
+`satisfied`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
+`resolved_baseline_entries` and `unmeasured_baseline_entries`; a measuring check may also carry a
+`measurement` object (for example `{"tests": 12}`).
 
-A finding has `subject`, `value`, `bound` (or null when no baseline entry exists), `threshold`,
-`baseline_reason` (or null), `blocking` and `location`; expired findings also carry `expired`, baseline
+`execution` is `completed`, `budget`, `signal` or `error`. `outcome` is the adapter's raw verdict:
+`pass`, `fail`, `unsupported` or `error`; later tier-3 adapters add `proved`, `no_counterexample` and
+`unknown`. `satisfied` is true when the policy obligation is met after baselines and enforcement: a
+finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = true`, and an advisory
+check never blocks. Missing evidence is `unsupported`, never `pass`.
+
+`diagnostics` carries `argv`, `exit_code` or `signal`, `output_bytes`, `output_tail` (at most 4 KiB),
+`output_truncated` and, when execution failed, `error`. Every subprocess the gate starts (git
+enumeration and identity, command checks, jscpd and test runs) uses one bounded runner: it starts its own
+process group, terminates the whole group at the budget (SIGTERM, then SIGKILL after 5 seconds) and reaps
+it. Check output is captured up to 1 MiB; later bytes are counted and discarded. A consumer therefore
+never has to parse stderr to learn why a check failed.
+
+A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
+`baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location` and `expired`; baseline
 errors carry `error`, and CRAP findings carry a `measurement` with `cc`, `statements`, `executed` and
-`excluded_lines`. Missing evidence is `unsupported`, never `pass`. Unrounded values are compared:
-exactly at a bound passes, and a value `0.1` above the bound fails.
+`excluded_lines`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
+bound fails.
 
-The decision is `error` (exit 2) for invalid policy or usage, `rejected` (exit 1) when inventory,
-hygiene or any enforced check does not pass, `accepted_with_exceptions` (exit 0) when every enforced
-check passes but at least one finding passes only through a baseline entry or an advisory check does not
-pass, and `accepted` (exit 0) otherwise. `check --prune ID` runs the same checks, then prunes only check
-`ID` if that check passed; an unknown id or a check without a baseline exits 2.
+`obligations` has one entry per code class and required tier with `class`, `tier`, `status`
+(`satisfied`, `exempted` or `unsatisfied`), `required` (the evidence names the tier demands), `checks`
+(the checks that counted) and `reason` (for an exemption; otherwise null). Tier 1 needs a satisfied
+enforced check producing `tests` evidence with at least one executed test, so a lint-only class leaves
+tier 1 unsatisfied and rejects. Tier 2 needs `properties` or `fuzzing`; tiers 3 and 4 reserve
+`bounded` and `proof`. No version-2 adapter produces those evidence names yet, so a required tier above
+1 is exempted by a `[[not_applicable]]` entry until its adapter lands.
+
+`prune` reports `requested` (the requested check ids), `performed` and `reason`. `check --prune ID`
+runs the same checks, then prunes only check `ID` when it is satisfied; an unknown id or a check without
+a baseline exits 2. A refused or failed prune writes nothing, makes the command exit 1, and leaves
+`decision` reporting the gate evaluation.
+
+The decision is `error` (exit 2) for invalid policy, usage or configuration, `rejected` (exit 1) when
+inventory, hygiene, any enforced check or any obligation is not satisfied, `accepted_with_exceptions`
+(exit 0) when every obligation and enforced check is satisfied but at least one finding passes only through
+a baseline entry or an advisory check does not pass, and `accepted` (exit 0) otherwise. With `--json`,
+usage errors (unknown options, bad arguments) still write one error document with `decision = "error"`
+and exit 2. An argument containing NUL is a configuration error.
 
 ### Exit codes
 
 * `0` - the command passed, possibly with exceptions;
-* `1` - a check failed, a missing tool made a check unsupported, a baseline was malformed, or pruning was
-  refused because the check failed;
-* `2` - missing or invalid configuration, invalid command line, a repository that is not the top level
-  of a git work tree, an unknown inventory class or check id for pruning, or a malformed tool lock.
+* `1` - a check failed, an obligation was unsatisfied, a missing tool made a check unsupported, a
+  baseline was malformed, or a requested prune was refused or failed;
+* `2` - missing or invalid configuration (including a baseline header that does not match the policy or
+  two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
+  git work tree, an unknown inventory class or check id for pruning, or a malformed tool lock.
 
 ## Configuration
 
@@ -307,7 +336,7 @@ pass, and `accepted` (exit 0) otherwise. `check --prune ID` runs the same checks
 file, the key, and expected versus actual. Unknown keys anywhere are configuration errors naming the key
 and the allowed keys. The complete shape is:
 
-    schema = 1
+    schema = 2
 
     [code]
     patterns = ["*.py", "*.sh", "*.el"]   # fnmatch on the repository-relative path
@@ -322,7 +351,7 @@ and the allowed keys. The complete shape is:
     [classes.python]
     code = true                           # may hold code files
     description = "Python programs and tests"
-    checks = ["ruff", "clones", "crap"]   # ids of [checks.ID] tables
+    checks = ["ruff", "clones", "tests", "crap"]  # ids of [checks.ID] tables
 
     [classes.test]
     code = true
@@ -340,6 +369,8 @@ and the allowed keys. The complete shape is:
     run = ["{tool:ruff}", "check", "--no-cache", "{files}"]
     budget_seconds = 600                  # optional; this is the default
     must_match = "Success"                # optional regular expression on combined output
+    # tests_pattern = "^Ran (\\d+) tests? in"  # optional; makes evidence tests
+    # skipped_pattern = "skipped=(\\d+)"       # optional; with tests_pattern
 
     [checks.clones]
     adapter = "clones"
@@ -367,7 +398,7 @@ and the allowed keys. The complete shape is:
 
     [[not_applicable]]
     class = "python"                      # a configured class
-    tier = 2                              # a required tier it has no enforced check for
+    tier = 2                              # a required tier it has no evidence for
     reason = "tier 2 has no adapter yet"  # non-empty
 
     [[rule]]
@@ -394,15 +425,18 @@ Notes:
 * A class with `code = true` may hold code files. A code file may not be placed in a class with
   `code = false`.
 * Every class named by a rule must exist in `[classes]`. A class may exist without any file.
-* Every code class must list at least one check. Every code class needs at least one enforced check of
-  each `[levels].required_tiers` entry, unless a `[[not_applicable]]` entry names the class and tier with
-  a non-empty reason.
+* Every code class must list at least one check. Every code class has an obligation for each
+  `[levels].required_tiers` entry; tier 1 needs `tests` evidence with at least one executed test. A
+  `[[not_applicable]]` entry with a non-empty reason reports the obligation as `exempted` instead of
+  `unsatisfied`.
 * A command check's `run` is an argument list. The token `{files}` expands in place to the sorted files
   of every class that lists this check, as separate arguments. A selected path beginning with `-` is
   passed as `./PATH`, so it cannot become a tool option. The token `{tool:NAME}` expands to the binary
   of a tool pinned in `tools.lock.toml`; an unknown or unfetched tool makes the check `unsupported`
   and names `qg.py tools fetch`. A check using `{files}` with no selected files fails: zero inputs is
-  not a pass.
+  not a pass. A command check without `tests_pattern` produces `static` evidence; with a one-group
+  `tests_pattern` it produces `tests` evidence, counts executed tests as `ran - skipped`, and fails when
+  none executed.
 * A clone check's files come from the classes that list it. Clone baselines use the generic ratchet
   format below; the old top-level `[clones]` table and the old `[[clone]]` baseline are gone.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
@@ -415,8 +449,11 @@ Notes:
 
 An adapter that measures subjects returns findings with a `subject`, a numeric `value` and a
 `location`. The policy gives the check's `threshold` (clones use `0`, so the value is the number of
-extra occurrences) and, for measuring adapters, a `baseline` path. A baseline is a TOML file of
-`[[entry]]` tables:
+extra occurrences) and, for measuring adapters, a `baseline` path. A baseline begins with the check's
+identity and then holds `[[entry]]` tables:
+
+    check = "clones"
+    metric_version = "jscpd-clone-occurrences/1"
 
     [[entry]]
     subject = "76c7cbddc2677be2"
@@ -425,29 +462,40 @@ extra occurrences) and, for measuring adapters, a `baseline` path. A baseline is
     reason = "the two front ends deliberately mirror each other"
     expires = 2026-12-31
 
+* `check` and `metric_version` must match the policy's check id and metric version. A missing or
+  mismatched header is a configuration error; migration is a hand edit.
+* Two checks may not name the same baseline path, including `./PATH` aliases. That is a configuration
+  error, because pruning one would drop the other's subjects.
 * `subject` identifies the measured thing (a clone fingerprint, a Python function identity, or a file's
   `PATH:<module>` outside-function subject).
 * `bound` is the largest value this entry accepts. It must be finite (`inf` and `nan` are errors),
   and is compared unrounded; exactly at the bound passes.
 * `reason` must be non-empty. An empty or missing reason fails the check even if the value is covered.
 * `expires` is optional. A TOML date before today no longer covers its subject and is reported as
-  expired. An entry expiring today still covers.
-* Adapter-specific informational keys are preserved, for example clone `files`.
+  expired. An entry expiring today still covers today.
+* Adapter-specific informational keys are preserved by prune, for example clone `files`.
 
 Thresholds, baseline bounds and measured values must be finite: a non-finite threshold or bound is a
 configuration error, and a non-finite measured value makes the check `unsupported`. JSON output is
 written with `allow_nan=False`.
 
 A finding passes when `value <= threshold`, or when a baseline entry for its subject exists, has not
-expired, and `value <= bound`. A finding above both fails, naming subject, value, threshold or bound, and
-location. An entry whose subject was not measured, or that now passes the threshold, is reported as
-resolved. A baseline that is absent means no exception is accepted; an empty baseline file is allowed.
+expired, has a non-empty reason, and `value <= bound`. Such a finding keeps its raw value and is
+reported with `covered_by_baseline = true`, `blocking = false`, and check `satisfied = true` even
+though its raw `outcome` remains `fail`. A finding above both fails, naming subject, value, threshold or
+bound, and location. A baseline that is absent means no exception is accepted; a file with only the
+header and no entries is allowed.
+
+Resolution requires a complete scan. Each adapter reports the subject domain it measured completely: for
+CRAP the selected files, and for clones the completed jscpd scan. An entry is resolved or pruned only
+when its subject lies in that domain and was not found above threshold. An entry outside the domain is
+reported as `unmeasured` in `unmeasured_baseline_entries` and kept; prune never drops it.
 
 `--prune` only lowers each bound to the measured value and drops resolved entries. It never raises a
-bound or adds an entry, and it refuses (exit 1, writing nothing) while that check fails. A new exception
-enters a baseline only by hand, with a reason. Because the clone fingerprint covers the clone's token
-sequence, changing the duplicated code makes the old entry resolve and the new clone fail until a human
-accepts it.
+bound or adds an entry, and it refuses (exit 1, writing nothing) while that check is not satisfied. A new
+exception enters a baseline only by hand, with a reason. Because the clone fingerprint covers the clone's
+token sequence, changing the duplicated code makes the old entry resolve and the new clone fail until a
+human accepts it.
 
 ## Pinned tools and this repository
 
@@ -458,15 +506,16 @@ installation without a network.
 
 This repository gates itself with `quality-gate.toml`:
 
-* the `python` class lists `ruff`, `clones` and `crap`; the `test` class lists `ruff`, `clones`
-  and `tests`;
+* the `python` class lists `ruff`, `clones`, `tests` and `crap`; the `test` class lists
+  `ruff`, `clones` and `tests`;
 * `ruff` runs the pinned binary through `{tool:ruff}` with `--no-cache` on the inventory's Python files;
 * `clones` uses jscpd with `min_tokens = 50` and the generic baseline format;
 * `tests` runs the gate's own unittest suite under the pinned coverage wheel;
 * `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
   requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
   and a worklist reason;
-* `levels.required_tiers = [1]` makes tier 1 mandatory for both code classes.
+* `levels.required_tiers = [1]` makes tier 1 mandatory for both code classes; the `tests` check
+  provides the required `tests` evidence and each class's obligation is reported as satisfied.
 
 `make check` is the single entry point and runs only `python3 -I qg.py check`; Ruff, the tests and
 CRAP are policy checks, so the Makefile does not duplicate them.
@@ -479,7 +528,9 @@ not installed. Command-check tests use the real command; the real ruff test runs
 ruff binary exists and proves enforcement: an unused import is rejected with F401, then the repaired
 fixture is accepted, including files whose names contain a space and begin with `-`. `tools fetch`
 tests use fixture tarballs and wheels with `file://` URLs, including wrong hashes, unknown keys, unsafe
-archive members and destinations outside the tools directory.
+archive members and destinations outside the tools directory. Contract tests cover schema-2 typing,
+obligations and exemptions, diagnostics, baseline identity and domain rules, prune reporting and
+round-trips, the bounded runner's group kill and output cap, and JSON usage errors.
 
 ## Continuous integration
 
@@ -499,7 +550,9 @@ Reproduce it locally with the same tools cache:
 ## Planned later layers
 
 The core gate is deliberately language-agnostic; adapters measure and the core decides. Tier 1 now
-includes the Python tests and CRAP adapters described above. The next metric layer is:
+includes the Python tests and CRAP adapters described above. The result and ratchet contract is fixed
+at schema 2 so M4 (tier 2 properties/fuzzing) and M5 (tiers 3/4 bounded/proof) add adapters without
+reworking the core. The next metric layer is:
 
 * **Emacs Lisp CRAP adapter** - reuse the same baseline and reporting model, but compute complexity and
   coverage through an Emacs batch helper, since Emacs Lisp has no maintained standalone CRAP tool.

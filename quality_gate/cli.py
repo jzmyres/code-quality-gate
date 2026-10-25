@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from .checks import command_check
 from .clones import command_clones
@@ -14,8 +15,15 @@ from .policy import UsageError, load_config
 from .tools import _default_lock_path, command_tools_fetch, command_tools_path
 
 
+class _Parser(argparse.ArgumentParser):
+    """An argument parser whose errors are UsageError, not SystemExit."""
+
+    def error(self, message: str) -> None:
+        raise UsageError(f"{self.prog}: {message}")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="qg.py",
         description="Tiered policy checks, inventory, hygiene and pinned tools.",
     )
@@ -24,7 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="top level of the git work tree (default: current directory)",
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command", required=True, parser_class=_Parser
+    )
 
     inventory = commands.add_parser("inventory", help="classify every file")
     inventory.add_argument(
@@ -36,7 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune", action="store_true", help="remove resolved baseline entries"
     )
     tools = commands.add_parser("tools", help="manage pinned external tools")
-    tool_commands = tools.add_subparsers(dest="tools_command", required=True)
+    tool_commands = tools.add_subparsers(
+        dest="tools_command", required=True, parser_class=_Parser
+    )
     fetch = tool_commands.add_parser("fetch", help="download and verify pinned tools")
     fetch.add_argument("--lock", metavar="FILE", help="tool lock file")
     path = tool_commands.add_parser("path", help="print a pinned tool's binary")
@@ -55,38 +67,66 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _repo_hint(raw: list[str]) -> Path | None:
+    for index, argument in enumerate(raw):
+        if argument == "--repo" and index + 1 < len(raw):
+            return Path(raw[index + 1]).expanduser()
+        if argument.startswith("--repo="):
+            return Path(argument.split("=", 1)[1]).expanduser()
+    return None
 
-    if args.command == "tools":
-        lock = (
-            Path(args.lock).expanduser()
-            if getattr(args, "lock", None)
-            else _default_lock_path()
+
+def _print_error_document(
+    root: Path | None,
+    message: str,
+    *,
+    prune: dict[str, Any] | None = None,
+) -> None:
+    policy = root / "quality-gate.toml" if root is not None else None
+    print(
+        json.dumps(
+            error_document(root, policy, message, prune=prune),
+            indent=2,
+            allow_nan=False,
+        ),
+        file=sys.stdout,
+    )
+
+
+def _reject_nul(raw: list[str]) -> None:
+    if any("\x00" in argument for argument in raw):
+        raise UsageError(
+            "qg.py: command line: expected an argument without NUL, "
+            "got embedded NUL"
         )
-        if args.tools_command == "fetch":
-            return command_tools_fetch(lock)
-        return command_tools_path(lock, args.name)
 
+
+def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    json_requested = "--json" in raw
     root: Path | None = None
     try:
+        _reject_nul(raw)
+        args = build_parser().parse_args(raw)
+
+        if args.command == "tools":
+            lock = (
+                Path(args.lock).expanduser()
+                if getattr(args, "lock", None)
+                else _default_lock_path()
+            )
+            if args.tools_command == "fetch":
+                return command_tools_fetch(lock)
+            return command_tools_path(lock, args.name)
+
         root = resolve_repo(args.repo)
         config = load_config(root)
     except UsageError as error:
         print(error, file=sys.stderr)
-        if args.command == "check" and args.json:
-            guessed = root
-            if guessed is None and args.repo is not None:
-                guessed = Path(args.repo).expanduser()
-            policy = guessed / "quality-gate.toml" if guessed is not None else None
-            print(
-                json.dumps(
-                    error_document(guessed, policy, str(error)),
-                    indent=2,
-                    allow_nan=False,
-                ),
-                file=sys.stdout,
-            )
+        if json_requested:
+            if root is None:
+                root = _repo_hint(raw)
+            _print_error_document(root, str(error))
         return error.exit_code
 
     if args.command == "inventory":

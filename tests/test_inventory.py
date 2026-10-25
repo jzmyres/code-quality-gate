@@ -294,7 +294,7 @@ class InventoryTests(FixtureCase):
 
     def test_missing_code_section_exits_2(self) -> None:
         self.write_config(
-            'schema = 1\n[classes.python]\ncode = true\n'
+            'schema = 2\n[classes.python]\ncode = true\n'
             'description = "Python"\nchecks = ["smoke"]\n'
         )
         result = self.run_qg("inventory")
@@ -343,7 +343,7 @@ class InventoryTests(FixtureCase):
 
     def test_missing_classes_section_exits_2(self) -> None:
         self.write_config(
-            'schema = 1\n[code]\npatterns = ["*.py"]\n'
+            'schema = 2\n[code]\npatterns = ["*.py"]\n'
             'shebangs = ["python*"]\n'
         )
         result = self.run_qg("inventory")
@@ -467,7 +467,7 @@ class InventoryTests(FixtureCase):
         cases = [
             (
                 "code section is not a table",
-                'schema = 1\ncode = "x"\n',
+                'schema = 2\ncode = "x"\n',
                 "code:",
             ),
             (
@@ -487,13 +487,13 @@ class InventoryTests(FixtureCase):
             ),
             (
                 "classes is not a table",
-                'schema = 1\nclasses = "x"\n'
+                'schema = 2\nclasses = "x"\n'
                 "[code]\npatterns = []\nshebangs = []\n",
                 "classes:",
             ),
             (
                 "class entry is not a table",
-                'schema = 1\nclasses = { python = "x" }\n'
+                'schema = 2\nclasses = { python = "x" }\n'
                 "[code]\npatterns = []\nshebangs = []\n",
                 "classes.python",
             ),

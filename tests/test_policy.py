@@ -27,31 +27,31 @@ class PolicyTests(FixtureCase):
 
     def test_schema_is_required(self) -> None:
         self.config_error(
-            BASE_CONFIG.replace("schema = 1\n", ""),
+            BASE_CONFIG.replace("schema = 2\n", ""),
             "schema",
             "missing",
         )
 
-    def test_schema_must_be_one(self) -> None:
+    def test_schema_must_be_two(self) -> None:
         self.config_error(
-            BASE_CONFIG.replace("schema = 1", "schema = 2"),
+            BASE_CONFIG.replace("schema = 2", "schema = 1"),
             "schema",
-            "expected 1",
-            "2",
+            "expected 2",
+            "1",
         )
 
-    def test_schema_boolean_is_not_one(self) -> None:
+    def test_schema_boolean_is_not_two(self) -> None:
         self.config_error(
-            BASE_CONFIG.replace("schema = 1", "schema = true"),
+            BASE_CONFIG.replace("schema = 2", "schema = true"),
             "schema",
-            "expected 1",
+            "expected 2",
         )
 
-    def test_schema_float_is_not_one(self) -> None:
+    def test_schema_float_is_not_two(self) -> None:
         self.config_error(
-            BASE_CONFIG.replace("schema = 1", "schema = 1.0"),
+            BASE_CONFIG.replace("schema = 2", "schema = 2.0"),
             "schema",
-            "expected 1",
+            "expected 2",
         )
 
     def test_unknown_top_level_key_names_the_allowed_keys(self) -> None:
@@ -96,8 +96,8 @@ class PolicyTests(FixtureCase):
     def test_unknown_check_key(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(
-                'run = ["python3", "-c", "pass"]',
-                'run = ["python3", "-c", "pass"]\nextra = true',
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["python3", "-c", "print(1)"]\nextra = true',
             ),
             "checks.smoke.extra",
             "allowed keys",
@@ -127,14 +127,21 @@ class PolicyTests(FixtureCase):
         )
 
     def test_missing_required_tier_without_not_applicable(self) -> None:
-        self.inventory_failure(
+        self.write_config(
             BASE_CONFIG.replace(
                 "required_tiers = [1]", "required_tiers = [1, 2]"
-            ),
-            "classes.python",
-            "required tier 2",
-            "not_applicable",
+            )
         )
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        obligation = next(
+            item
+            for item in document["obligations"]
+            if item["class"] == "python" and item["tier"] == 2
+        )
+        self.assertEqual(obligation["status"], "unsatisfied")
+        self.assertEqual(obligation["required"], ["properties", "fuzzing"])
 
     def test_missing_required_tier_with_not_applicable(self) -> None:
         self.write_config(
@@ -144,8 +151,15 @@ class PolicyTests(FixtureCase):
             + '\n[[not_applicable]]\nclass = "python"\ntier = 2\n'
             'reason = "tier 2 has no adapter yet"\n'
         )
-        result = self.run_qg("inventory")
+        result, document = self.run_json()
         self.assertEqual(result.returncode, 0, output(result))
+        obligation = next(
+            item
+            for item in document["obligations"]
+            if item["class"] == "python" and item["tier"] == 2
+        )
+        self.assertEqual(obligation["status"], "exempted")
+        self.assertEqual(obligation["reason"], "tier 2 has no adapter yet")
 
     def test_not_applicable_reason_must_be_non_empty(self) -> None:
         self.config_error(
@@ -191,7 +205,7 @@ class PolicyTests(FixtureCase):
     def test_completed_check_needs_an_argument_list(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(
-                'run = ["python3", "-c", "pass"]', "run = []"
+                'run = ["python3", "-c", "print(1)"]', "run = []"
             ),
             "checks.smoke.run",
             "non-empty",
@@ -200,8 +214,8 @@ class PolicyTests(FixtureCase):
     def test_must_match_must_be_a_valid_regular_expression(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(
-                'run = ["python3", "-c", "pass"]',
-                'run = ["python3", "-c", "pass"]\nmust_match = "[unclosed"',
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["python3", "-c", "print(1)"]\nmust_match = "[unclosed"',
             ),
             "checks.smoke.must_match",
             "valid regular expression",
@@ -210,8 +224,8 @@ class PolicyTests(FixtureCase):
     def test_budget_seconds_must_be_positive(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(
-                'run = ["python3", "-c", "pass"]',
-                'run = ["python3", "-c", "pass"]\nbudget_seconds = 0',
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["python3", "-c", "print(1)"]\nbudget_seconds = 0',
             ),
             "checks.smoke.budget_seconds",
             ">= 1",
@@ -297,6 +311,65 @@ class PolicyTests(FixtureCase):
                     "checks.crap.threshold",
                     "finite",
                 )
+
+
+    def test_baseline_check_header_must_match_the_policy(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[checks.orphan]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nbaseline = "orphan.toml"\n'
+        )
+        self.add_file(
+            "orphan.toml",
+            'check = "other"\nmetric_version = '
+            '"jscpd-clone-occurrences/1"\n',
+        )
+        message = self.config_error(
+            self.read_file("quality-gate.toml"),
+            "orphan.toml",
+            "check",
+            "other",
+        )
+        self.assertIn("orphan", message)
+
+    def test_baseline_metric_version_must_match_the_policy(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[checks.orphan]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nbaseline = "orphan.toml"\n'
+        )
+        self.add_file(
+            "orphan.toml",
+            'check = "orphan"\nmetric_version = "jscpd-clone-occurrences/2"\n',
+        )
+        self.config_error(
+            self.read_file("quality-gate.toml"),
+            "orphan.toml",
+            "metric_version",
+            "jscpd-clone-occurrences/1",
+        )
+
+    def test_two_checks_may_not_share_a_baseline_path(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.one]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nbaseline = "shared.toml"\n'
+            '\n[checks.two]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nbaseline = "./shared.toml"\n',
+            "checks.two.baseline",
+            "shared.toml",
+            "checks.one",
+        )
+
+    def test_command_argument_with_nul_is_a_configuration_error(self) -> None:
+        self.config_error(
+            BASE_CONFIG.replace(
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["python3", "-c", "print(1)\\u0000"]',
+            ),
+            "checks.smoke.run[2]",
+            "NUL",
+        )
 
 
 if __name__ == "__main__":

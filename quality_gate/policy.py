@@ -14,7 +14,7 @@ DEFAULT_MIN_TOKENS = 50
 DEFAULT_BUDGET_SECONDS = 600
 DEFAULT_TESTS_BUDGET_SECONDS = 900
 DEFAULT_CRAP_THRESHOLD = 6.0
-SUPPORTED_SCHEMA = 1
+SUPPORTED_SCHEMA = 2
 SUPPORTED_ADAPTERS = ("command", "clones", "python_tests", "python_crap")
 COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement")
 TOP_LEVEL_KEYS = (
@@ -71,6 +71,10 @@ class CommandSpec:
     budget_seconds: int
     must_match: str | None
     must_match_pattern: re.Pattern[str] | None
+    tests_pattern: str | None = None
+    tests_pattern_re: re.Pattern[str] | None = None
+    skipped_pattern: str | None = None
+    skipped_pattern_re: re.Pattern[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,7 @@ class CheckDef:
     tier: int
     enforcement: str
     metric_version: str
+    evidence: tuple[str, ...]
     command: CommandSpec | None
     clones: CloneSpec | None
     python_tests: PythonTestsSpec | None
@@ -346,10 +351,74 @@ def _parse_rules(data: dict[str, Any], path: Path) -> tuple[Rule, ...]:
     return tuple(rules)
 
 
+def _argv_list(
+    parent: dict[str, Any], key: str, path: Path, full_key: str
+) -> tuple[str, ...]:
+    values = _string_list(parent, key, path, full_key)
+    for index, value in enumerate(values):
+        if "\x00" in value:
+            raise _config_error(
+                path,
+                f"{full_key}[{index}]",
+                "an argument without NUL",
+                "embedded NUL",
+            )
+    return values
+
+
+def _one_group_pattern(
+    raw: dict[str, Any], key: str, path: Path, full_key: str
+) -> tuple[str | None, re.Pattern[str] | None]:
+    if key not in raw:
+        return None, None
+    text = _string(raw, key, path, full_key)
+    try:
+        pattern = re.compile(text, re.MULTILINE)
+    except re.error as error:
+        raise _config_error(
+            path,
+            full_key,
+            "a valid regular expression",
+            str(error),
+        ) from error
+    if pattern.groups != 1:
+        raise _config_error(
+            path,
+            full_key,
+            "a regular expression with one capture group",
+            f"{pattern.groups} capture groups",
+        )
+    return text, pattern
+
+
+def _test_patterns(
+    raw: dict[str, Any], path: Path, full_key: str
+) -> tuple[
+    str | None,
+    re.Pattern[str] | None,
+    str | None,
+    re.Pattern[str] | None,
+]:
+    if "skipped_pattern" in raw and "tests_pattern" not in raw:
+        raise _config_error(
+            path,
+            f"{full_key}.skipped_pattern",
+            "tests_pattern in the same check",
+            "skipped_pattern without tests_pattern",
+        )
+    tests_text, tests_re = _one_group_pattern(
+        raw, "tests_pattern", path, f"{full_key}.tests_pattern"
+    )
+    skipped_text, skipped_re = _one_group_pattern(
+        raw, "skipped_pattern", path, f"{full_key}.skipped_pattern"
+    )
+    return tests_text, tests_re, skipped_text, skipped_re
+
+
 def _parse_command(
     raw: dict[str, Any], path: Path, full_key: str
 ) -> CommandSpec:
-    run = _string_list(raw, "run", path, f"{full_key}.run")
+    run = _argv_list(raw, "run", path, f"{full_key}.run")
     if not run:
         raise _config_error(path, f"{full_key}.run", "a non-empty argument list", "an empty list")
     budget = _integer(
@@ -373,7 +442,19 @@ def _parse_command(
                 "a valid regular expression",
                 str(error),
             ) from error
-    return CommandSpec(tuple(run), budget, must_match, pattern)
+    tests_text, tests_re, skipped_text, skipped_re = _test_patterns(
+        raw, path, full_key
+    )
+    return CommandSpec(
+        tuple(run),
+        budget,
+        must_match,
+        pattern,
+        tests_text,
+        tests_re,
+        skipped_text,
+        skipped_re,
+    )
 
 
 def _parse_clones(
@@ -397,54 +478,21 @@ def _parse_clones(
 def _parse_python_tests(
     raw: dict[str, Any], path: Path, full_key: str
 ) -> PythonTestsSpec:
-    run = _string_list(raw, "run", path, f"{full_key}.run")
+    run = _argv_list(raw, "run", path, f"{full_key}.run")
     if not run:
         raise _config_error(
             path, f"{full_key}.run", "a non-empty argument list", "an empty list"
         )
-    pattern_text = _string(
-        raw, "tests_pattern", path, f"{full_key}.tests_pattern"
+    pattern_text, pattern, skipped_pattern_text, skipped_pattern = _test_patterns(
+        raw, path, full_key
     )
-    try:
-        pattern = re.compile(pattern_text, re.MULTILINE)
-    except re.error as error:
-        raise _config_error(
-            path,
-            f"{full_key}.tests_pattern",
-            "a valid regular expression",
-            str(error),
-        ) from error
-    if pattern.groups != 1:
+    if pattern_text is None or pattern is None:
         raise _config_error(
             path,
             f"{full_key}.tests_pattern",
             "a regular expression with one capture group",
-            f"{pattern.groups} capture groups",
+            "missing",
         )
-    skipped_pattern_text: str | None = None
-    skipped_pattern: re.Pattern[str] | None = None
-    if "skipped_pattern" in raw:
-        skipped_pattern_text = _string(
-            raw, "skipped_pattern", path, f"{full_key}.skipped_pattern"
-        )
-        try:
-            skipped_pattern = re.compile(
-                skipped_pattern_text, re.MULTILINE
-            )
-        except re.error as error:
-            raise _config_error(
-                path,
-                f"{full_key}.skipped_pattern",
-                "a valid regular expression",
-                str(error),
-            ) from error
-        if skipped_pattern.groups != 1:
-            raise _config_error(
-                path,
-                f"{full_key}.skipped_pattern",
-                "a regular expression with one capture group",
-                f"{skipped_pattern.groups} capture groups",
-            )
     budget = _integer(
         raw,
         "budget_seconds",
@@ -474,6 +522,52 @@ def _parse_python_crap(
     return PythonCrapSpec(requires, baseline)
 
 
+def _allowed_keys(adapter: str) -> tuple[str, ...]:
+    if adapter == "command":
+        return (
+            *COMMON_CHECK_KEYS,
+            "run",
+            "budget_seconds",
+            "must_match",
+            "tests_pattern",
+            "skipped_pattern",
+        )
+    if adapter == "clones":
+        return (*COMMON_CHECK_KEYS, "min_tokens", "baseline")
+    if adapter == "python_tests":
+        return (
+            *COMMON_CHECK_KEYS,
+            "run",
+            "tests_pattern",
+            "skipped_pattern",
+            "budget_seconds",
+        )
+    return (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
+
+
+def _validate_requires(
+    checks: dict[str, CheckDef],
+    name: str,
+    python_crap: PythonCrapSpec | None,
+    path: Path,
+) -> None:
+    if python_crap is None:
+        return
+    required = checks.get(python_crap.requires)
+    if required is None:
+        actual = f"unknown check {python_crap.requires!r}"
+    elif required.adapter != "python_tests":
+        actual = f"{python_crap.requires!r} is a {required.adapter} check"
+    else:
+        return
+    raise _config_error(
+        path,
+        f"checks.{name}.requires",
+        "the id of a python_tests check declared earlier",
+        actual,
+    )
+
+
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path
 ) -> dict[str, CheckDef]:
@@ -496,21 +590,7 @@ def _parse_checks(
                 f"one of {names}",
                 _describe(adapter),
             )
-        if adapter == "command":
-            allowed = (*COMMON_CHECK_KEYS, "run", "budget_seconds", "must_match")
-        elif adapter == "clones":
-            allowed = (*COMMON_CHECK_KEYS, "min_tokens", "baseline")
-        elif adapter == "python_tests":
-            allowed = (
-                *COMMON_CHECK_KEYS,
-                "run",
-                "tests_pattern",
-                "skipped_pattern",
-                "budget_seconds",
-            )
-        else:
-            allowed = (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
-        _check_keys(raw, allowed, path, full_key)
+        _check_keys(raw, _allowed_keys(adapter), path, full_key)
         tier = _integer(
             raw, "tier", path, f"{full_key}.tier", minimum=1, maximum=4
         )
@@ -551,12 +631,21 @@ def _parse_checks(
                 minimum=0,
             )
             metric_version = "python-lines/1"
+        if command is not None:
+            evidence = ("tests",) if command.tests_pattern is not None else ("static",)
+        elif clones is not None:
+            evidence = ("duplication",)
+        elif python_tests is not None:
+            evidence = ("tests",)
+        else:
+            evidence = ("crap",)
         checks[name] = CheckDef(
             id=name,
             adapter=adapter,
             tier=tier,
             enforcement=enforcement,
             metric_version=metric_version,
+            evidence=evidence,
             command=command,
             clones=clones,
             python_tests=python_tests,
@@ -564,21 +653,95 @@ def _parse_checks(
             threshold=threshold,
             baseline=baseline,
         )
-        if python_crap is not None:
-            required = checks.get(python_crap.requires)
-            if required is None:
-                actual = f"unknown check {python_crap.requires!r}"
-            elif required.adapter != "python_tests":
-                actual = f"{python_crap.requires!r} is a {required.adapter} check"
-            else:
-                continue
+        _validate_requires(checks, name, python_crap, path)
+    _validate_baselines(checks, path)
+    return checks
+
+
+def _header_string(
+    data: dict[str, Any], key: str, path: Path, expected: str
+) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise _config_error(
+            path,
+            key,
+            expected,
+            "missing" if value is None else _describe(value),
+        )
+    return value
+
+
+def _baseline_header(path: Path) -> tuple[str, str] | None:
+    """Read a baseline's identity header, deferring malformed TOML to the check."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as stream:
+            data = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+    return (
+        _header_string(
+            data, "check", path, 'a baseline header check = "CHECK ID"'
+        ),
+        _header_string(
+            data,
+            "metric_version",
+            path,
+            'a baseline header metric_version = "VERSION"',
+        ),
+    )
+
+
+def _baseline_key(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def _check_baseline_header(
+    path: Path, name: str, check: CheckDef
+) -> None:
+    header = _baseline_header(path)
+    if header is None:
+        return
+    expected = {
+        "check": (check.id, f"(from checks.{name})"),
+        "metric_version": (check.metric_version, f"(from checks.{name})"),
+    }
+    actual = {
+        "check": header[0],
+        "metric_version": header[1],
+    }
+    for key, value in actual.items():
+        want, source = expected[key]
+        if value != want:
             raise _config_error(
                 path,
-                f"checks.{name}.requires",
-                "the id of a python_tests check declared earlier",
-                actual,
+                key,
+                f"{want!r} {source}",
+                f"{value!r}",
             )
-    return checks
+
+
+def _validate_baselines(checks: dict[str, CheckDef], path: Path) -> None:
+    owners: dict[Path, str] = {}
+    for name, check in checks.items():
+        if check.baseline is None:
+            continue
+        key = _baseline_key(check.baseline)
+        owner = owners.get(key)
+        if owner is not None:
+            raise _config_error(
+                path,
+                f"checks.{name}.baseline",
+                "a baseline path used by exactly one check",
+                f"{check.baseline} is also used by checks.{owner}",
+            )
+        owners[key] = name
+        _check_baseline_header(check.baseline, name, check)
 
 
 def _parse_levels(

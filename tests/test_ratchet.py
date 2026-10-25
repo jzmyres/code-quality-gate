@@ -6,7 +6,9 @@ import datetime
 import importlib
 import io
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from support import GATE
 
@@ -22,6 +24,8 @@ class RatchetTests(unittest.TestCase):
         entries: list[tuple[str, float, str, object]],
         *,
         threshold: float = 0,
+        domain=None,
+        today: datetime.date | None = None,
     ):
         output = io.StringIO()
         errors = io.StringIO()
@@ -41,6 +45,8 @@ class RatchetTests(unittest.TestCase):
                 enforcement="enforced",
                 prefix="check: metric",
                 adapter="metric",
+                domain=domain or ratchet.Domain.all(),
+                today=today,
             )
         return result, output.getvalue(), errors.getvalue()
 
@@ -52,12 +58,15 @@ class RatchetTests(unittest.TestCase):
         self.assertIn("threshold 0", errors)
         self.assertIn("file:1", errors)
 
-    def test_exactly_at_bound_passes(self) -> None:
+    def test_exactly_at_bound_passes_through_the_baseline(self) -> None:
         result, _out, _errors = self.decide(
             [("subject", 5.0)], [("subject", 5.0, "accepted", None)]
         )
-        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.outcome, "fail")
+        self.assertTrue(result.satisfied)
         self.assertTrue(result.exceptions)
+        self.assertTrue(result.findings[0].covered_by_baseline)
+        self.assertFalse(result.findings[0].blocking)
 
     def test_one_tenth_above_bound_fails(self) -> None:
         result, _out, errors = self.decide(
@@ -80,6 +89,7 @@ class RatchetTests(unittest.TestCase):
             [("subject", 10, "old", datetime.date(2000, 1, 1))],
         )
         self.assertEqual(result.outcome, "fail")
+        self.assertFalse(result.satisfied)
         self.assertTrue(result.findings[0].expired)
         self.assertIn("expired baseline entry", stdout + errors)
         self.assertIn("2000-01-01", stdout + errors)
@@ -89,7 +99,26 @@ class RatchetTests(unittest.TestCase):
             [("subject", 1)],
             [("subject", 10, "accepted", datetime.date(2999, 1, 1))],
         )
-        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.outcome, "fail")
+        self.assertTrue(result.satisfied)
+
+    def test_entry_expiring_today_still_covers(self) -> None:
+        result, _out, _errors = self.decide(
+            [("subject", 1)],
+            [("subject", 10, "accepted", datetime.date(2026, 10, 25))],
+            today=datetime.date(2026, 10, 25),
+        )
+        self.assertTrue(result.satisfied)
+        self.assertFalse(result.findings[0].expired)
+
+    def test_entry_expired_yesterday_does_not_cover(self) -> None:
+        result, _out, _errors = self.decide(
+            [("subject", 1)],
+            [("subject", 10, "accepted", datetime.date(2026, 10, 24))],
+            today=datetime.date(2026, 10, 25),
+        )
+        self.assertFalse(result.satisfied)
+        self.assertTrue(result.findings[0].expired)
 
     def test_entry_below_threshold_is_resolved(self) -> None:
         result, stdout, _errors = self.decide(
@@ -102,7 +131,7 @@ class RatchetTests(unittest.TestCase):
         self.assertFalse(result.exceptions)
         self.assertIn("resolved subject", stdout)
 
-    def test_unmeasured_entry_is_resolved(self) -> None:
+    def test_unmeasured_entry_is_resolved_only_inside_the_domain(self) -> None:
         result, stdout, _errors = self.decide(
             [], [("gone", 4, "old", None)]
         )
@@ -110,11 +139,28 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(result.resolved, ["gone"])
         self.assertIn("resolved gone", stdout)
 
+    def test_entry_outside_the_measured_domain_stays_unmeasured(self) -> None:
+        result, stdout, _errors = self.decide(
+            [],
+            [("other.py:gone", 4, "old", None)],
+            domain=ratchet.Domain.of_files(("a.py",)),
+        )
+        self.assertEqual(result.outcome, "pass")
+        self.assertTrue(result.satisfied)
+        self.assertEqual(result.resolved, [])
+        self.assertEqual(result.unmeasured, ["other.py:gone"])
+        self.assertIn("unmeasured other.py:gone", stdout)
+        self.assertEqual(
+            [entry.subject for entry in ratchet.pruned_entries(result)],
+            ["other.py:gone"],
+        )
+
     def test_baseline_exception_is_reported(self) -> None:
         result, _out, _errors = self.decide(
             [("subject", 2)], [("subject", 2, "accepted", None)]
         )
-        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.outcome, "fail")
+        self.assertTrue(result.satisfied)
         self.assertTrue(result.exceptions)
 
     def test_prune_lowers_but_never_raises(self) -> None:
@@ -161,6 +207,77 @@ class RatchetTests(unittest.TestCase):
                         [("subject", 1)],
                         [("subject", value, "accepted", None)],
                     )
+
+
+class BaselineFileTests(unittest.TestCase):
+    def test_write_and_load_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            ratchet.write_baseline(
+                path,
+                [
+                    ratchet.BaselineEntry(
+                        "subject",
+                        2,
+                        "reason",
+                        datetime.date(2999, 1, 1),
+                        {"files": ["a.py", "b.py"]},
+                    )
+                ],
+                check_id="metric",
+                metric_version="metric/1",
+            )
+            entries = ratchet.load_baseline(
+                path,
+                check_id="metric",
+                metric_version="metric/1",
+                allowed_extras=("files",),
+            )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].subject, "subject")
+        self.assertEqual(entries[0].expires, datetime.date(2999, 1, 1))
+        self.assertEqual(entries[0].extras["files"], ["a.py", "b.py"])
+
+    def test_header_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            path.write_text(
+                'check = "other"\nmetric_version = "metric/1"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(policy.GateError) as raised:
+                ratchet.load_baseline(
+                    path, check_id="metric", metric_version="metric/1"
+                )
+        self.assertIn("check", str(raised.exception))
+
+    def test_missing_header_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            path.write_text("[[entry]]\n", encoding="utf-8")
+            with self.assertRaises(policy.GateError) as raised:
+                ratchet.load_baseline(
+                    path, check_id="metric", metric_version="metric/1"
+                )
+        self.assertIn("check", str(raised.exception))
+
+    def test_invalid_files_extra_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            path.write_text(
+                'check = "metric"\nmetric_version = "metric/1"\n'
+                '[[entry]]\nsubject = "s"\nbound = 1\n'
+                'reason = "r"\nfiles = "not a list"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(policy.GateError) as raised:
+                ratchet.load_baseline(
+                    path,
+                    check_id="metric",
+                    metric_version="metric/1",
+                    allowed_extras=("files",),
+                )
+        self.assertIn("list of strings", str(raised.exception))
 
 
 if __name__ == "__main__":

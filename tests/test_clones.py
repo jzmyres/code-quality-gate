@@ -70,6 +70,23 @@ class CloneGateTests(FixtureCase):
             sarif_report(clones), **(fake or {})
         )
 
+    def mirror_entries(
+        self,
+        *,
+        bound: int = 3,
+        expires: str | None = None,
+        reason: str = "deliberate mirror",
+    ) -> list[dict[str, object]]:
+        entry: dict[str, object] = {
+            "fingerprint": "fp1",
+            "count": bound,
+            "files": ["a.py", "b.py"],
+            "reason": reason,
+        }
+        if expires is not None:
+            entry["expires"] = expires
+        return [entry]
+
     def clone_failure(
         self, env: dict[str, str], *needles: str, prune: bool = False
     ) -> str:
@@ -299,19 +316,8 @@ class CloneGateTests(FixtureCase):
     def test_prune_removes_resolved_entries_and_lowers_count(self) -> None:
         env = self.clone_env(
             [("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])],
-            [
-                {
-                    "fingerprint": "fp1",
-                    "count": 3,
-                    "files": ["a.py", "b.py"],
-                    "reason": "deliberate mirror",
-                },
-                {
-                    "fingerprint": "fp-old",
-                    "files": ["old.py"],
-                    "reason": "gone",
-                },
-            ],
+            self.mirror_entries()
+            + [{"fingerprint": "fp-old", "files": ["old.py"], "reason": "gone"}],
         )
         result = self.run_qg("clones", "--prune", env=env)
         self.assertEqual(result.returncode, 0, output(result))
@@ -405,19 +411,48 @@ class CloneGateTests(FixtureCase):
     def test_check_prune_lowers_a_passing_baseline(self) -> None:
         env = self.clone_env(
             [("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])],
-            [
-                {
-                    "fingerprint": "fp1",
-                    "bound": 3,
-                    "files": ["a.py", "b.py"],
-                    "reason": "lower me",
-                }
-            ],
+            self.mirror_entries(bound=3, reason="lower me"),
         )
         result = self.run_qg("check", "--prune", "clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         entry = self.single_baseline("fp1", "lower me")
         self.assertEqual(entry["files"], ["a.py", "b.py"])
+
+    def test_check_prune_reports_refusal_in_json(self) -> None:
+        env = self.repeated_clone_env(
+            [{"fingerprint": "fp1", "bound": 1, "reason": "only one"}]
+        )
+        result, document = self.run_json("--prune", "clones", env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["prune"]["requested"], ["clones"])
+        self.assertFalse(document["prune"]["performed"])
+        self.assertIn("did not pass", document["prune"]["reason"])
+        check = self.check_by_id(document, "clones")
+        self.assertFalse(check["satisfied"])
+
+    def test_prune_round_trips_expiry_files_and_headers(self) -> None:
+        env = self.clone_env(
+            [("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])],
+            self.mirror_entries(expires="2999-01-01"),
+        )
+        result, document = self.run_json("--prune", "clones", env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(
+            document["prune"],
+            {"requested": ["clones"], "performed": True, "reason": None},
+        )
+        loaded = tomllib.loads(self.read_file("quality-gate-clones.toml"))
+        self.assertEqual(loaded["check"], "clones")
+        self.assertEqual(
+            loaded["metric_version"], "jscpd-clone-occurrences/1"
+        )
+        entry = loaded["entry"][0]
+        self.assertEqual(entry["subject"], "fp1")
+        self.assertEqual(entry["bound"], 1)
+        self.assertEqual(entry["files"], ["a.py", "b.py"])
+        self.assertEqual(str(entry["expires"]), "2999-01-01")
+        self.assertEqual(entry["reason"], "deliberate mirror")
 
     def test_check_prune_refuses_while_the_check_fails(self) -> None:
         env = self.clone_env(
@@ -450,6 +485,8 @@ class CloneGateTests(FixtureCase):
         env = self.clone_env([])
         self.add_file(
             "quality-gate-clones.toml",
+            'check = "clones"\nmetric_version = '
+            '"jscpd-clone-occurrences/1"\n'
             '[[entry]]\nsubject = "fp1"\nbound = "high"\n'
             'reason = "never valid"\n',
         )
@@ -461,6 +498,8 @@ class CloneGateTests(FixtureCase):
                 env = self.clone_env([])
                 self.add_file(
                     "quality-gate-clones.toml",
+                    f'check = "clones"\nmetric_version = '
+                    '"jscpd-clone-occurrences/1"\n'
                     f'[[entry]]\nsubject = "fp1"\nbound = {value}\n'
                     'reason = "never valid"\n',
                 )
@@ -485,7 +524,7 @@ class CloneGateTests(FixtureCase):
     def test_real_jscpd_reports_elisp_and_bash_clone_pairs(self) -> None:
         self.write_config(
             """\
-schema = 1
+schema = 2
 
 [code]
 patterns = ["*.el", "*.sh"]
@@ -497,12 +536,12 @@ required_tiers = [1]
 [classes.lisp]
 code = true
 description = "Emacs Lisp"
-checks = ["clones"]
+checks = ["clones", "tests"]
 
 [classes.shell]
 code = true
 description = "Bash"
-checks = ["clones"]
+checks = ["clones", "tests"]
 
 [classes.config]
 code = false
@@ -534,6 +573,13 @@ tier = 1
 enforcement = "enforced"
 min_tokens = 50
 baseline = "quality-gate-clones.toml"
+
+[checks.tests]
+adapter = "command"
+tier = 1
+enforcement = "enforced"
+run = ["python3", "-c", "print('Ran 1 test in 0.001s')"]
+tests_pattern = "^Ran (\\\\d+) tests? in"
 """
         )
         (self.repo / "a.py").unlink()

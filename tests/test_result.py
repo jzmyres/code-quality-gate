@@ -28,9 +28,11 @@ class ResultTests(FixtureCase):
             "policy_sha256",
             "decision",
             "checks",
+            "obligations",
+            "prune",
         ):
             self.assertIn(key, document)
-        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["schema"], 2)
         self.assertEqual(document["decision"], "accepted")
         self.assertFalse(document["dirty"])
         self.assertEqual(
@@ -45,22 +47,56 @@ class ResultTests(FixtureCase):
         check = self.check_by_id(document, "smoke")
         for key in (
             "id",
+            "kind",
             "tier",
             "enforcement",
             "adapter",
+            "evidence",
             "metric_version",
+            "execution",
             "outcome",
+            "satisfied",
             "duration_seconds",
             "budget_seconds",
-            "termination",
+            "diagnostics",
             "findings",
             "resolved_baseline_entries",
+            "unmeasured_baseline_entries",
         ):
             self.assertIn(key, check)
+        self.assertEqual(check["kind"], "check")
+        self.assertEqual(check["evidence"], ["tests"])
+        self.assertEqual(check["execution"], "completed")
         self.assertEqual(check["outcome"], "pass")
-        self.assertEqual(check["termination"], "exit")
+        self.assertTrue(check["satisfied"])
         self.assertIsInstance(check["duration_seconds"], float)
         self.assertEqual(check["budget_seconds"], 600)
+        diagnostics = check["diagnostics"]
+        for key in (
+            "argv",
+            "exit_code",
+            "signal",
+            "output_bytes",
+            "output_tail",
+            "output_truncated",
+        ):
+            self.assertIn(key, diagnostics)
+        self.assertEqual(diagnostics["exit_code"], 0)
+        self.assertIsNone(diagnostics["signal"])
+        self.assertIsInstance(diagnostics["output_bytes"], int)
+        self.assertIsInstance(diagnostics["output_tail"], str)
+        self.assertEqual(check["measurement"], {"tests": 1})
+        for name in ("inventory", "hygiene"):
+            builtin = self.check_by_id(document, name)
+            self.assertEqual(builtin["kind"], name)
+            self.assertEqual(builtin["outcome"], "pass")
+            self.assertTrue(builtin["satisfied"])
+        obligation = document["obligations"][0]
+        self.assertEqual(obligation["class"], "python")
+        self.assertEqual(obligation["tier"], 1)
+        self.assertEqual(obligation["status"], "satisfied")
+        self.assertEqual(obligation["checks"], ["smoke"])
+        self.assertEqual(obligation["required"], ["tests"])
 
     def test_dirty_tracks_a_changed_tree(self) -> None:
         self.commit_all()
@@ -73,7 +109,7 @@ class ResultTests(FixtureCase):
     def test_enforced_failure_is_rejected_and_exits_one(self) -> None:
         self.write_config(
             BASE_CONFIG.replace(
-                'run = ["python3", "-c", "pass"]',
+                'run = ["python3", "-c", "print(1)"]',
                 'run = ["python3", "-c", "import sys; sys.exit(1)"]',
             )
         )
@@ -85,12 +121,29 @@ class ResultTests(FixtureCase):
         self.assertEqual(check["outcome"], "fail")
         self.assertNotIn("check:", result.stdout)
 
+    def test_lint_only_class_leaves_tier_one_unsatisfied(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace("tests_pattern = '(\\d+)'\n", "")
+        )
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        check = self.check_by_id(document, "smoke")
+        self.assertEqual(check["evidence"], ["static"])
+        self.assertTrue(check["satisfied"])
+        obligation = document["obligations"][0]
+        self.assertEqual(obligation["status"], "unsatisfied")
+        self.assertEqual(obligation["checks"], [])
+        self.assertIn(
+            "obligation python tier 1", result.stderr
+        )
+
     def test_advisory_failure_is_accepted_with_exceptions(self) -> None:
         self.write_config(
             BASE_CONFIG.replace(
                 'enforcement = "enforced"', 'enforcement = "advisory"'
             ).replace(
-                'run = ["python3", "-c", "pass"]',
+                'run = ["python3", "-c", "print(1)"]',
                 'run = ["python3", "-c", "import sys; sys.exit(1)"]',
             )
             + '\n[[not_applicable]]\nclass = "python"\ntier = 1\n'
@@ -127,7 +180,8 @@ class ResultTests(FixtureCase):
         document = self.parse_json(result)
         self.assertEqual(document["decision"], "accepted_with_exceptions")
         check = self.check_by_id(document, "clones")
-        self.assertEqual(check["outcome"], "pass")
+        self.assertEqual(check["outcome"], "fail")
+        self.assertTrue(check["satisfied"])
         self.assertEqual(len(check["findings"]), 1)
         finding = check["findings"][0]
         for key in (
@@ -136,10 +190,12 @@ class ResultTests(FixtureCase):
             "bound",
             "threshold",
             "baseline_reason",
+            "covered_by_baseline",
             "blocking",
             "location",
         ):
             self.assertIn(key, finding)
+        self.assertTrue(finding["covered_by_baseline"])
         self.assertEqual(finding["subject"], "fp1")
         self.assertEqual(finding["value"], 1)
         self.assertEqual(finding["bound"], 1)
@@ -149,7 +205,7 @@ class ResultTests(FixtureCase):
         self.assertIn("a.py:1-8", finding["location"])
 
     def test_policy_error_with_json_is_one_error_document(self) -> None:
-        self.write_config(BASE_CONFIG.replace("schema = 1\n", ""))
+        self.write_config(BASE_CONFIG.replace("schema = 2\n", ""))
         result = self.run_qg("check", "--json")
         self.assertEqual(result.returncode, 2, output(result))
         document = self.parse_json(result)
@@ -157,6 +213,33 @@ class ResultTests(FixtureCase):
         self.assertEqual(document["checks"], [])
         self.assertIn("schema", document["error"])
         self.assertIn("schema", result.stderr)
+
+    def test_unknown_option_with_json_is_one_error_document(self) -> None:
+        result = self.run_qg("check", "--json", "--unknown-option")
+        self.assertEqual(result.returncode, 2, output(result))
+        document = self.parse_json(result)
+        self.assertEqual(document["schema"], 2)
+        self.assertEqual(document["decision"], "error")
+        self.assertEqual(document["checks"], [])
+        self.assertEqual(document["obligations"], [])
+        self.assertIn("unrecognized arguments", document["error"])
+        self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_usage_error_with_repo_equals_still_finds_policy(self) -> None:
+        result = self.run_qg(
+            f"--repo={self.repo}",
+            "check",
+            "--json",
+            "--unknown-option",
+            include_repo=False,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        document = self.parse_json(result)
+        self.assertEqual(document["decision"], "error")
+        self.assertEqual(
+            document["policy_sha256"],
+            hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
+        )
 
     def test_resolved_baseline_entry_is_in_the_result(self) -> None:
         self.write_config(with_clones())

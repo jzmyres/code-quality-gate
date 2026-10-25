@@ -20,7 +20,7 @@ def tests_config(
     budget: int | None = None,
 ) -> str:
     lines = [
-        "schema = 1",
+        "schema = 2",
         "",
         "[code]",
         'patterns = ["*.py"]',
@@ -117,7 +117,7 @@ class PythonTestsTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         check = self.check_by_id(document, "tests")
         self.assertEqual(check["outcome"], "pass")
-        self.assertEqual(check["termination"], "exit")
+        self.assertEqual(check["execution"], "completed")
         self.assertEqual(check["measurement"], {"tests": 2})
         self.assertEqual(check["metric_version"], "test-count/1")
         self.assertIn("passed (2 tests", result.stderr)
@@ -155,12 +155,56 @@ class PythonTestsTests(FixtureCase):
         )
         self.unsupported_tests("ambiguous test summary")
 
+    def test_ambiguous_test_summary_on_failure_is_unsupported(self) -> None:
+        self.add_file(
+            "tests/failing_summary.py",
+            "import sys\n"
+            "print('Ran 1 test in 0.1s')\n"
+            "print('Ran 2 tests in 0.2s')\n"
+            "sys.exit(1)\n",
+        )
+        self.write_config(
+            tests_config(run='["{python}", "tests/failing_summary.py"]')
+        )
+        self.unsupported_tests("ambiguous test summary")
+
     def test_failing_test_fails(self) -> None:
         self.add_test(
             "test_failure",
             "    def test_fails(self):\n        self.fail('deliberate')\n",
         )
         self.failed_tests("command exited 1", "deliberate")
+
+    def test_failed_command_without_summary_has_no_measurement(self) -> None:
+        self.add_file(
+            "tests/failing.py",
+            "import sys\nprint('no summary')\nsys.exit(1)\n",
+        )
+        self.write_config(
+            tests_config(run='["{python}", "tests/failing.py"]')
+        )
+        _result, check = self.failed_tests("command exited 1", "no summary")
+        self.assertNotIn("measurement", check)
+
+    def test_failed_command_with_zero_executed_tests_reports_counts(self) -> None:
+        self.add_file(
+            "tests/failing.py",
+            "import sys\n"
+            "print('Ran 1 test in 0.1s')\n"
+            "print('skipped=1')\n"
+            "sys.exit(1)\n",
+        )
+        self.write_config(
+            tests_config(
+                run='["{python}", "tests/failing.py"]',
+                skipped_pattern=r"skipped=(\d+)",
+            )
+        )
+        _result, check = self.failed_tests(
+            "command exited 1 and no test executed: 1 ran, 1 skipped",
+            "zero tests is not a pass",
+        )
+        self.assertEqual(check["measurement"], {"tests": 0})
 
     def test_timeout_reports_budget(self) -> None:
         self.write_config(tests_config(budget=1))
@@ -173,7 +217,7 @@ class PythonTestsTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         check = self.check_by_id(document, "tests")
         self.assertEqual(check["outcome"], "fail")
-        self.assertEqual(check["termination"], "budget")
+        self.assertEqual(check["execution"], "budget")
         self.assertEqual(check["budget_seconds"], 1)
         self.assertIn("exceeded its 1 second budget", result.stderr)
 

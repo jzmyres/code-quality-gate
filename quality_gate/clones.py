@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -19,6 +18,7 @@ from .policy import (
     UnsupportedError,
 )
 from .ratchet import Finding, pruned_entries, write_baseline
+from .runner import Diagnostics, run
 from .tools import _jscpd_binary
 
 
@@ -79,6 +79,30 @@ def _read_report(report: Path) -> Any:
         raise _no_completed(report, f"cannot read report: {error}") from error
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise _no_completed(report, f"invalid JSON: {error}") from error
+
+
+class CloneEvidenceError(UnsupportedError):
+    """A jscpd run did not produce complete clone evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: Diagnostics | None = None,
+        execution: str = "completed",
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+        self.execution = execution
+
+
+@dataclass
+class CloneMeasurement:
+    findings: list[Finding]
+    diagnostics: Diagnostics
+    execution: str
+    error: str | None = None
+    unsupported: bool = False
 
 
 @dataclass(frozen=True)
@@ -261,98 +285,121 @@ def _parse_jscpd_json(report: Path, files: list[str]) -> None:
         )
 
 
+def _jscpd_command(
+    binary: Path,
+    files: list[str],
+    min_tokens: int,
+    max_bytes: int,
+    output: Path,
+    config: Path,
+) -> list[str]:
+    formats = {
+        FORMAT_BY_SUFFIX.get(Path(name).suffix.lower()) for name in files
+    }
+    command = [
+        str(binary),
+        "--config",
+        str(config),
+        "--min-tokens",
+        str(min_tokens),
+        "--min-lines",
+        "5",
+        "--max-size",
+        str(max_bytes),
+        "--ignore",
+        ".qg-never-match",
+        "--no-gitignore",
+        "--mode",
+        "mild",
+    ]
+    if None not in formats:
+        command.extend(["--format", ",".join(sorted(formats))])
+    command.extend(
+        [
+            "--reporters",
+            "json,sarif",
+            "--output",
+            str(output),
+            "--fail-on-empty",
+            "--no-tips",
+            "--no-colors",
+            "--",
+            *files,
+        ]
+    )
+    return command
+
+
+def _raise_jscpd_termination(
+    result: Any, diagnostics: Diagnostics
+) -> None:
+    if result.execution == "error":
+        raise CloneEvidenceError(
+            f"cannot run jscpd: {result.error}",
+            diagnostics=diagnostics,
+            execution="error",
+        )
+    if result.execution == "budget":
+        raise CloneEvidenceError(
+            "jscpd exceeded its 600 second budget",
+            diagnostics=diagnostics,
+            execution="budget",
+        )
+    if result.execution == "signal":
+        raise CloneEvidenceError(
+            f"jscpd terminated by signal {-result.returncode}",
+            diagnostics=diagnostics,
+            execution="signal",
+        )
+
+
+def _raise_jscpd_failure(result: Any, diagnostics: Diagnostics) -> None:
+    _raise_jscpd_termination(result, diagnostics)
+    if result.returncode != 0:
+        detail = result.stderr_text.strip() or result.stdout_text.strip()
+        raise CloneEvidenceError(
+            f"jscpd failed (exit {result.returncode}): "
+            f"{detail or 'no output'}",
+            diagnostics=diagnostics,
+        )
+
+
 def _run_jscpd(
     root: Path,
     binary: Path,
     files: list[str],
     min_tokens: int,
     max_bytes: int,
-) -> list[Clone]:
+) -> tuple[list[Clone], Diagnostics, str]:
     with tempfile.TemporaryDirectory(prefix="qg-clones-") as temporary:
         output = Path(temporary)
         config = output / "jscpd-config.json"
         config.write_text("{}", encoding="utf-8")
-        formats = {
-            FORMAT_BY_SUFFIX.get(Path(name).suffix.lower())
-            for name in files
-        }
-        command = [
-            str(binary),
-            "--config",
-            str(config),
-            "--min-tokens",
-            str(min_tokens),
-            "--min-lines",
-            "5",
-            "--max-size",
-            str(max_bytes),
-            "--ignore",
-            ".qg-never-match",
-            "--no-gitignore",
-            "--mode",
-            "mild",
-        ]
-        if None not in formats:
-            command.extend(
-                ["--format", ",".join(sorted(formats))]
-            )
-        command.extend(
-            [
-                "--reporters",
-                "json,sarif",
-                "--output",
-                str(output),
-                "--fail-on-empty",
-                "--no-tips",
-                "--no-colors",
-                "--",
-                *files,
-            ]
+        command = _jscpd_command(
+            binary, files, min_tokens, max_bytes, output, config
         )
-        try:
-            result = subprocess.run(
-                command,
-                cwd=root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=600,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise _no_completed(
-                output, f"jscpd exceeded its 600 second budget: {error}"
-            ) from error
-        except OSError as error:
-            raise _no_completed(
-                binary, f"cannot run jscpd: {error}"
-            ) from error
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            raise _no_completed(
-                output,
-                f"jscpd failed (exit {result.returncode}): "
-                f"{detail or 'no output'}",
-            )
+        result = run(command, cwd=root, budget_seconds=600)
+        diagnostics = result.diagnostics()
+        _raise_jscpd_failure(result, diagnostics)
         sarif = output / "jscpd-report.sarif"
         json_report = output / "jscpd-report.json"
         if not sarif.is_file() or not json_report.is_file():
-            raise _no_completed(
-                output,
+            raise CloneEvidenceError(
                 f"jscpd wrote no report at {sarif} or {json_report}",
+                diagnostics=diagnostics,
             )
-        _parse_jscpd_json(json_report, files)
-        return _parse_sarif(sarif, root)
+        try:
+            _parse_jscpd_json(json_report, files)
+            clones = _parse_sarif(sarif, root)
+        except UnsupportedError as error:
+            raise CloneEvidenceError(
+                str(error),
+                diagnostics=diagnostics,
+            ) from error
+        return clones, diagnostics, result.execution
 
 
-def measure_clones(
-    root: Path,
-    files: list[str],
-    min_tokens: int,
-    max_bytes: int = DEFAULT_MAX_BYTES,
-) -> list[Finding]:
-    binary = _jscpd_binary()
-    clones = _run_jscpd(root, binary, files, min_tokens, max_bytes)
+def _clone_findings(clones: list[Clone]) -> list[Finding]:
     occurrences: dict[str, list[Clone]] = {}
     for clone in clones:
         occurrences.setdefault(clone.fingerprint, []).append(clone)
@@ -364,6 +411,62 @@ def measure_clones(
         )
         findings.append(Finding(fingerprint, len(actual), locations))
     return findings
+
+
+def measure_clones(
+    root: Path,
+    files: list[str],
+    min_tokens: int,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> CloneMeasurement:
+    try:
+        binary = _jscpd_binary()
+    except UnsupportedError as error:
+        return CloneMeasurement([], Diagnostics(), "error", str(error), True)
+    try:
+        clones, diagnostics, execution = _run_jscpd(
+            root, binary, files, min_tokens, max_bytes
+        )
+    except CloneEvidenceError as error:
+        return CloneMeasurement(
+            [],
+            error.diagnostics or Diagnostics(),
+            error.execution,
+            str(error),
+            True,
+        )
+    except GateError as error:
+        return CloneMeasurement([], Diagnostics(), "error", str(error), False)
+    return CloneMeasurement(
+        _clone_findings(clones), diagnostics, execution
+    )
+
+
+def _prune_clone(check: Any, result: Any) -> tuple[bool, bool]:
+    assert check.baseline is not None
+    if result.ratchet is None:
+        print(
+            f"clones: prune refused because check {check.id} produced "
+            "no ratchet result; nothing written",
+            file=sys.stderr,
+        )
+        return False, True
+    existed = check.baseline.exists()
+    try:
+        write_baseline(
+            check.baseline,
+            pruned_entries(result.ratchet),
+            check_id=check.id,
+            metric_version=check.metric_version,
+        )
+    except GateError as error:
+        print(f"clones: {error}", file=sys.stderr)
+        return True, False
+    if check.baseline.exists():
+        print(f"clones: baseline updated at {check.baseline}")
+    elif existed:
+        print(f"clones: baseline removed at {check.baseline}")
+    return False, False
 
 
 def command_clones(root: Path, config: Config, prune: bool = False) -> int:
@@ -395,7 +498,7 @@ def command_clones(root: Path, config: Config, prune: bool = False) -> int:
         result = run_check(
             root, config, check, files, classes, prefix="clones"
         )
-        if result.outcome != "pass":
+        if not result.is_satisfied():
             failed = True
             if prune:
                 print(
@@ -407,18 +510,9 @@ def command_clones(root: Path, config: Config, prune: bool = False) -> int:
             continue
         if not prune:
             continue
-        assert check.baseline is not None
-        existed = check.baseline.exists()
-        try:
-            write_baseline(check.baseline, pruned_entries(result.ratchet))
-        except GateError as error:
-            print(f"clones: {error}", file=sys.stderr)
-            failed = True
-            continue
-        if check.baseline.exists():
-            print(f"clones: baseline updated at {check.baseline}")
-        elif existed:
-            print(f"clones: baseline removed at {check.baseline}")
+        write_failed, write_refused = _prune_clone(check, result)
+        failed = failed or write_failed
+        refused = refused or write_refused
     if failed or refused:
         return 1
     return 0

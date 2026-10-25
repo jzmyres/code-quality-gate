@@ -18,7 +18,7 @@ JSCPD_VERSION = "5.4.1"
 RUFF_VERSION = "0.17.0"
 
 BASE_CONFIG = """\
-schema = 1
+schema = 2
 
 [code]
 patterns = ["*.py", "*.sh", "*.el"]
@@ -44,7 +44,8 @@ description = "Configuration"
 adapter = "command"
 tier = 1
 enforcement = "enforced"
-run = ["python3", "-c", "pass"]
+run = ["python3", "-c", "print(1)"]
+tests_pattern = '(\\d+)'
 
 [[rule]]
 pattern = "*.py"
@@ -200,8 +201,17 @@ def with_clones(
     )
 
 
-def baseline_text(entries: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
+def baseline_text(
+    entries: list[dict[str, Any]],
+    *,
+    check: str = "clones",
+    metric_version: str = "jscpd-clone-occurrences/1",
+) -> str:
+    lines: list[str] = [
+        f'check = "{check}"',
+        f'metric_version = "{metric_version}"',
+        "",
+    ]
     for entry in entries:
         subject = entry.get("subject", entry.get("fingerprint", ""))
         bound = entry.get("bound", entry.get("count", 1))

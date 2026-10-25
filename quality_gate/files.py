@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import fnmatch
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .policy import Config, GateError, UsageError
+from .runner import run
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,43 @@ class GitFile:
     @property
     def gitlink(self) -> bool:
         return self.mode == "160000"
+
+
+@dataclass(frozen=True)
+class HygieneResult:
+    ok: bool
+    messages: list[str]
+    summary: str
+    execution: str = "completed"
+
+
+def _git_toplevel(root: Path) -> str:
+    result = run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={root}",
+            "-C",
+            str(root),
+            "rev-parse",
+            "--show-toplevel",
+        ],
+        budget_seconds=600,
+        capture_limit=None,
+    )
+    if result.execution == "error":
+        raise UsageError(f"{root}: cannot run git: {result.error}")
+    if result.execution != "completed":
+        raise UsageError(
+            f"{root}: expected the top level of a git work tree, got "
+            f"git {result.execution}"
+        )
+    if result.returncode != 0:
+        detail = result.stderr_text.strip() or "git rev-parse failed"
+        raise UsageError(
+            f"{root}: expected the top level of a git work tree, got {detail}"
+        )
+    return result.stdout_text.strip()
 
 
 def resolve_repo(value: str | None) -> Path:
@@ -32,27 +69,7 @@ def resolve_repo(value: str | None) -> Path:
         raise UsageError(
             f"{root}: expected the top level of a git work tree, got a non-directory"
         )
-    command = [
-        "git",
-        "-c",
-        f"safe.directory={root}",
-        "-C",
-        str(root),
-        "rev-parse",
-        "--show-toplevel",
-    ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
-    except OSError as error:
-        raise UsageError(f"{root}: cannot run git: {error}") from error
-    if result.returncode != 0:
-        detail = result.stderr.strip() or "git rev-parse failed"
-        raise UsageError(
-            f"{root}: expected the top level of a git work tree, got {detail}"
-        )
-    top = Path(result.stdout.strip())
+    top = Path(_git_toplevel(root))
     try:
         top = top.resolve(strict=True)
     except OSError:
@@ -66,12 +83,13 @@ def resolve_repo(value: str | None) -> Path:
 
 def _git(root: Path, args: list[str], what: str) -> bytes:
     command = ["git", "-c", f"safe.directory={root}", "-C", str(root), *args]
-    try:
-        result = subprocess.run(command, capture_output=True)
-    except OSError as error:
-        raise GateError(f"{what} failed: {error}") from error
+    result = run(command, budget_seconds=600, capture_limit=None)
+    if result.execution == "error":
+        raise GateError(f"{what} failed: {result.error}")
+    if result.execution != "completed":
+        raise GateError(f"{what} failed: git {result.execution}")
     if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip()
+        detail = result.stderr_text.strip()
         raise GateError(f"{what} failed: {detail or f'git exited {result.returncode}'}")
     return result.stdout
 
@@ -156,10 +174,6 @@ def validate_inventory(
     violations: list[str] = []
     known_classes = ", ".join(sorted(config.classes)) or "none"
     known_checks = ", ".join(config.checks) or "none"
-    exempt = {
-        (entry.class_name, entry.tier) for entry in config.not_applicable
-    }
-
     for name, class_def in config.classes.items():
         for check_id in class_def.checks:
             if check_id not in config.checks:
@@ -174,18 +188,6 @@ def validate_inventory(
                 f"classes.{name}: code class lists no check "
                 "(expected at least one check id)"
             )
-        for tier in config.required_tiers:
-            satisfied = any(
-                check_id in config.checks
-                and config.checks[check_id].tier == tier
-                and config.checks[check_id].enforcement == "enforced"
-                for check_id in class_def.checks
-            )
-            if not satisfied and (name, tier) not in exempt:
-                violations.append(
-                    f"classes.{name}: required tier {tier} has no enforced "
-                    "check and no not_applicable entry"
-                )
 
     for rule in config.rules:
         if not rule.pattern:
@@ -274,31 +276,22 @@ def command_inventory(
     return 0
 
 
-def command_hygiene(root: Path, config: Config) -> int:
-    try:
-        raw = _git(
-            root,
-            ["ls-files", "-z", "-c", "-i", "--exclude-standard"],
-            "ignored-file enumeration",
-        )
-        ignored = [
-            name
-            for name in raw.decode("utf-8", "surrogateescape").split("\0")
-            if name
-        ]
-        if ignored:
-            for relative in ignored:
-                print(
-                    f"hygiene: tracked file matches ignore rules: {relative}",
-                    file=sys.stderr,
-                )
-            return 1
-        entries = enumerate_entries(root)
-        files = [entry.path for entry in entries]
-    except GateError as error:
-        print(f"hygiene: {error}", file=sys.stderr)
-        return 1
+def _ignored_tracked_files(root: Path) -> list[str]:
+    raw = _git(
+        root,
+        ["ls-files", "-z", "-c", "-i", "--exclude-standard"],
+        "ignored-file enumeration",
+    )
+    return [
+        name
+        for name in raw.decode("utf-8", "surrogateescape").split("\0")
+        if name
+    ]
 
+
+def _size_violations(
+    root: Path, entries: list[GitFile], max_bytes: int
+) -> list[str]:
     violations: list[str] = []
     for entry in entries:
         if entry.gitlink:
@@ -307,15 +300,52 @@ def command_hygiene(root: Path, config: Config) -> int:
         try:
             size = (root / relative).stat().st_size
         except OSError as error:
-            violations.append(f"{relative}: cannot measure size: {error}")
-            continue
-        if size > config.max_bytes:
             violations.append(
-                f"{relative}: {size} bytes exceeds max_bytes {config.max_bytes}"
+                f"hygiene: {relative}: cannot measure size: {error}"
             )
+            continue
+        if size > max_bytes:
+            violations.append(
+                f"hygiene: {relative}: {size} bytes exceeds max_bytes "
+                f"{max_bytes}"
+            )
+    return violations
+
+
+def hygiene_result(root: Path, config: Config) -> HygieneResult:
+    try:
+        ignored = _ignored_tracked_files(root)
+        entries = enumerate_entries(root)
+    except GateError as error:
+        return HygieneResult(
+            False,
+            [f"hygiene: {error}"],
+            "",
+            execution="error",
+        )
+    if ignored:
+        return HygieneResult(
+            False,
+            [
+                f"hygiene: tracked file matches ignore rules: {relative}"
+                for relative in ignored
+            ],
+            "",
+        )
+    violations = _size_violations(root, entries, config.max_bytes)
     if violations:
-        for violation in violations:
-            print(f"hygiene: {violation}", file=sys.stderr)
-        return 1
-    print(f"hygiene: {len(files)} files within {config.max_bytes} bytes")
-    return 0
+        return HygieneResult(False, violations, "")
+    return HygieneResult(
+        True,
+        [],
+        f"hygiene: {len(entries)} files within {config.max_bytes} bytes",
+    )
+
+
+def command_hygiene(root: Path, config: Config) -> int:
+    result = hygiene_result(root, config)
+    for message in result.messages:
+        print(message, file=sys.stderr)
+    if result.ok:
+        print(result.summary)
+    return 0 if result.ok else 1

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 import unittest
 
 from support import (
@@ -20,7 +21,7 @@ def crap_config(
     tests_pattern: str = r"^Ran (\d+) tests? in",
 ) -> str:
     lines = [
-        "schema = 1",
+        "schema = 2",
         "",
         "[code]",
         'patterns = ["*.py"]',
@@ -32,7 +33,7 @@ def crap_config(
         "[classes.python]",
         "code = true",
         'description = "Python source"',
-        'checks = ["crap"]',
+        'checks = ["tests", "crap"]',
         "",
         "[classes.test]",
         "code = true",
@@ -204,16 +205,20 @@ class PythonCrapTests(FixtureCase):
                         "bound": 30,
                         "reason": "worklist",
                     }
-                ]
+                ],
+                check="crap",
+                metric_version="python-lines/1",
             ),
         )
         result, document, check = self.run_crap()
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(check["outcome"], "pass")
+        self.assertEqual(check["outcome"], "fail")
+        self.assertTrue(check["satisfied"])
         finding = self.findings(check)["pkg/untested.py:five"]
         self.assertEqual(finding["value"], 30.0)
         self.assertEqual(finding["bound"], 30)
         self.assertEqual(finding["baseline_reason"], "worklist")
+        self.assertTrue(finding["covered_by_baseline"])
         self.assertEqual(document["decision"], "accepted_with_exceptions")
 
     def test_baseline_one_tenth_above_fails(self) -> None:
@@ -236,7 +241,9 @@ class PythonCrapTests(FixtureCase):
                         "bound": 29.9,
                         "reason": "worklist",
                     }
-                ]
+                ],
+                check="crap",
+                metric_version="python-lines/1",
             ),
         )
         result, _document, check = self.run_crap()
@@ -318,6 +325,45 @@ class PythonCrapTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         finding = self.findings(check)["pkg/pragma.py:with_pragma"]
         self.assertIn(3, finding["measurement"]["excluded_lines"])
+
+    def test_entry_outside_the_measured_files_is_unmeasured_and_kept(
+        self,
+    ) -> None:
+        self.add_default_test()
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text(
+                [
+                    {
+                        "subject": "gone.py:removed",
+                        "bound": 99,
+                        "expires": "2999-01-01",
+                        "reason": "the file is not selected any more",
+                    }
+                ],
+                check="crap",
+                metric_version="python-lines/1",
+            ),
+        )
+        result, document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue(check["satisfied"])
+        self.assertEqual(check["resolved_baseline_entries"], [])
+        self.assertEqual(
+            check["unmeasured_baseline_entries"], ["gone.py:removed"]
+        )
+        self.assertIn("unmeasured gone.py:removed", result.stderr)
+        result = self.run_qg(
+            "check", "--prune", "crap", env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        loaded = tomllib.loads(self.read_file("quality-gate-crap.toml"))
+        self.assertEqual(loaded["check"], "crap")
+        self.assertEqual(loaded["metric_version"], "python-lines/1")
+        entry = loaded["entry"][0]
+        self.assertEqual(entry["subject"], "gone.py:removed")
+        self.assertEqual(str(entry["expires"]), "2999-01-01")
+        self.assertEqual(entry["bound"], 99)
 
     def test_failed_tests_make_crap_unsupported(self) -> None:
         self.write_config(crap_config())
