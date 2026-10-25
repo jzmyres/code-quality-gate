@@ -1,17 +1,27 @@
 """Tests for the machine-readable check result and its decision."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib
+import io
+import json
+import sys
 import unittest
+from unittest import mock
 
 from support import (
     BASE_CONFIG,
+    GATE,
     FixtureCase,
     baseline_text,
     output,
     sarif_report,
     with_clones,
 )
+
+sys.path.insert(0, str(GATE))
+cli = importlib.import_module("quality_gate.cli")
 
 
 class ResultTests(FixtureCase):
@@ -62,8 +72,10 @@ class ResultTests(FixtureCase):
             "findings",
             "resolved_baseline_entries",
             "unmeasured_baseline_entries",
+            "reason",
         ):
             self.assertIn(key, check)
+        self.assertIsNone(check["reason"])
         self.assertEqual(check["kind"], "check")
         self.assertEqual(check["evidence"], ["tests"])
         self.assertEqual(check["execution"], "completed")
@@ -182,6 +194,7 @@ class ResultTests(FixtureCase):
         check = self.check_by_id(document, "clones")
         self.assertEqual(check["outcome"], "fail")
         self.assertTrue(check["satisfied"])
+        self.assertIn("ratchet findings", check["reason"])
         self.assertEqual(len(check["findings"]), 1)
         finding = check["findings"][0]
         for key in (
@@ -240,6 +253,46 @@ class ResultTests(FixtureCase):
             document["policy_sha256"],
             hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
         )
+
+    def adapter_configs(self) -> dict[str, str]:
+        pattern = json.dumps(r"Ran (\d+) tests")
+        tests = (
+            "\n[checks.tests]\nadapter = \"python_tests\"\ntier = 1\n"
+            "enforcement = \"enforced\"\n"
+            'run = ["{python}", "-m", "unittest"]\n'
+            f"tests_pattern = {pattern}\n"
+        )
+        crap = (
+            "\n[checks.crap]\nadapter = \"python_crap\"\ntier = 1\n"
+            "enforcement = \"enforced\"\nrequires = \"tests\"\n"
+            'baseline = "crap.toml"\n'
+        )
+        return {
+            "command": BASE_CONFIG,
+            "clones": with_clones(),
+            "python_tests": BASE_CONFIG + tests,
+            "python_crap": BASE_CONFIG + tests + crap,
+        }
+
+    def test_malformed_tool_lock_is_one_json_error_for_every_adapter(self) -> None:
+        lock = self.base / "bad-lock.toml"
+        lock.write_text('[jscpd]\nversion = "5.4.1"\n', encoding="utf-8")
+        for name, text in self.adapter_configs().items():
+            with self.subTest(adapter=name):
+                self.write_config(text)
+                stdout = io.StringIO()
+                with mock.patch.object(
+                    cli, "_default_lock_path", return_value=lock
+                ):
+                    with contextlib.redirect_stdout(stdout):
+                        code = cli.main(
+                            ["--repo", str(self.repo), "check", "--json"]
+                        )
+                self.assertEqual(code, 2, stdout.getvalue())
+                document = json.loads(stdout.getvalue())
+                self.assertEqual(document["decision"], "error")
+                self.assertEqual(document["checks"], [])
+                self.assertIn("bad-lock.toml", document["error"])
 
     def test_resolved_baseline_entry_is_in_the_result(self) -> None:
         self.write_config(with_clones())

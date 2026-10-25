@@ -86,17 +86,77 @@ def _decorator_name(node: ast.AST) -> str | None:
     return None
 
 
-def _decorator_base(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return None
+def _imported_from(
+    statement: ast.ImportFrom, modules: tuple[str, ...], name: str
+) -> set[str]:
+    if statement.module not in modules:
+        return set()
+    return {
+        alias.asname or alias.name
+        for alias in statement.names
+        if alias.name == name
+    }
 
 
-def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    return any(
-        _decorator_name(decorator) == "overload"
+def _imported_modules(
+    statement: ast.Import, names: tuple[str, ...]
+) -> set[str]:
+    return {
+        alias.asname or alias.name
+        for alias in statement.names
+        if alias.name in names
+    }
+
+
+def _typing_overload(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """The names bound to overload and the module aliases of typing."""
+    names: set[str] = set()
+    modules: set[str] = set()
+    for statement in tree.body:
+        if isinstance(statement, ast.ImportFrom):
+            names.update(
+                _imported_from(
+                    statement, ("typing", "typing_extensions"), "overload"
+                )
+            )
+        elif isinstance(statement, ast.Import):
+            modules.update(
+                _imported_modules(
+                    statement, ("typing", "typing_extensions")
+                )
+            )
+    return names, modules
+
+
+def _overload_decorator(
+    decorator: ast.AST, names: set[str], modules: set[str]
+) -> bool:
+    if isinstance(decorator, ast.Name):
+        return decorator.id in names
+    return (
+        isinstance(decorator, ast.Attribute)
+        and decorator.attr == "overload"
+        and isinstance(decorator.value, ast.Name)
+        and decorator.value.id in modules
+    )
+
+
+def _ellipsis_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return (
+        len(node.body) == 1
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and node.body[0].value.value is Ellipsis
+    )
+
+
+def _is_overload(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    names: set[str],
+    modules: set[str],
+) -> bool:
+    return _ellipsis_body(node) and any(
+        _overload_decorator(decorator, names, modules)
         for decorator in node.decorator_list
     )
 
@@ -105,12 +165,12 @@ def _function_identity(
     node: ast.FunctionDef | ast.AsyncFunctionDef, prefix: str
 ) -> str:
     for decorator in node.decorator_list:
-        suffix = _decorator_name(decorator)
-        if suffix not in ("setter", "deleter"):
-            continue
-        assert isinstance(decorator, ast.Attribute)
-        base = _decorator_base(decorator.value) or node.name
-        return f"{prefix}{base}.{suffix}"
+        if (
+            isinstance(decorator, ast.Attribute)
+            and decorator.attr in ("setter", "deleter")
+        ):
+            base = _decorator_name(decorator.value) or node.name
+            return f"{prefix}{base}.{decorator.attr}"
     return f"{prefix}{node.name}"
 
 
@@ -122,15 +182,27 @@ def _start_line(
     return node.lineno
 
 
+def _function_complexity(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> int:
+    # Defaults, decorators and annotations run at definition time and belong
+    # to the enclosing owner, so only the executable body counts here.
+    return cyclomatic_complexity(
+        ast.Module(body=node.body, type_ignores=[])
+    )
+
+
 def _collect_functions(
     nodes: list[ast.AST],
     prefix: str,
     path: str,
     found: list[MeasuredFunction],
+    overload_names: set[str],
+    typing_modules: set[str],
 ) -> None:
     for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _is_overload(node):
+            if _is_overload(node, overload_names, typing_modules):
                 continue
             start = _start_line(node)
             found.append(
@@ -141,17 +213,29 @@ def _collect_functions(
                     node=node,
                     start_line=start,
                     end_line=node.end_lineno or node.lineno,
-                    cc=cyclomatic_complexity(node),
+                    cc=_function_complexity(node),
                 )
             )
             continue
         if isinstance(node, ast.ClassDef):
             _collect_functions(
-                node.body, f"{prefix}{node.name}.", path, found
+                node.body,
+                f"{prefix}{node.name}.",
+                path,
+                found,
+                overload_names,
+                typing_modules,
             )
             continue
         for child in ast.iter_child_nodes(node):
-            _collect_functions([child], prefix, path, found)
+            _collect_functions(
+                [child],
+                prefix,
+                path,
+                found,
+                overload_names,
+                typing_modules,
+            )
 
 
 def _argument_defaults(arguments: ast.arguments) -> list[ast.AST]:
@@ -278,12 +362,56 @@ def _module_subject(
     )
 
 
+def _lambda_lines(node: ast.Lambda) -> tuple[int, ...]:
+    # The declaration line only runs when the module is imported; the body
+    # runs when the lambda is called, so it measures on its own lines.
+    return tuple(
+        line
+        for line in _node_lines(list(ast.walk(node.body)))
+        if line > node.lineno
+    )
+
+
+def _lambda_subject(
+    node: ast.Lambda, relative: str
+) -> MeasuredFunction | None:
+    cc = cyclomatic_complexity(node)
+    if cc == 1:
+        return None
+    return MeasuredFunction(
+        identity=f"{relative}:<lambda@{node.lineno}>",
+        path=relative,
+        name=f"<lambda@{node.lineno}>",
+        node=node,
+        start_line=node.lineno,
+        end_line=node.end_lineno or node.lineno,
+        cc=cc,
+        lines=_lambda_lines(node),
+    )
+
+
+def _lambda_subjects(
+    tree: ast.Module, relative: str
+) -> list[MeasuredFunction]:
+    found: list[MeasuredFunction] = []
+    for node in _outside_nodes(tree):
+        if isinstance(node, ast.Lambda):
+            subject = _lambda_subject(node, relative)
+            if subject is not None:
+                found.append(subject)
+    return found
+
+
 def collect_functions(
     relative: str, source: str
 ) -> list[MeasuredFunction]:
     tree = ast.parse(source, filename=relative)
+    overload_names, typing_modules = _typing_overload(tree)
     found: list[MeasuredFunction] = []
-    _collect_functions([tree], "", relative, found)
+    _collect_functions(
+        [tree], "", relative, found, overload_names, typing_modules
+    )
+    found.extend(_lambda_subjects(tree, relative))
     module = _module_subject(tree, relative)
     if module is not None:
         found.append(module)
@@ -321,14 +449,55 @@ def _executed_count(lines: list[int], missing: list[int]) -> int:
     return sum(1 for line in lines if line not in missing_set)
 
 
+def _crap_result(
+    function: MeasuredFunction,
+    lines: list[int],
+    excluded_lines: list[int],
+    executed: int,
+) -> tuple[float | None, dict[str, Any] | None, str | None]:
+    if not lines:
+        return None, None, "no coverage statements in the measured span"
+    coverage = executed / len(lines)
+    crap = function.cc**2 * (1 - coverage) ** 3 + function.cc
+    measurement = {
+        "cc": function.cc,
+        "statements": len(lines),
+        "executed": executed,
+        "excluded_lines": sorted(excluded_lines),
+    }
+    return crap, measurement, None
+
+
+def _measure_lambda(
+    function: MeasuredFunction,
+    excluded: list[int],
+    executed_lines: list[int],
+) -> tuple[float | None, dict[str, Any] | None, str | None]:
+    lines = list(function.lines or ())
+    if not lines:
+        return (
+            None,
+            None,
+            "lambda body shares the declaration line; put the body on its own "
+            "line",
+        )
+    excluded_lines = _lines_in(excluded, set(lines))
+    missing = [line for line in lines if line not in executed_lines]
+    executed = _executed_count(lines, missing)
+    return _crap_result(function, lines, excluded_lines, executed)
+
+
 def _measure_one(
     function: MeasuredFunction,
     statements: list[int],
     excluded: list[int],
     missing: list[int],
+    executed_lines: list[int],
 ) -> tuple[float | None, dict[str, Any] | None, str | None]:
     # The def and decorator lines run when the module is imported, not when the function is called, so
     # only the body's statements measure whether the tests exercised the function.
+    if isinstance(function.node, ast.Lambda):
+        return _measure_lambda(function, excluded, executed_lines)
     if function.lines is not None:
         owned = set(function.lines)
         lines = _lines_in(statements, owned)
@@ -348,18 +517,13 @@ def _measure_one(
         excluded_lines = _lines_between(
             excluded, body_start, function.end_line
         )
-    if not lines:
-        return None, None, "no coverage statements in the measured span"
     executed = _executed_count(lines, missing)
-    coverage = executed / len(lines)
-    crap = function.cc**2 * (1 - coverage) ** 3 + function.cc
-    measurement = {
-        "cc": function.cc,
-        "statements": len(lines),
-        "executed": executed,
-        "excluded_lines": sorted(excluded_lines),
-    }
-    return crap, measurement, None
+    return _crap_result(function, lines, excluded_lines, executed)
+
+
+def _executed_lines(cover: Any, filename: str) -> list[int]:
+    lines = cover.get_data().lines(filename)
+    return lines if lines is not None else []
 
 
 def _parse_selected(
@@ -412,9 +576,12 @@ def measure_crap(
             _filename, statements, excluded, missing, _formatted = (
                 cover.analysis2(str(root / relative))
             )
+            executed_lines = _executed_lines(
+                cover, str(root / relative)
+            )
             for function in functions:
                 value, measurement, problem = _measure_one(
-                    function, statements, excluded, missing
+                    function, statements, excluded, missing, executed_lines
                 )
                 if problem is not None:
                     failures.append(

@@ -17,22 +17,17 @@ reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
 subject = "quality_gate/checks.py:_run_clones"
-bound = 8.00462962962963
+bound = 7.003544560185185
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/checks.py:_run_command"
-bound = 15.276740160349854
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/checks.py:_run_python_crap"
-bound = 18.806513340137048
+bound = 12.155363374298286
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
 subject = "quality_gate/checks.py:_run_python_tests"
-bound = 14.25
+bound = 13.428531179564237
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
@@ -42,7 +37,7 @@ reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
 subject = "quality_gate/cli.py:main"
-bound = 11
+bound = 8
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
@@ -66,11 +61,6 @@ bound = 15
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
-subject = "quality_gate/files.py:_is_code"
-bound = 6.049382716049383
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/files.py:_shebang_interpreter"
 bound = 8.087791495198903
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
@@ -87,7 +77,7 @@ reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
 subject = "quality_gate/files.py:validate_inventory"
-bound = 29.005981167501137
+bound = 24.182569496619085
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
@@ -127,7 +117,7 @@ reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
 subject = "quality_gate/python_crap.py:measure_crap"
-bound = 11.14882470845481
+bound = 11.133953831645414
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]

@@ -12,7 +12,12 @@ from .clones import command_clones
 from .files import command_hygiene, command_inventory, resolve_repo
 from .gate_result import error_document
 from .policy import UsageError, load_config
-from .tools import _default_lock_path, command_tools_fetch, command_tools_path
+from .tools import (
+    _default_lock_path,
+    command_tools_fetch,
+    command_tools_path,
+    load_tools,
+)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -101,6 +106,21 @@ def _reject_nul(raw: list[str]) -> None:
         )
 
 
+def _dispatch(root: Path, config: Any, args: Any) -> int:
+    if args.command == "inventory":
+        return command_inventory(root, config, args.list_class)
+    if args.command == "hygiene":
+        return command_hygiene(root, config)
+    if args.command == "clones":
+        return command_clones(root, config, args.prune)
+    return command_check(
+        root,
+        config,
+        json_output=args.json,
+        prune_id=args.prune,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     json_requested = "--json" in raw
@@ -121,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
 
         root = resolve_repo(args.repo)
         config = load_config(root)
+        load_tools(_default_lock_path())
+        return _dispatch(root, config, args)
     except UsageError as error:
         print(error, file=sys.stderr)
         if json_requested:
@@ -128,16 +150,3 @@ def main(argv: list[str] | None = None) -> int:
                 root = _repo_hint(raw)
             _print_error_document(root, str(error))
         return error.exit_code
-
-    if args.command == "inventory":
-        return command_inventory(root, config, args.list_class)
-    if args.command == "hygiene":
-        return command_hygiene(root, config)
-    if args.command == "clones":
-        return command_clones(root, config, args.prune)
-    return command_check(
-        root,
-        config,
-        json_output=args.json,
-        prune_id=args.prune,
-    )

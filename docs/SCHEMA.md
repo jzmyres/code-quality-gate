@@ -147,8 +147,9 @@ expires = 2026-12-31
   check id and metric version. A missing or mismatched header is a
   configuration error; migration is a hand edit of the baseline.
 * `subject` is the measured thing. Adapters use clone fingerprints, Python
-  function identities such as `PATH:Qualified.name`, or `PATH:<module>` for
-  code outside every function.
+  function identities such as `PATH:Qualified.name`, `PATH:<lambda@LINE>`
+  for a lambda outside every function, or `PATH:<module>` for code outside
+  every function.
 * `bound` is the largest accepted value, must be finite, and is compared
   unrounded. Exactly at the bound passes.
 * `reason` must be non-empty. An empty reason fails even when the value is
@@ -160,10 +161,11 @@ expires = 2026-12-31
   only the header is allowed.
 
 Resolution requires a complete scan. An adapter reports the subject domain it
-measured completely (the selected files for CRAP; the completed jscpd scan for
-clones). An entry is resolved or pruned only when its subject lies in that
-domain and was not found above threshold. An entry outside the domain is
-reported as `unmeasured` and kept; prune never drops it.
+measured completely (the selected files for CRAP; for clones, the selected
+files each entry's `files` metadata names). An entry is resolved or pruned only
+when its subject lies in that domain and was not found above threshold. An
+entry outside the domain is reported as `unmeasured` and kept; prune never
+drops it. A clone entry naming a file deleted from the repository resolves.
 
 ## Result: `check --json`
 
@@ -200,6 +202,7 @@ reported as `unmeasured` and kept; prune never drops it.
       "findings": [],
       "resolved_baseline_entries": [],
       "unmeasured_baseline_entries": [],
+      "reason": null,
       "measurement": {"tests": 12}
     }
   ],
@@ -241,7 +244,9 @@ Check keys:
   built-ins), `enforcement`, `adapter`, `evidence` (array),
   `metric_version`.
 * `execution` - `completed`, `budget`, `signal` or `error`. It says how
-  the attempt to produce evidence ended, independently of its verdict.
+  the attempt to produce evidence ended, independently of its verdict. One
+  absolute deadline covers the command, pattern matching, coverage
+  combination and analysis; an overrun is `budget`.
 * `outcome` - the adapter's raw verdict: `pass`, `fail`, `unsupported` or
   `error`. Tier 3 adapters later add `proved`, `no_counterexample` and
   `unknown`.
@@ -254,6 +259,8 @@ Check keys:
   `output_truncated`, and `error` when execution failed. Check subprocess
   output is captured up to 1 MiB; later bytes are counted and discarded.
 * `findings`, `resolved_baseline_entries`, `unmeasured_baseline_entries`.
+* `reason` - a structured explanation of a non-passing adapter verdict
+  (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,

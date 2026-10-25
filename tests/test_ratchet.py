@@ -140,6 +140,16 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(result.resolved, ["gone"])
         self.assertIn("resolved gone", stdout)
 
+    def test_file_domain_splits_subjects_at_their_last_colon(self) -> None:
+        domain = ratchet.Domain.of_files(("pkg/a:b.py",))
+        self.assertTrue(domain.contains("pkg/a:b.py:f"))
+        self.assertFalse(domain.contains("pkg/a.py:f"))
+
+    def test_subject_domain_lists_explicit_subjects(self) -> None:
+        domain = ratchet.Domain.of_subjects(("one",))
+        self.assertTrue(domain.contains("one"))
+        self.assertFalse(domain.contains("two"))
+
     def test_entry_outside_the_measured_domain_stays_unmeasured(self) -> None:
         result, stdout, _errors = self.decide(
             [],

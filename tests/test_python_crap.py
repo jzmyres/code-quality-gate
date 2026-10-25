@@ -127,6 +127,7 @@ class PythonCrapTests(FixtureCase):
         result, _document, check = self.run_crap()
         self.assertEqual(result.returncode, 1, output(result))
         self.assertEqual(check["outcome"], "fail")
+        self.assertIsNotNone(check["reason"])
         finding = self.findings(check)["pkg/new.py:three"]
         self.assertEqual(finding["value"], 12.0)
         self.assertEqual(finding["measurement"]["cc"], 3)
@@ -413,6 +414,16 @@ class PythonCrapTests(FixtureCase):
             "coverage unreliable: tests did not pass", result.stderr
         )
 
+    def test_a_syntax_error_is_an_execution_error(self) -> None:
+        self.add_default_test()
+        self.add_file("pkg/broken.py", "def broken(:\n")
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertEqual(check["execution"], "error")
+        self.assertIn("cannot parse pkg/broken.py", result.stderr)
+        self.assertIn("cannot parse", check["reason"])
+
     def test_duplicate_identity_fails(self) -> None:
         self.add_default_test()
         self.add_file(
@@ -572,6 +583,151 @@ class PythonCrapTests(FixtureCase):
         finding = self.findings(check)["pkg/worker.py:work"]
         self.assertGreater(finding["measurement"]["executed"], 0)
         self.assertEqual(finding["value"], 1.0)
+
+    def test_module_lambda_body_decisions_are_measured(self) -> None:
+        # Importing defines the lambda; its two decisions run only when it is called.
+        self.add_tests(
+            "    def test_import_only(self):\n"
+            "        import pkg.lambdas\n"
+            "        self.assertTrue(pkg.lambdas)\n"
+        )
+        self.add_file(
+            "pkg/lambdas.py",
+            "f = lambda x: 1 if x else (2 if x is None else 3)\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "fail")
+        self.assertIn("pkg/lambdas.py:<lambda@1>", result.stderr)
+        self.assertIn("unmeasured", result.stderr)
+
+    def test_uncalled_multiline_module_lambda_scores_zero_coverage(self) -> None:
+        self.add_tests(
+            "    def test_import_only(self):\n"
+            "        import pkg.lambdas\n"
+            "        self.assertTrue(pkg.lambdas)\n"
+        )
+        self.add_file(
+            "pkg/lambdas.py",
+            "f = lambda x: (\n"
+            "    1 if x else (2 if x is None else 3)\n"
+            ")\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        finding = self.findings(check)["pkg/lambdas.py:<lambda@1>"]
+        self.assertEqual(finding["measurement"]["cc"], 3)
+        self.assertEqual(finding["measurement"]["executed"], 0)
+        self.assertEqual(finding["value"], 12.0)
+
+    def test_called_multiline_module_lambda_is_measured(self) -> None:
+        self.add_tests(
+            "    def test_call(self):\n"
+            "        import pkg.lambdas\n"
+            "        self.assertEqual(pkg.lambdas.f(True), 1)\n"
+        )
+        self.add_file(
+            "pkg/lambdas.py",
+            "f = lambda x: (\n"
+            "    1 if x else (2 if x is None else 3)\n"
+            ")\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        finding = self.findings(check)["pkg/lambdas.py:<lambda@1>"]
+        self.assertEqual(finding["measurement"]["cc"], 3)
+        self.assertEqual(
+            finding["measurement"]["executed"],
+            finding["measurement"]["statements"],
+        )
+        self.assertEqual(finding["value"], 3.0)
+
+    def test_a_custom_overload_named_decorator_does_not_hide_its_body(self) -> None:
+        self.add_file(
+            "pkg/custom.py",
+            "def overload(function):\n"
+            "    return function\n"
+            "\n"
+            "@overload\n"
+            "def convert(value):\n"
+            "    if value:\n"
+            "        return 1\n"
+            "    return 2\n",
+        )
+        self.add_tests(
+            "    def test_custom(self):\n"
+            "        import pkg.custom\n"
+            "        self.assertEqual(pkg.custom.convert(True), 1)\n"
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        finding = self.findings(check)["pkg/custom.py:convert"]
+        self.assertEqual(finding["measurement"]["cc"], 2)
+
+    def test_typing_overload_with_a_runtime_body_is_measured(self) -> None:
+        self.add_file(
+            "pkg/runtime_overload.py",
+            "from typing import overload\n"
+            "\n"
+            "\n"
+            "@overload\n"
+            "def convert(value):\n"
+            "    return value\n",
+        )
+        self.add_tests(
+            "    def test_runtime(self):\n"
+            "        import pkg.runtime_overload\n"
+            "        self.assertTrue(pkg.runtime_overload)\n"
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        finding = self.findings(check)["pkg/runtime_overload.py:convert"]
+        self.assertEqual(finding["measurement"]["cc"], 1)
+        self.assertEqual(finding["measurement"]["executed"], 0)
+
+    def test_bare_accessor_decorator_is_not_an_accessor(self) -> None:
+        self.add_file(
+            "pkg/bare.py",
+            "def setter(function):\n"
+            "    return function\n"
+            "\n"
+            "@setter\n"
+            "def decorated(value):\n"
+            "    return value\n",
+        )
+        self.add_tests(
+            "    def test_bare(self):\n"
+            "        import pkg.bare\n"
+            "        self.assertEqual(pkg.bare.decorated(1), 1)\n"
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("pkg/bare.py:decorated", self.findings(check))
+
+    def test_definition_time_decisions_count_once_in_the_owner(self) -> None:
+        self.add_file(
+            "pkg/ownership.py",
+            "def decorate(function):\n"
+            "    return function\n"
+            "\n"
+            "@(decorate if True else decorate)\n"
+            "def composed(value=1 if True else 2):\n"
+            "    return value\n",
+        )
+        self.add_tests(
+            "    def test_owned(self):\n"
+            "        import pkg.ownership\n"
+            "        self.assertEqual(pkg.ownership.composed(), 1)\n"
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        findings = self.findings(check)
+        self.assertEqual(
+            findings["pkg/ownership.py:composed"]["measurement"]["cc"], 1
+        )
+        self.assertEqual(
+            findings["pkg/ownership.py:<module>"]["measurement"]["cc"], 3
+        )
 
     def test_cc_table_counts_each_construct_once(self) -> None:
         self.add_file(

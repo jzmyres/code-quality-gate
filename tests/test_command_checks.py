@@ -1,17 +1,23 @@
 """Tests for command checks, tool tokens and execution reporting."""
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 import time
 import unittest
 from pathlib import Path
 
 from support import (
     BASE_CONFIG,
+    GATE,
     FixtureCase,
     _add_check_to_class,
     output,
 )
+
+sys.path.insert(0, str(GATE))
+regexrun = importlib.import_module("quality_gate.regexrun")
 
 
 def process_state(pid: int) -> str | None:
@@ -232,6 +238,45 @@ class CommandCheckTests(FixtureCase):
         self.assertEqual(check["measurement"], {"tests": 0})
         self.assertIn("no test executed: 1 ran, 1 skipped", result.stderr)
 
+    def test_ambiguous_skipped_summary_is_unsupported(self) -> None:
+        run = json.dumps(
+            [
+                "python3",
+                "-c",
+                "print('Ran 1 test in 0.1s'); print('skipped=0'); "
+                "print('skipped=1')",
+            ]
+        )
+        self.write_config(
+            with_command(
+                run,
+                tests_pattern="^Ran (\\d+) tests? in",
+                skipped_pattern="skipped=(\\d+)",
+            )
+        )
+        result, check = self.failed_lint()
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertIn("ambiguous skipped summary", result.stderr)
+
+    def test_negative_skipped_count_is_unsupported(self) -> None:
+        run = json.dumps(
+            [
+                "python3",
+                "-c",
+                "print('Ran 1 test in 0.1s'); print('skipped=-1')",
+            ]
+        )
+        self.write_config(
+            with_command(
+                run,
+                tests_pattern="^Ran (\\d+) tests? in",
+                skipped_pattern="skipped=(-?\\d+)",
+            )
+        )
+        result, check = self.failed_lint()
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertIn("not a test count", result.stderr)
+
     def test_failing_command_diagnostics_name_argv_and_exit(self) -> None:
         run = json.dumps(
             ["python3", "-c", "import sys; print('bad output'); sys.exit(7)"]
@@ -270,6 +315,33 @@ class CommandCheckTests(FixtureCase):
         self.assertIsNone(check["diagnostics"]["exit_code"])
         self.assertEqual(check["diagnostics"]["signal"], 15)
 
+    def wait_for_process_death(self, pid: int) -> None:
+        # A killed grandchild is reparented to PID 1, which in a CI container may never reap it: a
+        # zombie is dead, so only a running state fails.
+        deadline = time.monotonic() + 5
+        state = process_state(pid)
+        while state not in (None, "Z", "X") and time.monotonic() < deadline:
+            time.sleep(0.05)
+            state = process_state(pid)
+        self.assertIn(
+            state,
+            (None, "Z", "X"),
+            f"grandchild {pid} still running (state {state})",
+        )
+
+    def run_budget_kill_script(
+        self, name: str, script: str, pid_file: Path
+    ) -> int:
+        script_file = self.base / name
+        script_file.write_text(script, encoding="utf-8")
+        self.write_config(
+            with_command(json.dumps(["python3", str(script_file)]), budget=1)
+        )
+        result, check = self.failed_lint()
+        self.assertEqual(check["execution"], "budget")
+        self.assertIn("exceeded its 1 second budget", result.stderr)
+        return int(pid_file.read_text(encoding="utf-8"))
+
     def test_budget_kills_the_whole_process_group(self) -> None:
         pid_file = self.base / "child.pid"
         script = (
@@ -283,23 +355,51 @@ class CommandCheckTests(FixtureCase):
             f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
             "time.sleep(60)\n"
         )
-        script_file = self.base / "spawn.py"
-        script_file.write_text(script, encoding="utf-8")
-        self.write_config(
-            with_command(json.dumps(["python3", str(script_file)]), budget=1)
+        child_pid = self.run_budget_kill_script("spawn.py", script, pid_file)
+        self.wait_for_process_death(child_pid)
+
+    def test_budget_kills_a_descendant_after_the_leader_and_pipes_are_gone(self) -> None:
+        # Sol's reproduction: the leader exits and its output goes to a file, so the pipes close
+        # before the budget; the runner must still escalate against the process group.
+        pid_file = self.base / "grandchild.pid"
+        sink_file = self.base / "grandchild.log"
+        script = (
+            "import pathlib, subprocess, sys\n"
+            f"sink = open({str(sink_file)!r}, 'wb')\n"
+            "child = subprocess.Popen([\n"
+            "    sys.executable, '-c',\n"
+            "    'import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)',\n"
+            "], stdout=sink, stderr=sink)\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+            "sink.close()\n"
         )
+        child_pid = self.run_budget_kill_script(
+            "spawn_and_exit.py", script, pid_file
+        )
+        self.wait_for_process_death(child_pid)
+
+    def test_evidence_matching_is_bounded_by_the_budget(self) -> None:
+        run = json.dumps(
+            ["python3", "-c", "print('a' * 27 + '!')"]
+        )
+        self.write_config(
+            with_command(run, budget=1, must_match="(a+)+$")
+        )
+        started = time.monotonic()
         result, check = self.failed_lint()
+        elapsed = time.monotonic() - started
+        self.assertEqual(check["outcome"], "fail")
         self.assertEqual(check["execution"], "budget")
-        self.assertIn("exceeded its 1 second budget", result.stderr)
-        child_pid = int(pid_file.read_text(encoding="utf-8"))
-        # A killed grandchild is reparented to PID 1, which in a CI container may never reap it: a zombie is
-        # dead, so only a running state fails. Poll briefly for the kill to take effect.
-        deadline = time.monotonic() + 5
-        state = process_state(child_pid)
-        while state not in (None, "Z", "X") and time.monotonic() < deadline:
-            time.sleep(0.05)
-            state = process_state(child_pid)
-        self.assertIn(state, (None, "Z", "X"), f"grandchild {child_pid} still running (state {state})")
+        self.assertIn("output matching exceeded", result.stderr)
+        self.assertLess(elapsed, 5.0)
+
+    def test_unsupported_verdict_carries_a_reason(self) -> None:
+        self.write_config(with_command('["{tool:mystery}"]'))
+        _result, check = self.failed_lint()
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertIn("unknown tool 'mystery'", check["reason"])
 
     def test_output_over_one_mib_is_capped_and_counted(self) -> None:
         run = json.dumps(
@@ -317,6 +417,28 @@ class CommandCheckTests(FixtureCase):
         self.assertGreater(diagnostics["output_bytes"], 1024 * 1024)
         self.assertTrue(diagnostics["output_truncated"])
         self.assertLessEqual(len(diagnostics["output_tail"].encode()), 4096)
+
+class RegexRunnerTests(unittest.TestCase):
+    def test_evaluate_returns_the_captures_of_every_pattern(self) -> None:
+        result = regexrun.evaluate(
+            {
+                "text": "Ran 2 tests\nskipped=1",
+                "patterns": {
+                    "tests": r"Ran (\d+) tests",
+                    "skipped": r"skipped=(\d+)",
+                },
+            }
+        )
+        self.assertEqual(
+            result, {"tests": [["2"]], "skipped": [["1"]]}
+        )
+
+    def test_evaluate_returns_no_matches(self) -> None:
+        result = regexrun.evaluate(
+            {"text": "nothing", "patterns": {"tests": r"Ran (\d+)"}}
+        )
+        self.assertEqual(result, {"tests": []})
+
 
 if __name__ == "__main__":
     unittest.main()

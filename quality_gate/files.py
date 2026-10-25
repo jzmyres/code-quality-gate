@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import fnmatch
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .policy import Config, GateError, UsageError
 from .runner import run
+
+
+SHEBANG_LIMIT = 4096
 
 
 @dataclass(frozen=True)
@@ -94,32 +98,40 @@ def _git(root: Path, args: list[str], what: str) -> bytes:
     return result.stdout
 
 
-def _git_file(token: str) -> GitFile:
-    mode: str | None = None
-    name = token
-    if "\t" in token:
-        metadata, candidate = token.split("\t", 1)
-        fields = metadata.split()
-        if (
-            len(fields) == 3
-            and len(fields[0]) == 6
-            and fields[0].isdigit()
-        ):
-            mode = fields[0]
-            name = candidate
-    return GitFile(name, mode)
-
-
-def enumerate_entries(root: Path) -> list[GitFile]:
+def _staged_entries(root: Path) -> list[GitFile]:
+    """Tracked and staged index records; only these carry a git mode."""
     raw = _git(
         root,
-        ["ls-files", "-s", "-z", "-co", "--exclude-standard"],
+        ["ls-files", "-s", "-z"],
         "file enumeration",
     )
     entries: list[GitFile] = []
     for token in raw.decode("utf-8", "surrogateescape").split("\0"):
-        if token:
-            entries.append(_git_file(token))
+        if not token:
+            continue
+        metadata, _separator, name = token.partition("\t")
+        fields = metadata.split()
+        mode = fields[0] if fields else None
+        entries.append(GitFile(name, mode))
+    return entries
+
+
+def _untracked_entries(root: Path) -> list[GitFile]:
+    raw = _git(
+        root,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        "file enumeration",
+    )
+    return [
+        GitFile(name, None)
+        for name in raw.decode("utf-8", "surrogateescape").split("\0")
+        if name
+    ]
+
+
+def enumerate_entries(root: Path) -> list[GitFile]:
+    entries = _staged_entries(root)
+    entries.extend(_untracked_entries(root))
     return sorted(entries, key=lambda entry: entry.path)
 
 
@@ -148,6 +160,34 @@ def _shebang_interpreter(first_line: str) -> str | None:
     return PurePosixPath(words[index]).name
 
 
+def _type_name(mode: int) -> str | None:
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return None
+
+
+def _entry_type(path: Path) -> str | None:
+    return _type_name(path.lstat().st_mode)
+
+
+def _shebang_line(path: Path) -> str:
+    with path.open("rb") as stream:
+        data = stream.read(SHEBANG_LIMIT)
+    return data.decode("utf-8", "replace").split("\n", 1)[0]
+
+
+def _regular_interpreter(path: Path) -> str | None:
+    if not stat.S_ISREG(path.lstat().st_mode):
+        return None
+    return _shebang_interpreter(_shebang_line(path))
+
+
 def _is_code(path: Path, relative: str, config: Config) -> bool:
     if any(
         fnmatch.fnmatchcase(relative, pattern)
@@ -156,8 +196,7 @@ def _is_code(path: Path, relative: str, config: Config) -> bool:
         return True
     if not config.code_shebangs:
         return False
-    with path.open("r", encoding="utf-8", errors="replace") as stream:
-        interpreter = _shebang_interpreter(stream.readline())
+    interpreter = _regular_interpreter(path)
     if interpreter is None:
         return False
     return any(
@@ -166,16 +205,61 @@ def _is_code(path: Path, relative: str, config: Config) -> bool:
     )
 
 
+def _reject_special_files(
+    root: Path, entries: list[GitFile]
+) -> tuple[list[GitFile], list[str]]:
+    kept: list[GitFile] = []
+    violations: list[str] = []
+    for entry in entries:
+        if entry.gitlink:
+            kept.append(entry)
+            continue
+        try:
+            kind = _entry_type(root / entry.path)
+        except OSError as error:
+            violations.append(f"{entry.path}: cannot inspect: {error}")
+            continue
+        if kind is not None:
+            violations.append(
+                f"{entry.path}: unsupported file type {kind} "
+                "(expected a regular file or symlink)"
+            )
+            continue
+        kept.append(entry)
+    return kept, violations
+
+
+def _rule_violations(config: Config) -> list[str]:
+    violations: list[str] = []
+    known_classes = ", ".join(sorted(config.classes)) or "none"
+    for rule in config.rules:
+        if not rule.pattern:
+            violations.append(
+                f"rule[{rule.index}]: empty pattern (expected a non-empty pattern)"
+            )
+        if not rule.reason.strip():
+            violations.append(
+                f"rule[{rule.index}] (pattern {rule.pattern!r}): "
+                "empty reason (expected a non-empty reason)"
+            )
+        if rule.class_name not in config.classes:
+            violations.append(
+                f"rule[{rule.index}] (pattern {rule.pattern!r}): "
+                f"unknown class {rule.class_name!r} (known classes: {known_classes})"
+            )
+    return violations
+
+
 def validate_inventory(
     root: Path, config: Config
 ) -> tuple[list[str], dict[str, str], list[str]]:
-    entries = enumerate_entries(root)
+    entries, violations = _reject_special_files(
+        root, enumerate_entries(root)
+    )
     files = [entry.path for entry in entries]
     gitlinks = {entry.path for entry in entries if entry.gitlink}
     matched = [0] * len(config.rules)
     classes: dict[str, str] = {}
-    violations: list[str] = []
-    known_classes = ", ".join(sorted(config.classes)) or "none"
     known_checks = ", ".join(config.checks) or "none"
     for name, class_def in config.classes.items():
         for check_id in class_def.checks:
@@ -192,21 +276,7 @@ def validate_inventory(
                 "(expected at least one check id)"
             )
 
-    for rule in config.rules:
-        if not rule.pattern:
-            violations.append(
-                f"rule[{rule.index}]: empty pattern (expected a non-empty pattern)"
-            )
-        if not rule.reason.strip():
-            violations.append(
-                f"rule[{rule.index}] (pattern {rule.pattern!r}): "
-                "empty reason (expected a non-empty reason)"
-            )
-        if rule.class_name not in config.classes:
-            violations.append(
-                f"rule[{rule.index}] (pattern {rule.pattern!r}): "
-                f"unknown class {rule.class_name!r} (known classes: {known_classes})"
-            )
+    violations.extend(_rule_violations(config))
 
     for relative in files:
         hits = [
@@ -301,15 +371,22 @@ def _size_violations(
             continue
         relative = entry.path
         try:
-            size = (root / relative).stat().st_size
+            info = (root / relative).lstat()
         except OSError as error:
             violations.append(
                 f"hygiene: {relative}: cannot measure size: {error}"
             )
             continue
-        if size > max_bytes:
+        kind = _type_name(info.st_mode)
+        if kind is not None:
             violations.append(
-                f"hygiene: {relative}: {size} bytes exceeds max_bytes "
+                f"hygiene: {relative}: unsupported file type {kind} "
+                "(expected a regular file or symlink)"
+            )
+            continue
+        if info.st_size > max_bytes:
+            violations.append(
+                f"hygiene: {relative}: {info.st_size} bytes exceeds max_bytes "
                 f"{max_bytes}"
             )
     return violations

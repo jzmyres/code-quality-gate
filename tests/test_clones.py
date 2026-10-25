@@ -17,8 +17,10 @@ from support import (
 )
 
 sys.path.insert(0, str(GATE))
+checks = importlib.import_module("quality_gate.checks")
 clones = importlib.import_module("quality_gate.clones")
 policy = importlib.import_module("quality_gate.policy")
+runner = importlib.import_module("quality_gate.runner")
 
 ELISP_SOURCE = """\
 ;;; sample.el --- file summary -*- lexical-binding: t; -*-
@@ -112,9 +114,9 @@ class CloneGateTests(FixtureCase):
         result, document = self.run_json(env=env)
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
-        self.assertEqual(
-            self.check_by_id(document, "clones")["outcome"], "unsupported"
-        )
+        check = self.check_by_id(document, "clones")
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertIsInstance(check["reason"], str)
         for needle in needles:
             self.assertIn(needle, text)
         return text
@@ -207,6 +209,61 @@ class CloneGateTests(FixtureCase):
         text = self.clone_failure(env, "empty reason", "resolved fp-old")
         self.assertIn("files: old.py", text)
 
+    def test_entry_outside_the_selected_files_is_unmeasured_and_kept(self) -> None:
+        env = self.clone_env(
+            [],
+            [
+                {
+                    "fingerprint": "fp-other",
+                    "files": ["README.md"],
+                    "reason": "another class is not in this scan",
+                }
+            ],
+        )
+        result, document = self.run_json(env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(document, "clones")
+        self.assertTrue(check["satisfied"])
+        self.assertEqual(check["resolved_baseline_entries"], [])
+        self.assertEqual(
+            check["unmeasured_baseline_entries"], ["fp-other"]
+        )
+        self.assertIn("unmeasured fp-other", result.stderr)
+        result = self.run_qg("clones", "--prune", env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        loaded = tomllib.loads(self.read_file("quality-gate-clones.toml"))
+        self.assertEqual(loaded["entry"][0]["subject"], "fp-other")
+
+    def run_resolved(
+        self, entry: dict[str, object]
+    ) -> tuple[object, dict[str, object]]:
+        env = self.clone_env([], [entry])
+        result, document = self.run_json(env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        return result, self.check_by_id(document, "clones")
+
+    def test_entry_whose_file_was_deleted_is_resolved(self) -> None:
+        result, check = self.run_resolved(
+            {
+                "fingerprint": "fp-old",
+                "files": ["deleted.py"],
+                "reason": "the file was deleted",
+            }
+        )
+        self.assertEqual(check["resolved_baseline_entries"], ["fp-old"])
+        self.assertEqual(check["unmeasured_baseline_entries"], [])
+        self.assertIn("resolved fp-old", result.stderr)
+
+    def test_entry_with_every_selected_file_resolves(self) -> None:
+        _result, check = self.run_resolved(
+            {
+                "fingerprint": "fp-gone",
+                "files": ["a.py", "b.py"],
+                "reason": "the clone is gone",
+            }
+        )
+        self.assertEqual(check["resolved_baseline_entries"], ["fp-gone"])
+
     def test_absent_baseline_with_no_clones_passes(self) -> None:
         env = self.clone_env([])
         result = self.run_qg("clones", env=env)
@@ -218,6 +275,26 @@ class CloneGateTests(FixtureCase):
             [("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])]
         )
         self.clone_failure(env, "new clone fp1")
+
+    def test_jscpd_signal_is_a_raw_fail(self) -> None:
+        env = self.clone_env([], fake={"signal_number": 15})
+        result, document = self.run_json(env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        check = self.check_by_id(document, "clones")
+        self.assertEqual(check["outcome"], "fail")
+        self.assertEqual(check["execution"], "signal")
+        self.assertEqual(check["diagnostics"]["signal"], 15)
+        self.assertIn("terminated by signal", check["reason"])
+
+    def test_unsupported_clone_carries_the_structured_reason(self) -> None:
+        env = self.clone_env([], fake={})
+        sarif_path = self.base / "sarif.json"
+        sarif_path.write_text('{"version": "2.1.0"}', encoding="utf-8")
+        result, document = self.run_json(env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        check = self.check_by_id(document, "clones")
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertIn("no completed jscpd run", check["reason"])
 
     def test_jscpd_nonzero_exit_fails(self) -> None:
         env = self.clone_env(
@@ -681,6 +758,39 @@ tests_pattern = "^Ran (\\\\d+) tests? in"
                 for line in new_clone_lines
             ),
             text,
+        )
+
+
+class CloneOutcomeTests(unittest.TestCase):
+    def measurement(
+        self, *, execution: str, unsupported: bool
+    ) -> object:
+        return clones.CloneMeasurement(
+            [], runner.Diagnostics(), execution, "detail", unsupported
+        )
+
+    def test_budget_and_signal_are_raw_failures(self) -> None:
+        for execution in ("budget", "signal"):
+            with self.subTest(execution=execution):
+                self.assertEqual(
+                    checks._clone_outcome(
+                        self.measurement(
+                            execution=execution, unsupported=True
+                        )
+                    ),
+                    "fail",
+                )
+        self.assertEqual(
+            checks._clone_outcome(
+                self.measurement(execution="error", unsupported=True)
+            ),
+            "unsupported",
+        )
+        self.assertEqual(
+            checks._clone_outcome(
+                self.measurement(execution="error", unsupported=False)
+            ),
+            "error",
         )
 
 

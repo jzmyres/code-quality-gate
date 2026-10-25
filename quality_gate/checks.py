@@ -30,7 +30,7 @@ from .python_crap import measure_crap
 from .python_tests import (
     coverage_prefix,
     expand_run,
-    parse_test_summary,
+    summarize_matches,
 )
 from .ratchet import (
     Domain,
@@ -45,6 +45,7 @@ from .tools import load_tools, tool_binary, _default_lock_path
 
 
 CLONE_BUDGET_SECONDS = 600
+REGEX_RUNNER = Path(__file__).with_name("regexrun.py")
 
 
 @dataclass
@@ -68,6 +69,7 @@ class CheckResult:
     ratchet: RatchetResult | None = None
     measurement: dict[str, Any] | None = None
     satisfied: bool | None = None
+    reason: str | None = None
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     evidence_path: Path | None = None
     coverage_config: Path | None = None
@@ -101,6 +103,7 @@ class CheckResult:
             ],
             "resolved_baseline_entries": list(self.resolved_baseline_entries),
             "unmeasured_baseline_entries": list(self.unmeasured_baseline_entries),
+            "reason": self.reason,
         }
         if self.measurement is not None:
             document["measurement"] = self.measurement
@@ -220,165 +223,249 @@ def _evaluate_ratchet(
         return None, "error"
 
 
-def _run_command(
-    root: Path,
-    config: Config,
+def _command_failure(
     check: CheckDef,
-    files: list[str],
-    classes: dict[str, str],
+    spec: Any,
+    start: float,
     prefix: str,
+    reason: str,
+    **fields: Any,
 ) -> CheckResult:
-    assert check.command is not None
-    spec = check.command
-    start = time.monotonic()
-    selected, names = _select_files(config, check, files, classes)
-    if "{files}" in spec.run and not selected:
-        class_text = _class_text(names)
-        print(
-            f"{prefix}: no files selected (classes: {class_text}); "
-            "zero inputs is not a pass",
-            file=sys.stderr,
-        )
-        return _check_result(
-            check,
-            start,
-            "fail",
-            budget_seconds=spec.budget_seconds,
-        )
+    return _tests_result(check, spec, start, prefix, reason, **fields)
+
+
+def _expanded_or_failure(
+    check: CheckDef,
+    spec: Any,
+    selected: list[str],
+    prefix: str,
+    start: float,
+) -> tuple[list[str] | None, CheckResult | None]:
     try:
         expanded, unsupported = _expand_run(check, selected)
     except UsageError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return _check_result(
+        return None, _command_failure(
             check,
+            spec,
             start,
-            "error",
+            prefix,
+            str(error),
+            outcome="error",
             execution="error",
-            budget_seconds=spec.budget_seconds,
             diagnostics=Diagnostics(error=str(error)),
         )
     if unsupported is not None:
-        print(f"{prefix}: {unsupported}", file=sys.stderr)
-        return _check_result(
+        return None, _command_failure(
             check,
+            spec,
             start,
-            "unsupported",
+            prefix,
+            unsupported,
+            outcome="unsupported",
             execution="error",
-            budget_seconds=spec.budget_seconds,
             diagnostics=Diagnostics(error=unsupported),
         )
+    return expanded, None
 
-    result = run(
-        expanded,
-        cwd=root,
-        budget_seconds=spec.budget_seconds,
-    )
-    diagnostics = result.diagnostics()
+
+def _termination_failure(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    result: RunResult,
+    diagnostics: Diagnostics,
+) -> CheckResult | None:
     combined = result.combined_text
     if result.execution == "error":
-        print(f"{prefix}: {result.error}", file=sys.stderr)
-        return _check_result(
+        return _command_failure(
             check,
+            spec,
             start,
-            "error",
+            prefix,
+            result.error or "cannot run command",
+            outcome="error",
             execution="error",
-            budget_seconds=spec.budget_seconds,
             diagnostics=diagnostics,
         )
     if result.execution == "budget":
-        print(
-            f"{prefix}: command exceeded its "
-            f"{spec.budget_seconds} second budget",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return _check_result(
+        return _command_failure(
             check,
+            spec,
             start,
-            "fail",
+            prefix,
+            f"command exceeded its {spec.budget_seconds} second budget",
             execution="budget",
-            budget_seconds=spec.budget_seconds,
             diagnostics=diagnostics,
+            combined=combined,
         )
     if result.execution == "signal":
-        print(
-            f"{prefix}: command terminated by signal {-result.returncode}",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return _check_result(
+        return _command_failure(
             check,
+            spec,
             start,
-            "fail",
+            prefix,
+            f"command terminated by signal {-result.returncode}",
             execution="signal",
-            budget_seconds=spec.budget_seconds,
             diagnostics=diagnostics,
+            combined=combined,
         )
-    assert result.returncode is not None
     if result.returncode != 0:
-        print(
-            f"{prefix}: command exited {result.returncode}",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return _check_result(
+        return _command_failure(
             check,
+            spec,
             start,
-            "fail",
-            budget_seconds=spec.budget_seconds,
+            prefix,
+            f"command exited {result.returncode}",
+            diagnostics=diagnostics,
+            combined=combined,
+        )
+    return None
+
+
+def _command_patterns(spec: Any) -> dict[str, str]:
+    patterns: dict[str, str] = {}
+    for name in ("tests", "skipped"):
+        value = getattr(spec, f"{name}_pattern", None)
+        if value is not None:
+            patterns[name] = value
+    must_match = getattr(spec, "must_match", None)
+    if must_match is not None:
+        patterns["must_match"] = must_match
+    return patterns
+
+
+def _pattern_matches(
+    patterns: dict[str, str], text: str, budget_seconds: float
+) -> tuple[dict[str, Any] | None, RunResult | None]:
+    with tempfile.TemporaryDirectory(prefix="qg-regex-") as temporary:
+        job = Path(temporary) / "job.json"
+        job.write_text(
+            json.dumps({"text": text, "patterns": patterns}),
+            encoding="utf-8",
+        )
+        result = run(
+            [sys.executable, "-I", str(REGEX_RUNNER), str(job)],
+            budget_seconds=budget_seconds,
+        )
+    if result.execution != "completed" or result.returncode != 0:
+        return None, result
+    try:
+        return json.loads(result.stdout_text), result
+    except ValueError:
+        return None, result
+
+
+def _pattern_failure(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    diagnostics: Diagnostics,
+    evaluation: RunResult | None,
+) -> CheckResult:
+    if evaluation is not None and evaluation.execution == "budget":
+        return _command_failure(
+            check,
+            spec,
+            start,
+            prefix,
+            "output matching exceeded the remaining budget",
+            execution="budget",
             diagnostics=diagnostics,
         )
+    return _command_failure(
+        check,
+        spec,
+        start,
+        prefix,
+        "output matching failed",
+        outcome="error",
+        execution="error",
+        diagnostics=diagnostics,
+    )
 
-    measurement: dict[str, Any] | None = None
-    if spec.tests_pattern_re is not None:
-        ran, skipped, count_error = parse_test_summary(spec, combined)
-        if count_error is not None:
-            print(f"{prefix}: {count_error}", file=sys.stderr)
-            _print_output(prefix, combined)
-            return _check_result(
-                check,
-                start,
-                "unsupported",
-                budget_seconds=spec.budget_seconds,
-                diagnostics=diagnostics,
-            )
-        assert ran is not None and skipped is not None
-        executed = ran - skipped
-        if executed == 0:
-            print(
-                f"{prefix}: no test executed: {ran} ran, {skipped} skipped; "
-                "zero tests is not a pass",
-                file=sys.stderr,
-            )
-            _print_output(prefix, combined)
-            return _check_result(
-                check,
-                start,
-                "fail",
-                budget_seconds=spec.budget_seconds,
-                diagnostics=diagnostics,
-                measurement={"tests": 0},
-            )
-        measurement = {"tests": executed}
-    if (
-        spec.must_match_pattern is not None
-        and spec.must_match_pattern.search(combined) is None
-    ):
-        print(
-            f"{prefix}: output did not match must_match "
-            f"{spec.must_match!r}",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return _check_result(
+
+def _tests_measurement(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    matches: dict[str, Any],
+    diagnostics: Diagnostics,
+    combined: str,
+) -> tuple[dict[str, Any] | None, CheckResult | None]:
+    if spec.tests_pattern_re is None:
+        return None, None
+    ran, skipped, count_error = summarize_matches(
+        spec, matches.get("tests", []), matches.get("skipped", [])
+    )
+    if count_error is not None:
+        return None, _command_failure(
             check,
+            spec,
             start,
-            "fail",
-            budget_seconds=spec.budget_seconds,
+            prefix,
+            count_error,
+            outcome="unsupported",
+            diagnostics=diagnostics,
+            combined=combined,
+        )
+    assert ran is not None and skipped is not None
+    executed = ran - skipped
+    if executed == 0:
+        return None, _command_failure(
+            check,
+            spec,
+            start,
+            prefix,
+            f"no test executed: {ran} ran, {skipped} skipped; "
+            "zero tests is not a pass",
+            diagnostics=diagnostics,
+            measurement={"tests": 0},
+            combined=combined,
+        )
+    return {"tests": executed}, None
+
+
+def _command_evidence(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    result: RunResult,
+    diagnostics: Diagnostics,
+    deadline: float,
+) -> CheckResult:
+    combined = result.combined_text
+    patterns = _command_patterns(spec)
+    matches: dict[str, Any] = {}
+    if patterns:
+        matches, evaluation = _pattern_matches(
+            patterns,
+            combined,
+            max(0.0, deadline - time.monotonic()),
+        )
+        if matches is None:
+            return _pattern_failure(
+                check, spec, start, prefix, diagnostics, evaluation
+            )
+    measurement, failure = _tests_measurement(
+        check, spec, start, prefix, matches, diagnostics, combined
+    )
+    if failure is not None:
+        return failure
+    if spec.must_match_pattern is not None and not matches.get("must_match"):
+        return _command_failure(
+            check,
+            spec,
+            start,
+            prefix,
+            f"output did not match must_match {spec.must_match!r}",
             diagnostics=diagnostics,
             measurement=measurement,
+            combined=combined,
         )
-
     outcome = _check_result(
         check,
         start,
@@ -394,16 +481,77 @@ def _run_command(
     return outcome
 
 
-def _clone_result(
+def _run_command(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    files: list[str],
+    classes: dict[str, str],
+    prefix: str,
+) -> CheckResult:
+    assert check.command is not None
+    spec = check.command
+    start = time.monotonic()
+    selected, names = _select_files(config, check, files, classes)
+    if "{files}" in spec.run and not selected:
+        return _command_failure(
+            check,
+            spec,
+            start,
+            prefix,
+            f"no files selected (classes: {_class_text(names)}); "
+            "zero inputs is not a pass",
+        )
+    expanded, failure = _expanded_or_failure(
+        check, spec, selected, prefix, start
+    )
+    if failure is not None:
+        return failure
+    assert expanded is not None
+    deadline = start + spec.budget_seconds
+    result = run(
+        expanded,
+        cwd=root,
+        budget_seconds=max(0.0, deadline - time.monotonic()),
+    )
+    diagnostics = result.diagnostics()
+    failure = _termination_failure(
+        check, spec, start, prefix, result, diagnostics
+    )
+    if failure is not None:
+        return failure
+    return _command_evidence(
+        check, spec, start, prefix, result, diagnostics, deadline
+    )
+
+
+def _clone_outcome(measurement: Any) -> str:
+    if measurement.execution in ("budget", "signal"):
+        return "fail"
+    return "unsupported" if measurement.unsupported else "error"
+
+
+def _ratchet_reason(
+    ratchet: RatchetResult | None, reason: str | None
+) -> str | None:
+    if ratchet is None or ratchet.outcome == "pass":
+        return reason
+    return reason or (
+        "ratchet findings did not satisfy the threshold or baseline"
+    )
+
+
+def _ratchet_result(
     check: CheckDef,
     start: float,
-    *,
     outcome: str,
+    *,
     execution: str = "completed",
     ratchet: RatchetResult | None = None,
+    measurement: dict[str, Any] | None = None,
     diagnostics: Diagnostics | None = None,
+    reason: str | None = None,
 ) -> CheckResult:
-    assert check.clones is not None
     return _check_result(
         check,
         start,
@@ -417,7 +565,31 @@ def _clone_result(
         ),
         satisfied=ratchet.satisfied if ratchet is not None else None,
         ratchet=ratchet,
+        measurement=measurement,
         diagnostics=diagnostics or Diagnostics(),
+        reason=_ratchet_reason(ratchet, reason),
+    )
+
+
+def _clone_result(
+    check: CheckDef,
+    start: float,
+    *,
+    outcome: str,
+    execution: str = "completed",
+    ratchet: RatchetResult | None = None,
+    diagnostics: Diagnostics | None = None,
+    reason: str | None = None,
+) -> CheckResult:
+    assert check.clones is not None
+    return _ratchet_result(
+        check,
+        start,
+        outcome,
+        execution=execution,
+        ratchet=ratchet,
+        diagnostics=diagnostics,
+        reason=reason,
     )
 
 
@@ -430,6 +602,30 @@ def _print_clone_summary(prefix: str, findings: list[Any]) -> None:
         )
     else:
         print(f"{prefix}: 0 clones", flush=True)
+
+
+def _scope_resolves(
+    entry: Any, selected: set[str], present: set[str]
+) -> bool:
+    scope = entry.extras.get("files")
+    if not scope:
+        return True
+    return all(name in selected for name in scope) or any(
+        name not in present for name in scope
+    )
+
+
+def _clone_domain(
+    entries: list[Any], selected: list[str], files: list[str]
+) -> Domain:
+    chosen = set(selected)
+    present = set(files)
+    subjects = [
+        entry.subject
+        for entry in entries
+        if _scope_resolves(entry, chosen, present)
+    ]
+    return Domain.of_subjects(subjects, "the selected files")
 
 
 def _run_clones(
@@ -450,7 +646,13 @@ def _run_clones(
             "zero inputs is not a pass",
             file=sys.stderr,
         )
-        return _clone_result(check, start, outcome="fail")
+        return _clone_result(
+            check,
+            start,
+            outcome="fail",
+            reason=f"no files selected (classes: {class_text}); "
+            "zero inputs is not a pass",
+        )
     measurement = measure_clones(
         root,
         selected,
@@ -463,9 +665,10 @@ def _run_clones(
         return _clone_result(
             check,
             start,
-            outcome="unsupported" if measurement.unsupported else "error",
+            outcome=_clone_outcome(measurement),
             execution=measurement.execution,
             diagnostics=diagnostics,
+            reason=measurement.error,
         )
     try:
         entries = load_baseline(
@@ -482,13 +685,14 @@ def _run_clones(
             outcome="error",
             execution="error",
             diagnostics=diagnostics,
+            reason=str(error),
         )
     ratchet, failure = _evaluate_ratchet(
         measurement.findings,
         entries,
         check,
         prefix,
-        Domain.all("the complete jscpd scan"),
+        _clone_domain(entries, selected, files),
     )
     if ratchet is None:
         return _clone_result(
@@ -497,6 +701,7 @@ def _run_clones(
             outcome=failure or "error",
             execution="completed",
             diagnostics=diagnostics,
+            reason=failure,
         )
     result = _clone_result(
         check,
@@ -523,6 +728,103 @@ def _executed_tests(
     return ran - skipped
 
 
+def _tests_result(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    reason: str,
+    *,
+    outcome: str = "fail",
+    execution: str = "completed",
+    diagnostics: Diagnostics | None = None,
+    measurement: dict[str, Any] | None = None,
+    combined: str | None = None,
+    **fields: Any,
+) -> CheckResult:
+    print(f"{prefix}: {reason}", file=sys.stderr)
+    if combined is not None:
+        _print_output(prefix, combined)
+    return _check_result(
+        check,
+        start,
+        outcome,
+        execution=execution,
+        budget_seconds=spec.budget_seconds,
+        diagnostics=diagnostics or Diagnostics(),
+        measurement=measurement,
+        reason=reason,
+        **fields,
+    )
+
+
+def _tests_summary(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    combined: str,
+    diagnostics: Diagnostics,
+    deadline: float,
+) -> tuple[
+    int | None, int | None, str | None, CheckResult | None
+]:
+    matches, evaluation = _pattern_matches(
+        _command_patterns(spec),
+        combined,
+        max(0.0, deadline - time.monotonic()),
+    )
+    if matches is None:
+        if evaluation is not None and evaluation.execution == "budget":
+            return (
+                None,
+                None,
+                "test summary matching exceeded the remaining budget",
+                _tests_result(
+                    check,
+                    spec,
+                    start,
+                    prefix,
+                    "test summary matching exceeded the remaining budget",
+                    execution="budget",
+                    diagnostics=diagnostics,
+                ),
+            )
+        return (
+            None,
+            None,
+            "test summary matching failed",
+            _tests_result(
+                check,
+                spec,
+                start,
+                prefix,
+                "test summary matching failed",
+                outcome="error",
+                execution="error",
+                diagnostics=diagnostics,
+            ),
+        )
+    ran, skipped, error = summarize_matches(
+        spec, matches.get("tests", []), matches.get("skipped", [])
+    )
+    return ran, skipped, error, None
+
+
+def _tests_failure_reason(
+    run_result: RunResult,
+    ran: int | None,
+    skipped: int | None,
+    executed: int | None,
+) -> str:
+    if executed == 0:
+        return (
+            f"command exited {run_result.returncode} and no test executed: "
+            f"{ran} ran, {skipped} skipped; zero tests is not a pass"
+        )
+    return f"command exited {run_result.returncode}"
+
+
 def _tests_failed(
     check: CheckDef,
     spec: Any,
@@ -531,39 +833,34 @@ def _tests_failed(
     combined: str,
     prefix: str,
     start: float,
+    deadline: float,
 ) -> CheckResult:
-    ran, skipped, count_error = parse_test_summary(spec, combined)
+    ran, skipped, count_error, failure = _tests_summary(
+        check, spec, start, prefix, combined, diagnostics, deadline
+    )
+    if failure is not None:
+        return failure
     if count_error is not None and "ambiguous test summary" in count_error:
-        print(f"{prefix}: {count_error}", file=sys.stderr)
-        _print_output(prefix, combined)
-        return _check_result(
+        return _tests_result(
             check,
+            spec,
             start,
-            "unsupported",
-            budget_seconds=spec.budget_seconds,
+            prefix,
+            count_error,
+            outcome="unsupported",
             diagnostics=diagnostics,
+            combined=combined,
         )
     executed = _executed_tests(ran, skipped)
-    if executed == 0:
-        print(
-            f"{prefix}: command exited {run_result.returncode} and no "
-            f"test executed: {ran} ran, {skipped} skipped; "
-            "zero tests is not a pass",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"{prefix}: command exited {run_result.returncode}",
-            file=sys.stderr,
-        )
-    _print_output(prefix, combined)
-    return _check_result(
+    return _tests_result(
         check,
+        spec,
         start,
-        "fail",
-        budget_seconds=spec.budget_seconds,
+        prefix,
+        _tests_failure_reason(run_result, ran, skipped, executed),
         diagnostics=diagnostics,
         measurement={"tests": executed} if executed is not None else None,
+        combined=combined,
     )
 
 
@@ -576,6 +873,53 @@ def _test_environment(python_prefix: list[str]) -> dict[str, str]:
     return environment
 
 
+def _combine_tests_evidence(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    data_dir: Path,
+    combined_file: Path,
+    config_file: Path,
+    diagnostics: Diagnostics,
+    deadline: float,
+) -> CheckResult | None:
+    reason = "coverage combination exceeded the remaining budget"
+    if time.monotonic() >= deadline:
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            reason,
+            execution="budget",
+            diagnostics=diagnostics,
+        )
+    try:
+        combine_coverage(data_dir, combined_file, config_file)
+    except (UnsupportedError, GateError) as error:
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            f"coverage combination failed: {error}",
+            outcome="unsupported",
+            diagnostics=diagnostics,
+        )
+    if time.monotonic() >= deadline:
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            reason,
+            execution="budget",
+            diagnostics=diagnostics,
+        )
+    return None
+
+
 def _run_python_tests(
     root: Path,
     check: CheckDef,
@@ -585,39 +929,32 @@ def _run_python_tests(
     assert check.python_tests is not None
     spec = check.python_tests
     start = time.monotonic()
-
-    def result(
-        outcome: str,
-        *,
-        execution: str = "completed",
-        **fields: Any,
-    ) -> CheckResult:
-        return _check_result(
-            check,
-            start,
-            outcome,
-            execution=execution,
-            budget_seconds=spec.budget_seconds,
-            **fields,
-        )
-
+    deadline = start + spec.budget_seconds
     temporary = tempfile.TemporaryDirectory(prefix="qg-coverage-")
     data_dir = Path(temporary.name) / "data"
     try:
         data_dir.mkdir()
         python_prefix = coverage_prefix(root, data_dir)
     except UnsupportedError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return result(
-            "unsupported",
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            str(error),
+            outcome="unsupported",
             execution="error",
             diagnostics=Diagnostics(error=str(error)),
         )
     except OSError as error:
         message = f"cannot create coverage data directory: {error}"
-        print(f"{prefix}: {message}", file=sys.stderr)
-        return result(
-            "error",
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            message,
+            outcome="error",
             execution="error",
             diagnostics=Diagnostics(error=message),
         )
@@ -628,40 +965,43 @@ def _run_python_tests(
         command,
         cwd=root,
         env=environment,
-        budget_seconds=spec.budget_seconds,
+        budget_seconds=max(0.0, deadline - time.monotonic()),
     )
     diagnostics = run_result.diagnostics()
     combined = run_result.combined_text
     if run_result.execution == "error":
-        print(f"{prefix}: {run_result.error}", file=sys.stderr)
-        return result(
-            "error",
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            run_result.error or "cannot run command",
+            outcome="error",
             execution="error",
             diagnostics=diagnostics,
         )
     if run_result.execution == "budget":
-        print(
-            f"{prefix}: command exceeded its {spec.budget_seconds} second budget",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return result(
-            "fail",
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            f"command exceeded its {spec.budget_seconds} second budget",
             execution="budget",
             diagnostics=diagnostics,
+            combined=combined,
         )
     if run_result.execution == "signal":
-        print(
-            f"{prefix}: command terminated by signal {-run_result.returncode}",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return result(
-            "fail",
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            f"command terminated by signal {-run_result.returncode}",
             execution="signal",
             diagnostics=diagnostics,
+            combined=combined,
         )
-    assert run_result.returncode is not None
     if run_result.returncode != 0:
         return _tests_failed(
             check,
@@ -671,50 +1011,60 @@ def _run_python_tests(
             combined,
             prefix,
             start,
+            deadline,
         )
 
-    ran, skipped, count_error = parse_test_summary(spec, combined)
+    ran, skipped, count_error, failure = _tests_summary(
+        check, spec, start, prefix, combined, diagnostics, deadline
+    )
+    if failure is not None:
+        return failure
     if count_error is not None:
-        print(f"{prefix}: {count_error}", file=sys.stderr)
-        _print_output(prefix, combined)
-        return result(
-            "unsupported",
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            count_error,
+            outcome="unsupported",
             diagnostics=diagnostics,
+            combined=combined,
         )
     assert ran is not None and skipped is not None
     executed = ran - skipped
     if executed == 0:
-        print(
-            f"{prefix}: no test executed: {ran} ran, {skipped} skipped; "
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            f"no test executed: {ran} ran, {skipped} skipped; "
             "zero tests is not a pass",
-            file=sys.stderr,
-        )
-        _print_output(prefix, combined)
-        return result(
-            "fail",
             diagnostics=diagnostics,
             measurement={"tests": 0},
+            combined=combined,
         )
 
     combined_file = Path(temporary.name) / "combined" / ".coverage"
     config_file = coverage_config_path(data_dir)
-    try:
-        combine_coverage(data_dir, combined_file, config_file)
-    except UnsupportedError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return result(
-            "unsupported",
-            diagnostics=diagnostics,
-        )
-    except GateError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return result(
-            "unsupported",
-            diagnostics=diagnostics,
-        )
-
-    outcome = result(
+    failure = _combine_tests_evidence(
+        check,
+        spec,
+        start,
+        prefix,
+        data_dir,
+        combined_file,
+        config_file,
+        diagnostics,
+        deadline,
+    )
+    if failure is not None:
+        return failure
+    outcome = _check_result(
+        check,
+        start,
         "pass",
+        budget_seconds=spec.budget_seconds,
         diagnostics=diagnostics,
         measurement={"tests": executed},
         evidence_path=combined_file,
@@ -760,6 +1110,44 @@ def _crap_required(
     return None, None, Diagnostics(error=message), message
 
 
+def _crap_measure(
+    root: Path,
+    selected: list[str],
+    evidence_path: Path | None,
+    config_path: Path | None,
+    check: CheckDef,
+    start: float,
+    prefix: str,
+) -> tuple[Any | None, CheckResult | None]:
+    try:
+        measurement = measure_crap(
+            root,
+            selected,
+            evidence_path,
+            config_path,
+        )
+    except UnsupportedError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return None, _ratchet_result(
+            check,
+            start,
+            "unsupported",
+            diagnostics=Diagnostics(error=str(error)),
+            reason=str(error),
+        )
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return None, _ratchet_result(
+            check,
+            start,
+            "error",
+            execution="error",
+            diagnostics=Diagnostics(error=str(error)),
+            reason=str(error),
+        )
+    return measurement, None
+
+
 def _run_python_crap(
     root: Path,
     config: Config,
@@ -773,79 +1161,60 @@ def _run_python_crap(
     assert check.python_crap is not None
     spec = check.python_crap
     start = time.monotonic()
-
-    def result(
-        outcome: str,
-        *,
-        execution: str = "completed",
-        ratchet: RatchetResult | None = None,
-        measurement: dict[str, Any] | None = None,
-        diagnostics: Diagnostics | None = None,
-    ) -> CheckResult:
-        return _check_result(
-            check,
-            start,
-            outcome,
-            execution=execution,
-            budget_seconds=CLONE_BUDGET_SECONDS,
-            findings=ratchet.findings if ratchet is not None else [],
-            resolved_baseline_entries=(
-                ratchet.resolved if ratchet is not None else []
-            ),
-            unmeasured_baseline_entries=(
-                ratchet.unmeasured if ratchet is not None else []
-            ),
-            satisfied=ratchet.satisfied if ratchet is not None else None,
-            ratchet=ratchet,
-            measurement=measurement,
-            diagnostics=diagnostics or Diagnostics(),
-        )
+    deadline = start + CLONE_BUDGET_SECONDS
 
     selected, names = _select_files(config, check, files, classes)
     if not selected:
         class_text = _class_text(names)
-        print(
-            f"{prefix}: no files selected (classes: {class_text}); "
-            "zero inputs is not a pass",
-            file=sys.stderr,
+        reason = (
+            f"no files selected (classes: {class_text}); "
+            "zero inputs is not a pass"
         )
-        return result("fail")
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        return _ratchet_result(check, start, "fail", reason=reason)
 
     evidence_path, config_path, failure_diagnostics, message = _crap_required(
         prior, spec, prefix
     )
     if message is not None:
-        return result(
+        return _ratchet_result(
+            check,
+            start,
             "unsupported",
             diagnostics=failure_diagnostics,
+            reason=message,
         )
 
-    try:
-        measurement = measure_crap(
-            root,
-            selected,
-            evidence_path,
-            config_path,
-        )
-    except UnsupportedError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return result(
-            "unsupported",
-            diagnostics=Diagnostics(error=str(error)),
-        )
-    except GateError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return result(
-            "error",
-            execution="error",
-            diagnostics=Diagnostics(error=str(error)),
+    measurement, failure = _crap_measure(
+        root,
+        selected,
+        evidence_path,
+        config_path,
+        check,
+        start,
+        prefix,
+    )
+    if failure is not None:
+        return failure
+    assert measurement is not None
+    if time.monotonic() >= deadline:
+        reason = "analysis exceeded the remaining budget"
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        return _ratchet_result(
+            check, start, "fail", execution="budget", reason=reason
         )
     if measurement.failures:
         for failure in measurement.failures:
             print(f"{prefix}: {failure}", file=sys.stderr)
-        return result(
+        diagnostics = _tail_diagnostics(
+            measurement.failures, argv=None, exit_code=1
+        )
+        return _ratchet_result(
+            check,
+            start,
             "fail",
-            diagnostics=Diagnostics(output_tail="\n".join(measurement.failures)),
+            diagnostics=diagnostics,
+            reason=diagnostics.output_tail,
         )
 
     try:
@@ -856,10 +1225,13 @@ def _run_python_crap(
         )
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
-        return result(
+        return _ratchet_result(
+            check,
+            start,
             "error",
             execution="error",
             diagnostics=Diagnostics(error=str(error)),
+            reason=str(error),
         )
     ratchet, failure = _evaluate_ratchet(
         measurement.findings,
@@ -869,8 +1241,10 @@ def _run_python_crap(
         Domain.of_files(selected),
     )
     if ratchet is None:
-        return result(failure or "error")
-    outcome = result(
+        return _ratchet_result(check, start, failure or "error", reason=failure)
+    outcome = _ratchet_result(
+        check,
+        start,
         ratchet.outcome,
         ratchet=ratchet,
         measurement={"functions": len(measurement.findings)},
@@ -882,7 +1256,6 @@ def _run_python_crap(
             flush=True,
         )
     return outcome
-
 
 def run_check(
     root: Path,
@@ -934,6 +1307,16 @@ def _skipped(check: CheckDef) -> CheckResult:
         budget_seconds=budget,
         threshold=check.threshold,
         baseline_path=check.baseline,
+        reason="skipped because inventory failed",
+    )
+
+
+def _tail_text(messages: list[str]) -> tuple[str, int, bool]:
+    encoded = "\n".join(messages).encode("utf-8")
+    return (
+        encoded[-4096:].decode("utf-8", "replace"),
+        len(encoded),
+        len(encoded) > 4096,
     )
 
 
@@ -943,14 +1326,13 @@ def _tail_diagnostics(
     argv: list[str] | None,
     exit_code: int,
 ) -> Diagnostics:
-    text = "\n".join(messages)
-    encoded = text.encode("utf-8")
+    tail, size, truncated = _tail_text(messages)
     return Diagnostics(
         argv=argv,
         exit_code=exit_code,
-        output_bytes=len(encoded),
-        output_tail=encoded[-4096:].decode("utf-8", "replace"),
-        output_truncated=len(encoded) > 4096,
+        output_bytes=size,
+        output_tail=tail,
+        output_truncated=truncated,
     )
 
 
@@ -963,6 +1345,9 @@ def _builtin_result(
     execution: str,
     argv: list[str] | None,
 ) -> CheckResult:
+    diagnostics = _tail_diagnostics(
+        messages, argv=argv, exit_code=0 if ok else 1
+    )
     return CheckResult(
         id=identifier,
         kind=identifier,
@@ -976,9 +1361,8 @@ def _builtin_result(
         duration_seconds=duration_seconds,
         budget_seconds=None,
         satisfied=ok,
-        diagnostics=_tail_diagnostics(
-            messages, argv=argv, exit_code=0 if ok else 1
-        ),
+        reason=None if ok else diagnostics.output_tail,
+        diagnostics=diagnostics,
     )
 
 

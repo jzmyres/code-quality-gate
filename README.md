@@ -85,10 +85,14 @@ All commands accept the repository selector before the command:
     python3 -I qg.py [--repo DIR] COMMAND
 
 `DIR` defaults to the current directory and must be the top level of a git work tree. Configuration is
-`DIR/quality-gate.toml`. Files are enumerated with
-`git ls-files -s -z -co --exclude-standard`, so tracked and stageable untracked files are checked and
-ignored files are not. The staged entry type identifies gitlinks (mode `160000`): a submodule path
-matches exactly one rule like any other enumerated path, but it is never opened or measured as a file.
+`DIR/quality-gate.toml`. Staged entries come from `git ls-files -s -z` and untracked names from
+`git ls-files --others --exclude-standard -z`; the two record types are parsed separately, so tracked
+and stageable untracked files are checked, ignored files are not, and an untracked name shaped like a
+staged record cannot become a gitlink. Only staged records carry a git mode; mode `160000` identifies
+a gitlink, which matches exactly one rule like any other enumerated path but is never opened or
+measured as a file. Every other entry is inspected with `lstat`: a symlink is recorded as a symlink
+and never followed or read, while FIFOs, sockets and devices are rejected with a message. Shebang
+inspection reads at most 4096 bytes and only from a regular file.
 
 ### inventory
 
@@ -117,8 +121,9 @@ Whether a class has the evidence a required tier demands is reported by `check` 
 
 Hygiene fails (exit 1) when a tracked file matches the repository's ignore rules
 (`git ls-files -z -c -i --exclude-standard` returns it), an enumerated file is larger than
-`[hygiene].max_bytes` (default `10485760`), or enumeration or a size measurement fails. It prints every
-offending path and, for oversized files, the actual and allowed sizes.
+`[hygiene].max_bytes` (default `10485760`), an enumerated path is a FIFO, socket or device, or
+enumeration or a size measurement fails. Sizes are measured with `lstat`, so a symlink is never
+followed. It prints every offending path and, for oversized files, the actual and allowed sizes.
 
 ### clones
 
@@ -136,6 +141,13 @@ The JSON report's `statistics.total.sources` must equal the number of selected f
 produced by jscpd with a `results` list; absent, malformed or foreign evidence is `unsupported`
 (`no completed jscpd run`), never zero clones. A clone fingerprint is a subject; its value is how many reported clones have that
 fingerprint; the threshold is `0`, so any occurrence needs a baseline entry.
+
+A clone baseline entry is bound to its measured scope through its `files` metadata: an entry whose
+files all lie outside the selected files, but still exist in the repository, is `unmeasured` and kept;
+an entry naming a file that no longer exists in the repository is resolved. An entry without `files`
+cannot be scoped and is resolved by the completed scan. A budget or signal termination of jscpd is the
+raw outcome `fail` with its execution and diagnostics; `unsupported` remains for unavailable or
+invalid evidence such as a missing report or a source-count mismatch.
 
 `clones --prune` lowers each surviving bound to the measured occurrence count and drops resolved entries.
 It never adds an entry and never raises a bound, and it refuses (exit 1, writing nothing) while that
@@ -160,9 +172,9 @@ and uses one gate-owned coverage configuration (line mode, `branch = False`, `so
 root, `exclude_lines` exactly the `pragma: no cover` expression) for collection, combination and
 analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and `pyproject.toml` configuration is
 ignored, and every `COVERAGE_*` environment variable other than `COVERAGE_CORE` is removed before the
-test command and by `covrun.py`. The prefix runs `coverage run --parallel-mode --data-file=...
+test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
 --source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so
-`run` can name a script or `-m MODULE`.
+`run` can name a script or `-m MODULE`; each invocation gets its own data file.
 
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:
@@ -170,18 +182,26 @@ The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command
     prefix = json.loads(os.environ["QG_PYTHON"]) if "QG_PYTHON" in os.environ else [sys.executable, "-I"]
     subprocess.run([*prefix, "path/to/program.py"], env=os.environ.copy(), check=True)
 
-Pass the environment through to the child. The child then writes its own parallel coverage data, which
-the adapter combines with the test process's data.
+Pass the environment through to the child. The child then writes its own coverage dataset, which the
+adapter combines with the test process's data. The adapter creates the one gate-owned coverage
+configuration before the test command starts, and every child consumes it instead of rewriting it.
+Each coverage invocation registers itself under `registry/` in the data directory and records the
+dataset it finalized; combination requires every registered dataset to be present and loadable, so a
+child that exits without saving, or a corrupt dataset, makes the tests evidence `unsupported` rather
+than a pass.
 
 `tests_pattern` is required and must contain exactly one capture group: the number of tests that ran.
 `skipped_pattern` is optional and also has exactly one capture group: the number of skipped tests (for
 example `skipped=(\d+)` for unittest). Both patterns are searched with `re.MULTILINE` over the
 combined stdout and stderr. Executed tests are `ran - skipped`; the outcome is `fail` when the command
 exits non-zero, times out (`execution = "budget"`) or executes no tests, with
-`no test executed: N ran, N skipped`. It is `unsupported` when `tests_pattern` does not match, matches
-more than once (`ambiguous test summary`), a captured count is not an integer, or coverage is not
-installed; the message names `qg.py tools fetch`. On `pass` the adapter combines the parallel data
-files and keeps the combined data as the evidence for checks that require it.
+`no test executed: N ran, N skipped`. An optional capture that did not participate counts as 0; a
+negative or non-numeric count is invalid. It is `unsupported` when `tests_pattern` does not match,
+matches more than once (`ambiguous test summary`), `skipped_pattern` matches more than once
+(`ambiguous skipped summary`), a captured count is not a non-negative integer, or coverage is not
+installed. On `pass` the adapter combines the registered coverage datasets and keeps the combined data
+as the evidence for checks that require it. Pattern matching runs in an interruptible child bounded by
+the check's remaining budget, together with coverage combination.
 
 ### Python CRAP
 
@@ -201,9 +221,14 @@ scored.
 
 A measured function is every `def` or `async def` that is not inside another function: module-level
 functions and methods of classes at any depth. Nested functions and lambdas belong to their enclosing
-function. A `@property` getter is `PATH:Class.x`, and its `@x.setter` and `@x.deleter` functions are
-`PATH:Class.x.setter` and `PATH:Class.x.deleter`. Declarations decorated with `typing.overload` or
-`overload` are skipped because they have no runtime body. Every other function's identity is
+function. A lambda with no enclosing function and at least one decision is its own subject,
+`PATH:<lambda@LINE>`: its body is measured on the lines after its declaration, and a body sharing the
+declaration line is `unmeasured` with a message asking for the body on its own line. A `@property`
+getter is `PATH:Class.x`, and its `@x.setter` and `@x.deleter` functions are
+`PATH:Class.x.setter` and `PATH:Class.x.deleter`; a bare `@setter` is an ordinary decorator.
+Declarations decorated with `typing.overload`, an `overload` imported from `typing` or
+`typing_extensions`, or `typing.overload` are skipped only when the body is `...`; a decorator with
+that spelling and a runtime body keeps its subject. Every other function's identity is
 `PATH:Qualified.name`, for example `quality_gate/policy.py:load_config` or
 `quality_gate/files.py:Rule.matches`; two remaining functions with the same identity in one file fail
 the check, naming both lines.
@@ -217,8 +242,10 @@ Cyclomatic complexity is 1 plus one for each `if` (an `elif` is a nested `if`), 
 (including `except*`), `match` case that is not an unguarded irrefutable pattern, and each operand of
 `and`/`or` after the first. An irrefutable pattern is a capture name, `_`, or an or-pattern with an
 irrefutable alternative, so `case remaining` and `case 1 | _` add nothing, like `case _`. Nested
-function and lambda bodies add to the enclosing function. The rules are one data table in
-`quality_gate/python_crap.py`.
+function and lambda bodies add to the enclosing function. A function's own CC counts only its
+executable body: defaults, decorators and annotations count once, in the owner where they execute (the
+enclosing function, or the module subject for a module-level definition). The rules are one data table
+in `quality_gate/python_crap.py`.
 
 Coverage comes from coverage's own analysis of the combined data (`Coverage.analysis2`) under the same
 gate-owned configuration as collection and combination, which also reports files the tests never imported
@@ -281,14 +308,17 @@ has `error`.
 `kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
 `evidence` (the evidence names the adapter produces), `metric_version`, `execution`, `outcome`,
 `satisfied`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
-`resolved_baseline_entries` and `unmeasured_baseline_entries`; a measuring check may also carry a
-`measurement` object (for example `{"tests": 12}`).
+`resolved_baseline_entries`, `unmeasured_baseline_entries` and `reason` (a structured explanation of
+a non-passing adapter verdict, null otherwise); a measuring check may also carry a `measurement`
+object (for example `{"tests": 12}`).
 
 `execution` is `completed`, `budget`, `signal` or `error`. `outcome` is the adapter's raw verdict:
 `pass`, `fail`, `unsupported` or `error`; later tier-3 adapters add `proved`, `no_counterexample` and
 `unknown`. `satisfied` is true when the policy obligation is met after baselines and enforcement: a
 finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = true`, and an advisory
-check never blocks. Missing evidence is `unsupported`, never `pass`.
+check never blocks. Missing evidence is `unsupported`, never `pass`. A check has one absolute
+deadline: the command, its pattern matching, coverage combination and analysis share the configured
+budget, and an overrun reports `execution = "budget"` with the diagnostics collected so far.
 
 `diagnostics` carries `argv`, `exit_code` or `signal`, `output_bytes`, `output_tail` (at most 4 KiB),
 `output_truncated` and, when execution failed, `error`. Every subprocess the gate starts (git
@@ -489,9 +519,11 @@ bound, and location. A baseline that is absent means no exception is accepted; a
 header and no entries is allowed.
 
 Resolution requires a complete scan. Each adapter reports the subject domain it measured completely: for
-CRAP the selected files, and for clones the completed jscpd scan. An entry is resolved or pruned only
-when its subject lies in that domain and was not found above threshold. An entry outside the domain is
-reported as `unmeasured` in `unmeasured_baseline_entries` and kept; prune never drops it.
+CRAP the selected files, and for clones the selected files each baseline entry names. An entry is
+resolved or pruned only when its subject lies in that domain and was not found above threshold. An
+entry outside the domain is reported as `unmeasured` in `unmeasured_baseline_entries` and kept; prune
+never drops it. A clone entry naming a file deleted from the repository resolves; one naming a file
+that still exists but was not selected stays unmeasured.
 
 `--prune` only lowers each bound to the measured value and drops resolved entries. It never raises a
 bound or adds an entry, and it refuses (exit 1, writing nothing) while that check is not satisfied. A new

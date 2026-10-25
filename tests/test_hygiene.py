@@ -1,9 +1,16 @@
 """Tests for the hygiene command."""
 from __future__ import annotations
 
+import importlib
+import os
+import stat
+import sys
 import unittest
 
-from support import BASE_CONFIG, FixtureCase, output
+from support import BASE_CONFIG, GATE, FixtureCase, output
+
+sys.path.insert(0, str(GATE))
+files = importlib.import_module("quality_gate.files")
 
 
 class HygieneTests(FixtureCase):
@@ -43,13 +50,39 @@ class HygieneTests(FixtureCase):
         self.assertIn("big.txt", text)
         self.assertIn("5001 bytes exceeds max_bytes 5000", text)
 
-    def test_size_measurement_failure_fails(self) -> None:
-        (self.repo / "broken").symlink_to(self.base / "missing")
+    def test_a_fifo_is_rejected(self) -> None:
+        self.add_file("pipe", "regular\n")
+        self.git("add", "pipe")
+        (self.repo / "pipe").unlink()
+        os.mkfifo(self.repo / "pipe")
         result = self.run_qg("hygiene")
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("cannot measure size", text)
-        self.assertIn("broken", text)
+        self.assertIn("pipe", text)
+        self.assertIn("unsupported file type FIFO", text)
+
+    def test_a_deleted_worktree_file_fails_size_measurement(self) -> None:
+        self.add_file("gone.txt", "x\n")
+        self.git("add", "gone.txt")
+        (self.repo / "gone.txt").unlink()
+        result = self.run_qg("hygiene")
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("gone.txt: cannot measure size", text)
+
+    def test_symlink_size_is_not_followed(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace(
+                "[classes.python]",
+                "[hygiene]\nmax_bytes = 5000\n\n[classes.python]",
+            )
+        )
+        target = self.base / "big-outside"
+        target.write_text("x" * 6000, encoding="utf-8")
+        (self.repo / "link.txt").symlink_to(target)
+        result = self.run_qg("hygiene")
+        self.assertEqual(result.returncode, 0, output(result))
+
 
     def test_ignored_enumeration_failure_fails_hygiene(self) -> None:
         env = self.fake_git_failing_ls_files()
@@ -73,6 +106,16 @@ class HygieneTests(FixtureCase):
         result = self.run_qg("hygiene")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("10485760", result.stdout)
+
+
+class FileTypeTests(unittest.TestCase):
+    def test_type_names_cover_regular_symlink_and_special_files(self) -> None:
+        self.assertIsNone(files._type_name(stat.S_IFREG))
+        self.assertIsNone(files._type_name(stat.S_IFLNK))
+        self.assertEqual(files._type_name(stat.S_IFIFO), "FIFO")
+        self.assertEqual(files._type_name(stat.S_IFSOCK), "socket")
+        self.assertEqual(files._type_name(stat.S_IFCHR), "character device")
+        self.assertEqual(files._type_name(stat.S_IFBLK), "block device")
 
 
 if __name__ == "__main__":

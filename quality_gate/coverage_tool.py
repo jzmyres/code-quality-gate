@@ -5,6 +5,7 @@ adapters, and they put the tools cache's coverage install on sys.path first.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -14,6 +15,7 @@ from .tools import installed_tool_dir
 
 
 COVERAGE_CONFIG_NAME = "coverage.ini"
+REGISTRY_NAME = "registry"
 PRAGMA_NO_COVER = "pragma: no cover"
 
 
@@ -66,13 +68,86 @@ def import_coverage() -> ModuleType:
     return coverage
 
 
+def registry_dir(data_dir: Path) -> Path:
+    """The directory where coverage invocations register themselves."""
+    return data_dir / REGISTRY_NAME
+
+
+def _valid_dataset_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and Path(name).name == name
+    )
+
+
+def _dataset_names(path: Path, document: object) -> list[str]:
+    names = document.get("datasets") if isinstance(document, dict) else None
+    if not isinstance(names, list) or not names:
+        raise UnsupportedError(
+            f"coverage registry record {path} has no usable dataset list"
+        )
+    for name in names:
+        if not _valid_dataset_name(name):
+            raise UnsupportedError(
+                f"coverage registry record {path} names an unsafe dataset "
+                f"{name!r}"
+            )
+    return names
+
+
+def _read_completed(path: Path) -> list[str]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise UnsupportedError(
+            f"coverage registry record {path} is unreadable: {error}"
+        ) from error
+    return _dataset_names(path, document)
+
+
+def registered_datasets(data_dir: Path) -> list[Path]:
+    """Every dataset a registered invocation says it finalized."""
+    directory = registry_dir(data_dir)
+    started = sorted(directory.glob("*.started"))
+    if not started:
+        raise UnsupportedError(
+            f"no coverage invocation registered in {directory}"
+        )
+    datasets: list[Path] = []
+    for record in started:
+        invocation = record.name.removesuffix(".started")
+        completion = directory / f"{invocation}.json"
+        if not completion.is_file():
+            raise UnsupportedError(
+                f"coverage invocation {invocation} did not finalize"
+            )
+        for name in _read_completed(completion):
+            datasets.append(data_dir / name)
+    return datasets
+
+
+def _check_datasets(datasets: list[Path]) -> None:
+    coverage = import_coverage()
+    for path in datasets:
+        if not path.is_file():
+            raise UnsupportedError(f"coverage dataset {path} is missing")
+        try:
+            coverage.CoverageData(str(path)).read()
+        except coverage.CoverageException as error:
+            raise UnsupportedError(
+                f"coverage dataset {path} is corrupt: {error}"
+            ) from error
+
+
 def combine_coverage(
     data_dir: Path,
     combined_file: Path,
     config_file: Path | None = None,
 ) -> None:
-    """Combine every parallel data file under DATA_DIR into COMBINED_FILE."""
+    """Combine every registered dataset under DATA_DIR into COMBINED_FILE."""
     coverage = import_coverage()
+    _check_datasets(registered_datasets(data_dir))
     combined_file.parent.mkdir(parents=True, exist_ok=True)
     config = (
         config_file

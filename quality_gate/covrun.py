@@ -5,15 +5,23 @@ Invoked by the python_tests adapter, and exported through QG_PYTHON, as:
 
     python -I covrun.py DATA_DIR SOURCE_ROOT COVERAGE_DIR ARGS...
 
-DATA_DIR receives parallel coverage data files, SOURCE_ROOT is the measured
-repository root, and COVERAGE_DIR is the install directory of the pinned
-coverage wheel.  ARGS is a script or '-m MODULE' plus its arguments.
+DATA_DIR receives one coverage dataset per invocation plus the adapter's
+registry; SOURCE_ROOT is the measured repository root, and COVERAGE_DIR is the
+install directory of the pinned coverage wheel.  ARGS is a script or
+'-m MODULE' plus its arguments.  The gate configuration is created once by the
+python_tests adapter and every child consumes it.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import uuid
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from quality_gate.coverage_tool import coverage_config_path, registry_dir
 
 
 def _fail(message: str) -> int:
@@ -34,19 +42,18 @@ def _remove_overrides() -> None:
             del os.environ[name]
 
 
-def _write_config(data_dir: Path, source_root: Path) -> Path:
-    data_dir.mkdir(parents=True, exist_ok=True)
-    config_file = data_dir / "coverage.ini"
-    config_file.write_text(
-        "[run]\n"
-        "branch = False\n"
-        f"source =\n    {source_root}\n"
-        "[report]\n"
-        "exclude_lines =\n    pragma: no cover\n",
-        encoding="utf-8",
+def _register(data_dir: Path) -> tuple[Path, str]:
+    directory = registry_dir(data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    invocation = uuid.uuid4().hex
+    (directory / f"{invocation}.started").write_text("", encoding="utf-8")
+    return directory, invocation
+
+
+def _finalize(directory: Path, invocation: str, dataset: str) -> None:
+    (directory / f"{invocation}.json").write_text(
+        json.dumps({"datasets": [dataset]}), encoding="utf-8"
     )
-    os.environ["COVERAGE_RCFILE"] = str(config_file)
-    return config_file
 
 
 def _coverage_main(coverage_dir: Path):
@@ -58,6 +65,32 @@ def _coverage_main(coverage_dir: Path):
             "run 'python3 -I qg.py tools fetch'"
         )
     return coverage_main, None
+
+
+def _run_dataset(
+    data_dir: Path,
+    source_root: Path,
+    config_file: Path,
+    coverage_main,
+    command: list[str],
+) -> int:
+    directory, invocation = _register(data_dir)
+    dataset = f".coverage.{uuid.uuid4().hex}"
+    data_file = data_dir / dataset
+    code = coverage_main(
+        [
+            "run",
+            f"--data-file={data_file}",
+            f"--source={source_root}",
+            f"--rcfile={config_file}",
+            *command,
+        ]
+    )
+    # The wrapped program's exit status says nothing about whether coverage
+    # saved its dataset; a completed run finalizes whenever the dataset exists.
+    if data_file.is_file():
+        _finalize(directory, invocation, dataset)
+    return code
 
 
 def _run(argv: list[str]) -> int:
@@ -72,29 +105,25 @@ def _run(argv: list[str]) -> int:
             f"coverage is not installed at {coverage_dir}; "
             "run 'python3 -I qg.py tools fetch'"
         )
+    config_file = coverage_config_path(data_dir)
+    if not config_file.is_file():
+        return _fail(
+            f"coverage configuration is missing at {config_file}; "
+            "the python_tests adapter creates it"
+        )
 
     sys.path.insert(0, str(coverage_dir))
     # A consumer's coverage configuration must not change this metric: line
     # coverage only, with no branch measurement or omit rules of its own.
     _remove_overrides()
     os.environ["COVERAGE_CORE"] = "sysmon"
-    config_file = _write_config(data_dir, source_root)
 
     coverage_main, error = _coverage_main(coverage_dir)
     if error is not None:
         return _fail(error)
     assert coverage_main is not None
-
-    data_file = data_dir / ".coverage"
-    return coverage_main(
-        [
-            "run",
-            "--parallel-mode",
-            f"--data-file={data_file}",
-            f"--source={source_root}",
-            f"--rcfile={config_file}",
-            *command,
-        ]
+    return _run_dataset(
+        data_dir, source_root, config_file, coverage_main, command
     )
 
 

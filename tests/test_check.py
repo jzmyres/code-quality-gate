@@ -1,9 +1,14 @@
 """Tests for the combined check command and CLI wiring."""
 from __future__ import annotations
 
+import importlib
+import sys
 import unittest
 
-from support import BASE_CONFIG, FixtureCase, output, sarif_report, with_clones
+from support import BASE_CONFIG, GATE, FixtureCase, output, sarif_report, with_clones
+
+sys.path.insert(0, str(GATE))
+checks = importlib.import_module("quality_gate.checks")
 
 
 class CheckTests(FixtureCase):
@@ -86,6 +91,24 @@ class CheckTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
         self.assertIn("quality-gate.toml", text)
+
+    def test_failed_builtin_carries_the_structured_reason(self) -> None:
+        self.add_file("mystery.txt", "x\n")
+        _result, document = self.run_json()
+        inventory = self.check_by_id(document, "inventory")
+        self.assertEqual(inventory["outcome"], "fail")
+        self.assertIn("unclassified", inventory["reason"])
+
+    def test_in_process_diagnostics_keep_the_last_four_kib(self) -> None:
+        messages = [f"{index:04d} " + "x" * 100 for index in range(100)]
+        diagnostics = checks._tail_diagnostics(
+            messages, argv=None, exit_code=1
+        )
+        self.assertTrue(diagnostics.output_truncated)
+        self.assertLessEqual(
+            len(diagnostics.output_tail.encode("utf-8")), 4096
+        )
+        self.assertTrue(diagnostics.output_tail.endswith("x" * 100))
 
     def test_check_skips_clones_when_inventory_fails(self) -> None:
         self.add_file("mystery.txt", "x\n")

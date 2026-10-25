@@ -115,6 +115,10 @@ args_file = os.environ.get("QG_FAKE_ARGS")
 if args_file:
     pathlib.Path(args_file).write_text("\\n".join(args), encoding="utf-8")
 exit_code = int(os.environ.get("QG_FAKE_EXIT", "0"))
+signal_number = os.environ.get("QG_FAKE_SIGNAL")
+if signal_number:
+    import signal
+    os.kill(os.getpid(), int(signal_number))
 if exit_code:
     print(os.environ.get("QG_FAKE_ERROR", "fake jscpd failed"), file=sys.stderr)
     sys.exit(exit_code)
@@ -350,6 +354,7 @@ class FixtureCase(unittest.TestCase):
             "QG_FAKE_ARGS",
             "QG_FAKE_NO_REPORT",
             "QG_FAKE_JSON",
+            "QG_FAKE_SIGNAL",
         ):
             env.pop(key, None)
         env.update(
@@ -410,6 +415,7 @@ class FixtureCase(unittest.TestCase):
         error: str = "",
         args_file: Path | None = None,
         json_report: dict[str, Any] | None = None,
+        signal_number: int | None = None,
     ) -> dict[str, str]:
         tools = self.base / "tools"
         destination = tools / f"jscpd-{JSCPD_VERSION}"
@@ -440,6 +446,8 @@ class FixtureCase(unittest.TestCase):
             json_path = self.base / "jscpd-json.json"
             json_path.write_text(json.dumps(json_report), encoding="utf-8")
             env["QG_FAKE_JSON"] = str(json_path)
+        if signal_number is not None:
+            env["QG_FAKE_SIGNAL"] = str(signal_number)
         return env
 
     def default_tool_env(self) -> dict[str, str]:

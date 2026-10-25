@@ -28,13 +28,15 @@ class Domain:
     """The subjects one complete measurement covered.
 
     A file domain matches subjects whose `PATH` prefix is one of the
-    measured files (CRAP's `PATH:Qualified.name` subjects).  `all` is for a
-    scan whose own completeness proves the absence of every subject, such
-    as a completed jscpd run over the selected files.
+    measured files (CRAP's `PATH:Qualified.name` subjects).  A subject
+    domain lists the subjects one scan measured (clone fingerprints bound to
+    their files).  `all` is for a scan whose own completeness proves the
+    absence of every subject.
     """
 
     files: tuple[str, ...] | None = None
     description: str = "all measured subjects"
+    subjects: tuple[str, ...] | None = None
 
     @classmethod
     def all(cls, description: str = "the complete subject domain") -> "Domain":
@@ -46,10 +48,20 @@ class Domain:
     ) -> "Domain":
         return cls(tuple(files), description)
 
+    @classmethod
+    def of_subjects(
+        cls,
+        subjects: list[str] | tuple[str, ...],
+        description: str = "the measured subjects",
+    ) -> "Domain":
+        return cls(None, description, tuple(subjects))
+
     def contains(self, subject: str) -> bool:
+        if self.subjects is not None:
+            return subject in self.subjects
         if self.files is None:
             return True
-        return subject.partition(":")[0] in self.files
+        return subject.rpartition(":")[0] in self.files
 
 
 @dataclass(frozen=True)

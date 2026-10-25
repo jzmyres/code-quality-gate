@@ -127,6 +127,14 @@ def _signal_group(pid: int, number: int) -> None:
         pass
 
 
+def _group_alive(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 @dataclass
 class _Capture:
     limit: int
@@ -224,6 +232,14 @@ def _read_ready(
             break
 
 
+def _finished(
+    process: subprocess.Popen[bytes], selector: selectors.BaseSelector
+) -> bool:
+    if selector.get_map() or process.poll() is None:
+        return False
+    return not _group_alive(process.pid)
+
+
 def _drain(
     process: subprocess.Popen[bytes],
     selector: selectors.BaseSelector,
@@ -236,7 +252,7 @@ def _drain(
     while True:
         now = time.monotonic()
         state.advance(now, process.pid)
-        if not selector.get_map() and process.poll() is not None:
+        if _finished(process, selector):
             break
         if state.past_hard_deadline(now):
             break

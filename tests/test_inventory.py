@@ -1,10 +1,17 @@
 """Tests for inventory classification and configuration errors."""
 from __future__ import annotations
 
+import importlib
+import os
+import socket
 import subprocess
+import sys
 import unittest
 
-from support import BASE_CONFIG, FixtureCase, output
+from support import BASE_CONFIG, GATE, FixtureCase, output
+
+sys.path.insert(0, str(GATE))
+files = importlib.import_module("quality_gate.files")
 
 
 class InventoryTests(FixtureCase):
@@ -59,6 +66,29 @@ class InventoryTests(FixtureCase):
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("a.py", text)
         self.assertIn("matches 2 rules", text)
+
+    def test_a_rule_with_an_empty_pattern_fails(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[[rule]]\npattern = ""\nclass = "config"\n'
+            'reason = "an empty pattern"\n'
+        )
+        result = self.run_qg("inventory")
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("empty pattern", text)
+
+    def test_shebang_detection_is_skipped_without_patterns(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace(
+                'shebangs = ["sh", "bash", "python*"]', "shebangs = []"
+            )
+            + '\n[[rule]]\npattern = "script"\nclass = "doc"\n'
+            'reason = "a shell script"\n'
+        )
+        self.add_file("script", "#!/bin/sh\necho hi\n")
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
 
     def test_rule_matching_no_file_fails(self) -> None:
         self.write_config(
@@ -146,17 +176,86 @@ class InventoryTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("inventory: 5 files match 5 rules", result.stdout)
 
-    def test_unreadable_shebang_fails(self) -> None:
+    def test_symlink_is_recorded_and_never_followed(self) -> None:
         self.write_config(
             BASE_CONFIG
-            + '\n[[rule]]\npattern = "script"\nclass = "doc"\n'
-            'reason = "dangling link"\n'
+            + '\n[[rule]]\npattern = "script*"\nclass = "doc"\n'
+            'reason = "links"\n'
         )
-        (self.repo / "script").symlink_to(self.base / "missing")
+        target = self.base / "outside-script"
+        target.write_text("#!/bin/sh\necho outside\n", encoding="utf-8")
+        (self.repo / "script-external").symlink_to(target)
+        (self.repo / "script-dangling").symlink_to(self.base / "missing")
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
+        entries = files.enumerate_entries(self.repo)
+        links = {entry.path for entry in entries if entry.path.startswith("script-")}
+        self.assertEqual(links, {"script-external", "script-dangling"})
+        self.assertTrue((self.repo / "script-external").is_symlink())
+
+    def test_a_fifo_is_rejected(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[[rule]]\npattern = "pipe"\nclass = "doc"\n'
+            'reason = "a fifo"\n'
+        )
+        self.add_file("pipe", "regular\n")
+        self.git("add", "pipe")
+        (self.repo / "pipe").unlink()
+        os.mkfifo(self.repo / "pipe")
         result = self.run_qg("inventory")
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("cannot read shebang", text)
+        self.assertIn("pipe", text)
+        self.assertIn("unsupported file type FIFO", text)
+
+    def test_a_socket_is_rejected(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[[rule]]\npattern = "sock"\nclass = "doc"\n'
+            'reason = "a socket"\n'
+        )
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        self.add_file("sock", "regular\n")
+        self.git("add", "sock")
+        (self.repo / "sock").unlink()
+        server.bind(str(self.repo / "sock"))
+        result = self.run_qg("inventory")
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("sock", text)
+        self.assertIn("unsupported file type socket", text)
+
+    def test_an_untracked_metadata_shaped_name_is_its_own_file(self) -> None:
+        name = "160000 " + "1" * 40 + " 0\tREADME.md"
+        self.add_file(name, "x\n")
+        entries = files.enumerate_entries(self.repo)
+        paths = [entry.path for entry in entries]
+        self.assertIn(name, paths)
+        self.assertEqual(paths.count("README.md"), 1)
+        for entry in entries:
+            if entry.path == name:
+                self.assertFalse(entry.gitlink)
+
+    def test_a_deleted_worktree_file_is_reported(self) -> None:
+        self.add_file("gone.py", "print('x')\n")
+        self.git("add", "gone.py")
+        (self.repo / "gone.py").unlink()
+        result = self.run_qg("inventory")
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("gone.py: cannot inspect", text)
+
+    def test_shebang_reads_are_bounded(self) -> None:
+        path = self.repo / "long-shebang"
+        path.write_text(
+            "#!/usr/bin/env python3\n" + "x" * 100000 + "\n",
+            encoding="utf-8",
+        )
+        line = files._shebang_line(path)
+        self.assertTrue(line.startswith("#!/usr/bin/env python3"))
+        self.assertLessEqual(len(line.encode("utf-8")), files.SHEBANG_LIMIT)
 
     def test_gitlink_is_never_opened_and_needs_one_rule(self) -> None:
         self.write_config(

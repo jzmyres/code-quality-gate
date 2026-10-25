@@ -1,6 +1,7 @@
 """Helpers for the python_tests adapter: the coverage prefix and test count."""
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -34,56 +35,62 @@ def expand_run(run: tuple[str, ...], prefix: list[str]) -> list[str]:
 
 
 def _capture_count(
-    text: str, pattern: str, label: str
+    text: str | None, pattern: str, label: str
 ) -> tuple[int | None, str | None]:
-    try:
-        return int(text), None
-    except ValueError:
+    if text is None:
+        return 0, None
+    if re.fullmatch(r"[0-9]+", text) is None:
         return (
             None,
             f"{label}_pattern {pattern!r} captured "
-            f"{text!r}, which is not a test count",
+            f"{text!r}, which is not a test count "
+            "(expected a non-negative integer)",
         )
+    return int(text), None
 
 
-def _skipped_count(
-    spec: PythonTestsSpec, output: str
+def _skipped_from_matches(
+    spec: PythonTestsSpec, matches: list[list[str | None]]
 ) -> tuple[int | None, str | None]:
-    if spec.skipped_pattern_re is None:
+    if spec.skipped_pattern_re is None or not matches:
         return 0, None
-    match = spec.skipped_pattern_re.search(output)
-    if match is None:
-        return 0, None
+    if len(matches) > 1:
+        return (
+            None,
+            f"ambiguous skipped summary: skipped_pattern "
+            f"{spec.skipped_pattern!r} matched {len(matches)} times",
+        )
     assert spec.skipped_pattern is not None
     return _capture_count(
-        match.group(1), spec.skipped_pattern, "skipped"
+        matches[0][0], spec.skipped_pattern, "skipped"
     )
 
 
-def parse_test_summary(
-    spec: PythonTestsSpec, output: str
+def summarize_matches(
+    spec: PythonTestsSpec,
+    tests_matches: list[list[str | None]],
+    skipped_matches: list[list[str | None]],
 ) -> tuple[int | None, int | None, str | None]:
-    matches = list(spec.tests_pattern_re.finditer(output))
-    if not matches:
+    if not tests_matches:
         return (
             None,
             None,
             f"tests_pattern {spec.tests_pattern!r} did not match the "
             "command output",
         )
-    if len(matches) > 1:
+    if len(tests_matches) > 1:
         return (
             None,
             None,
             f"ambiguous test summary: tests_pattern {spec.tests_pattern!r} "
-            f"matched {len(matches)} times",
+            f"matched {len(tests_matches)} times",
         )
     ran, error = _capture_count(
-        matches[0].group(1), spec.tests_pattern, "tests"
+        tests_matches[0][0], spec.tests_pattern, "tests"
     )
     if error is not None:
         return None, None, error
-    skipped, error = _skipped_count(spec, output)
+    skipped, error = _skipped_from_matches(spec, skipped_matches)
     if error is not None:
         return None, None, error
     if skipped > ran:
@@ -93,6 +100,23 @@ def parse_test_summary(
             f"skipped {skipped} tests but only {ran} ran",
         )
     return ran, skipped, None
+
+
+def parse_test_summary(
+    spec: PythonTestsSpec, output: str
+) -> tuple[int | None, int | None, str | None]:
+    tests_matches = [
+        list(match.groups()) for match in spec.tests_pattern_re.finditer(output)
+    ]
+    skipped_matches = (
+        [
+            list(match.groups())
+            for match in spec.skipped_pattern_re.finditer(output)
+        ]
+        if spec.skipped_pattern_re is not None
+        else []
+    )
+    return summarize_matches(spec, tests_matches, skipped_matches)
 
 
 def parse_test_count(
