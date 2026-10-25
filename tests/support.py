@@ -430,17 +430,17 @@ class FixtureCase(unittest.TestCase):
         lock.write_text(text[:start] + updated + text[end:], encoding="utf-8")
 
     def fixture_runner(self) -> Path:
-        """A runner that pins a disposable gate's own lock for its checks."""
+        """A runner that pins a disposable lock for the candidate's checks."""
         runner = self.base / "fixture-runner.py"
         runner.write_text(
             "import importlib\n"
             "import runpy\n"
             "import sys\n"
-            f"sys.path.insert(0, {str(self.gate)!r})\n"
+            f"sys.path.insert(0, {str(GATE)!r})\n"
             "tools = importlib.import_module('quality_gate.tools')\n"
             f"tools._default_lock_path = lambda: __import__('pathlib').Path("
             f"{str(self.gate / 'tools.lock.toml')!r})\n"
-            f"runpy.run_path({str(self.gate / 'qg.py')!r}, "
+            f"runpy.run_path({str(GATE / 'qg.py')!r}, "
             "run_name='__main__')\n",
             encoding="utf-8",
         )

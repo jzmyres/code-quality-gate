@@ -368,6 +368,8 @@ class CovrunTests(unittest.TestCase):
                         temporary,
                         temporary,
                         str(missing),
+                        str(Path(temporary) / "config"),
+                        str(Path(temporary) / "registry"),
                         "-c",
                         "pass",
                     ]
@@ -387,6 +389,7 @@ class CovrunTests(unittest.TestCase):
         self.config_file = coverage_tool.write_coverage_config(
             self.data_dir, self.source_root
         )
+        self.registry = coverage_tool.registry_dir(self.data_dir)
         self.runner = GATE / "quality_gate" / "covrun.py"
 
     def script(self, name: str, text: str) -> Path:
@@ -402,15 +405,18 @@ class CovrunTests(unittest.TestCase):
             str(self.data_dir),
             str(self.source_root),
             str(self.coverage_dir),
+            str(self.config_file),
+            str(self.registry),
             program,
             *arguments,
         ]
 
     def run_program(
-        self, program: str, *arguments: str
+        self, program: str, *arguments: str, cwd: Path | None = None
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.command(program, *arguments),
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=60,
@@ -430,6 +436,31 @@ class CovrunTests(unittest.TestCase):
             self.base / "combined" / ".coverage",
             self.config_file,
         )
+
+    def test_program_imports_its_own_quality_gate_package(self) -> None:
+        package = self.source_root / "quality_gate"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        candidate = package / "candidate.py"
+        candidate.write_text(
+            "def candidate_only():\n    return 'candidate'\n",
+            encoding="utf-8",
+        )
+        script = self.script(
+            "prog.py",
+            "import pathlib\n"
+            "import sys\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))\n"
+            "from quality_gate.candidate import candidate_only\n"
+            "assert candidate_only() == 'candidate'\n",
+        )
+        result = self.run_program(str(script), cwd=self.base)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.combine()
+        coverage = coverage_tool.import_coverage()
+        data = coverage.CoverageData(str(self.base / "combined" / ".coverage"))
+        data.read()
+        self.assertIn(2, data.lines(str(candidate)) or [])
 
     def start(self, program: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
@@ -481,6 +512,8 @@ class CovrunTests(unittest.TestCase):
                     str(self.data_dir),
                     str(self.source_root),
                     str(self.coverage_dir),
+                    str(self.config_file),
+                    str(self.registry),
                     "prog.py",
                     "--secret",
                 ]
@@ -555,6 +588,8 @@ class CovrunTests(unittest.TestCase):
                     str(self.data_dir),
                     str(self.source_root),
                     str(destination),
+                    str(self.config_file),
+                    str(self.registry),
                     str(script),
                 ]
             )
@@ -581,6 +616,8 @@ class CovrunTests(unittest.TestCase):
                 str(self.data_dir),
                 str(self.source_root),
                 str(destination),
+                str(self.config_file),
+                str(self.registry),
                 str(script),
             ],
             capture_output=True,

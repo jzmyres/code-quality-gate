@@ -174,14 +174,17 @@ instead of written.
 
 `python_tests` runs the consumer's own test command from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
-`covrun.py`, a fresh data directory, the source root, and the pinned coverage install. The prefix writes
-and uses one gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`,
-`source` the repository root, `exclude_lines` exactly the `pragma: no cover` expression) for
-collection, combination and analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
+`covrun.py`, a fresh data directory, the source root, the pinned coverage install, the gate-owned
+coverage configuration path, and the registry directory. The adapter writes and every child uses one
+gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`, `source` the
+repository root, `exclude_lines` exactly the `pragma: no cover` expression) for collection,
+combination and analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
 `pyproject.toml` configuration is ignored, and every `COVERAGE_*` environment variable other than
 `COVERAGE_CORE` is removed before the test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
 --source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so
-`run` can name a script or `-m MODULE`; each invocation gets its own data file.
+`run` can name a script or `-m MODULE`; each invocation gets its own data file. `covrun.py` uses
+only the standard library and that verified coverage install, so it adds no gate package or gate
+repository path to the measured program's imports.
 
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:

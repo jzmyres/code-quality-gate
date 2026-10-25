@@ -93,6 +93,10 @@ Rules:
 * `python_tests` requires a one-group `tests_pattern`; `skipped_pattern` is
   optional, has one group, and is only valid with `tests_pattern`. Both are
   searched with `re.MULTILINE` over combined stdout and stderr.
+* The `{python}` token expands to the gate's `covrun.py` under the current
+  interpreter with a fresh data directory, the source root, the pinned coverage
+  install, the gate-owned coverage configuration path and the registry
+  directory.
 * A command check may also declare `tests_pattern` and `skipped_pattern`.
   It then has `tests` evidence and counts executed tests the same way:
   `executed = ran - skipped`, and zero executed tests fail.
