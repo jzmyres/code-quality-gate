@@ -18,6 +18,7 @@ from .tools import (
     command_tools_path,
     load_tools,
 )
+from .trust import prepare_trust
 
 
 class _Parser(argparse.ArgumentParser):
@@ -68,6 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune",
         metavar="ID",
         help="lower one check's baseline after it passes",
+    )
+    check.add_argument(
+        "--policy-from",
+        metavar="REV",
+        help="evaluate the working tree against REV's policy and inputs",
+    )
+    check.add_argument(
+        "--allow-protected",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="authorize the candidate's version of a protected path",
     )
     return parser
 
@@ -121,28 +134,50 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    raw = list(sys.argv[1:] if argv is None else argv)
+def _run_tools(args: Any) -> int:
+    lock = (
+        Path(args.lock).expanduser()
+        if getattr(args, "lock", None)
+        else _default_lock_path()
+    )
+    if args.tools_command == "fetch":
+        return command_tools_fetch(lock)
+    return command_tools_path(lock, args.name)
+
+
+def _run_trusted_check(root: Path, args: Any) -> int:
+    trust = prepare_trust(root, args.policy_from, args.allow_protected)
+    return command_check(
+        root,
+        trust.config,
+        json_output=args.json,
+        prune_id=args.prune,
+        trust=trust,
+    )
+
+
+def _run_gate(root: Path, args: Any) -> int:
+    if args.command == "check" and args.policy_from is not None:
+        return _run_trusted_check(root, args)
+    if getattr(args, "allow_protected", None):
+        raise UsageError(
+            "qg.py: --allow-protected: expected --policy-from"
+        )
+    config = load_config(root)
+    load_tools(_default_lock_path())
+    return _dispatch(root, config, args)
+
+
+def _main(raw: list[str]) -> int:
     json_requested = "--json" in raw
     root: Path | None = None
     try:
         _reject_nul(raw)
         args = build_parser().parse_args(raw)
-
         if args.command == "tools":
-            lock = (
-                Path(args.lock).expanduser()
-                if getattr(args, "lock", None)
-                else _default_lock_path()
-            )
-            if args.tools_command == "fetch":
-                return command_tools_fetch(lock)
-            return command_tools_path(lock, args.name)
-
+            return _run_tools(args)
         root = resolve_repo(args.repo)
-        config = load_config(root)
-        load_tools(_default_lock_path())
-        return _dispatch(root, config, args)
+        return _run_gate(root, args)
     except UsageError as error:
         print(error, file=sys.stderr)
         if json_requested:
@@ -150,3 +185,7 @@ def main(argv: list[str] | None = None) -> int:
                 root = _repo_hint(raw)
             _print_error_document(root, str(error))
         return error.exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    return _main(list(sys.argv[1:] if argv is None else argv))

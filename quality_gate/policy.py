@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ TOP_LEVEL_KEYS = (
     "checks",
     "levels",
     "not_applicable",
+    "protect",
 )
 
 
@@ -135,6 +136,8 @@ class Config:
     checks: dict[str, CheckDef]
     required_tiers: tuple[int, ...]
     not_applicable: tuple[NotApplicable, ...]
+    protect_paths: tuple[str, ...] = ()
+    prune_paths: dict[str, Path] = field(default_factory=dict)
 
 
 def _config_error(path: Path, key: str, expected: str, actual: str) -> ConfigError:
@@ -805,6 +808,79 @@ def _parse_not_applicable(
     return tuple(entries)
 
 
+def _declared_schema(data: dict[str, Any], path: Path) -> int:
+    if "schema" not in data:
+        raise _config_error(path, "schema", str(SUPPORTED_SCHEMA), "missing")
+    declared_schema = data["schema"]
+    if (
+        isinstance(declared_schema, bool)
+        or not isinstance(declared_schema, int)
+        or declared_schema != SUPPORTED_SCHEMA
+    ):
+        raise _config_error(
+            path, "schema", str(SUPPORTED_SCHEMA), _describe(declared_schema)
+        )
+    return SUPPORTED_SCHEMA
+
+
+def _parse_hygiene(data: dict[str, Any], path: Path) -> int:
+    hygiene = _optional_table(data, "hygiene", path, "hygiene")
+    if hygiene is None:
+        return DEFAULT_MAX_BYTES
+    _check_keys(hygiene, ("max_bytes",), path, "hygiene")
+    return _integer(
+        hygiene,
+        "max_bytes",
+        path,
+        "hygiene.max_bytes",
+        default=DEFAULT_MAX_BYTES,
+        minimum=0,
+    )
+
+
+def _parse_protect(data: dict[str, Any], path: Path) -> tuple[str, ...]:
+    protect = _optional_table(data, "protect", path, "protect")
+    if protect is None:
+        return ()
+    _check_keys(protect, ("paths",), path, "protect")
+    return _optional_string_list(protect, "paths", path, "protect.paths")
+
+
+def _config_from_data(
+    root: Path, path: Path, data: dict[str, Any]
+) -> Config:
+    _check_keys(data, TOP_LEVEL_KEYS, path, "")
+    schema = _declared_schema(data, path)
+
+    code = _required_table(data, "code", path, "code")
+    _check_keys(code, ("patterns", "shebangs"), path, "code")
+    patterns = _string_list(code, "patterns", path, "code.patterns")
+    shebangs = _string_list(code, "shebangs", path, "code.shebangs")
+
+    classes = _parse_classes(data, path)
+    rules = _parse_rules(data, path)
+    max_bytes = _parse_hygiene(data, path)
+    checks = _parse_checks(data, root, path)
+    required_tiers = _parse_levels(data, path)
+    not_applicable = _parse_not_applicable(data, classes, path)
+    protect_paths = _parse_protect(data, path)
+
+    return Config(
+        path=path,
+        root=root,
+        schema=schema,
+        code_patterns=patterns,
+        code_shebangs=shebangs,
+        classes=classes,
+        rules=rules,
+        max_bytes=max_bytes,
+        checks=checks,
+        required_tiers=required_tiers,
+        not_applicable=not_applicable,
+        protect_paths=protect_paths,
+    )
+
+
 def load_config(root: Path) -> Config:
     path = root / "quality-gate.toml"
     try:
@@ -820,55 +896,4 @@ def load_config(root: Path) -> Config:
         ) from error
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise ConfigError(f"{path}: expected valid TOML, got {error}") from error
-
-    _check_keys(data, TOP_LEVEL_KEYS, path, "")
-    if "schema" not in data:
-        raise _config_error(path, "schema", str(SUPPORTED_SCHEMA), "missing")
-    declared_schema = data["schema"]
-    if (
-        isinstance(declared_schema, bool)
-        or not isinstance(declared_schema, int)
-        or declared_schema != SUPPORTED_SCHEMA
-    ):
-        raise _config_error(
-            path, "schema", str(SUPPORTED_SCHEMA), _describe(declared_schema)
-        )
-
-    code = _required_table(data, "code", path, "code")
-    _check_keys(code, ("patterns", "shebangs"), path, "code")
-    patterns = _string_list(code, "patterns", path, "code.patterns")
-    shebangs = _string_list(code, "shebangs", path, "code.shebangs")
-
-    classes = _parse_classes(data, path)
-    rules = _parse_rules(data, path)
-
-    hygiene = _optional_table(data, "hygiene", path, "hygiene")
-    max_bytes = DEFAULT_MAX_BYTES
-    if hygiene is not None:
-        _check_keys(hygiene, ("max_bytes",), path, "hygiene")
-        max_bytes = _integer(
-            hygiene,
-            "max_bytes",
-            path,
-            "hygiene.max_bytes",
-            default=DEFAULT_MAX_BYTES,
-            minimum=0,
-        )
-
-    checks = _parse_checks(data, root, path)
-    required_tiers = _parse_levels(data, path)
-    not_applicable = _parse_not_applicable(data, classes, path)
-
-    return Config(
-        path=path,
-        root=root,
-        schema=SUPPORTED_SCHEMA,
-        code_patterns=patterns,
-        code_shebangs=shebangs,
-        classes=classes,
-        rules=rules,
-        max_bytes=max_bytes,
-        checks=checks,
-        required_tiers=required_tiers,
-        not_applicable=not_applicable,
-    )
+    return _config_from_data(root, path, data)

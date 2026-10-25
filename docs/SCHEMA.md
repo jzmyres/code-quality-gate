@@ -1,13 +1,16 @@
-# Schema reference (version 2)
+# Schema reference (version 2, with trust result version 3)
 
 This is the authoritative contract for the gate's policy, baseline and result
 formats. The files in `plans/` are historical records; where they disagree with
-this document, this document wins.
+this document, this document wins. The trust-root semantics behind
+`--policy-from` are specified in [`TRUST.md`](TRUST.md).
 
 Version 2 is a breaking change from version 1: policy files declare
 `schema = 2`, result documents declare `schema = 2`, baselines begin with the
 check identity header, and the result separates execution, the adapter's raw
-outcome and policy satisfaction.
+outcome and policy satisfaction. A result produced with `--policy-from` adds a
+`trust` object and declares `schema = 3`; a result without it remains version
+2 and has no `trust` key.
 
 ## Policy: `quality-gate.toml`
 
@@ -65,6 +68,9 @@ requires = "tests"            # an earlier python_tests check
 threshold = 6                 # optional; finite
 baseline = "quality-gate-crap.toml"
 
+[protect]                     # optional; used only with --policy-from
+paths = ["ruff.toml", "Makefile", ".github/workflows/*.yml"]
+
 [[not_applicable]]
 class = "python"
 tier = 2
@@ -99,6 +105,10 @@ Rules:
 * `[[not_applicable]]` entries are the explicit, reasoned exemption for a
   class and required tier. A missing entry is an unsatisfied obligation, not a
   configuration error.
+* `[protect]` has one optional key, `paths`, a list of repository-relative
+  paths or `fnmatch` globs. It is the caller's protected-input list for
+  `check --policy-from REV`; without that option it is parsed and ignored. The
+  list used by a trust run always comes from `REV`.
 
 ### Evidence and obligations
 
@@ -270,17 +280,75 @@ drops it. A clone entry naming a file deleted from the repository resolves.
 
 Top-level keys:
 
-* `schema` - always `2`.
+* `schema` - `2`, or `3` when a `trust` object is present.
 * `gate_version` - the gate's own revision, or `unknown: ...`.
 * `revision`, `dirty` - the consumer's HEAD (or null) and worktree state.
-* `policy_sha256` - the policy file's SHA-256, or null.
-* `decision` - `accepted`, `accepted_with_exceptions`, `rejected` or
-  `error`.
+* `policy_sha256` - the effective policy file's SHA-256, or null. With
+  `--policy-from` and an unauthorized candidate policy, this is `REV`'s
+  policy; an authorized replacement is the candidate's.
+* `decision` - `accepted`, `accepted_with_exceptions`, `rejected`,
+  `blocked` or `error`.
 * `checks` - inventory, hygiene and every configured check, in that order.
 * `obligations` - one entry per code class and required tier.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
+* `trust` - present only on a `--policy-from` result; see below.
 * `error` - present only on a `decision = "error"` document.
+
+### Trust object
+
+A `--policy-from` result adds one `trust` object and declares schema 3:
+
+```json
+{
+  "schema": 3,
+  "trust": {
+    "policy_from": "8dbb703...",
+    "protected": [
+      {
+        "path": "quality-gate-clones.toml",
+        "rev_sha256": "c2a2...",
+        "candidate_sha256": "d29f...",
+        "status": "tightened",
+        "ignored_entries": []
+      }
+    ],
+    "identity_before": {
+      "revision": "8dbb703...",
+      "protected": {
+        "quality-gate-clones.toml": {
+          "rev_sha256": "c2a2...",
+          "candidate_sha256": "d29f..."
+        }
+      },
+      "tools": {
+        "ruff": {"version": "0.17.0", "payload_sha256": "720b..."}
+      },
+      "gate": {
+        "digest": "a1b2...",
+        "files": {"qg.py": "9c40...", "quality_gate/checks.py": "6842..."}
+      }
+    },
+    "identity_after": {}
+  }
+}
+```
+
+* `policy_from` is the full commit id `REV` resolved to.
+* `protected` has one entry per protected input. `path` is
+  repository-relative; `rev_sha256` and `candidate_sha256` are lowercase
+  SHA-256 hex or null when the file is absent. `status` is `unchanged`,
+  `tightened`, `ignored`, `authorized` or `blocked`. A baseline entry also
+  carries `ignored_entries`, the subjects whose candidate entry was ignored.
+* `identity_before` and `identity_after` record `REV`'s commit id, each
+  protected input's two SHA-256 values, every pinned tool's
+  `payload_sha256` (or null when not installed, or `invalid` when the tree has
+  no digest), and the gate program's own per-file SHA-256 values plus one
+  combined `digest`. `identity_after` is captured after the checks; a
+  difference in any protected input, tool payload or gate file makes the
+  decision `error` (exit 2) naming the changed input. The one exception is the
+  baseline the gate itself rewrote for a performed prune: that content is
+  `REV`'s baseline lowered by the measurement.
 
 Check keys:
 
@@ -320,7 +388,11 @@ The decision is `rejected` when inventory or hygiene fails, when an enforced
 check is not satisfied, or when any obligation is `unsatisfied`.
 `accepted_with_exceptions` means every obligation and enforced check is
 satisfied, but a baseline exception or a non-passing advisory check exists.
-`error` (exit 2) is invalid policy, usage or configuration.
+`blocked` (exit 1, trust runs only) means an unauthorized protected path other
+than the policy, a baseline or the tools lock differs from `REV`; the checks
+still ran and are reported. `error` (exit 2) is invalid policy, usage,
+configuration, or a protected input, tool payload or gate file that changed
+during the run.
 
 `execution` does not change the decision: a budget or signal makes the raw
 outcome fail, and policy satisfaction then decides acceptance. A prune that is
@@ -330,7 +402,7 @@ gate evaluation.
 ## Versions and superseded proposals
 
 * Policy: `schema = 2`.
-* Result: `schema = 2`.
+* Result: `schema = 2`; `schema = 3` when `--policy-from` adds `trust`.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Metric versions: `command-exit/1`, `test-count/1`,

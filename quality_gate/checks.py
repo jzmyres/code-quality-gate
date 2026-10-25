@@ -1447,13 +1447,14 @@ def _run_policy_checks(
     return results
 
 
-def _write_pruned(check: CheckDef, result: CheckResult) -> tuple[bool, str | None]:
-    assert check.baseline is not None
-    existed = check.baseline.exists()
+def _write_pruned(
+    check: CheckDef, result: CheckResult, destination: Path
+) -> tuple[bool, str | None]:
+    existed = destination.exists()
     try:
         assert result.ratchet is not None
         write_baseline(
-            check.baseline,
+            destination,
             pruned_entries(result.ratchet),
             check_id=check.id,
             metric_version=check.metric_version,
@@ -1461,10 +1462,10 @@ def _write_pruned(check: CheckDef, result: CheckResult) -> tuple[bool, str | Non
     except GateError as error:
         print(f"check: {check.id}: {error}", file=sys.stderr)
         return False, str(error)
-    if check.baseline.exists():
-        print(f"check: {check.id}: baseline updated at {check.baseline}")
+    if destination.exists():
+        print(f"check: {check.id}: baseline updated at {destination}")
     elif existed:
-        print(f"check: {check.id}: baseline removed at {check.baseline}")
+        print(f"check: {check.id}: baseline removed at {destination}")
     return True, None
 
 
@@ -1487,7 +1488,9 @@ def _perform_prune(
     check = config.checks[prune_id]
     if not target.is_satisfied() or target.ratchet is None:
         return _prune_refusal(prune_id)
-    performed, reason = _write_pruned(check, target)
+    assert check.baseline is not None
+    destination = config.prune_paths.get(prune_id, check.baseline)
+    performed, reason = _write_pruned(check, target, destination)
     return {
         "requested": [prune_id],
         "performed": performed,
@@ -1634,19 +1637,39 @@ def _check_command(
     )
 
 
+def _run_check_document(
+    root: Path, config: Config, prune_id: str | None, json_output: bool
+) -> tuple[int, dict[str, Any]]:
+    if not json_output:
+        return _check_command(root, config, prune_id)
+    with contextlib.redirect_stdout(sys.stderr):
+        return _check_command(root, config, prune_id)
+
+
 def command_check(
     root: Path,
     config: Config,
     *,
     json_output: bool = False,
     prune_id: str | None = None,
+    trust: Any = None,
 ) -> int:
-    if not json_output:
-        return _check_command(root, config, prune_id)[0]
-    with contextlib.redirect_stdout(sys.stderr):
-        code, document = _check_command(root, config, prune_id)
-    print(
-        json.dumps(document, indent=2, allow_nan=False),
-        file=sys.stdout,
-    )
+    if trust is None:
+        code, document = _run_check_document(
+            root, config, prune_id, json_output
+        )
+    else:
+        try:
+            with trust.activate():
+                code, document = _run_check_document(
+                    root, config, prune_id, json_output
+                )
+            code, document = trust.finish(code, document)
+        finally:
+            trust.close()
+    if json_output:
+        print(
+            json.dumps(document, indent=2, allow_nan=False),
+            file=sys.stdout,
+        )
     return code

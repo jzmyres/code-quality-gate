@@ -1,6 +1,7 @@
 """Pinned tool locks, installation and binary lookup."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -48,8 +49,25 @@ class Tool:
     format: str = "tar"
 
 
+_LOCK_OVERRIDE: Path | None = None
+
+
 def _default_lock_path() -> Path:
+    if _LOCK_OVERRIDE is not None:
+        return _LOCK_OVERRIDE
     return Path(__file__).resolve().parent.parent / "tools.lock.toml"
+
+
+@contextlib.contextmanager
+def lock_override(path: Path | None):
+    """Use PATH as the tool lock for the duration of the block."""
+    global _LOCK_OVERRIDE
+    previous = _LOCK_OVERRIDE
+    _LOCK_OVERRIDE = path
+    try:
+        yield
+    finally:
+        _LOCK_OVERRIDE = previous
 
 
 def _tools_dir() -> Path:

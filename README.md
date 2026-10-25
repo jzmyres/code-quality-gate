@@ -5,7 +5,8 @@ reason recorded, every check declared by policy, and every metric exception expl
 Its core is one standard-library Python 3.12 command plus pinned external tools; the Python adapters
 also load the pinned coverage wheel from the tools cache. A consuming repository pins it as a git
 submodule and keeps its own `quality-gate.toml` and baselines. The authoritative policy, baseline and
-result contract is [`docs/SCHEMA.md`](docs/SCHEMA.md); this README explains how to use it.
+result contract is [`docs/SCHEMA.md`](docs/SCHEMA.md); the trust-root contract for
+`check --policy-from` is [`docs/TRUST.md`](docs/TRUST.md); this README explains how to use it.
 
 The gate is deliberately narrow. It owns the orchestration no maintained tool owns end to end:
 
@@ -20,7 +21,7 @@ The gate is deliberately narrow. It owns the orchestration no maintained tool ow
   and fetched explicitly;
 * **result** - `check --json` writes one machine-readable schema-2 result that separates execution,
   the adapter's raw outcome and policy satisfaction, and carries diagnostics, obligations and prune
-  reporting.
+  reporting; `--policy-from` adds a `trust` object and result schema 3.
 
 Tier 1 now includes Python tests and per-function CRAP scores; the next metric layer is an Emacs Lisp
 CRAP adapter.
@@ -43,7 +44,8 @@ pinned tool lock and extraction, `ratchet.py` owns baseline decisions and prunin
 jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage, `python_crap.py` joins
 coverage with `ast` complexity, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
-result, `gate_result.py` computes identity, obligations and the decision, and `cli.py` holds the
+result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
+`--policy-from` protected inputs, effective inputs and run identity, and `cli.py` holds the
 argument parser and dispatch. `qg.py` is only the entry point. The implementer agents' learned memory
 lives in `.agents/AGENTS.md`, written by the runner's reflection step after each batch and reviewed
 before landing.
@@ -313,6 +315,8 @@ The default tools directory is shared by every repository using the gate on this
     python3 -I qg.py check
     python3 -I qg.py check --json
     python3 -I qg.py check --prune clones
+    python3 -I qg.py check --policy-from REV
+    python3 -I qg.py check --policy-from REV --allow-protected ruff.toml
 
 `check` runs inventory and hygiene (built in, always), then every configured check in policy order. It
 prints progress on stdout and failures on stderr. When inventory fails, configured checks are reported
@@ -320,9 +324,9 @@ as skipped and the combined check still fails; hygiene still runs. Configuration
 any check starts.
 
 `check --json` writes exactly one JSON result to stdout and sends all human-readable lines to stderr.
-The result schema is `2`. Its top-level keys are `schema`, `gate_version`, `revision`, `dirty`,
-`policy_sha256`, `decision`, `checks`, `obligations` and `prune`; a `decision = "error"` document also
-has `error`.
+The result schema is `2`; a `--policy-from` result is schema `3` and adds `trust` (see below). Its
+top-level keys are `schema`, `gate_version`, `revision`, `dirty`, `policy_sha256`, `decision`,
+`checks`, `obligations` and `prune`; a `decision = "error"` document also has `error`.
 
 `checks` contains inventory, hygiene and every configured check, in that order. Each check has `id`,
 `kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
@@ -373,14 +377,29 @@ a baseline entry or an advisory check does not pass, and `accepted` (exit 0) oth
 usage errors (unknown options, bad arguments) still write one error document with `decision = "error"`
 and exit 2. An argument containing NUL is a configuration error.
 
+### Trust root
+
+`check --policy-from REV` evaluates the working tree against `REV`'s policy, baselines and tools lock,
+and `REV`'s `[protect] paths`, instead of the candidate's copies. An unauthorized candidate baseline
+edit can only tighten (remove entries or lower bounds); added or raised entries are ignored. An
+unauthorized change to
+another protected path makes the decision `blocked` (exit 1), while `--allow-protected PATH` accepts a
+reviewed replacement and reports it as authorized. The gate records protected-input, tool-payload and
+gate-program digests before and after the checks; a change makes the decision `error` (exit 2). It
+refuses to run from a gate program inside the candidate root. The full contract is
+[`docs/TRUST.md`](docs/TRUST.md); the result fields are in `docs/SCHEMA.md`.
+
 ### Exit codes
 
 * `0` - the command passed, possibly with exceptions;
 * `1` - a check failed, an obligation was unsatisfied, a missing tool made a check unsupported, a
-  baseline was malformed, or a requested prune was refused or failed;
+  baseline was malformed, a requested prune was refused or failed, or a trust run is `blocked` by an
+  unauthorized protected path;
 * `2` - missing or invalid configuration (including a baseline header that does not match the policy or
   two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
-  git work tree, an unknown inventory class or check id for pruning, or a malformed tool lock.
+  git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
+  `--policy-from` revision, a gate program inside the candidate, or a protected input, tool payload or
+  gate file that changed during the run.
 
 ## Configuration
 
@@ -448,6 +467,9 @@ and the allowed keys. The complete shape is:
     threshold = 6                         # optional; finite; this is the default
     baseline = "quality-gate-crap.toml"
 
+    [protect]                             # optional; used only with --policy-from
+    paths = ["ruff.toml", "Makefile", ".github/workflows/*.yml"]
+
     [[not_applicable]]
     class = "python"                      # a configured class
     tier = 2                              # a required tier it has no evidence for
@@ -496,6 +518,9 @@ Notes:
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the
   policy, and a `baseline` path. Its `threshold` defaults to 6 and must be finite. Its files come from
   the classes that list it.
+* `[protect] paths` is a list of repository-relative paths or `fnmatch` globs that `--policy-from`
+  treats as protected inputs. The list always comes from `REV`, so a candidate cannot unprotect a path;
+  without `--policy-from` it is parsed and ignored.
 
 ## The generic ratchet
 
@@ -587,7 +612,8 @@ archive members, payload mismatches and destinations outside the tools directory
 tampered Ruff or coverage install is `unsupported` before it runs and that a full run leaves the coverage
 install unchanged. Contract tests cover schema-2 typing,
 obligations and exemptions, diagnostics, baseline identity and domain rules, prune reporting and
-round-trips, the bounded runner's group kill and output cap, and JSON usage errors.
+round-trips, the bounded runner's group kill and output cap, JSON usage errors, and the trust root's
+baseline, policy, protected-path, prune and identity rules.
 
 ## Continuous integration
 
@@ -607,9 +633,9 @@ Reproduce it locally with the same tools cache:
 ## Planned later layers
 
 The core gate is deliberately language-agnostic; adapters measure and the core decides. Tier 1 now
-includes the Python tests and CRAP adapters described above. The result and ratchet contract is fixed
-at schema 2 so M4 (tier 2 properties/fuzzing) and M5 (tiers 3/4 bounded/proof) add adapters without
-reworking the core. The next metric layer is:
+includes the Python tests and CRAP adapters described above. The policy and baseline contract is fixed
+at schema 2 (a trust result adds schema 3) so M4 (tier 2 properties/fuzzing) and M5 (tiers 3/4
+bounded/proof) add adapters without reworking the core. The next metric layer is:
 
 * **Emacs Lisp CRAP adapter** - reuse the same baseline and reporting model, but compute complexity and
   coverage through an Emacs batch helper, since Emacs Lisp has no maintained standalone CRAP tool.
