@@ -47,6 +47,18 @@ class CommandCheckTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         return result, self.check_by_id(document, "lint")
 
+    def require_real_ruff(self) -> None:
+        if not self.ruff_binary().is_file():
+            self.skipTest(
+                "ruff is not installed; run python3 -I qg.py tools fetch"
+            )
+
+    def assert_lint_outcome(
+        self, document: dict[str, object], outcome: str
+    ) -> None:
+        check = self.check_by_id(document, "lint")
+        self.assertEqual(check["outcome"], outcome)
+
     def test_command_check_passes(self) -> None:
         self.write_config(
             with_command('["python3", "-c", "print(\'ok\')"]')
@@ -136,17 +148,35 @@ class CommandCheckTests(FixtureCase):
         self.assertIn("tools fetch", result.stderr)
 
     def test_real_ruff_runs_when_it_is_installed(self) -> None:
-        binary = self.ruff_binary()
-        if not binary.is_file():
-            self.skipTest(
-                "ruff is not installed; run python3 -I qg.py tools fetch"
-            )
+        self.require_real_ruff()
         self.write_config(with_command('["{tool:ruff}", "--version"]'))
         result, document = self.run_json(env=self.default_tool_env())
         self.assertEqual(result.returncode, 0, output(result))
+        self.assert_lint_outcome(document, "pass")
         check = self.check_by_id(document, "lint")
-        self.assertEqual(check["outcome"], "pass")
         self.assertEqual(check["termination"], "exit")
+
+    def test_real_ruff_rejects_then_accepts_a_fixture(self) -> None:
+        self.require_real_ruff()
+        self.write_config(
+            with_command(
+                '["{tool:ruff}", "check", "--no-cache", "{files}"]'
+            )
+        )
+        self.add_file("-x.py", "import os\n")
+        self.add_file("space name.py", "import sys\n")
+        result, document = self.run_json(env=self.default_tool_env())
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assert_lint_outcome(document, "fail")
+        self.assertIn("F401", text)
+        self.assertIn("-x.py", text)
+        self.assertIn("space name.py", text)
+        self.add_file("-x.py", "print('fixed')\n")
+        self.add_file("space name.py", "print('fixed')\n")
+        result, document = self.run_json(env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_lint_outcome(document, "pass")
 
 
 if __name__ == "__main__":

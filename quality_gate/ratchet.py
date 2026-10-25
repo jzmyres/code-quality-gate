@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .policy import GateError, _describe
+from .policy import GateError, UnsupportedError, _describe
 
 
 @dataclass(frozen=True)
@@ -143,11 +144,11 @@ def load_baseline(
             )
         seen.add(subject)
         bound = raw.get("bound")
-        if not _is_number(bound):
+        if not _is_number(bound) or not math.isfinite(bound):
             raise _baseline_error(
                 path,
                 f"{where}.bound",
-                "a number",
+                "a finite number",
                 "missing" if bound is None else _describe(bound),
             )
         reason = raw.get("reason", "")
@@ -196,6 +197,8 @@ def _toml_value(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise GateError("cannot write a non-finite baseline value")
         return _number(value)
     if isinstance(value, datetime.datetime):
         return value.isoformat()
@@ -309,6 +312,22 @@ def evaluate(
     today: datetime.date | None = None,
 ) -> RatchetResult:
     today = today or datetime.date.today()
+    if not math.isfinite(threshold):
+        raise UnsupportedError(
+            f"{prefix}: non-finite threshold {threshold!r}"
+        )
+    for entry in entries:
+        if not math.isfinite(entry.bound):
+            raise UnsupportedError(
+                f"{prefix}: baseline entry {entry.subject}: non-finite "
+                f"bound {entry.bound!r}"
+            )
+    for finding in findings:
+        if not math.isfinite(finding.value):
+            raise UnsupportedError(
+                f"{prefix}: {finding.subject}: non-finite measured value "
+                f"{finding.value!r}"
+            )
     by_subject = {entry.subject: entry for entry in entries}
     measured: dict[str, float] = {}
     failures: list[str] = []

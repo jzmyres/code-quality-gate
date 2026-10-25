@@ -15,7 +15,10 @@ from typing import Any
 
 from . import gate_result
 from .clones import measure_clones
-from .coverage_tool import combine_coverage
+from .coverage_tool import (
+    combine_coverage,
+    coverage_config_path,
+)
 from .files import command_hygiene, validate_inventory
 from .policy import (
     CheckDef,
@@ -25,7 +28,11 @@ from .policy import (
     UsageError,
 )
 from .python_crap import measure_crap
-from .python_tests import coverage_prefix, expand_run, parse_test_count
+from .python_tests import (
+    coverage_prefix,
+    expand_run,
+    parse_test_summary,
+)
 from .ratchet import (
     RatchetResult,
     evaluate,
@@ -57,6 +64,7 @@ class CheckResult:
     ratchet: RatchetResult | None = None
     measurement: dict[str, Any] | None = None
     evidence: Path | None = None
+    coverage_config: Path | None = None
     temporary: Any = field(default=None, repr=False, compare=False)
 
     def to_json(self) -> dict[str, Any]:
@@ -122,7 +130,10 @@ def _expand_run(
     lock = _default_lock_path()
     for argument in check.command.run:
         if argument == "{files}":
-            expanded.extend(files)
+            expanded.extend(
+                f"./{name}" if name.startswith("-") else name
+                for name in files
+            )
             continue
         match = re.fullmatch(r"\{tool:([^{}]+)\}", argument)
         if match is None:
@@ -190,6 +201,33 @@ def _adapter_result(
         termination=termination,
         **fields,
     )
+
+
+def _evaluate_ratchet(
+    findings: list[Any],
+    entries: list[Any],
+    check: CheckDef,
+    prefix: str,
+) -> tuple[RatchetResult | None, str | None]:
+    assert check.threshold is not None
+    try:
+        return (
+            evaluate(
+                findings,
+                entries,
+                threshold=check.threshold,
+                enforcement=check.enforcement,
+                prefix=prefix,
+                adapter=check.adapter,
+            ),
+            None,
+        )
+    except UnsupportedError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return None, "unsupported"
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return None, "error"
 
 
 def _run_command(
@@ -329,7 +367,12 @@ def _run_clones(
         )
         return _clone_result(check, start, outcome="fail")
     try:
-        findings = measure_clones(root, selected, check.clones.min_tokens)
+        findings = measure_clones(
+            root,
+            selected,
+            check.clones.min_tokens,
+            config.max_bytes,
+        )
     except UnsupportedError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _clone_result(check, start, outcome="unsupported")
@@ -341,15 +384,13 @@ def _run_clones(
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _clone_result(check, start, outcome="error")
-    assert check.threshold is not None
-    ratchet = evaluate(
-        findings,
-        entries,
-        threshold=check.threshold,
-        enforcement=check.enforcement,
-        prefix=prefix,
-        adapter=check.adapter,
+    ratchet, failure = _evaluate_ratchet(
+        findings, entries, check, prefix
     )
+    if ratchet is None:
+        return _clone_result(
+            check, start, outcome=failure or "error"
+        )
     result = _clone_result(
         check, start, outcome=ratchet.outcome, ratchet=ratchet
     )
@@ -409,6 +450,9 @@ def _run_python_tests(
 
     command = expand_run(spec.run, python_prefix)
     environment = os.environ.copy()
+    for name in list(environment):
+        if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
+            del environment[name]
     environment["QG_PYTHON"] = json.dumps(python_prefix)
     try:
         completed = subprocess.run(
@@ -442,11 +486,24 @@ def _run_python_tests(
         _print_output(prefix, combined)
         return result("fail", termination="signal")
     if completed.returncode != 0:
-        count, _count_error = parse_test_count(spec, combined)
-        if count == 0:
+        ran, skipped, _count_error = parse_test_summary(spec, combined)
+        if (
+            _count_error is not None
+            and "ambiguous test summary" in _count_error
+        ):
+            print(f"{prefix}: {_count_error}", file=sys.stderr)
+            _print_output(prefix, combined)
+            return result("unsupported")
+        executed = (
+            ran - skipped
+            if ran is not None and skipped is not None
+            else None
+        )
+        if executed == 0:
             print(
-                f"{prefix}: command exited {completed.returncode} and "
-                "reported 0 tests; zero tests is not a pass",
+                f"{prefix}: command exited {completed.returncode} and no "
+                f"test executed: {ran} ran, {skipped} skipped; "
+                "zero tests is not a pass",
                 file=sys.stderr,
             )
         else:
@@ -457,23 +514,26 @@ def _run_python_tests(
         _print_output(prefix, combined)
         return result("fail")
 
-    count, count_error = parse_test_count(spec, combined)
+    ran, skipped, count_error = parse_test_summary(spec, combined)
     if count_error is not None:
         print(f"{prefix}: {count_error}", file=sys.stderr)
         _print_output(prefix, combined)
         return result("unsupported")
-    assert count is not None
-    if count == 0:
+    assert ran is not None and skipped is not None
+    executed = ran - skipped
+    if executed == 0:
         print(
-            f"{prefix}: command reported 0 tests; zero tests is not a pass",
+            f"{prefix}: no test executed: {ran} ran, {skipped} skipped; "
+            "zero tests is not a pass",
             file=sys.stderr,
         )
         _print_output(prefix, combined)
         return result("fail")
 
     combined_file = Path(temporary.name) / "combined" / ".coverage"
+    config_file = coverage_config_path(data_dir)
     try:
-        combine_coverage(data_dir, combined_file)
+        combine_coverage(data_dir, combined_file, config_file)
     except UnsupportedError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return result("unsupported")
@@ -483,12 +543,13 @@ def _run_python_tests(
 
     outcome = result(
         "pass",
-        measurement={"tests": count},
+        measurement={"tests": executed},
         evidence=combined_file,
+        coverage_config=config_file,
         temporary=temporary,
     )
     print(
-        f"{prefix}: passed ({count} tests, "
+        f"{prefix}: passed ({executed} tests, "
         f"{outcome.duration_seconds:.2f}s)",
         flush=True,
     )
@@ -554,9 +615,24 @@ def _run_python_crap(
             file=sys.stderr,
         )
         return result("unsupported")
+    if (
+        required.coverage_config is None
+        or not required.coverage_config.is_file()
+    ):
+        print(
+            f"{prefix}: coverage unreliable: {spec.requires} produced no "
+            "gate coverage configuration",
+            file=sys.stderr,
+        )
+        return result("unsupported")
 
     try:
-        measurement = measure_crap(root, selected, required.evidence)
+        measurement = measure_crap(
+            root,
+            selected,
+            required.evidence,
+            required.coverage_config,
+        )
     except UnsupportedError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return result("unsupported")
@@ -573,15 +649,11 @@ def _run_python_crap(
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return result("error")
-    assert check.threshold is not None
-    ratchet = evaluate(
-        measurement.findings,
-        entries,
-        threshold=check.threshold,
-        enforcement=check.enforcement,
-        prefix=prefix,
-        adapter=check.adapter,
+    ratchet, failure = _evaluate_ratchet(
+        measurement.findings, entries, check, prefix
     )
+    if ratchet is None:
+        return result(failure or "error")
     outcome = result(
         ratchet.outcome,
         ratchet=ratchet,
@@ -785,5 +857,8 @@ def command_check(
         return _check_command(root, config, prune_id)[0]
     with contextlib.redirect_stdout(sys.stderr):
         code, document = _check_command(root, config, prune_id)
-    print(json.dumps(document, indent=2), file=sys.stdout)
+    print(
+        json.dumps(document, indent=2, allow_nan=False),
+        file=sys.stdout,
+    )
     return code

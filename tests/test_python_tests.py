@@ -16,6 +16,7 @@ def tests_config(
     *,
     run: str = '["{python}", "-m", "unittest", "discover", "-s", "tests"]',
     tests_pattern: str = r"^Ran (\d+) tests? in",
+    skipped_pattern: str | None = None,
     budget: int | None = None,
 ) -> str:
     lines = [
@@ -48,6 +49,8 @@ def tests_config(
         f"run = {run}",
         f"tests_pattern = {json.dumps(tests_pattern)}",
     ]
+    if skipped_pattern is not None:
+        lines.append(f"skipped_pattern = {json.dumps(skipped_pattern)}")
     if budget is not None:
         lines.append(f"budget_seconds = {budget}")
     lines.extend(
@@ -91,6 +94,19 @@ class PythonTestsTests(FixtureCase):
             self.assertIn(needle, result.stderr)
         return result, check
 
+    def unsupported_tests(
+        self,
+        *needles: str,
+        env: dict[str, str] | None = None,
+    ) -> tuple[object, dict[str, object]]:
+        result, document = self.run_tests(env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        check = self.check_by_id(document, "tests")
+        self.assertEqual(check["outcome"], "unsupported")
+        for needle in needles:
+            self.assertIn(needle, result.stderr)
+        return result, check
+
     def test_tests_pass_and_report_the_count(self) -> None:
         self.add_test(
             "test_sample",
@@ -108,7 +124,36 @@ class PythonTestsTests(FixtureCase):
 
     def test_zero_tests_fails(self) -> None:
         self.add_file("tests/helper.py", "VALUE = 1\n")
-        self.failed_tests("reported 0 tests", "zero tests is not a pass")
+        self.failed_tests(
+            "no test executed: 0 ran, 0 skipped",
+            "zero tests is not a pass",
+        )
+
+    def test_all_skipped_tests_fail_as_no_test_executed(self) -> None:
+        self.write_config(
+            tests_config(skipped_pattern=r"skipped=(\d+)")
+        )
+        self.add_test(
+            "test_skipped",
+            "    @unittest.skip('deliberate')\n"
+            "    def test_skipped(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        self.failed_tests(
+            "no test executed: 1 ran, 1 skipped",
+            "zero tests is not a pass",
+        )
+
+    def test_ambiguous_test_summary_is_unsupported(self) -> None:
+        self.add_file(
+            "tests/summary.py",
+            "print('Ran 1 test in 0.1s')\n"
+            "print('Ran 2 tests in 0.2s')\n",
+        )
+        self.write_config(
+            tests_config(run='["{python}", "tests/summary.py"]')
+        )
+        self.unsupported_tests("ambiguous test summary")
 
     def test_failing_test_fails(self) -> None:
         self.add_test(
@@ -138,26 +183,18 @@ class PythonTestsTests(FixtureCase):
             "test_sample",
             "    def test_one(self):\n        self.assertTrue(True)\n",
         )
-        result, document = self.run_tests()
-        self.assertEqual(result.returncode, 1, output(result))
-        check = self.check_by_id(document, "tests")
-        self.assertEqual(check["outcome"], "unsupported")
-        self.assertIn("tests_pattern", result.stderr)
-        self.assertIn("did not match", result.stderr)
+        self.unsupported_tests("tests_pattern", "did not match")
 
     def test_missing_coverage_is_unsupported(self) -> None:
         self.add_test(
             "test_sample",
             "    def test_one(self):\n        self.assertTrue(True)\n",
         )
-        result, document = self.run_tests(
-            env={"QG_TOOLS_DIR": str(self.base / "empty-tools")}
+        self.unsupported_tests(
+            "not installed",
+            "tools fetch",
+            env={"QG_TOOLS_DIR": str(self.base / "empty-tools")},
         )
-        self.assertEqual(result.returncode, 1, output(result))
-        check = self.check_by_id(document, "tests")
-        self.assertEqual(check["outcome"], "unsupported")
-        self.assertIn("not installed", result.stderr)
-        self.assertIn("tools fetch", result.stderr)
 
 
 if __name__ == "__main__":

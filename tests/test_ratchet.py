@@ -147,6 +147,21 @@ class RatchetTests(unittest.TestCase):
         with self.assertRaises(policy.GateError):
             ratchet.pruned_entries(result)
 
+    def test_non_finite_measured_value_is_unsupported(self) -> None:
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaises(policy.UnsupportedError):
+                    self.decide([("subject", value)], [])
+
+    def test_non_finite_baseline_bound_is_unsupported(self) -> None:
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaises(policy.UnsupportedError):
+                    self.decide(
+                        [("subject", 1)],
+                        [("subject", value, "accepted", None)],
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

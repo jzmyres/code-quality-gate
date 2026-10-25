@@ -262,6 +262,46 @@ class PythonCrapTests(FixtureCase):
         self.assertEqual(finding["measurement"]["executed"], 0)
         self.assertGreater(finding["measurement"]["statements"], 0)
 
+    def test_repository_coverage_configuration_is_ignored(self) -> None:
+        self.write_config(
+            crap_config()
+            + '\n[[rule]]\npattern = ".coveragerc"\n'
+            'class = "config"\nreason = "repository coverage configuration"\n'
+        )
+        self.add_file(
+            ".coveragerc",
+            "[run]\n"
+            "branch = True\n"
+            "source = nowhere\n"
+            "omit = pkg/*\n"
+            "[report]\n"
+            "exclude_lines =\n"
+            "    .*\n",
+        )
+        self.add_file(
+            "pkg/covered.py",
+            "def covered():\n    return 1\n",
+        )
+        self.add_tests(
+            "    def test_covered(self):\n"
+            "        import pkg.covered\n"
+            "        self.assertEqual(pkg.covered.covered(), 1)\n"
+        )
+        result, _document, check = self.run_crap(
+            env={
+                **self.default_tool_env(),
+                "COVERAGE_OMIT": "pkg/*",
+                "COVERAGE_BRANCH": "1",
+            }
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        finding = self.findings(check)["pkg/covered.py:covered"]
+        self.assertEqual(finding["value"], 1.0)
+        self.assertEqual(
+            finding["measurement"]["executed"],
+            finding["measurement"]["statements"],
+        )
+
     def test_pragma_line_appears_in_excluded_lines(self) -> None:
         self.add_file(
             "pkg/pragma.py",
@@ -325,6 +365,107 @@ class PythonCrapTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         self.assertEqual(check["outcome"], "fail")
         self.assertIn("pkg/excluded.py:empty: unmeasured", result.stderr)
+
+    def test_one_line_body_is_unmeasured(self) -> None:
+        self.add_default_test()
+        self.add_file(
+            "pkg/one_line.py",
+            "def one_line(value): return 1 if value else 2\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "fail")
+        self.assertIn("pkg/one_line.py:one_line: unmeasured", result.stderr)
+        self.assertIn(
+            "body shares the def line; put the body on its own line",
+            result.stderr,
+        )
+        self.assertIn("pkg/one_line.py:1", result.stderr)
+
+    def test_property_accessors_have_distinct_identities(self) -> None:
+        self.add_file(
+            "pkg/props.py",
+            "class Thing:\n"
+            "    def __init__(self):\n"
+            "        self._value = 1\n"
+            "\n"
+            "    @property\n"
+            "    def value(self):\n"
+            "        return self._value\n"
+            "\n"
+            "    @value.setter\n"
+            "    def value(self, new):\n"
+            "        self._value = new\n"
+            "\n"
+            "    @value.deleter\n"
+            "    def value(self):\n"
+            "        del self._value\n",
+        )
+        self.add_tests(
+            "    def test_props(self):\n"
+            "        import pkg.props\n"
+            "        thing = pkg.props.Thing()\n"
+            "        thing.value = 2\n"
+            "        self.assertEqual(thing.value, 2)\n"
+            "        del thing.value\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass")
+        findings = self.findings(check)
+        for subject in (
+            "pkg/props.py:Thing.value",
+            "pkg/props.py:Thing.value.setter",
+            "pkg/props.py:Thing.value.deleter",
+        ):
+            self.assertIn(subject, findings)
+
+    def test_overload_declarations_are_skipped(self) -> None:
+        self.add_default_test()
+        self.add_file(
+            "pkg/overloaded.py",
+            "from typing import overload\n"
+            "\n"
+            "\n"
+            "@overload\n"
+            "def convert(value: int) -> int: ...\n"
+            "\n"
+            "\n"
+            "@overload\n"
+            "def convert(value: str) -> str: ...\n"
+            "\n"
+            "\n"
+            "def convert(value):\n"
+            "    return value\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass")
+        findings = self.findings(check)
+        self.assertIn("pkg/overloaded.py:convert", findings)
+        self.assertNotIn("pkg/overloaded.py:convert.overload", findings)
+
+    def test_module_and_class_body_code_is_a_subject(self) -> None:
+        self.add_default_test()
+        self.add_file(
+            "pkg/module_code.py",
+            "if True:\n"
+            "    MODULE_VALUE = 1\n"
+            "\n"
+            "class Holder:\n"
+            "    if True:\n"
+            "        CLASS_VALUE = 2\n"
+            "\n"
+            "    def method(self):\n"
+            "        return 1\n",
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        finding = self.findings(check)["pkg/module_code.py:<module>"]
+        self.assertEqual(finding["measurement"]["cc"], 3)
+        self.assertEqual(finding["measurement"]["executed"], 0)
+        self.assertEqual(finding["value"], 12.0)
+        self.assertIn("pkg/module_code.py:<module>", result.stderr)
 
     def test_qg_python_child_process_is_measured(self) -> None:
         self.add_file(
@@ -425,6 +566,16 @@ class PythonCrapTests(FixtureCase):
             "            return 1\n"
             "    return 0\n"
             "\n"
+            "def with_match_capture(x):\n"
+            "    match x:\n"
+            "        case remaining:\n"
+            "            return remaining\n"
+            "\n"
+            "def with_match_or_wildcard(x):\n"
+            "    match x:\n"
+            "        case 1 | _:\n"
+            "            return 0\n"
+            "\n"
             "def with_bool_and(a, b, c):\n"
             "    return a and b and c\n"
             "\n"
@@ -468,6 +619,8 @@ class PythonCrapTests(FixtureCase):
             "pkg/constructs.py:with_except_star": 2,
             "pkg/constructs.py:with_match": 2,
             "pkg/constructs.py:with_guarded_wildcard": 2,
+            "pkg/constructs.py:with_match_capture": 1,
+            "pkg/constructs.py:with_match_or_wildcard": 1,
             "pkg/constructs.py:with_bool_and": 3,
             "pkg/constructs.py:with_bool_or": 2,
             "pkg/constructs.py:with_nested": 2,

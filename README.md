@@ -51,6 +51,24 @@ and run the gate:
     $EDITOR quality-gate.toml
     python3 -I code-quality-gate/qg.py check
 
+A submodule is a gitlink: it is never opened, read for a shebang, or sized, so it needs exactly one
+class rule and may live in a class with `code = false`. The quick-start configuration therefore also
+classifies the submodule path and `.gitmodules`:
+
+    [classes.gate]
+    code = false
+    description = "The pinned code-quality-gate submodule"
+
+    [[rule]]
+    pattern = "code-quality-gate"
+    class = "gate"
+    reason = "the gate is pinned as a submodule"
+
+    [[rule]]
+    pattern = ".gitmodules"
+    class = "config"
+    reason = "submodule declarations"
+
 `check` never downloads a tool. If a configured check needs a pinned tool and it is missing, the check's
 outcome is `unsupported` and the message names `python3 -I code-quality-gate/qg.py tools fetch`.
 
@@ -62,8 +80,9 @@ All commands accept the repository selector before the command:
 
 `DIR` defaults to the current directory and must be the top level of a git work tree. Configuration is
 `DIR/quality-gate.toml`. Files are enumerated with
-`git ls-files -z -co --exclude-standard`, so tracked and stageable untracked files are checked and
-ignored files are not.
+`git ls-files -s -z -co --exclude-standard`, so tracked and stageable untracked files are checked and
+ignored files are not. The staged entry type identifies gitlinks (mode `160000`): a submodule path
+matches exactly one rule like any other enumerated path, but it is never opened or measured as a file.
 
 ### inventory
 
@@ -101,9 +120,15 @@ offending path and, for oversized files, the actual and allowed sizes.
     python3 -I qg.py clones --prune
 
 `clones` runs every configured check whose adapter is `clones`. It takes the files of the classes that
-list that check from the inventory, runs jscpd with the SARIF reporter in a temporary directory, groups
-the SARIF clone fingerprints into subjects, and sends every fingerprint occurrence count through the
-generic ratchet. A clone fingerprint is a subject; its value is how many reported clones have that
+list that check from the inventory, runs jscpd with its JSON and SARIF reporters in a temporary directory,
+groups the SARIF clone fingerprints into subjects, and sends every fingerprint occurrence count through the
+generic ratchet. The adapter owns the detection configuration: an empty `--config`, the configured
+`--min-tokens`, `--min-lines 5`, `--max-size` at the hygiene limit, an ignore pattern that matches
+nothing, `--no-gitignore` and a format list covering the selected extensions when they are all known.
+The JSON report's `statistics.total.sources` must equal the number of selected files; a mismatch is
+`unsupported` and names the files jscpd did not analyse. The SARIF report must contain exactly one run
+produced by jscpd with a `results` list; absent, malformed or foreign evidence is `unsupported`
+(`no completed jscpd run`), never zero clones. A clone fingerprint is a subject; its value is how many reported clones have that
 fingerprint; the threshold is `0`, so any occurrence needs a baseline entry.
 
 `clones --prune` lowers each surviving bound to the measured occurrence count and drops resolved entries.
@@ -119,14 +144,19 @@ instead of written.
     enforcement = "enforced"
     run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
     tests_pattern = "^Ran (\\d+) tests? in"
+    skipped_pattern = "skipped=(\\d+)"  # optional; one capture group
     budget_seconds = 900                  # optional; this is the default
 
 `python_tests` runs the consumer's own test command from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
-`covrun.py`, a fresh data directory, the source root, and the pinned coverage install. The prefix runs
-`coverage run --parallel-mode --data-file=... --source=ROOT` with line coverage only
-(`COVERAGE_CORE=sysmon`, no branch measurement) on the rest of the arguments, so `run` can name a
-script or `-m MODULE`.
+`covrun.py`, a fresh data directory, the source root, and the pinned coverage install. The prefix writes
+and uses one gate-owned coverage configuration (line mode, `branch = False`, `source` the repository
+root, `exclude_lines` exactly the `pragma: no cover` expression) for collection, combination and
+analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and `pyproject.toml` configuration is
+ignored, and every `COVERAGE_*` environment variable other than `COVERAGE_CORE` is removed before the
+test command and by `covrun.py`. The prefix runs `coverage run --parallel-mode --data-file=...
+--source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so
+`run` can name a script or `-m MODULE`.
 
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:
@@ -138,9 +168,12 @@ Pass the environment through to the child. The child then writes its own paralle
 the adapter combines with the test process's data.
 
 `tests_pattern` is required and must contain exactly one capture group: the number of tests that ran.
-The pattern is searched with `re.MULTILINE` over the combined stdout and stderr. The outcome is
-`fail` when the command exits non-zero, times out (`termination = "budget"`) or reports zero tests.
-It is `unsupported` when the pattern does not match, its group is not an integer, or coverage is not
+`skipped_pattern` is optional and also has exactly one capture group: the number of skipped tests (for
+example `skipped=(\d+)` for unittest). Both patterns are searched with `re.MULTILINE` over the
+combined stdout and stderr. Executed tests are `ran - skipped`; the outcome is `fail` when the command
+exits non-zero, times out (`termination = "budget"`) or executes no tests, with
+`no test executed: N ran, N skipped`. It is `unsupported` when `tests_pattern` does not match, matches
+more than once (`ambiguous test summary`), a captured count is not an integer, or coverage is not
 installed; the message names `qg.py tools fetch`. On `pass` the adapter combines the parallel data
 files and keeps the combined data as the evidence for checks that require it.
 
@@ -150,36 +183,50 @@ files and keeps the combined data as the evidence for checks that require it.
     adapter = "python_crap"
     tier = 1
     enforcement = "enforced"
-    requires = "tests"                    # one python_tests check id
-    threshold = 6                         # optional; this is the default
+    requires = "tests"                    # an earlier python_tests check id
+    threshold = 6                         # optional; finite; this is the default
     baseline = "quality-gate-crap.toml"   # the file may not exist yet
 
-`python_crap` measures every function in the files of the classes that list it. If the required
-`python_tests` check did not pass, the outcome is `unsupported` with `coverage unreliable: CHECK did
-not pass`; nothing is scored.
+`python_crap` measures every function in the files of the classes that list it. `requires` must name a
+`python_tests` check declared earlier in the policy; an unknown, later or different-adapter reference is
+a configuration error naming the check, the reference and what was expected. If the required check did
+not pass, the outcome is `unsupported` with `coverage unreliable: CHECK did not pass`; nothing is
+scored.
 
 A measured function is every `def` or `async def` that is not inside another function: module-level
 functions and methods of classes at any depth. Nested functions and lambdas belong to their enclosing
-function. The identity is `PATH:Qualified.name`, for example `quality_gate/policy.py:load_config` or
-`quality_gate/files.py:Rule.matches`; two functions with the same identity in one file fail the check,
-naming both lines.
+function. A `@property` getter is `PATH:Class.x`, and its `@x.setter` and `@x.deleter` functions are
+`PATH:Class.x.setter` and `PATH:Class.x.deleter`. Declarations decorated with `typing.overload` or
+`overload` are skipped because they have no runtime body. Every other function's identity is
+`PATH:Qualified.name`, for example `quality_gate/policy.py:load_config` or
+`quality_gate/files.py:Rule.matches`; two remaining functions with the same identity in one file fail
+the check, naming both lines.
+
+Executable code outside every function - module and class bodies - is one subject per file,
+`PATH:<module>`. Its CC is the complexity of those statements and its coverage is their combined
+coverage, so top-level control flow goes through the same ratchet as a function.
 
 Cyclomatic complexity is 1 plus one for each `if` (an `elif` is a nested `if`), conditional expression,
 `for`, `async for`, `while`, comprehension `for` clause and comprehension `if`, `except` handler
-(including `except*`), `match` case other than an unguarded `case _`, and each operand of `and`/`or`
-after the first. Nested function and lambda bodies add to the enclosing function. The rules are one
-data table in `quality_gate/python_crap.py`.
+(including `except*`), `match` case that is not an unguarded irrefutable pattern, and each operand of
+`and`/`or` after the first. An irrefutable pattern is a capture name, `_`, or an or-pattern with an
+irrefutable alternative, so `case remaining` and `case 1 | _` add nothing, like `case _`. Nested
+function and lambda bodies add to the enclosing function. The rules are one data table in
+`quality_gate/python_crap.py`.
 
-Coverage comes from coverage's own analysis of the combined data (`Coverage.analysis2`), which also
-reports files the tests never imported with every statement missing. A function's statements are those
-whose line falls between its first body statement and its `end_lineno`: the `def` and decorator lines run when
-the module is imported, so counting them would credit a function no test calls. `cov` is executed divided by
-statements (a one-line `def f(): return x` cannot be told apart from its import and counts its line). A function with no statements is `unmeasured` and fails; it is never scored as
-covered. CRAP is `CC^2 * (1 - cov)^3 + CC`. Findings go through the generic ratchet with the identity as
-`subject` and the unrounded CRAP as `value`; the human report rounds to one decimal, comparisons do not.
+Coverage comes from coverage's own analysis of the combined data (`Coverage.analysis2`) under the same
+gate-owned configuration as collection and combination, which also reports files the tests never imported
+with every statement missing. A function's statements are those whose line falls between its first body
+statement and its `end_lineno`: the `def` and decorator lines run when the module is imported, so
+counting them would credit a function no test calls. A function whose first body statement shares the
+`def` line is therefore `unmeasured` and fails with `body shares the def line; put the body on its own
+line`; it is never scored as covered. A function with no statements is also `unmeasured`. `cov` is
+executed divided by statements. CRAP is `CC^2 * (1 - cov)^3 + CC`. Findings go through the generic
+ratchet with the identity as `subject` and the unrounded CRAP as `value`; the human report rounds to one
+decimal, comparisons do not. An untested CC-3 function has value `3^2 * 1^3 + 3 = 12`.
 
 Each finding carries `measurement`: `cc`, `statements`, `executed` and `excluded_lines` (the lines
-excluded by `# pragma: no cover` inside the function's span). An added pragma is therefore visible in
+excluded by `# pragma: no cover` inside the measured span). An added pragma is therefore visible in
 `check --json`. The metric version is `python-lines/1`.
 
 ### tools
@@ -191,9 +238,11 @@ excluded by `# pragma: no cover` inside the function's span). An added pragma is
 `tools fetch` reads the gate's `tools.lock.toml` (or `--lock FILE`) and installs every pinned tool under
 `QG_TOOLS_DIR`, which defaults to `~/.local/share/code-quality-gate/tools`, as `NAME-VERSION/`. It
 downloads with `urllib`, verifies the SHA-256 before extracting, and refuses a mismatch or an unsafe
-archive member (absolute path, `..`, link, or non-regular file) without installing anything. An existing
-install whose binary is present is kept and not downloaded again. Extraction is staged in the tools
-directory and moved into place atomically.
+archive member (absolute path, `..`, link, or non-regular file) without installing anything. Tool names
+and versions must match `[A-Za-z0-9][A-Za-z0-9._-]*`, the install destination must resolve inside the
+tools directory, and a lock table accepts only `version`, `url`, `sha256`, `binary` and `format`;
+other keys are configuration errors. An existing install whose binary is present is kept and not
+downloaded again. Extraction is staged in the tools directory and moved into place atomically.
 
 An archive without `format` is a tar archive. `format = "wheel"` marks a Python wheel: it is a zip, so
 it is extracted with `zipfile` under the same safety rules. The wheel's install directory is what the
@@ -305,14 +354,15 @@ and the allowed keys. The complete shape is:
     enforcement = "enforced"
     run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
     tests_pattern = "^Ran (\\d+) tests? in"
+    skipped_pattern = "skipped=(\\d+)"  # optional; one capture group
     budget_seconds = 900                  # optional; this is the default
 
     [checks.crap]
     adapter = "python_crap"
     tier = 1
     enforcement = "enforced"
-    requires = "tests"
-    threshold = 6                         # optional; this is the default
+    requires = "tests"                    # an earlier python_tests check id
+    threshold = 6                         # optional; finite; this is the default
     baseline = "quality-gate-crap.toml"
 
     [[not_applicable]]
@@ -348,16 +398,18 @@ Notes:
   each `[levels].required_tiers` entry, unless a `[[not_applicable]]` entry names the class and tier with
   a non-empty reason.
 * A command check's `run` is an argument list. The token `{files}` expands in place to the sorted files
-  of every class that lists this check, as separate arguments. The token `{tool:NAME}` expands to the
-  binary of a tool pinned in `tools.lock.toml`; an unknown or unfetched tool makes the check
-  `unsupported` and names `qg.py tools fetch`. A check using `{files}` with no selected files fails:
-  zero inputs is not a pass.
+  of every class that lists this check, as separate arguments. A selected path beginning with `-` is
+  passed as `./PATH`, so it cannot become a tool option. The token `{tool:NAME}` expands to the binary
+  of a tool pinned in `tools.lock.toml`; an unknown or unfetched tool makes the check `unsupported`
+  and names `qg.py tools fetch`. A check using `{files}` with no selected files fails: zero inputs is
+  not a pass.
 * A clone check's files come from the classes that list it. Clone baselines use the generic ratchet
   format below; the old top-level `[clones]` table and the old `[[clone]]` baseline are gone.
-* A `python_tests` check needs `run` and a one-group `tests_pattern`; its `{python}` token and
-  `QG_PYTHON` export are described above.
-* A `python_crap` check needs `requires`, naming one configured `python_tests` check, and a
-  `baseline` path. Its `threshold` defaults to 6. Its files come from the classes that list it.
+* A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
+  with one group. Its `{python}` token and `QG_PYTHON` export are described above.
+* A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the
+  policy, and a `baseline` path. Its `threshold` defaults to 6 and must be finite. Its files come from
+  the classes that list it.
 
 ## The generic ratchet
 
@@ -373,12 +425,18 @@ extra occurrences) and, for measuring adapters, a `baseline` path. A baseline is
     reason = "the two front ends deliberately mirror each other"
     expires = 2026-12-31
 
-* `subject` identifies the measured thing (a clone fingerprint or a Python function identity).
-* `bound` is the largest value this entry accepts. It is compared unrounded; exactly at the bound passes.
+* `subject` identifies the measured thing (a clone fingerprint, a Python function identity, or a file's
+  `PATH:<module>` outside-function subject).
+* `bound` is the largest value this entry accepts. It must be finite (`inf` and `nan` are errors),
+  and is compared unrounded; exactly at the bound passes.
 * `reason` must be non-empty. An empty or missing reason fails the check even if the value is covered.
 * `expires` is optional. A TOML date before today no longer covers its subject and is reported as
   expired. An entry expiring today still covers.
 * Adapter-specific informational keys are preserved, for example clone `files`.
+
+Thresholds, baseline bounds and measured values must be finite: a non-finite threshold or bound is a
+configuration error, and a non-finite measured value makes the check `unsupported`. JSON output is
+written with `allow_nan=False`.
 
 A finding passes when `value <= threshold`, or when a baseline entry for its subject exists, has not
 expired, and `value <= bound`. A finding above both fails, naming subject, value, threshold or bound, and
@@ -405,9 +463,9 @@ This repository gates itself with `quality-gate.toml`:
 * `ruff` runs the pinned binary through `{tool:ruff}` with `--no-cache` on the inventory's Python files;
 * `clones` uses jscpd with `min_tokens = 50` and the generic baseline format;
 * `tests` runs the gate's own unittest suite under the pinned coverage wheel;
-* `crap` measures every function in `qg.py` and `quality_gate/*.py` and requires `tests`;
-  `quality-gate-crap.toml` lists the functions above 6 at adoption, each with its measured bound and
-  the reason `above 6 at adoption (M1c, 2026-10-24); worklist`;
+* `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
+  requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
+  and a worklist reason;
 * `levels.required_tiers = [1]` makes tier 1 mandatory for both code classes.
 
 `make check` is the single entry point and runs only `python3 -I qg.py check`; Ruff, the tests and
@@ -418,16 +476,19 @@ starts those subprocesses through `QG_PYTHON` when the gate exports it, so the g
 programs are measured by the `crap` check. Clone-gate tests use a fake jscpd in a temporary
 `QG_TOOLS_DIR`; one test runs the real pinned jscpd and fails, rather than skipping, when the tool is
 not installed. Command-check tests use the real command; the real ruff test runs only when the pinned
-ruff binary exists. `tools fetch` tests use fixture tarballs and wheels with `file://` URLs, including
-wrong hashes and unsafe archive members.
+ruff binary exists and proves enforcement: an unused import is rejected with F401, then the repaired
+fixture is accepted, including files whose names contain a space and begin with `-`. `tools fetch`
+tests use fixture tarballs and wheels with `file://` URLs, including wrong hashes, unknown keys, unsafe
+archive members and destinations outside the tools directory.
 
 ## Continuous integration
 
 Every push to `main` and every pull request runs `.github/workflows/check.yml` on GitHub Actions;
-the workflow can also be dispatched manually. It runs in a Debian 13 container, restores the pinned
-tools cache keyed on `tools.lock.toml`, fetches any missing pinned tools (including the coverage wheel),
-and runs `make -k check`, which is the gate's self-check: Ruff, clones, the test suite under coverage
-and Python CRAP.
+the workflow can also be dispatched manually. A matrix runs the job in `debian:13` with Python 3.13
+and in `ubuntu:24.04` with Python 3.12, the two supported interpreter versions. It restores the pinned
+tools cache keyed on the image and `tools.lock.toml`, fetches any missing pinned tools (including the
+coverage wheel), and runs `make -k check`, which is the gate's self-check: Ruff, clones, the test suite
+under coverage and Python CRAP.
 
 Reproduce it locally with the same tools cache:
 

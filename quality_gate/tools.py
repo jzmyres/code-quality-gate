@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import os
+import re
 import shutil
 import stat
 import sys
@@ -19,6 +20,8 @@ from pathlib import Path, PurePosixPath
 from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
+TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+LOCK_KEYS = ("version", "url", "sha256", "binary", "format")
 
 
 @dataclass(frozen=True)
@@ -67,9 +70,32 @@ def load_tools(lock: Path) -> dict[str, Tool]:
     tools: dict[str, Tool] = {}
     for name, raw in data.items():
         full_key = name
+        if TOOL_COMPONENT.fullmatch(name) is None:
+            raise _tool_error(
+                lock,
+                full_key,
+                "a tool name matching [A-Za-z0-9][A-Za-z0-9._-]*",
+                _describe(name),
+            )
         if not isinstance(raw, dict):
             raise _tool_error(lock, full_key, "a table", _describe(raw))
+        for key in raw:
+            if key not in LOCK_KEYS:
+                raise _tool_error(
+                    lock,
+                    f"{full_key}.{key}",
+                    f"a known key ({', '.join(LOCK_KEYS)}); "
+                    "allowed keys: " + ", ".join(LOCK_KEYS),
+                    "unknown key",
+                )
         version = _string(raw, "version", lock, f"{full_key}.version")
+        if TOOL_COMPONENT.fullmatch(version) is None:
+            raise _tool_error(
+                lock,
+                f"{full_key}.version",
+                "a version matching [A-Za-z0-9][A-Za-z0-9._-]*",
+                _describe(version),
+            )
         url = _string(raw, "url", lock, f"{full_key}.url")
         digest = _string(raw, "sha256", lock, f"{full_key}.sha256")
         if len(digest) != 64 or any(
@@ -255,6 +281,20 @@ def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
 
 def _fetch_tool(tool: Tool, tools_root: Path) -> None:
     destination = tools_root / f"{tool.name}-{tool.version}"
+    root = tools_root.resolve()
+    try:
+        resolved = destination.resolve()
+    except (OSError, RuntimeError) as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: cannot resolve install "
+            f"destination {destination}: {error}; nothing installed"
+        ) from error
+    if not resolved.is_relative_to(root):
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: install destination "
+            f"{destination} resolves outside the tools directory {root}; "
+            "nothing installed"
+        )
     binary = _tool_binary(tool, tools_root)
     if binary.is_file():
         print(

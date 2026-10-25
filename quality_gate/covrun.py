@@ -43,10 +43,23 @@ if not coverage_dir.is_dir():
     )
 
 sys.path.insert(0, str(coverage_dir))
-os.environ["COVERAGE_CORE"] = "sysmon"
 # A consumer's coverage configuration must not change this metric: line
 # coverage only, with no branch measurement or omit rules of its own.
-os.environ["COVERAGE_RCFILE"] = os.devnull
+for name in list(os.environ):
+    if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
+        del os.environ[name]
+os.environ["COVERAGE_CORE"] = "sysmon"
+data_dir.mkdir(parents=True, exist_ok=True)
+config_file = data_dir / "coverage.ini"
+config_file.write_text(
+    "[run]\n"
+    "branch = False\n"
+    f"source =\n    {source_root}\n"
+    "[report]\n"
+    "exclude_lines =\n    pragma: no cover\n",
+    encoding="utf-8",
+)
+os.environ["COVERAGE_RCFILE"] = str(config_file)
 
 try:
     from coverage.cmdline import main as coverage_main
@@ -59,7 +72,6 @@ except ImportError as error:
     )
 
 data_file = data_dir / ".coverage"
-data_dir.mkdir(parents=True, exist_ok=True)
 sys.exit(
     coverage_main(
         [
@@ -67,6 +79,7 @@ sys.exit(
             "--parallel-mode",
             f"--data-file={data_file}",
             f"--source={source_root}",
+            f"--rcfile={config_file}",
             *command,
         ]
     )

@@ -96,6 +96,7 @@ tier = 1
 enforcement = "enforced"
 run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
 tests_pattern = "^Ran (\\d+) tests? in"
+skipped_pattern = "skipped=(\\d+)"
 
 [checks.crap]
 adapter = "python_crap"

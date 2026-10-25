@@ -310,6 +310,59 @@ class ToolsTests(FixtureCase):
         self.assertIn("jscpd.binary", text)
         self.assertIn("safe relative path", text)
 
+    def test_fetch_rejects_invalid_tool_name_and_version(self) -> None:
+        cases = [
+            ("../jscpd", VERSION, "tool name matching"),
+            ("bad/name", VERSION, "tool name matching"),
+            ("jscpd", "../9.9.9", "jscpd.version"),
+            ("jscpd", "bad/version", "jscpd.version"),
+        ]
+        for name, version, needle in cases:
+            with self.subTest(name=name, version=version):
+                lock = self.base / "lock.toml"
+                lock.write_text(
+                    f'["{name}"]\n'
+                    f'version = "{version}"\n'
+                    'url = "file:///tmp/x.tar.gz"\n'
+                    f'sha256 = "{"0" * 64}"\n'
+                    'binary = "jscpd"\n',
+                    encoding="utf-8",
+                )
+                result = self.fetch(lock, self.base / "tools")
+                text = output(result)
+                self.assertEqual(result.returncode, 2, text)
+                self.assertIn(needle, text)
+                self.assertIn("[A-Za-z0-9]", text)
+
+    def test_fetch_rejects_unknown_lock_keys(self) -> None:
+        lock = self.write_lock("file:///tmp/x.tar.gz", "0" * 64)
+        lock.write_text(
+            lock.read_text(encoding="utf-8")
+            + 'binary_sha256 = "ignored"\n',
+            encoding="utf-8",
+        )
+        result = self.fetch(lock, self.base / "tools")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("binary_sha256", text)
+        self.assertIn("allowed keys", text)
+
+    def test_fetch_destination_outside_the_tools_directory_is_refused(self) -> None:
+        archive = self.make_tarball()
+        lock = self.write_lock(archive.as_uri(), self.sha256(archive))
+        tools = self.base / "tools"
+        outside = self.base / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep\n", encoding="utf-8")
+        tools.mkdir()
+        (tools / f"jscpd-{VERSION}").symlink_to(outside)
+        result = self.fetch(lock, tools)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("outside", text)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+
     def test_fetch_invalid_lock_exits_2(self) -> None:
         lock = self.base / "lock.toml"
         lock.write_text('[jscpd]\nversion = "9.9.9"\n', encoding="utf-8")

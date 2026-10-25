@@ -1,6 +1,7 @@
 """Tests for inventory classification and configuration errors."""
 from __future__ import annotations
 
+import subprocess
 import unittest
 
 from support import BASE_CONFIG, FixtureCase, output
@@ -156,6 +157,75 @@ class InventoryTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("cannot read shebang", text)
+
+    def test_gitlink_is_never_opened_and_needs_one_rule(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace(
+                "[classes.doc]",
+                '[classes.gate]\ncode = false\n'
+                'description = "Pinned submodule"\n\n'
+                "[classes.doc]",
+            )
+            + '\n[[rule]]\npattern = "code-quality-gate"\n'
+            'class = "gate"\nreason = "the pinned gate"\n'
+        )
+        self.git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,"
+            "code-quality-gate",
+        )
+        result = self.run_qg("inventory")
+        text = output(result)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("inventory: 5 files match 5 rules", result.stdout)
+
+    def test_gate_submodule_passes_the_quick_start_inventory(self) -> None:
+        source = self.base / "gate-source"
+        source.mkdir()
+        env = self.env()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main"],
+            cwd=source,
+            env=env,
+            check=True,
+        )
+        (source / "qg.py").write_text("# gate\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "qg.py"], cwd=source, env=env, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "gate"],
+            cwd=source,
+            env=env,
+            check=True,
+        )
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(source),
+            "code-quality-gate",
+        )
+        self.write_config(
+            BASE_CONFIG.replace(
+                "[classes.doc]",
+                '[classes.gate]\ncode = false\n'
+                'description = "Pinned submodule"\n\n'
+                "[classes.doc]",
+            )
+            + '\n[[rule]]\npattern = ".gitmodules"\n'
+            'class = "config"\nreason = "submodule declarations"\n'
+            '\n[[rule]]\npattern = "code-quality-gate"\n'
+            'class = "gate"\nreason = "the pinned gate"\n'
+        )
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
+        hygiene = self.run_qg("hygiene")
+        self.assertEqual(hygiene.returncode, 0, output(hygiene))
 
     def test_every_violation_is_printed(self) -> None:
         self.add_file("mystery.txt", "x\n")

@@ -266,6 +266,38 @@ class PolicyTests(FixtureCase):
             "is a command check",
         )
 
+    def test_python_crap_requires_an_earlier_check(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.crap]\nadapter = "python_crap"\ntier = 1\n'
+            'enforcement = "enforced"\nrequires = "tests"\n'
+            'baseline = "crap.toml"\n'
+            '\n[checks.tests]\nadapter = "python_tests"\ntier = 1\n'
+            'enforcement = "enforced"\n'
+            'run = ["{python}", "-m", "unittest"]\n'
+            'tests_pattern = "Ran (\\\\d+) tests"\n',
+            "checks.crap.requires",
+            "'tests'",
+            "declared earlier",
+        )
+
+    def test_python_crap_threshold_must_be_finite(self) -> None:
+        for value in ("inf", "nan"):
+            with self.subTest(value=value):
+                self.config_error(
+                    BASE_CONFIG
+                    + '\n[checks.tests]\nadapter = "python_tests"\n'
+                    'tier = 1\nenforcement = "enforced"\n'
+                    'run = ["{python}", "-m", "unittest"]\n'
+                    'tests_pattern = "Ran (\\\\d+) tests"\n'
+                    '\n[checks.crap]\nadapter = "python_crap"\n'
+                    'tier = 1\nenforcement = "enforced"\n'
+                    'requires = "tests"\nbaseline = "crap.toml"\n'
+                    f"threshold = {value}\n",
+                    "checks.crap.threshold",
+                    "finite",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

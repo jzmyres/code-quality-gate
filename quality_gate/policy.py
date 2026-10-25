@@ -1,6 +1,7 @@
 """Configuration loading and the policy data types."""
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass
@@ -83,6 +84,8 @@ class PythonTestsSpec:
     run: tuple[str, ...]
     tests_pattern: str
     tests_pattern_re: re.Pattern[str]
+    skipped_pattern: str | None
+    skipped_pattern_re: re.Pattern[str] | None
     budget_seconds: int
 
 
@@ -263,10 +266,16 @@ def _number(
             raise _config_error(path, full_key, "a number", "missing")
         return default
     value = parent[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise _config_error(path, full_key, "a number", _describe(value))
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise _config_error(path, full_key, "a finite number", _describe(value))
     if minimum is not None and value < minimum:
-        raise _config_error(path, full_key, f"a number >= {minimum}", str(value))
+        raise _config_error(
+            path, full_key, f"a finite number >= {minimum}", str(value)
+        )
     return float(value)
 
 
@@ -412,6 +421,30 @@ def _parse_python_tests(
             "a regular expression with one capture group",
             f"{pattern.groups} capture groups",
         )
+    skipped_pattern_text: str | None = None
+    skipped_pattern: re.Pattern[str] | None = None
+    if "skipped_pattern" in raw:
+        skipped_pattern_text = _string(
+            raw, "skipped_pattern", path, f"{full_key}.skipped_pattern"
+        )
+        try:
+            skipped_pattern = re.compile(
+                skipped_pattern_text, re.MULTILINE
+            )
+        except re.error as error:
+            raise _config_error(
+                path,
+                f"{full_key}.skipped_pattern",
+                "a valid regular expression",
+                str(error),
+            ) from error
+        if skipped_pattern.groups != 1:
+            raise _config_error(
+                path,
+                f"{full_key}.skipped_pattern",
+                "a regular expression with one capture group",
+                f"{skipped_pattern.groups} capture groups",
+            )
     budget = _integer(
         raw,
         "budget_seconds",
@@ -420,7 +453,14 @@ def _parse_python_tests(
         default=DEFAULT_TESTS_BUDGET_SECONDS,
         minimum=1,
     )
-    return PythonTestsSpec(tuple(run), pattern_text, pattern, budget)
+    return PythonTestsSpec(
+        tuple(run),
+        pattern_text,
+        pattern,
+        skipped_pattern_text,
+        skipped_pattern,
+        budget,
+    )
 
 
 def _parse_python_crap(
@@ -465,6 +505,7 @@ def _parse_checks(
                 *COMMON_CHECK_KEYS,
                 "run",
                 "tests_pattern",
+                "skipped_pattern",
                 "budget_seconds",
             )
         else:
@@ -523,23 +564,19 @@ def _parse_checks(
             threshold=threshold,
             baseline=baseline,
         )
-    for name, check in checks.items():
-        if check.python_crap is None:
-            continue
-        required = checks.get(check.python_crap.requires)
-        if required is None:
+        if python_crap is not None:
+            required = checks.get(python_crap.requires)
+            if required is None:
+                actual = f"unknown check {python_crap.requires!r}"
+            elif required.adapter != "python_tests":
+                actual = f"{python_crap.requires!r} is a {required.adapter} check"
+            else:
+                continue
             raise _config_error(
                 path,
                 f"checks.{name}.requires",
-                "the id of a python_tests check",
-                f"unknown check {check.python_crap.requires!r}",
-            )
-        if required.adapter != "python_tests":
-            raise _config_error(
-                path,
-                f"checks.{name}.requires",
-                "the id of a python_tests check",
-                f"{check.python_crap.requires!r} is a {required.adapter} check",
+                "the id of a python_tests check declared earlier",
+                actual,
             )
     return checks
 

@@ -81,6 +81,19 @@ class CloneGateTests(FixtureCase):
             self.assertIn(needle, text)
         return text
 
+    def unsupported_clone(
+        self, env: dict[str, str], *needles: str
+    ) -> str:
+        result, document = self.run_json(env=env)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertEqual(
+            self.check_by_id(document, "clones")["outcome"], "unsupported"
+        )
+        for needle in needles:
+            self.assertIn(needle, text)
+        return text
+
     def single_baseline(self, fingerprint: str, reason: str) -> dict[str, object]:
         entries = tomllib.loads(
             self.read_file("quality-gate-clones.toml")
@@ -204,36 +217,84 @@ class CloneGateTests(FixtureCase):
 
     def test_jscpd_is_invoked_with_the_gate_options_and_files(self) -> None:
         args_file = self.base / "jscpd-args.txt"
-        env = self.clone_env(
-            [],
-            min_tokens=77,
-            fake={"args_file": args_file},
+        self.write_config(
+            with_clones(min_tokens=77).replace(
+                "[code]",
+                "[hygiene]\nmax_bytes = 12345\n\n[code]",
+            )
+        )
+        env = self.install_fake_jscpd(
+            sarif_report([]), args_file=args_file
         )
         result = self.run_qg("clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         arguments = args_file.read_text(encoding="utf-8").split("\n")
         self.assertIn("--fail-on-empty", arguments)
         self.assertIn("--reporters", arguments)
-        self.assertIn("sarif", arguments)
+        self.assertIn("json,sarif", arguments)
+        self.assertIn("--no-gitignore", arguments)
+        self.assertIn("--config", arguments)
         index = arguments.index("--min-tokens")
         self.assertEqual(arguments[index + 1], "77")
+        index = arguments.index("--min-lines")
+        self.assertEqual(arguments[index + 1], "5")
+        index = arguments.index("--max-size")
+        self.assertEqual(arguments[index + 1], "12345")
+        index = arguments.index("--ignore")
+        self.assertTrue(arguments[index + 1])
         separator = arguments.index("--")
         self.assertIn("a.py", arguments[separator + 1:])
 
-    def test_invalid_sarif_fails(self) -> None:
+    def test_jscpd_source_count_mismatch_is_unsupported(self) -> None:
+        env = self.clone_env(
+            [],
+            fake={
+                "json_report": {
+                    "statistics": {
+                        "formats": {},
+                        "total": {"sources": 1},
+                    }
+                }
+            },
+        )
+        self.unsupported_clone(env, "not analysed", "b.py")
+
+    def test_invalid_sarif_is_unsupported(self) -> None:
         env = self.clone_env([], fake={})
         sarif_path = self.base / "sarif.json"
         sarif_path.write_text('{"version": "2.1.0"}', encoding="utf-8")
-        self.clone_failure(env, "invalid SARIF")
+        self.unsupported_clone(env, "no completed jscpd run")
 
-    def test_sarif_without_fingerprint_fails(self) -> None:
+    def test_sarif_without_fingerprint_is_unsupported(self) -> None:
         env = self.clone_env([], fake={})
         sarif_path = self.base / "sarif.json"
         sarif_path.write_text(
-            '{"version": "2.1.0", "runs": [{"results": [{}]}]}',
+            '{"version": "2.1.0", "runs": ['
+            '{"tool": {"driver": {"name": "jscpd"}}, "results": [{}]}]}',
             encoding="utf-8",
         )
-        self.clone_failure(env, "jscpdCloneHash/v1")
+        self.unsupported_clone(
+            env, "no completed jscpd run", "jscpdCloneHash/v1"
+        )
+
+    def test_sarif_needs_exactly_one_jscpd_run_with_results(self) -> None:
+        cases = [
+            '{"version": "2.1.0", "runs": []}',
+            '{"version": "2.1.0", "runs": [{}]}',
+            '{"version": "2.1.0", "runs": ['
+            '{"tool": {"driver": {"name": "other"}}, "results": []}]}',
+            '{"version": "2.1.0", "runs": ['
+            '{"tool": {"driver": {"name": "jscpd"}}}]}',
+            '{"version": "2.1.0", "runs": ['
+            '{"tool": {"driver": {"name": "jscpd"}}, "results": []},'
+            '{"tool": {"driver": {"name": "jscpd"}}, "results": []}]}',
+        ]
+        for report in cases:
+            with self.subTest(report=report):
+                env = self.clone_env([], fake={})
+                sarif_path = self.base / "sarif.json"
+                sarif_path.write_text(report, encoding="utf-8")
+                self.clone_failure(env, "no completed jscpd run")
 
     def test_prune_removes_resolved_entries_and_lowers_count(self) -> None:
         env = self.clone_env(
@@ -392,7 +453,25 @@ class CloneGateTests(FixtureCase):
             '[[entry]]\nsubject = "fp1"\nbound = "high"\n'
             'reason = "never valid"\n',
         )
-        self.clone_failure(env, "bound", "a number")
+        self.clone_failure(env, "bound", "finite number")
+
+    def test_non_finite_baseline_bound_fails(self) -> None:
+        for value in ("inf", "-inf", "nan"):
+            with self.subTest(value=value):
+                env = self.clone_env([])
+                self.add_file(
+                    "quality-gate-clones.toml",
+                    f'[[entry]]\nsubject = "fp1"\nbound = {value}\n'
+                    'reason = "never valid"\n',
+                )
+                result, document = self.run_json(env=env)
+                self.assertEqual(result.returncode, 1, output(result))
+                self.assertNotIn("Infinity", result.stdout)
+                self.assertNotIn("NaN", result.stdout)
+                self.assertEqual(document["decision"], "rejected")
+                check = self.check_by_id(document, "clones")
+                self.assertEqual(check["outcome"], "error")
+                self.assertIn("finite number", result.stderr)
 
     def test_zero_count_rejects_an_occurrence(self) -> None:
         env = self.clone_env(

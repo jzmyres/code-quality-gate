@@ -11,11 +11,21 @@ permissions:
 
 jobs:
   check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debian13
+            image: debian:13
+            python: "3.13"
+          - name: ubuntu2404
+            image: ubuntu:24.04
+            python: "3.12"
     runs-on: ubuntu-latest
-    # Debian 13 ships Python 3.13, which satisfies the gate's 3.12 minimum.
-    container: debian:13
+    # Debian 13 ships Python 3.13 and Ubuntu 24.04 ships Python 3.12, the two supported versions.
+    container: ${{ matrix.image }}
     # Rule: smallest multiple of 5 minutes at least three times the measured check time.
-    # Local `make -k check` measured 20.8 s; 3 x 20.8 s = 62.4 s, so 5.
+    # Local `make -k check` measured 30.4 s; 3 x 30.4 s = 91.2 s, so 5.
     timeout-minutes: 5
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
@@ -26,6 +36,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             python3 make git ca-certificates
           python3 --version
+          python3 -c 'import sys; assert ".".join(map(str, sys.version_info[:2])) == "${{ matrix.python }}"'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -33,7 +44,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.QG_TOOLS_DIR }}
-          key: debian13-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
+          key: ${{ matrix.name }}-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Run the gate

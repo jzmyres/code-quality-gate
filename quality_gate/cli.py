@@ -80,7 +80,11 @@ def main(argv: list[str] | None = None) -> int:
                 guessed = Path(args.repo).expanduser()
             policy = guessed / "quality-gate.toml" if guessed is not None else None
             print(
-                json.dumps(error_document(guessed, policy, str(error)), indent=2),
+                json.dumps(
+                    error_document(guessed, policy, str(error)),
+                    indent=2,
+                    allow_nan=False,
+                ),
                 file=sys.stdout,
             )
         return error.exit_code

@@ -127,6 +127,22 @@ sarif = json.loads(
 (output / "jscpd-report.sarif").write_text(
     json.dumps(sarif), encoding="utf-8"
 )
+files = args[args.index("--") + 1:]
+json_report = os.environ.get("QG_FAKE_JSON")
+if json_report:
+    statistics = json.loads(
+        pathlib.Path(json_report).read_text(encoding="utf-8")
+    )
+else:
+    statistics = {
+        "statistics": {
+            "formats": {},
+            "total": {"sources": len(files)},
+        }
+    }
+(output / "jscpd-report.json").write_text(
+    json.dumps(statistics), encoding="utf-8"
+)
 """
 
 
@@ -215,7 +231,15 @@ def sarif_report(clones: list[tuple[str, list[tuple[str, int, int]]]]) -> dict[s
                 sarif_location(location) for location in locations[1:]
             ]
         results.append(result)
-    return {"version": "2.1.0", "runs": [{"results": results}]}
+    return {
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {"driver": {"name": "jscpd", "version": JSCPD_VERSION}},
+                "results": results,
+            }
+        ],
+    }
 
 
 def sarif_location(location: tuple[str, int, int]) -> dict[str, Any]:
@@ -315,6 +339,7 @@ class FixtureCase(unittest.TestCase):
             "QG_FAKE_ERROR",
             "QG_FAKE_ARGS",
             "QG_FAKE_NO_REPORT",
+            "QG_FAKE_JSON",
         ):
             env.pop(key, None)
         env.update(
@@ -374,6 +399,7 @@ class FixtureCase(unittest.TestCase):
         report: bool = True,
         error: str = "",
         args_file: Path | None = None,
+        json_report: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         tools = self.base / "tools"
         destination = tools / f"jscpd-{JSCPD_VERSION}"
@@ -400,6 +426,10 @@ class FixtureCase(unittest.TestCase):
             env["QG_FAKE_ERROR"] = error
         if args_file is not None:
             env["QG_FAKE_ARGS"] = str(args_file)
+        if json_report is not None:
+            json_path = self.base / "jscpd-json.json"
+            json_path.write_text(json.dumps(json_report), encoding="utf-8")
+            env["QG_FAKE_JSON"] = str(json_path)
         return env
 
     def default_tool_env(self) -> dict[str, str]:

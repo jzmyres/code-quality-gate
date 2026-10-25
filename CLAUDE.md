@@ -9,9 +9,13 @@ implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `ratc
 
 Policy declares `schema = 1`, code classes with their `checks`, and one `[checks.ID]` table per check
 (`command`, `clones`, `python_tests` or `python_crap`). Adapters measure subjects; the core in
-`ratchet.py` decides pass/fail, expiry, resolution and pruning. `check --json` writes one
-machine-readable result to stdout; human lines go to stderr. Start by reading `README.md`, then the
-module that owns the concern; tests execute the real command on disposable fixture repositories.
+`ratchet.py` decides pass/fail, expiry, resolution and pruning. Python coverage uses one gate-owned
+configuration, never repository coverage files or `COVERAGE_*` overrides; Python subjects include
+property accessors, overload declarations are skipped, and each file's outside-function code is a
+`PATH:<module>` subject. Clone evidence is complete only when jscpd's own source count covers every
+selected file and its SARIF has one jscpd run with results. `check --json` writes one machine-readable
+result to stdout; human lines go to stderr. Start by reading `README.md`, then the module that owns the
+concern; tests execute the real command on disposable fixture repositories.
 
 ## Principles
 

@@ -4,9 +4,20 @@ from __future__ import annotations
 import fnmatch
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .policy import Config, GateError, UsageError
+
+
+@dataclass(frozen=True)
+class GitFile:
+    path: str
+    mode: str | None
+
+    @property
+    def gitlink(self) -> bool:
+        return self.mode == "160000"
 
 
 def resolve_repo(value: str | None) -> Path:
@@ -65,12 +76,34 @@ def _git(root: Path, args: list[str], what: str) -> bytes:
     return result.stdout
 
 
-def enumerate_files(root: Path) -> list[str]:
+def enumerate_entries(root: Path) -> list[GitFile]:
     raw = _git(
-        root, ["ls-files", "-z", "-co", "--exclude-standard"], "file enumeration"
+        root,
+        ["ls-files", "-s", "-z", "-co", "--exclude-standard"],
+        "file enumeration",
     )
-    names = raw.decode("utf-8", "surrogateescape").split("\0")
-    return sorted(name for name in names if name)
+    entries: list[GitFile] = []
+    for token in raw.decode("utf-8", "surrogateescape").split("\0"):
+        if not token:
+            continue
+        mode: str | None = None
+        name = token
+        if "\t" in token:
+            metadata, candidate = token.split("\t", 1)
+            fields = metadata.split()
+            if (
+                len(fields) == 3
+                and len(fields[0]) == 6
+                and fields[0].isdigit()
+            ):
+                mode = fields[0]
+                name = candidate
+        entries.append(GitFile(name, mode))
+    return sorted(entries, key=lambda entry: entry.path)
+
+
+def enumerate_files(root: Path) -> list[str]:
+    return [entry.path for entry in enumerate_entries(root)]
 
 
 def _shebang_interpreter(first_line: str) -> str | None:
@@ -115,7 +148,9 @@ def _is_code(path: Path, relative: str, config: Config) -> bool:
 def validate_inventory(
     root: Path, config: Config
 ) -> tuple[list[str], dict[str, str], list[str]]:
-    files = enumerate_files(root)
+    entries = enumerate_entries(root)
+    files = [entry.path for entry in entries]
+    gitlinks = {entry.path for entry in entries if entry.gitlink}
     matched = [0] * len(config.rules)
     classes: dict[str, str] = {}
     violations: list[str] = []
@@ -190,6 +225,8 @@ def validate_inventory(
         if class_def is None:
             continue
         classes[relative] = rule.class_name
+        if relative in gitlinks:
+            continue
         try:
             code = _is_code(root / relative, relative, config)
         except OSError as error:
@@ -256,13 +293,17 @@ def command_hygiene(root: Path, config: Config) -> int:
                     file=sys.stderr,
                 )
             return 1
-        files = enumerate_files(root)
+        entries = enumerate_entries(root)
+        files = [entry.path for entry in entries]
     except GateError as error:
         print(f"hygiene: {error}", file=sys.stderr)
         return 1
 
     violations: list[str] = []
-    for relative in files:
+    for entry in entries:
+        if entry.gitlink:
+            continue
+        relative = entry.path
         try:
             size = (root / relative).stat().st_size
         except OSError as error:
