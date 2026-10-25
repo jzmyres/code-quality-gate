@@ -1,0 +1,26 @@
+check = "verification"
+metric_version = "verification/1"
+
+# Reasoned ratchet baseline: each entry accepts a measured subject up to
+# its bound, for the stated reason. Add entries by hand; --prune only
+# lowers bounds and removes resolved entries.
+
+[[entry]]
+subject = "tests:tests:executed"
+bound = 371
+reason = "measured at adoption (M2c, 2026-10-25)"
+
+[[entry]]
+subject = "exclusions:qg.py:noqa"
+bound = 1
+reason = "measured at adoption (M2c, 2026-10-25)"
+
+[[entry]]
+subject = "exclusions:quality_gate/coverage_tool.py:no-cover"
+bound = 1
+reason = "measured at adoption (M2c, 2026-10-25)"
+
+[[entry]]
+subject = "exclusions:tests/test_python_crap.py:no-cover"
+bound = 3
+reason = "measured at adoption (M2c, 2026-10-25)"

@@ -18,7 +18,13 @@ from typing import Any
 
 from . import tools as tools_module
 from .policy import Config, ConfigError, GateError, UsageError, load_config
-from .ratchet import BaselineEntry, load_baseline, write_baseline
+from .ratchet import (
+    BaselineEntry,
+    load_baseline,
+    subject_direction,
+    tighter_bound,
+    write_baseline,
+)
 from .runner import RunResult, run
 from .tools import _default_lock_path, _tools_dir, load_tools, payload_digest
 
@@ -394,17 +400,22 @@ def _ignored_parts(entry: BaselineEntry, chosen: BaselineEntry) -> bool:
     )
 
 
+def _merge_direction(check: Any, subject: str) -> str:
+    if check is None:
+        return "max"
+    return subject_direction(check.adapter, check.direction, subject)
+
+
 def _merge_entry(
-    entry: BaselineEntry, chosen: BaselineEntry
+    entry: BaselineEntry,
+    chosen: BaselineEntry,
+    direction: str = "max",
 ) -> tuple[BaselineEntry, bool, bool]:
     expires = _tighter_expiry(entry.expires, chosen.expires)
-    if chosen.bound < entry.bound or expires != entry.expires:
+    bound = tighter_bound(entry.bound, chosen.bound, direction)
+    if bound != entry.bound or expires != entry.expires:
         return (
-            replace(
-                entry,
-                bound=min(entry.bound, chosen.bound),
-                expires=expires,
-            ),
+            replace(entry, bound=bound, expires=expires),
             True,
             _ignored_parts(entry, chosen),
         )
@@ -412,7 +423,9 @@ def _merge_entry(
 
 
 def _merge_entries(
-    revision: list[BaselineEntry], candidate: list[BaselineEntry]
+    revision: list[BaselineEntry],
+    candidate: list[BaselineEntry],
+    check: Any = None,
 ) -> tuple[list[BaselineEntry], tuple[str, ...], bool]:
     remaining = {entry.subject: entry for entry in candidate}
     merged: list[BaselineEntry] = []
@@ -424,7 +437,7 @@ def _merge_entries(
             tightened = True
             continue
         merged_entry, entry_tightened, entry_ignored = _merge_entry(
-            entry, chosen
+            entry, chosen, _merge_direction(check, entry.subject)
         )
         tightened = tightened or entry_tightened
         if entry_ignored:
@@ -500,7 +513,7 @@ def _apply_baselines(
             temporary, root, relative, check
         )
         merged, ignored, tightened = _merge_entries(
-            revision_entries, candidate_entries
+            revision_entries, candidate_entries, check
         )
         checks[name] = replace(
             check, baseline=_write_merged(temporary, merged, check)

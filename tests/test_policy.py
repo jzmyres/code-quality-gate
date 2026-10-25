@@ -361,6 +361,42 @@ class PolicyTests(FixtureCase):
             "checks.one",
         )
 
+    def test_check_direction_defaults_to_max_and_accepts_min(self) -> None:
+        self.write_config(BASE_CONFIG)
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.write_config(
+            BASE_CONFIG.replace(
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["python3", "-c", "print(1)"]\n'
+                'direction = "min"',
+            )
+        )
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
+
+    def test_check_direction_must_be_max_or_min(self) -> None:
+        self.config_error(
+            BASE_CONFIG.replace(
+                'run = ["python3", "-c", "print(1)"]',
+                'run = ["python3", "-c", "print(1)"]\n'
+                'direction = "sideways"',
+            ),
+            "checks.smoke.direction",
+            "one of max, min",
+            "sideways",
+        )
+
+    def test_verification_requires_a_python_tests_check(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.verification]\nadapter = "verification"\n'
+            'tier = 1\nenforcement = "enforced"\nrequires = "smoke"\n'
+            'baseline = "verification.toml"\n',
+            "checks.verification.requires",
+            "'smoke' is a command check",
+        )
+
     def test_command_argument_with_nul_is_a_configuration_error(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(

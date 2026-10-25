@@ -68,6 +68,13 @@ requires = "tests"            # an earlier python_tests check
 threshold = 6                 # optional; finite
 baseline = "quality-gate-crap.toml"
 
+[checks.verification]
+adapter = "verification"
+tier = 1
+enforcement = "enforced"
+requires = "tests"            # optional; defaults to every earlier python_tests check
+baseline = "quality-gate-verification.toml"
+
 [protect]                     # optional; used only with --policy-from
 paths = ["ruff.toml", "Makefile", ".github/workflows/*.yml"]
 
@@ -86,7 +93,10 @@ Rules:
 
 * `schema = 2` is mandatory. Unknown keys are configuration errors.
 * `tier` is an integer from 1 to 4. `enforcement` is `enforced` or
-  `advisory`.
+  `advisory`. `direction` is `max` (the default) or `min`: a `max`
+  metric's value must not exceed its bound and tightening lowers the bound,
+  while a `min` metric's value must not fall below its bound and tightening
+  raises it.
 * A command's `run` is an argument list; no element may contain NUL.
   `{files}` expands to the sorted selected files, with a leading `./` when a
   path begins with `-`. `{tool:NAME}` expands to a pinned tool binary.
@@ -102,6 +112,8 @@ Rules:
   `executed = ran - skipped`, and zero executed tests fail.
 * `python_crap.requires` names an earlier `python_tests` check. Anything else
   is a configuration error.
+* `verification.requires`, when present, names an earlier `python_tests`
+  check. Without it the adapter reuses every earlier `python_tests` check.
 * A baseline path must be used by exactly one check. Two checks naming the
   same resolved path is a configuration error.
 * Every class named by a rule and every check named by a class must exist.
@@ -125,6 +137,7 @@ Each adapter declares the evidence it produces:
 | `python_tests` | `tests` |
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
+| `verification` | none |
 
 A code class has one obligation per required tier:
 
@@ -140,6 +153,15 @@ evidence do not satisfy it, and a policy with only a lint check rejects. Tiers
 2-4 name the evidence later adapters (M4/M5) will produce; no version-2 adapter
 produces them, so a required tier 2, 3 or 4 must be exempted until its adapter
 exists. An unsatisfied obligation rejects the gate.
+
+The `verification` adapter measures verification loss. For each reused
+`python_tests` check it records `tests:CHECK:executed` (direction `min`,
+value `ran - skipped`) and `tests:CHECK:skipped` (direction `max`). For each
+selected Python file it records `exclusions:FILE:no-cover` (lines matching the
+`pragma: no cover` coverage exclusion) and `exclusions:FILE:noqa` (`# noqa`
+comments), both `max`. A missing baseline entry accepts only 0 for a `max`
+metric; a `min` metric without an entry is unmeasured and fails until an entry
+exists.
 
 ## Tool lock: `tools.lock.toml`
 
@@ -208,22 +230,26 @@ expires = 2026-12-31
   function identities such as `PATH:Qualified.name`, `PATH:<lambda@LINE>`
   for a lambda outside every function, or `PATH:<module>` for code outside
   every function.
-* `bound` is the largest accepted value, must be finite, and is compared
-  unrounded. Exactly at the bound passes.
+* `bound` must be finite and is compared unrounded. For a `max` metric it
+  is the largest accepted value; for a `min` metric it is the smallest. Exactly
+  at the bound passes.
 * `reason` must be non-empty. An empty reason fails even when the value is
   within the bound.
 * `expires` is an optional TOML date. A date equal to today still covers
   today; only a date before today expires.
 * Adapter metadata (for example clone `files`) is preserved by `--prune`.
 * An absent baseline means no exception is accepted. An existing file with
-  only the header is allowed.
+  only the header is allowed. An absent entry accepts only 0 for a `max`
+  metric and leaves a `min` metric unmeasured.
 
 Resolution requires a complete scan. An adapter reports the subject domain it
 measured completely (the selected files for CRAP; for clones, the selected
 files each entry's `files` metadata names). An entry is resolved or pruned only
-when its subject lies in that domain and was not found above threshold. An
-entry outside the domain is reported as `unmeasured` and kept; prune never
-drops it. A clone entry naming a file deleted from the repository resolves.
+when its subject lies in that domain and was not found outside its bound. A
+`max` entry inside its bound resolves and prune drops it; a `min` entry is
+kept and prune raises its floor to the measured value. An entry outside the
+domain is reported as `unmeasured` and kept; prune never drops it. A clone
+entry naming a file deleted from the repository resolves.
 
 ## Result: `check --json`
 
@@ -410,8 +436,8 @@ gate evaluation.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Metric versions: `command-exit/1`, `test-count/1`,
-  `jscpd-clone-occurrences/1`, `python-lines/1`, `inventory/1`,
-  `hygiene/1`.
+  `jscpd-clone-occurrences/1`, `python-lines/1`, `verification/1`,
+  `inventory/1`, `hygiene/1`.
 
 The following proposals in the historical plans are superseded and are not part
 of the version-2 contract:

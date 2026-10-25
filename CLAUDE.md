@@ -4,13 +4,15 @@ A reusable, offline code-quality gate any repository can run, built to keep AI-w
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
 implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `runner`, `ratchet`, `clones`,
-`python_tests`, `python_crap`, `covrun`, `coverage_tool`, `checks`, `gate_result`, `trust`, `cli`);
+`python_tests`, `python_crap`, `verification`, `covrun`, `coverage_tool`, `checks`, `gate_result`,
+`trust`, `cli`);
 `qg.py` is only the entry point. `check --policy-from REV` takes its policy, baselines, tool lock and
 protected paths from `REV`; `docs/TRUST.md` is the contract.
 
 Policy declares `schema = 2`, code classes with their `checks`, and one `[checks.ID]` table per check
-(`command`, `clones`, `python_tests` or `python_crap`). Adapters declare evidence (`tests`, `crap`,
-`duplication`, `static`) and the result reports one obligation per code class and required tier.
+(`command`, `clones`, `python_tests`, `python_crap` or `verification`). Adapters declare evidence
+(`tests`, `crap`, `duplication`, `static`) and the result reports one obligation per code class and
+required tier.
 Adapters measure subjects; the core in `ratchet.py` decides raw outcome, policy satisfaction, expiry,
 resolution, unmeasured domains and pruning. Every subprocess goes through `runner.py`. Python
 coverage uses one gate-owned
@@ -38,7 +40,7 @@ step and reviewed before landing.
   test that makes it fail. A missing input is an error, never a skipped check or a plausible default.
 * Tests execute the real command on disposable fixture repositories; no network, no real home.
 * Messages name what failed, the offending input, and expected versus actual.
-* Ratchets only lower: a new exception enters a baseline only by hand, with a reason.
+* Ratchets only tighten: a new exception enters a baseline only by hand, with a reason.
 
 ## Rules
 

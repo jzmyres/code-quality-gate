@@ -31,11 +31,6 @@ bound = 13.428531179564237
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/checks.py:run_check"
-bound = 6.049382716049383
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/clones.py:_parse_sarif"
 bound = 21.166180758017493
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
@@ -91,11 +86,6 @@ bound = 8.512
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
-subject = "quality_gate/policy.py:_parse_checks"
-bound = 14.039894158355384
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/policy.py:_parse_not_applicable"
 bound = 7.124248685199098
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
@@ -111,18 +101,8 @@ bound = 11.133953831645414
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/ratchet.py:_format_failure"
-bound = 13
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/ratchet.py:_toml_value"
 bound = 12
-reason = "above 6 after QF1 (2026-10-25); worklist"
-
-[[entry]]
-subject = "quality_gate/ratchet.py:evaluate"
-bound = 25.00786094306162
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]

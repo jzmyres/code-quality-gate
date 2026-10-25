@@ -116,6 +116,31 @@ class RatchetResult:
     outcome: str
     satisfied: bool
     exceptions: bool
+    direction: str = "max"
+    adapter: str = "metric"
+
+
+@dataclass
+class _Verdict:
+    result: FindingResult
+    failure: str | None = None
+    raw_failure: bool = False
+    blocking_failure: bool = False
+    resolved: bool = False
+    exception: bool = False
+    unmeasured: bool = False
+
+
+@dataclass
+class _Evaluation:
+    measured: dict[str, float]
+    results: list[FindingResult]
+    resolved: list[str]
+    unmeasured: list[str]
+    failures: list[str]
+    raw_failure: bool
+    blocking_failure: bool
+    exceptions: bool
 
 
 def _baseline_error(path: Path, key: str, expected: str, actual: str) -> GateError:
@@ -398,6 +423,93 @@ def _display_number(value: float, adapter: str) -> str:
     return _number(value)
 
 
+def subject_direction(adapter: str, direction: str, subject: str) -> str:
+    if adapter != "verification":
+        return direction
+    if subject.startswith("tests:") and subject.endswith(":executed"):
+        return "min"
+    return "max"
+
+
+def _within(value: float, bound: float, direction: str) -> bool:
+    if direction == "min":
+        return value >= bound
+    return value <= bound
+
+
+def _outside(value: float, threshold: float, direction: str) -> bool:
+    if direction == "min":
+        return value < threshold
+    return value > threshold
+
+
+def tighter_bound(revision: float, candidate: float, direction: str) -> float:
+    if direction == "min":
+        return max(revision, candidate)
+    return min(revision, candidate)
+
+
+def _expiry_detail(entry: BaselineEntry | None, expired: bool) -> str:
+    if expired and entry is not None and entry.expires is not None:
+        return f" (baseline entry expired {entry.expires.isoformat()})"
+    return ""
+
+
+def _clone_detail(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    threshold: float,
+) -> str:
+    times = "time" if finding.value == 1 else "times"
+    detail = (
+        f"occurs {_number(finding.value)} {times}, exceeding threshold "
+        f"{_number(threshold)}"
+    )
+    if entry is not None and not expired:
+        detail += f" and baseline bound {_number(entry.bound)}"
+    return detail + _expiry_detail(entry, expired)
+
+
+def _min_detail(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    threshold: float,
+    adapter: str,
+) -> str:
+    value = _display_number(finding.value, adapter)
+    if entry is None:
+        return f"value {value} has no baseline floor"
+    detail = (
+        f"value {value} falls below baseline bound "
+        f"{_display_number(entry.bound, adapter)}"
+    )
+    return detail + _expiry_detail(entry, expired)
+
+
+def _metric_detail(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    threshold: float,
+    adapter: str,
+    direction: str,
+) -> str:
+    if direction == "min":
+        return _min_detail(finding, entry, expired, threshold, adapter)
+    detail = (
+        f"value {_display_number(finding.value, adapter)} exceeds "
+        f"threshold {_display_number(threshold, adapter)}"
+    )
+    if entry is not None and not expired:
+        detail += (
+            " and baseline bound "
+            f"{_display_number(entry.bound, adapter)}"
+        )
+    return detail + _expiry_detail(entry, expired)
+
+
 def _format_failure(
     prefix: str,
     finding: Finding,
@@ -405,30 +517,15 @@ def _format_failure(
     expired: bool,
     threshold: float,
     adapter: str,
+    direction: str = "max",
 ) -> str:
     label = _subject_label(finding.subject, adapter, entry is not None)
     if adapter == "clones":
-        times = "time" if finding.value == 1 else "times"
-        detail = (
-            f"occurs {_number(finding.value)} {times}, exceeding threshold "
-            f"{_number(threshold)}"
-        )
-        if entry is not None and not expired:
-            detail += f" and baseline bound {_number(entry.bound)}"
-        if expired and entry is not None and entry.expires is not None:
-            detail += f" (baseline entry expired {entry.expires.isoformat()})"
+        detail = _clone_detail(finding, entry, expired, threshold)
     else:
-        detail = (
-            f"value {_display_number(finding.value, adapter)} exceeds "
-            f"threshold {_display_number(threshold, adapter)}"
+        detail = _metric_detail(
+            finding, entry, expired, threshold, adapter, direction
         )
-        if entry is not None and not expired:
-            detail += (
-                " and baseline bound "
-                f"{_display_number(entry.bound, adapter)}"
-            )
-        if expired and entry is not None and entry.expires is not None:
-            detail += f" (baseline entry expired {entry.expires.isoformat()})"
     return f"{prefix}: {label}: {detail} at {finding.location}"
 
 
@@ -531,6 +628,319 @@ def _record_unmeasured(
             unmeasured.append(entry.subject)
 
 
+def _missing_min(
+    finding: Finding,
+    threshold: float,
+    enforcement: str,
+    prefix: str,
+) -> _Verdict:
+    reason = "unmeasured: no baseline entry for a min metric"
+    message = (
+        f"{prefix}: {finding.subject}: {reason} "
+        f"(measured {_number(finding.value)} at {finding.location})"
+    )
+    result = FindingResult(
+        subject=finding.subject,
+        value=finding.value,
+        bound=None,
+        threshold=threshold,
+        baseline_reason=None,
+        blocking=enforcement == "enforced",
+        location=finding.location,
+        covered_by_baseline=False,
+        expired=False,
+        error=reason,
+        measurement=finding.measurement,
+    )
+    return _Verdict(
+        result=result,
+        failure=message,
+        raw_failure=True,
+        blocking_failure=enforcement == "enforced",
+        unmeasured=True,
+    )
+
+
+def _valid_entry(
+    entry: BaselineEntry | None,
+    value: float,
+    direction: str,
+    expired: bool,
+) -> bool:
+    if entry is None or expired:
+        return False
+    if not entry.reason.strip():
+        return False
+    return _within(value, entry.bound, direction)
+
+
+def _finding_result(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    valid_entry: bool,
+    blocking: bool,
+    empty_reason_subjects: set[str],
+    threshold: float,
+    enforcement: str,
+) -> FindingResult:
+    result = FindingResult(
+        subject=finding.subject,
+        value=finding.value,
+        bound=entry.bound if entry is not None else None,
+        threshold=threshold,
+        baseline_reason=entry.reason if entry is not None else None,
+        blocking=blocking,
+        location=finding.location,
+        covered_by_baseline=valid_entry,
+        expired=expired,
+        measurement=finding.measurement,
+    )
+    if finding.subject in empty_reason_subjects:
+        result.blocking = enforcement == "enforced"
+        result.error = "empty baseline reason"
+    return result
+
+
+def _verdict_failure(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    passes: bool,
+    empty_reason_subjects: set[str],
+    threshold: float,
+    adapter: str,
+    direction: str,
+    prefix: str,
+) -> str | None:
+    if finding.subject in empty_reason_subjects:
+        return (
+            f"{prefix}: baseline entry {finding.subject}: empty reason "
+            f"at {finding.location}"
+        )
+    if passes:
+        return None
+    return _format_failure(
+        prefix, finding, entry, expired, threshold, adapter, direction
+    )
+
+
+def _max_verdict(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    empty_reason_subjects: set[str],
+    threshold: float,
+    enforcement: str,
+    prefix: str,
+    adapter: str,
+) -> _Verdict:
+    outside = _outside(finding.value, threshold, "max")
+    valid = _valid_entry(entry, finding.value, "max", expired)
+    passes = (not outside) or valid
+    blocking = (not passes) and enforcement == "enforced"
+    result = _finding_result(
+        finding,
+        entry,
+        expired,
+        valid,
+        blocking,
+        empty_reason_subjects,
+        threshold,
+        enforcement,
+    )
+    failure = _verdict_failure(
+        finding,
+        entry,
+        expired,
+        passes,
+        empty_reason_subjects,
+        threshold,
+        adapter,
+        "max",
+        prefix,
+    )
+    return _Verdict(
+        result=result,
+        failure=failure,
+        raw_failure=outside,
+        blocking_failure=blocking or result.blocking,
+        resolved=entry is not None and not outside,
+        exception=outside and valid,
+    )
+
+
+def _min_verdict(
+    finding: Finding,
+    entry: BaselineEntry | None,
+    expired: bool,
+    empty_reason_subjects: set[str],
+    threshold: float,
+    enforcement: str,
+    prefix: str,
+    adapter: str,
+) -> _Verdict:
+    valid = _valid_entry(entry, finding.value, "min", expired)
+    blocking = (not valid) and enforcement == "enforced"
+    result = _finding_result(
+        finding,
+        entry,
+        expired,
+        valid,
+        blocking,
+        empty_reason_subjects,
+        threshold,
+        enforcement,
+    )
+    failure = _verdict_failure(
+        finding,
+        entry,
+        expired,
+        valid,
+        empty_reason_subjects,
+        threshold,
+        adapter,
+        "min",
+        prefix,
+    )
+    return _Verdict(
+        result=result,
+        failure=failure,
+        raw_failure=not valid,
+        blocking_failure=blocking or result.blocking,
+    )
+
+
+def _evaluate_finding(
+    finding: Finding,
+    by_subject: dict[str, BaselineEntry],
+    expired_subjects: set[str],
+    empty_reason_subjects: set[str],
+    threshold: float,
+    enforcement: str,
+    prefix: str,
+    adapter: str,
+    direction: str,
+) -> _Verdict:
+    direction = subject_direction(adapter, direction, finding.subject)
+    entry = by_subject.get(finding.subject)
+    if direction == "min":
+        if entry is None:
+            return _missing_min(
+                finding, threshold, enforcement, prefix
+            )
+        return _min_verdict(
+            finding,
+            entry,
+            finding.subject in expired_subjects,
+            empty_reason_subjects,
+            threshold,
+            enforcement,
+            prefix,
+            adapter,
+        )
+    return _max_verdict(
+        finding,
+        entry,
+        finding.subject in expired_subjects,
+        empty_reason_subjects,
+        threshold,
+        enforcement,
+        prefix,
+        adapter,
+    )
+
+
+def _accumulate_verdict(
+    verdict: _Verdict,
+    results: list[FindingResult],
+    resolved: list[str],
+    unmeasured: list[str],
+    failures: list[str],
+) -> None:
+    results.append(verdict.result)
+    if verdict.failure is not None:
+        failures.append(verdict.failure)
+    if verdict.resolved:
+        resolved.append(verdict.result.subject)
+    if verdict.unmeasured:
+        unmeasured.append(verdict.result.subject)
+
+
+def _report(
+    prefix: str,
+    failures: list[str],
+    resolved: list[str],
+    unmeasured: list[str],
+    by_subject: dict[str, BaselineEntry],
+    domain: Domain,
+) -> None:
+    for message in failures:
+        print(message, file=sys.stderr)
+    for subject in resolved:
+        print(f"{prefix}: resolved {subject}")
+    for subject in unmeasured:
+        if subject in by_subject:
+            print(
+                f"{prefix}: unmeasured {subject} (outside "
+                f"{domain.description}); kept"
+            )
+
+
+def _evaluate_all(
+    findings: list[Finding],
+    by_subject: dict[str, BaselineEntry],
+    expired_subjects: set[str],
+    empty_reason_subjects: set[str],
+    threshold: float,
+    enforcement: str,
+    prefix: str,
+    adapter: str,
+    direction: str,
+    failures: list[str],
+    raw_failure: bool,
+    blocking_failure: bool,
+) -> _Evaluation:
+    measured: dict[str, float] = {}
+    results: list[FindingResult] = []
+    resolved: list[str] = []
+    unmeasured: list[str] = []
+    exceptions = False
+    for finding in findings:
+        if finding.subject in measured:
+            raise GateError(
+                f"{prefix}: duplicate measured subject {finding.subject!r}"
+            )
+        measured[finding.subject] = finding.value
+        verdict = _evaluate_finding(
+            finding,
+            by_subject,
+            expired_subjects,
+            empty_reason_subjects,
+            threshold,
+            enforcement,
+            prefix,
+            adapter,
+            direction,
+        )
+        _accumulate_verdict(
+            verdict, results, resolved, unmeasured, failures
+        )
+        raw_failure |= verdict.raw_failure
+        blocking_failure |= verdict.blocking_failure
+        exceptions |= verdict.exception
+    return _Evaluation(
+        measured=measured,
+        results=results,
+        resolved=resolved,
+        unmeasured=unmeasured,
+        failures=failures,
+        raw_failure=raw_failure,
+        blocking_failure=blocking_failure,
+        exceptions=exceptions,
+    )
+
+
 def evaluate(
     findings: list[Finding],
     entries: list[BaselineEntry],
@@ -541,14 +951,11 @@ def evaluate(
     adapter: str,
     domain: Domain,
     today: datetime.date | None = None,
+    direction: str = "max",
 ) -> RatchetResult:
     today = today or datetime.date.today()
     _finite_inputs(findings, entries, threshold, prefix)
     by_subject = {entry.subject: entry for entry in entries}
-    measured: dict[str, float] = {}
-    results: list[FindingResult] = []
-    resolved: list[str] = []
-    unmeasured: list[str] = []
     (
         expired_subjects,
         empty_reason_subjects,
@@ -556,88 +963,63 @@ def evaluate(
         raw_failure,
         blocking_failure,
     ) = _scan_entries(entries, today, enforcement, prefix)
-    exceptions = False
-
-    for finding in findings:
-        if finding.subject in measured:
-            raise GateError(
-                f"{prefix}: duplicate measured subject {finding.subject!r}"
-            )
-        measured[finding.subject] = finding.value
-        entry = by_subject.get(finding.subject)
-        expired = finding.subject in expired_subjects
-        above_threshold = finding.value > threshold
-        valid_entry = (
-            entry is not None
-            and not expired
-            and bool(entry.reason.strip())
-            and finding.value <= entry.bound
-        )
-        passes = (not above_threshold) or valid_entry
-        if above_threshold:
-            raw_failure = True
-        blocking = (not passes) and enforcement == "enforced"
-        blocking_failure = blocking_failure or blocking
-        if entry is not None and not above_threshold:
-            resolved.append(entry.subject)
-        if not passes:
-            failures.append(
-                _format_failure(prefix, finding, entry, expired, threshold, adapter)
-            )
-        elif above_threshold and valid_entry:
-            exceptions = True
-        result = FindingResult(
-            subject=finding.subject,
-            value=finding.value,
-            bound=entry.bound if entry is not None else None,
-            threshold=threshold,
-            baseline_reason=entry.reason if entry is not None else None,
-            blocking=blocking,
-            location=finding.location,
-            covered_by_baseline=valid_entry,
-            expired=expired,
-            measurement=finding.measurement,
-        )
-        if finding.subject in empty_reason_subjects:
-            result.blocking = enforcement == "enforced"
-            blocking_failure = blocking_failure or result.blocking
-            result.error = "empty baseline reason"
-            failures.append(
-                f"{prefix}: baseline entry {finding.subject}: empty reason "
-                f"at {finding.location}"
-            )
-        results.append(result)
-
+    evaluation = _evaluate_all(
+        findings,
+        by_subject,
+        expired_subjects,
+        empty_reason_subjects,
+        threshold,
+        enforcement,
+        prefix,
+        adapter,
+        direction,
+        failures,
+        raw_failure,
+        blocking_failure,
+    )
     _record_unmeasured(
         entries,
-        measured,
+        evaluation.measured,
         empty_reason_subjects,
         expired_subjects,
         enforcement,
         threshold,
         domain,
-        results,
-        resolved,
-        unmeasured,
+        evaluation.results,
+        evaluation.resolved,
+        evaluation.unmeasured,
     )
-    for message in failures:
-        print(message, file=sys.stderr)
-    for subject in resolved:
-        print(f"{prefix}: resolved {subject}")
-    for subject in unmeasured:
-        print(
-            f"{prefix}: unmeasured {subject} (outside {domain.description}); kept"
-        )
+    _report(
+        prefix,
+        evaluation.failures,
+        evaluation.resolved,
+        evaluation.unmeasured,
+        by_subject,
+        domain,
+    )
     return RatchetResult(
-        findings=results,
-        resolved=resolved,
-        unmeasured=unmeasured,
+        findings=evaluation.results,
+        resolved=evaluation.resolved,
+        unmeasured=evaluation.unmeasured,
         entries=entries,
-        measured=measured,
-        outcome="fail" if raw_failure else "pass",
-        satisfied=not blocking_failure,
-        exceptions=exceptions,
+        measured=evaluation.measured,
+        outcome="fail" if evaluation.raw_failure else "pass",
+        satisfied=not evaluation.blocking_failure,
+        exceptions=evaluation.exceptions,
+        direction=direction,
+        adapter=adapter,
     )
+
+
+def _prune_entry(
+    entry: BaselineEntry, value: float, result: RatchetResult
+) -> BaselineEntry:
+    direction = subject_direction(
+        result.adapter, result.direction, entry.subject
+    )
+    if direction == "min":
+        return replace(entry, bound=max(entry.bound, value))
+    return replace(entry, bound=min(entry.bound, value))
 
 
 def pruned_entries(result: RatchetResult) -> list[BaselineEntry]:
@@ -654,5 +1036,5 @@ def pruned_entries(result: RatchetResult) -> list[BaselineEntry]:
             if entry.subject in unmeasured:
                 pruned.append(entry)
             continue
-        pruned.append(replace(entry, bound=min(entry.bound, value)))
+        pruned.append(_prune_entry(entry, value, result))
     return pruned

@@ -13,12 +13,12 @@ required_tiers = [1]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "tests", "crap"]
+checks = ["ruff", "clones", "tests", "crap", "verification"]
 
 [classes.test]
 code = true
 description = "Python tests that execute the gate on fixture repositories"
-checks = ["ruff", "clones", "tests"]
+checks = ["ruff", "clones", "tests", "verification"]
 
 [classes.config]
 code = false
@@ -110,3 +110,10 @@ enforcement = "enforced"
 requires = "tests"
 threshold = 6
 baseline = "quality-gate-crap.toml"
+
+[checks.verification]
+adapter = "verification"
+tier = 1
+enforcement = "enforced"
+requires = "tests"
+baseline = "quality-gate-verification.toml"

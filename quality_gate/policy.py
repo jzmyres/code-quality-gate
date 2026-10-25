@@ -15,8 +15,14 @@ DEFAULT_BUDGET_SECONDS = 600
 DEFAULT_TESTS_BUDGET_SECONDS = 900
 DEFAULT_CRAP_THRESHOLD = 6.0
 SUPPORTED_SCHEMA = 2
-SUPPORTED_ADAPTERS = ("command", "clones", "python_tests", "python_crap")
-COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement")
+SUPPORTED_ADAPTERS = (
+    "command",
+    "clones",
+    "python_tests",
+    "python_crap",
+    "verification",
+)
+COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement", "direction")
 TOP_LEVEL_KEYS = (
     "schema",
     "code",
@@ -101,6 +107,12 @@ class PythonCrapSpec:
 
 
 @dataclass(frozen=True)
+class VerificationSpec:
+    requires: str | None
+    baseline: Path
+
+
+@dataclass(frozen=True)
 class CheckDef:
     id: str
     adapter: str
@@ -114,6 +126,8 @@ class CheckDef:
     python_crap: PythonCrapSpec | None
     threshold: float | None
     baseline: Path | None
+    verification: VerificationSpec | None = None
+    direction: str = "max"
 
 
 @dataclass(frozen=True)
@@ -525,6 +539,115 @@ def _parse_python_crap(
     return PythonCrapSpec(requires, baseline)
 
 
+def _parse_verification(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> VerificationSpec:
+    requires: str | None = None
+    if "requires" in raw:
+        requires = _string(raw, "requires", path, f"{full_key}.requires")
+    baseline_name = _string(raw, "baseline", path, f"{full_key}.baseline")
+    baseline = Path(baseline_name)
+    if not baseline.is_absolute():
+        baseline = root / baseline
+    return VerificationSpec(requires, baseline)
+
+
+@dataclass(frozen=True)
+class _ParsedSpec:
+    command: CommandSpec | None = None
+    clones: CloneSpec | None = None
+    python_tests: PythonTestsSpec | None = None
+    python_crap: PythonCrapSpec | None = None
+    verification: VerificationSpec | None = None
+    baseline: Path | None = None
+    threshold: float | None = None
+    metric_version: str = ""
+    evidence: tuple[str, ...] = ()
+
+
+def _command_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    command = _parse_command(raw, path, full_key)
+    evidence = ("tests",) if command.tests_pattern is not None else ("static",)
+    return _ParsedSpec(
+        command=command,
+        metric_version="command-exit/1",
+        evidence=evidence,
+    )
+
+
+def _clones_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    clones = _parse_clones(raw, root, path, full_key)
+    return _ParsedSpec(
+        clones=clones,
+        baseline=clones.baseline,
+        threshold=0,
+        metric_version="jscpd-clone-occurrences/1",
+        evidence=("duplication",),
+    )
+
+
+def _python_tests_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    python_tests = _parse_python_tests(raw, path, full_key)
+    return _ParsedSpec(
+        python_tests=python_tests,
+        metric_version="test-count/1",
+        evidence=("tests",),
+    )
+
+
+def _python_crap_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    python_crap = _parse_python_crap(raw, root, path, full_key)
+    return _ParsedSpec(
+        python_crap=python_crap,
+        baseline=python_crap.baseline,
+        threshold=_number(
+            raw,
+            "threshold",
+            path,
+            f"{full_key}.threshold",
+            default=DEFAULT_CRAP_THRESHOLD,
+            minimum=0,
+        ),
+        metric_version="python-lines/1",
+        evidence=("crap",),
+    )
+
+
+def _verification_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    verification = _parse_verification(raw, root, path, full_key)
+    return _ParsedSpec(
+        verification=verification,
+        baseline=verification.baseline,
+        threshold=0,
+        metric_version="verification/1",
+        evidence=(),
+    )
+
+
+def _adapter_spec(
+    adapter: str, raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    if adapter == "command":
+        return _command_spec(raw, root, path, full_key)
+    if adapter == "clones":
+        return _clones_spec(raw, root, path, full_key)
+    if adapter == "python_tests":
+        return _python_tests_spec(raw, root, path, full_key)
+    if adapter == "python_crap":
+        return _python_crap_spec(raw, root, path, full_key)
+    return _verification_spec(raw, root, path, full_key)
+
+
 def _allowed_keys(adapter: str) -> tuple[str, ...]:
     if adapter == "command":
         return (
@@ -545,22 +668,40 @@ def _allowed_keys(adapter: str) -> tuple[str, ...]:
             "skipped_pattern",
             "budget_seconds",
         )
-    return (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
+    if adapter == "python_crap":
+        return (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
+    return (*COMMON_CHECK_KEYS, "requires", "baseline")
+
+
+def _parse_direction(
+    raw: dict[str, Any], path: Path, full_key: str
+) -> str:
+    if "direction" not in raw:
+        return "max"
+    direction = _string(raw, "direction", path, f"{full_key}.direction")
+    if direction not in ("max", "min"):
+        raise _config_error(
+            path,
+            f"{full_key}.direction",
+            "one of max, min",
+            _describe(direction),
+        )
+    return direction
 
 
 def _validate_requires(
     checks: dict[str, CheckDef],
     name: str,
-    python_crap: PythonCrapSpec | None,
+    requires: str | None,
     path: Path,
 ) -> None:
-    if python_crap is None:
+    if requires is None:
         return
-    required = checks.get(python_crap.requires)
+    required = checks.get(requires)
     if required is None:
-        actual = f"unknown check {python_crap.requires!r}"
+        actual = f"unknown check {requires!r}"
     elif required.adapter != "python_tests":
-        actual = f"{python_crap.requires!r} is a {required.adapter} check"
+        actual = f"{requires!r} is a {required.adapter} check"
     else:
         return
     raise _config_error(
@@ -571,6 +712,75 @@ def _validate_requires(
     )
 
 
+def _required_check(parts: _ParsedSpec) -> str | None:
+    if parts.python_crap is not None:
+        return parts.python_crap.requires
+    if parts.verification is not None:
+        return parts.verification.requires
+    return None
+
+
+def _check_header(
+    raw: dict[str, Any], path: Path, full_key: str
+) -> tuple[str, int, str]:
+    adapter = _string(raw, "adapter", path, f"{full_key}.adapter")
+    if adapter not in SUPPORTED_ADAPTERS:
+        names = ", ".join(SUPPORTED_ADAPTERS)
+        raise _config_error(
+            path,
+            f"{full_key}.adapter",
+            f"one of {names}",
+            _describe(adapter),
+        )
+    _check_keys(raw, _allowed_keys(adapter), path, full_key)
+    tier = _integer(
+        raw, "tier", path, f"{full_key}.tier", minimum=1, maximum=4
+    )
+    enforcement = _string(raw, "enforcement", path, f"{full_key}.enforcement")
+    if enforcement not in ("enforced", "advisory"):
+        raise _config_error(
+            path,
+            f"{full_key}.enforcement",
+            "one of enforced, advisory",
+            _describe(enforcement),
+        )
+    return adapter, tier, enforcement
+
+
+def _parse_check(
+    name: str,
+    raw: Any,
+    root: Path,
+    path: Path,
+    checks: dict[str, CheckDef],
+) -> CheckDef:
+    full_key = f"checks.{name}"
+    if not name.strip():
+        raise _config_error(path, full_key, "a non-empty check id", "an empty key")
+    if not isinstance(raw, dict):
+        raise _config_error(path, full_key, "a table", _describe(raw))
+    adapter, tier, enforcement = _check_header(raw, path, full_key)
+    parts = _adapter_spec(adapter, raw, root, path, full_key)
+    check = CheckDef(
+        id=name,
+        adapter=adapter,
+        tier=tier,
+        enforcement=enforcement,
+        metric_version=parts.metric_version,
+        evidence=parts.evidence,
+        command=parts.command,
+        clones=parts.clones,
+        python_tests=parts.python_tests,
+        python_crap=parts.python_crap,
+        threshold=parts.threshold,
+        baseline=parts.baseline,
+        verification=parts.verification,
+        direction=_parse_direction(raw, path, full_key),
+    )
+    _validate_requires(checks, name, _required_check(parts), path)
+    return check
+
+
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path
 ) -> dict[str, CheckDef]:
@@ -579,84 +789,7 @@ def _parse_checks(
         return {}
     checks: dict[str, CheckDef] = {}
     for name, raw in raw_checks.items():
-        full_key = f"checks.{name}"
-        if not name.strip():
-            raise _config_error(path, full_key, "a non-empty check id", "an empty key")
-        if not isinstance(raw, dict):
-            raise _config_error(path, full_key, "a table", _describe(raw))
-        adapter = _string(raw, "adapter", path, f"{full_key}.adapter")
-        if adapter not in SUPPORTED_ADAPTERS:
-            names = ", ".join(SUPPORTED_ADAPTERS)
-            raise _config_error(
-                path,
-                f"{full_key}.adapter",
-                f"one of {names}",
-                _describe(adapter),
-            )
-        _check_keys(raw, _allowed_keys(adapter), path, full_key)
-        tier = _integer(
-            raw, "tier", path, f"{full_key}.tier", minimum=1, maximum=4
-        )
-        enforcement = _string(raw, "enforcement", path, f"{full_key}.enforcement")
-        if enforcement not in ("enforced", "advisory"):
-            raise _config_error(
-                path,
-                f"{full_key}.enforcement",
-                "one of enforced, advisory",
-                _describe(enforcement),
-            )
-        command: CommandSpec | None = None
-        clones: CloneSpec | None = None
-        python_tests: PythonTestsSpec | None = None
-        python_crap: PythonCrapSpec | None = None
-        baseline: Path | None = None
-        threshold: float | None = None
-        if adapter == "command":
-            command = _parse_command(raw, path, full_key)
-            metric_version = "command-exit/1"
-        elif adapter == "clones":
-            clones = _parse_clones(raw, root, path, full_key)
-            baseline = clones.baseline
-            threshold = 0
-            metric_version = "jscpd-clone-occurrences/1"
-        elif adapter == "python_tests":
-            python_tests = _parse_python_tests(raw, path, full_key)
-            metric_version = "test-count/1"
-        else:
-            python_crap = _parse_python_crap(raw, root, path, full_key)
-            baseline = python_crap.baseline
-            threshold = _number(
-                raw,
-                "threshold",
-                path,
-                f"{full_key}.threshold",
-                default=DEFAULT_CRAP_THRESHOLD,
-                minimum=0,
-            )
-            metric_version = "python-lines/1"
-        if command is not None:
-            evidence = ("tests",) if command.tests_pattern is not None else ("static",)
-        elif clones is not None:
-            evidence = ("duplication",)
-        elif python_tests is not None:
-            evidence = ("tests",)
-        else:
-            evidence = ("crap",)
-        checks[name] = CheckDef(
-            id=name,
-            adapter=adapter,
-            tier=tier,
-            enforcement=enforcement,
-            metric_version=metric_version,
-            evidence=evidence,
-            command=command,
-            clones=clones,
-            python_tests=python_tests,
-            python_crap=python_crap,
-            threshold=threshold,
-            baseline=baseline,
-        )
-        _validate_requires(checks, name, python_crap, path)
+        checks[name] = _parse_check(name, raw, root, path, checks)
     _validate_baselines(checks, path)
     return checks
 

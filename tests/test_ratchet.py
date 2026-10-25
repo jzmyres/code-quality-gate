@@ -27,6 +27,7 @@ class RatchetTests(unittest.TestCase):
         threshold: float = 0,
         domain=None,
         today: datetime.date | None = None,
+        direction: str = "max",
     ):
         output = io.StringIO()
         errors = io.StringIO()
@@ -48,6 +49,7 @@ class RatchetTests(unittest.TestCase):
                 adapter="metric",
                 domain=domain or ratchet.Domain.all(),
                 today=today,
+                direction=direction,
             )
         return result, output.getvalue(), errors.getvalue()
 
@@ -203,6 +205,52 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(result.outcome, "fail")
         with self.assertRaises(policy.GateError):
             ratchet.pruned_entries(result)
+
+    def test_min_metric_passes_at_or_above_its_floor(self) -> None:
+        result, _out, _errors = self.decide(
+            [("subject", 5.0)],
+            [("subject", 5.0, "floor", None)],
+            direction="min",
+        )
+        self.assertEqual(result.outcome, "pass")
+        self.assertTrue(result.satisfied)
+        self.assertFalse(result.exceptions)
+
+    def test_min_metric_below_its_floor_fails(self) -> None:
+        result, _out, errors = self.decide(
+            [("subject", 4.0)],
+            [("subject", 5.0, "floor", None)],
+            direction="min",
+        )
+        self.assertEqual(result.outcome, "fail")
+        self.assertFalse(result.satisfied)
+        self.assertIn("falls below baseline bound 5", errors)
+        self.assertIn("file:1", errors)
+
+    def test_min_metric_without_a_baseline_entry_is_unmeasured(self) -> None:
+        result, _out, errors = self.decide(
+            [("subject", 5.0)], [], direction="min"
+        )
+        self.assertEqual(result.outcome, "fail")
+        self.assertFalse(result.satisfied)
+        self.assertEqual(result.unmeasured, ["subject"])
+        self.assertEqual(
+            result.findings[0].error,
+            "unmeasured: no baseline entry for a min metric",
+        )
+        self.assertIn("unmeasured: no baseline entry", errors)
+
+    def test_prune_raises_a_min_floor_but_never_lowers_it(self) -> None:
+        result, _out, _errors = self.decide(
+            [("raise", 7), ("same", 3)],
+            [
+                ("raise", 5, "floor", None),
+                ("same", 3, "floor", None),
+            ],
+            direction="min",
+        )
+        pruned = ratchet.pruned_entries(result)
+        self.assertEqual([entry.bound for entry in pruned], [7, 3])
 
     def test_non_finite_measured_value_is_unsupported(self) -> None:
         for value in (float("inf"), float("-inf"), float("nan")):

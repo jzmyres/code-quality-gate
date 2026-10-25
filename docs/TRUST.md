@@ -172,4 +172,5 @@ schema 2 and has no `trust` key.
   and review cover it. A `[protect]` glob can still block an unreviewed change
   to it.
 * **Verification loss inside test code.** Deleted tests, added skips and grown
-  pragmas are M2c, not this contract.
+  pragmas are measured by the `verification` adapter (M2c), not by this
+  contract; its baseline is protected like every other baseline.

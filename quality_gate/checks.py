@@ -42,6 +42,7 @@ from .ratchet import (
 )
 from .runner import Diagnostics, RunResult, run
 from .tools import load_tools, tool_binary, _default_lock_path
+from .verification import measure_verification
 
 
 CLONE_BUDGET_SECONDS = 600
@@ -68,6 +69,8 @@ class CheckResult:
     baseline_path: Path | None = None
     ratchet: RatchetResult | None = None
     measurement: dict[str, Any] | None = None
+    tests_ran: int | None = None
+    tests_skipped: int | None = None
     satisfied: bool | None = None
     reason: str | None = None
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
@@ -212,6 +215,7 @@ def _evaluate_ratchet(
                 prefix=prefix,
                 adapter=check.adapter,
                 domain=domain,
+                direction=check.direction,
             ),
             None,
         )
@@ -568,6 +572,24 @@ def _ratchet_result(
         measurement=measurement,
         diagnostics=diagnostics or Diagnostics(),
         reason=_ratchet_reason(ratchet, reason),
+    )
+
+
+def _ratchet_error(
+    check: CheckDef,
+    start: float,
+    prefix: str,
+    error: Exception,
+) -> CheckResult:
+    message = str(error)
+    print(f"{prefix}: {message}", file=sys.stderr)
+    return _ratchet_result(
+        check,
+        start,
+        "error",
+        execution="error",
+        diagnostics=Diagnostics(error=message),
+        reason=message,
     )
 
 
@@ -1068,6 +1090,8 @@ def _run_python_tests(
         budget_seconds=spec.budget_seconds,
         diagnostics=diagnostics,
         measurement={"tests": executed},
+        tests_ran=ran,
+        tests_skipped=skipped,
         evidence_path=combined_file,
         coverage_config=config_file,
         temporary=temporary,
@@ -1137,15 +1161,7 @@ def _crap_measure(
             reason=str(error),
         )
     except GateError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return None, _ratchet_result(
-            check,
-            start,
-            "error",
-            execution="error",
-            diagnostics=Diagnostics(error=str(error)),
-            reason=str(error),
-        )
+        return None, _ratchet_error(check, start, prefix, error)
     return measurement, None
 
 
@@ -1258,15 +1274,224 @@ def _run_python_crap(
         )
     return outcome
 
-def run_check(
+def _verification_test_checks(
+    check: CheckDef, prior: dict[str, CheckResult]
+) -> list[str]:
+    assert check.verification is not None
+    if check.verification.requires is not None:
+        return [check.verification.requires]
+    return [
+        identifier
+        for identifier, result in prior.items()
+        if result.adapter == "python_tests"
+    ]
+
+
+def _missing_test_count(
+    identifier: str, result: CheckResult
+) -> str | None:
+    if result.tests_ran is None:
+        return (
+            f"test counts unreliable: {identifier} recorded no "
+            "ran/skipped counts"
+        )
+    if result.tests_skipped is None:
+        return (
+            f"test counts unreliable: {identifier} recorded no "
+            "ran/skipped counts"
+        )
+    return None
+
+
+def _count_problem(
+    identifier: str, result: CheckResult | None
+) -> str | None:
+    if result is None:
+        return f"test counts unreliable: {identifier} did not run"
+    if result.outcome != "pass":
+        return f"test counts unreliable: {identifier} did not pass"
+    return _missing_test_count(identifier, result)
+
+
+def _verification_counts(
+    check: CheckDef, prior: dict[str, CheckResult]
+) -> tuple[list[tuple[str, int, int]] | None, str | None]:
+    identifiers = _verification_test_checks(check, prior)
+    if not identifiers:
+        return None, "no python_tests check to measure"
+    counts: list[tuple[str, int, int]] = []
+    for identifier in identifiers:
+        result = prior.get(identifier)
+        problem = _count_problem(identifier, result)
+        if problem is not None:
+            return None, problem
+        assert result is not None
+        assert result.tests_ran is not None
+        assert result.tests_skipped is not None
+        counts.append(
+            (identifier, result.tests_ran, result.tests_skipped)
+        )
+    return counts, None
+
+
+def _verification_files(selected: list[str]) -> list[str]:
+    return [relative for relative in selected if relative.endswith(".py")]
+
+
+def _verification_domain(findings: list[Any]) -> Domain:
+    return Domain.of_subjects(
+        [finding.subject for finding in findings],
+        "the measured Python files and test checks",
+    )
+
+
+def _verification_selection(
     root: Path,
     config: Config,
     check: CheckDef,
     files: list[str],
     classes: dict[str, str],
+    start: float,
+    prefix: str,
+) -> tuple[list[str] | None, CheckResult | None]:
+    selected, names = _select_files(config, check, files, classes)
+    python_files = _verification_files(selected)
+    if python_files:
+        return python_files, None
+    class_text = _class_text(names)
+    reason = (
+        f"no Python files selected (classes: {class_text}); "
+        "zero inputs is not a pass"
+    )
+    print(f"{prefix}: {reason}", file=sys.stderr)
+    return None, _ratchet_result(check, start, "fail", reason=reason)
+
+
+def _verification_findings(
+    root: Path,
+    check: CheckDef,
+    files: list[str],
+    prior: dict[str, CheckResult],
+    start: float,
+    prefix: str,
+) -> list[Any] | CheckResult:
+    counts, problem = _verification_counts(check, prior)
+    if problem is not None:
+        print(f"{prefix}: {problem}", file=sys.stderr)
+        return _ratchet_result(
+            check,
+            start,
+            "unsupported",
+            diagnostics=Diagnostics(error=problem),
+            reason=problem,
+        )
+    assert counts is not None
+    try:
+        return measure_verification(root, files, counts)
+    except GateError as error:
+        return _ratchet_error(check, start, prefix, error)
+
+
+def _verification_measurement(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    files: list[str],
+    classes: dict[str, str],
+    prior: dict[str, CheckResult],
+    start: float,
+    prefix: str,
+) -> list[Any] | CheckResult:
+    python_files, failure = _verification_selection(
+        root, config, check, files, classes, start, prefix
+    )
+    if failure is not None:
+        return failure
+    assert python_files is not None
+    return _verification_findings(
+        root, check, python_files, prior, start, prefix
+    )
+
+
+def _verification_entries(
+    check: CheckDef, start: float, prefix: str
+) -> tuple[list[Any] | None, CheckResult | None]:
+    try:
+        return (
+            load_baseline(
+                check.baseline,
+                check_id=check.id,
+                metric_version=check.metric_version,
+            ),
+            None,
+        )
+    except GateError as error:
+        return None, _ratchet_error(check, start, prefix, error)
+
+
+def _verification_ratchet(
+    check: CheckDef,
+    findings: list[Any],
+    prefix: str,
+    start: float,
+) -> CheckResult:
+    entries, failure = _verification_entries(check, start, prefix)
+    if failure is not None:
+        return failure
+    assert entries is not None
+    ratchet, failure = _evaluate_ratchet(
+        findings, entries, check, prefix, _verification_domain(findings)
+    )
+    if ratchet is None:
+        return _ratchet_result(
+            check, start, failure or "error", reason=failure
+        )
+    result = _ratchet_result(
+        check, start, ratchet.outcome, ratchet=ratchet
+    )
+    if ratchet.satisfied:
+        print(
+            f"{prefix}: {len(findings)} subjects within baseline",
+            flush=True,
+        )
+    return result
+
+
+def _run_verification(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    selected_files: list[str],
+    file_classes: dict[str, str],
     *,
     prefix: str,
-    prior: dict[str, CheckResult] | None = None,
+    prior: dict[str, CheckResult],
+) -> CheckResult:
+    assert check.verification is not None
+    start = time.monotonic()
+    measured = _verification_measurement(
+        root,
+        config,
+        check,
+        selected_files,
+        file_classes,
+        prior,
+        start,
+        prefix,
+    )
+    if isinstance(measured, CheckResult):
+        return measured
+    return _verification_ratchet(check, measured, prefix, start)
+
+
+def _adapter_runner(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    files: list[str],
+    classes: dict[str, str],
+    prefix: str,
+    prior: dict[str, CheckResult],
 ) -> CheckResult:
     if check.adapter == "command":
         return _run_command(root, config, check, files, classes, prefix)
@@ -1282,9 +1507,40 @@ def run_check(
             files,
             classes,
             prefix=prefix,
-            prior=prior or {},
+            prior=prior,
         )
-    raise GateError(f"unsupported adapter {check.adapter!r}")
+    return _run_verification(
+        root,
+        config,
+        check,
+        files,
+        classes,
+        prefix=prefix,
+        prior=prior,
+    )
+
+
+def run_check(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    files: list[str],
+    classes: dict[str, str],
+    *,
+    prefix: str,
+    prior: dict[str, CheckResult] | None = None,
+) -> CheckResult:
+    if check.adapter not in (
+        "command",
+        "clones",
+        "python_tests",
+        "python_crap",
+        "verification",
+    ):
+        raise GateError(f"unsupported adapter {check.adapter!r}")
+    return _adapter_runner(
+        root, config, check, files, classes, prefix, prior or {}
+    )
 
 
 def _skipped(check: CheckDef) -> CheckResult:
