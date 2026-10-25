@@ -88,11 +88,15 @@ All commands accept the repository selector before the command:
 `DIR/quality-gate.toml`. Staged entries come from `git ls-files -s -z` and untracked names from
 `git ls-files --others --exclude-standard -z`; the two record types are parsed separately, so tracked
 and stageable untracked files are checked, ignored files are not, and an untracked name shaped like a
-staged record cannot become a gitlink. Only staged records carry a git mode; mode `160000` identifies
-a gitlink, which matches exactly one rule like any other enumerated path but is never opened or
-measured as a file. Every other entry is inspected with `lstat`: a symlink is recorded as a symlink
-and never followed or read, while FIFOs, sockets and devices are rejected with a message. Shebang
-inspection reads at most 4096 bytes and only from a regular file.
+staged record cannot become a gitlink. Tracked entries deleted from the working tree
+(`git ls-files --deleted -z`) are excluded: a deletion is not inspected, sized or classified, and a
+rule that then matches no file still fails as stale. A tracked path whose worktree entry was replaced
+by something else (for example a directory) is not deleted and keeps its usual handling. Only staged
+records carry a git mode; mode `160000` identifies a gitlink, which matches exactly one rule like any
+other enumerated path but is never opened or measured as a file. Every other entry is inspected with
+`lstat`: a symlink is recorded as a symlink and never followed or read, while FIFOs, sockets and
+devices are rejected with a message. Shebang inspection reads at most 4096 bytes and only from a
+regular file.
 
 ### inventory
 

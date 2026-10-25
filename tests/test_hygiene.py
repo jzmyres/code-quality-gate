@@ -61,14 +61,28 @@ class HygieneTests(FixtureCase):
         self.assertIn("pipe", text)
         self.assertIn("unsupported file type FIFO", text)
 
-    def test_a_deleted_worktree_file_fails_size_measurement(self) -> None:
-        self.add_file("gone.txt", "x\n")
-        self.git("add", "gone.txt")
-        (self.repo / "gone.txt").unlink()
-        result = self.run_qg("hygiene")
-        text = output(result)
-        self.assertEqual(result.returncode, 1, text)
-        self.assertIn("gone.txt: cannot measure size", text)
+    def test_a_deletion_is_not_measured(self) -> None:
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                self.add_file("gone.md", "# gone\n")
+                self.git("add", "gone.md")
+                (self.repo / "gone.md").unlink()
+                if staged:
+                    self.git("add", "-u", "gone.md")
+                result = self.run_qg("hygiene")
+                text = output(result)
+                self.assertEqual(result.returncode, 0, text)
+                self.assertNotIn("gone.md", text)
+                self.assertIn(
+                    "hygiene: 4 files within 10485760 bytes", result.stdout
+                )
+
+    def test_a_missing_worktree_entry_fails_size_measurement(self) -> None:
+        violations = files._size_violations(
+            self.repo, [files.GitFile("missing.txt", None)], 10485760
+        )
+        self.assertEqual(len(violations), 1)
+        self.assertIn("missing.txt: cannot measure size", violations[0])
 
     def test_symlink_size_is_not_followed(self) -> None:
         self.write_config(

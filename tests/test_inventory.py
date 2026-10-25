@@ -238,14 +238,49 @@ class InventoryTests(FixtureCase):
             if entry.path == name:
                 self.assertFalse(entry.gitlink)
 
-    def test_a_deleted_worktree_file_is_reported(self) -> None:
-        self.add_file("gone.py", "print('x')\n")
-        self.git("add", "gone.py")
-        (self.repo / "gone.py").unlink()
+    def _inventory_after_deletion(
+        self, staged: bool
+    ) -> subprocess.CompletedProcess[str]:
+        self.add_file("gone.md", "# gone\n")
+        self.git("add", "gone.md")
+        (self.repo / "gone.md").unlink()
+        if staged:
+            self.git("add", "-u", "gone.md")
+        return self.run_qg("inventory")
+
+    def test_a_deletion_is_not_enumerated(self) -> None:
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                result = self._inventory_after_deletion(staged)
+                text = output(result)
+                self.assertEqual(result.returncode, 0, text)
+                self.assertNotIn("gone.md", text)
+                self.assertIn("inventory: 4 files match 4 rules", result.stdout)
+
+    def test_a_deletion_makes_its_rule_stale(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[[rule]]\npattern = "gone.md"\nclass = "doc"\n'
+            'reason = "a deleted file"\n'
+        )
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                result = self._inventory_after_deletion(staged)
+                text = output(result)
+                self.assertEqual(result.returncode, 1, text)
+                self.assertIn("gone.md", text)
+                self.assertIn("matches no file", text)
+                self.assertNotIn("cannot inspect", text)
+
+    def test_a_replaced_worktree_entry_is_not_a_deletion(self) -> None:
+        self.add_file("gone.md", "# gone\n")
+        self.git("add", "gone.md")
+        (self.repo / "gone.md").unlink()
+        (self.repo / "gone.md").mkdir()
         result = self.run_qg("inventory")
         text = output(result)
-        self.assertEqual(result.returncode, 1, text)
-        self.assertIn("gone.py: cannot inspect", text)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("gone.md", files.enumerate_files(self.repo))
 
     def test_shebang_reads_are_bounded(self) -> None:
         path = self.repo / "long-shebang"

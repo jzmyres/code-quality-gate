@@ -129,8 +129,27 @@ def _untracked_entries(root: Path) -> list[GitFile]:
     ]
 
 
+def _deleted_paths(root: Path) -> set[str]:
+    raw = _git(
+        root,
+        ["ls-files", "--deleted", "-z"],
+        "deleted-file enumeration",
+    )
+    return {
+        name
+        for name in raw.decode("utf-8", "surrogateescape").split("\0")
+        if name
+    }
+
+
 def enumerate_entries(root: Path) -> list[GitFile]:
     entries = _staged_entries(root)
+    deleted = _deleted_paths(root)
+    # Gitlinks are not files and stay enumerated without a worktree entry.
+    entries = [
+        entry for entry in entries
+        if entry.gitlink or entry.path not in deleted
+    ]
     entries.extend(_untracked_entries(root))
     return sorted(entries, key=lambda entry: entry.path)
 
