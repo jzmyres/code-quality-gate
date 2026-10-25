@@ -25,8 +25,8 @@ jobs:
     # Debian 13 ships Python 3.13 and Ubuntu 24.04 ships Python 3.12, the two supported versions.
     container: ${{ matrix.image }}
     # Rule: smallest multiple of 5 minutes at least three times the measured check time.
-    # Local `make -k check` measured 30.4 s; 3 x 30.4 s = 91.2 s, so 5.
-    timeout-minutes: 5
+    # CI run 40188680325 measured the slower job (debian:13) at 101 s; 3 x 101 s = 303 s, so 10.
+    timeout-minutes: 10
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
     steps:
