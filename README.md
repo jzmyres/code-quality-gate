@@ -172,11 +172,11 @@ instead of written.
 `python_tests` runs the consumer's own test command from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
 `covrun.py`, a fresh data directory, the source root, and the pinned coverage install. The prefix writes
-and uses one gate-owned coverage configuration (line mode, `branch = False`, `source` the repository
-root, `exclude_lines` exactly the `pragma: no cover` expression) for collection, combination and
-analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and `pyproject.toml` configuration is
-ignored, and every `COVERAGE_*` environment variable other than `COVERAGE_CORE` is removed before the
-test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
+and uses one gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`,
+`source` the repository root, `exclude_lines` exactly the `pragma: no cover` expression) for
+collection, combination and analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
+`pyproject.toml` configuration is ignored, and every `COVERAGE_*` environment variable other than
+`COVERAGE_CORE` is removed before the test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
 --source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so
 `run` can name a script or `-m MODULE`; each invocation gets its own data file.
 
@@ -189,10 +189,14 @@ The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command
 Pass the environment through to the child. The child then writes its own coverage dataset, which the
 adapter combines with the test process's data. The adapter creates the one gate-owned coverage
 configuration before the test command starts, and every child consumes it instead of rewriting it.
-Each coverage invocation registers itself under `registry/` in the data directory and records the
-dataset it finalized; combination requires every registered dataset to be present and loadable, so a
-child that exits without saving, or a corrupt dataset, makes the tests evidence `unsupported` rather
-than a pass.
+Each coverage invocation registers itself under `registry/` in the data directory before it runs,
+naming the dataset it will write and the program it runs (the script path or `-m MODULE`, not its
+arguments). Combination requires every registered dataset to exist and load. Complete means saved: a
+program that ends with an uncaught exception or is stopped by SIGTERM still counts when coverage wrote
+its dataset. The gate-owned configuration sets `sigterm = true`, so SIGTERM saves the dataset; coverage
+then re-delivers SIGTERM, leaving the child's exit status unchanged. A child stopped before coverage
+saves (for example SIGKILL or `os._exit`) or a corrupt dataset makes the tests evidence `unsupported`
+rather than a pass.
 
 `tests_pattern` is required and must contain exactly one capture group: the number of tests that ran.
 `skipped_pattern` is optional and also has exactly one capture group: the number of skipped tests (for

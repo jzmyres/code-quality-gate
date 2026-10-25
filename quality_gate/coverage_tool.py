@@ -24,6 +24,7 @@ def coverage_config_text(root: Path) -> str:
     return (
         "[run]\n"
         "branch = False\n"
+        "sigterm = true\n"
         f"source =\n    {root}\n"
         "[report]\n"
         f"exclude_lines =\n    {PRAGMA_NO_COVER}\n"
@@ -81,62 +82,61 @@ def _valid_dataset_name(name: object) -> bool:
     )
 
 
-def _dataset_names(path: Path, document: object) -> list[str]:
-    names = document.get("datasets") if isinstance(document, dict) else None
-    if not isinstance(names, list) or not names:
+def _registry_dataset(path: Path, document: object) -> str:
+    dataset = document.get("dataset") if isinstance(document, dict) else None
+    if dataset is None:
         raise UnsupportedError(
-            f"coverage registry record {path} has no usable dataset list"
+            f"coverage registry record {path} has no usable dataset"
         )
-    for name in names:
-        if not _valid_dataset_name(name):
-            raise UnsupportedError(
-                f"coverage registry record {path} names an unsafe dataset "
-                f"{name!r}"
-            )
-    return names
+    if not _valid_dataset_name(dataset):
+        raise UnsupportedError(
+            f"coverage registry record {path} names an unsafe dataset "
+            f"{dataset!r}"
+        )
+    return dataset
 
 
-def _read_completed(path: Path) -> list[str]:
+def _read_registration(path: Path) -> tuple[str, str]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise UnsupportedError(
             f"coverage registry record {path} is unreadable: {error}"
         ) from error
-    return _dataset_names(path, document)
+    dataset = _registry_dataset(path, document)
+    program = document.get("program", "") if isinstance(document, dict) else ""
+    return dataset, str(program)
 
 
-def registered_datasets(data_dir: Path) -> list[Path]:
-    """Every dataset a registered invocation says it finalized."""
+def registered_datasets(data_dir: Path) -> list[tuple[str, str, Path]]:
+    """Every dataset a registered invocation will write."""
     directory = registry_dir(data_dir)
-    started = sorted(directory.glob("*.started"))
-    if not started:
+    records = sorted(directory.glob("*.json"))
+    if not records:
         raise UnsupportedError(
             f"no coverage invocation registered in {directory}"
         )
-    datasets: list[Path] = []
-    for record in started:
-        invocation = record.name.removesuffix(".started")
-        completion = directory / f"{invocation}.json"
-        if not completion.is_file():
-            raise UnsupportedError(
-                f"coverage invocation {invocation} did not finalize"
-            )
-        for name in _read_completed(completion):
-            datasets.append(data_dir / name)
+    datasets: list[tuple[str, str, Path]] = []
+    for record in records:
+        dataset, program = _read_registration(record)
+        datasets.append((record.stem, program, data_dir / dataset))
     return datasets
 
 
-def _check_datasets(datasets: list[Path]) -> None:
+def _check_datasets(datasets: list[tuple[str, str, Path]]) -> None:
     coverage = import_coverage()
-    for path in datasets:
+    for invocation, program, path in datasets:
         if not path.is_file():
-            raise UnsupportedError(f"coverage dataset {path} is missing")
+            raise UnsupportedError(
+                f"coverage invocation {invocation} ({program}) dataset "
+                f"{path} is missing"
+            )
         try:
             coverage.CoverageData(str(path)).read()
         except coverage.CoverageException as error:
             raise UnsupportedError(
-                f"coverage dataset {path} is corrupt: {error}"
+                f"coverage invocation {invocation} ({program}) dataset "
+                f"{path} is corrupt: {error}"
             ) from error
 
 

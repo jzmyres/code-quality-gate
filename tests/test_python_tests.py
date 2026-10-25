@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -269,8 +271,8 @@ class PythonTestsTests(FixtureCase):
         )
         self.unsupported_tests("not a test count")
 
-    def test_a_child_that_never_finalizes_is_unsupported(self) -> None:
-        # The child registers and exits before coverage saves or finalizes.
+    def test_a_child_that_exits_without_saving_is_unsupported(self) -> None:
+        # The child registers before it runs and exits before coverage saves.
 
         self.add_file("tests/abrupt_child.py", "import os\nos._exit(0)\n")
         self.add_test(
@@ -286,7 +288,7 @@ class PythonTestsTests(FixtureCase):
             "        subprocess.run([*prefix, str(child)], check=True,\n"
             "                       env=os.environ.copy())\n"
         )
-        _result, check = self.unsupported_tests("did not finalize")
+        _result, check = self.unsupported_tests("abrupt_child.py", "is missing")
         self.assertIn("coverage combination failed", check["reason"])
 
     def test_unmatched_tests_pattern_is_unsupported(self) -> None:
@@ -335,60 +337,90 @@ class CovrunTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("coverage is not installed", stderr.getvalue())
 
-    def coverage_dirs(
-        self, temporary: str
-    ) -> tuple[Path, Path, Path, Path]:
-        base = Path(temporary)
-        data_dir = base / "data"
-        data_dir.mkdir()
-        source_root = base / "root"
-        source_root.mkdir()
-        coverage_dir = base / "coverage"
-        coverage_dir.mkdir()
-        config_file = data_dir / "coverage.ini"
-        config_file.write_text("marker\n", encoding="utf-8")
-        return data_dir, source_root, coverage_dir, config_file
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="qg-covrun-")
+        self.addCleanup(self._temporary.cleanup)
+        self.base = Path(self._temporary.name)
+        self.data_dir = self.base / "data"
+        self.data_dir.mkdir()
+        self.source_root = self.base / "root"
+        self.source_root.mkdir()
+        self.coverage_dir = coverage_tool.coverage_installation()
+        self.config_file = coverage_tool.write_coverage_config(
+            self.data_dir, self.source_root
+        )
+        self.runner = GATE / "quality_gate" / "covrun.py"
 
-    def run_with_fake_coverage(
-        self,
-        fake_main: object,
-        *,
-        data_dir: Path,
-        source_root: Path,
-        coverage_dir: Path,
+    def script(self, name: str, text: str) -> Path:
+        path = self.source_root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def command(self, program: str, *arguments: str) -> list[str]:
+        return [
+            sys.executable,
+            "-I",
+            str(self.runner),
+            str(self.data_dir),
+            str(self.source_root),
+            str(self.coverage_dir),
+            program,
+            *arguments,
+        ]
+
+    def run_program(
+        self, program: str, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            self.command(program, *arguments),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def registration(self) -> tuple[Path, dict[str, str]]:
+        records = list(
+            coverage_tool.registry_dir(self.data_dir).glob("*.json")
+        )
+        self.assertEqual(len(records), 1, records)
+        document = json.loads(records[0].read_text(encoding="utf-8"))
+        return records[0], document
+
+    def combine(self) -> None:
+        coverage_tool.combine_coverage(
+            self.data_dir,
+            self.base / "combined" / ".coverage",
+            self.config_file,
+        )
+
+    def start(self, program: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            self.command(program),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def read_ready(self, process: subprocess.Popen[str]) -> None:
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.readline(), "ready\n")
+
+    def finish(
+        self, process: subprocess.Popen[str], *, kill: bool
     ) -> int:
-        with mock.patch.dict(
-            os.environ, {"COVERAGE_TEST_OVERRIDE": "1"}
-        ), mock.patch.object(
-            covrun, "_coverage_main", return_value=(fake_main, None)
-        ), mock.patch.object(sys, "path", list(sys.path)):
-            return covrun._run(
-                [
-                    "covrun.py",
-                    str(data_dir),
-                    str(source_root),
-                    str(coverage_dir),
-                    "prog.py",
-                ]
-            )
+        if kill:
+            process.kill()
+        else:
+            process.terminate()
+        try:
+            return process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.communicate()
 
-    def run_covrun(
-        self, fake_main: object
-    ) -> tuple[int, Path, Path]:
-        temporary = tempfile.TemporaryDirectory(prefix="qg-covrun-")
-        self.addCleanup(temporary.cleanup)
-        data_dir, source_root, coverage_dir, config_file = self.coverage_dirs(
-            temporary.name
-        )
-        code = self.run_with_fake_coverage(
-            fake_main,
-            data_dir=data_dir,
-            source_root=source_root,
-            coverage_dir=coverage_dir,
-        )
-        return code, data_dir, config_file
-
-    def test_run_consumes_the_gate_configuration(self) -> None:
+    def test_run_wires_the_gate_configuration_before_execution(self) -> None:
         calls: list[list[str]] = []
 
         def fake_main(arguments: list[str]) -> int:
@@ -400,52 +432,90 @@ class CovrunTests(unittest.TestCase):
                     )
             return 7
 
-        code, data_dir, config_file = self.run_covrun(fake_main)
+        with mock.patch.dict(
+            os.environ, {"COVERAGE_TEST_OVERRIDE": "1"}
+        ), mock.patch.object(
+            covrun, "_coverage_main", return_value=(fake_main, None)
+        ), mock.patch.object(sys, "path", list(sys.path)):
+            code = covrun._run(
+                [
+                    "covrun.py",
+                    str(self.data_dir),
+                    str(self.source_root),
+                    str(self.coverage_dir),
+                    "prog.py",
+                    "--secret",
+                ]
+            )
         self.assertEqual(code, 7)
         self.assertNotIn("COVERAGE_TEST_OVERRIDE", os.environ)
-        self.assertEqual(
-            config_file.read_text(encoding="utf-8"), "marker\n"
-        )
         self.assertEqual(calls[0][0], "run")
         self.assertNotIn("--parallel-mode", calls[0])
-        self.assertIn(f"--rcfile={config_file}", calls[0])
-        self.assertEqual(calls[0][-1], "prog.py")
-        self.assertEqual(
-            len(list((data_dir / "registry").glob("*.started"))), 1
-        )
-        self.assertEqual(
-            len(list((data_dir / "registry").glob("*.json"))), 1
-        )
+        self.assertIn(f"--rcfile={self.config_file}", calls[0])
+        self.assertEqual(calls[0][-1], "--secret")
+        record, document = self.registration()
+        self.assertEqual(document["program"], "prog.py")
+        self.assertNotIn("--secret", record.read_text(encoding="utf-8"))
 
-    def test_run_without_a_dataset_does_not_finalize(self) -> None:
-        def fake_main(arguments: list[str]) -> int:
-            return 1
+    def test_keyboard_interrupt_still_counts(self) -> None:
+        script = self.script("prog.py", "x = 1\nraise KeyboardInterrupt\n")
+        result = self.run_program(str(script))
+        self.assertEqual(result.returncode, -signal.SIGINT, output(result))
+        self.assertIn("KeyboardInterrupt", result.stderr)
+        _record, document = self.registration()
+        self.assertEqual(document["program"], str(script))
+        self.assertTrue((self.data_dir / document["dataset"]).is_file())
+        self.combine()
+        self.assertTrue((self.base / "combined" / ".coverage").is_file())
 
-        code, data_dir, _config_file = self.run_covrun(fake_main)
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            len(list((data_dir / "registry").glob("*.started"))), 1
+    def test_sigterm_saves_without_changing_the_signal_status(self) -> None:
+        script = self.script(
+            "prog.py",
+            "import time\nprint('ready', flush=True)\ntime.sleep(60)\n",
         )
+        process = self.start(str(script))
+        self.read_ready(process)
         self.assertEqual(
-            len(list((data_dir / "registry").glob("*.json"))), 0
+            self.finish(process, kill=False), -signal.SIGTERM
         )
+        _record, document = self.registration()
+        self.assertTrue((self.data_dir / document["dataset"]).is_file())
+        self.combine()
 
-    def test_run_records_successful_finalization(self) -> None:
-        def fake_main(arguments: list[str]) -> int:
-            for argument in arguments:
-                if argument.startswith("--data-file="):
-                    Path(argument.split("=", 1)[1]).write_text(
-                        "data", encoding="utf-8"
-                    )
-            return 0
+    def test_sigkill_before_the_dataset_is_saved_is_unsupported(self) -> None:
+        script = self.script(
+            "prog.py",
+            "import time\nprint('ready', flush=True)\ntime.sleep(60)\n",
+        )
+        process = self.start(str(script))
+        self.read_ready(process)
+        self.assertEqual(
+            self.finish(process, kill=True), -signal.SIGKILL
+        )
+        record, document = self.registration()
+        with self.assertRaises(policy.UnsupportedError) as raised:
+            self.combine()
+        message = str(raised.exception)
+        self.assertIn(record.stem, message)
+        self.assertIn(str(script), message)
+        self.assertIn(document["dataset"], message)
 
-        code, data_dir, _config_file = self.run_covrun(fake_main)
-        self.assertEqual(code, 0)
-        records = list((data_dir / "registry").glob("*.json"))
-        self.assertEqual(len(records), 1)
-        document = json.loads(records[0].read_text(encoding="utf-8"))
-        self.assertEqual(len(document["datasets"]), 1)
-        self.assertTrue((data_dir / document["datasets"][0]).is_file())
+    def test_registration_names_the_program_without_its_arguments(
+        self,
+    ) -> None:
+        script = self.script("prog.py", "print('done')\n")
+        result = self.run_program(str(script), "--secret", "value")
+        self.assertEqual(result.returncode, 0, output(result))
+        record, document = self.registration()
+        self.assertEqual(document["program"], str(script))
+        self.assertTrue((self.data_dir / document["dataset"]).is_file())
+        self.assertNotIn("--secret", record.read_text(encoding="utf-8"))
+
+    def test_registration_names_a_module_command(self) -> None:
+        self.assertEqual(
+            covrun._program(["-m", "prog", "--secret"]), "-m prog"
+        )
+        self.assertEqual(covrun._program(["prog.py", "--secret"]), "prog.py")
 
 
 class CoverageRegistryTests(unittest.TestCase):
@@ -461,16 +531,18 @@ class CoverageRegistryTests(unittest.TestCase):
     def record(
         self,
         *,
-        started: bool = True,
-        completed: bool = True,
-        datasets: tuple[str, ...] = (".coverage.abc",),
-    ) -> None:
-        if started:
-            (self.registry / "abc.started").write_text("", encoding="utf-8")
-        if completed:
-            (self.registry / "abc.json").write_text(
-                json.dumps({"datasets": list(datasets)}), encoding="utf-8"
-            )
+        dataset: str = ".coverage.abc",
+        program: str = "prog.py",
+        text: str | None = None,
+    ) -> Path:
+        path = self.registry / "abc.json"
+        path.write_text(
+            text
+            if text is not None
+            else json.dumps({"dataset": dataset, "program": program}),
+            encoding="utf-8",
+        )
+        return path
 
     def combine(self) -> None:
         coverage_tool.combine_coverage(
@@ -484,49 +556,58 @@ class CoverageRegistryTests(unittest.TestCase):
             self.combine()
         self.assertIn("no coverage invocation registered", str(raised.exception))
 
-    def test_missing_finalization_is_unsupported(self) -> None:
-        self.record(completed=False)
+    def test_missing_dataset_names_the_invocation_program_and_dataset(
+        self,
+    ) -> None:
+        record = self.record()
         with self.assertRaises(policy.UnsupportedError) as raised:
             self.combine()
-        self.assertIn("did not finalize", str(raised.exception))
+        message = str(raised.exception)
+        self.assertIn(record.stem, message)
+        self.assertIn("prog.py", message)
+        self.assertIn(".coverage.abc", message)
+        self.assertIn("is missing", message)
 
-    def test_missing_dataset_is_unsupported(self) -> None:
-        self.record()
+    def test_a_record_without_a_dataset_is_unsupported(self) -> None:
+        record = self.record(text=json.dumps({"program": "prog.py"}))
         with self.assertRaises(policy.UnsupportedError) as raised:
             self.combine()
-        self.assertIn("is missing", str(raised.exception))
-
-    def test_a_registry_record_without_datasets_is_unsupported(self) -> None:
-        (self.registry / "abc.started").write_text("", encoding="utf-8")
-        for document in ([], {"datasets": []}, {"datasets": "x"}):
-            with self.subTest(document=document):
-                (self.registry / "abc.json").write_text(
-                    json.dumps(document), encoding="utf-8"
-                )
-                with self.assertRaises(policy.UnsupportedError) as raised:
-                    self.combine()
-                self.assertIn(
-                    "no usable dataset list", str(raised.exception)
-                )
+        message = str(raised.exception)
+        self.assertIn("no usable dataset", message)
+        self.assertIn(str(record), message)
 
     def test_unsafe_dataset_names_are_unsupported(self) -> None:
-        for name in ("../escape", ""):
+        for name in ("../x", "/absolute/.coverage", ""):
             with self.subTest(name=name):
-                for record in self.registry.glob("*"):
-                    record.unlink()
-                self.record(datasets=(name,))
+                record = self.record(dataset=name)
                 with self.assertRaises(policy.UnsupportedError) as raised:
                     self.combine()
-                self.assertIn("unsafe dataset", str(raised.exception))
+                message = str(raised.exception)
+                self.assertIn("unsafe dataset", message)
+                self.assertIn(str(record), message)
 
-    def test_corrupt_dataset_is_unsupported(self) -> None:
-        self.record()
+    def test_truncated_record_is_unsupported_with_its_path(self) -> None:
+        record = self.record(text='{"dataset": ".coverage.abc"')
+        with self.assertRaises(policy.UnsupportedError) as raised:
+            self.combine()
+        message = str(raised.exception)
+        self.assertIn("is unreadable", message)
+        self.assertIn(str(record), message)
+
+    def test_corrupt_dataset_names_the_invocation_program_and_dataset(
+        self,
+    ) -> None:
+        record = self.record()
         (self.data_dir / ".coverage.abc").write_text(
             "garbage", encoding="utf-8"
         )
         with self.assertRaises(policy.UnsupportedError) as raised:
             self.combine()
-        self.assertIn("corrupt", str(raised.exception))
+        message = str(raised.exception)
+        self.assertIn("corrupt", message)
+        self.assertIn(record.stem, message)
+        self.assertIn("prog.py", message)
+        self.assertIn(".coverage.abc", message)
 
 
 class CoverageDeadlineTests(unittest.TestCase):

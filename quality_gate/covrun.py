@@ -42,18 +42,22 @@ def _remove_overrides() -> None:
             del os.environ[name]
 
 
-def _register(data_dir: Path) -> tuple[Path, str]:
+def _program(command: list[str]) -> str:
+    if command[0] == "-m":
+        return " ".join(command[:2])
+    return command[0]
+
+
+def _register(data_dir: Path, dataset: str, program: str) -> None:
     directory = registry_dir(data_dir)
     directory.mkdir(parents=True, exist_ok=True)
     invocation = uuid.uuid4().hex
-    (directory / f"{invocation}.started").write_text("", encoding="utf-8")
-    return directory, invocation
-
-
-def _finalize(directory: Path, invocation: str, dataset: str) -> None:
-    (directory / f"{invocation}.json").write_text(
-        json.dumps({"datasets": [dataset]}), encoding="utf-8"
+    temporary = directory / f"{invocation}.tmp"
+    temporary.write_text(
+        json.dumps({"dataset": dataset, "program": program}),
+        encoding="utf-8",
     )
+    temporary.replace(directory / f"{invocation}.json")
 
 
 def _coverage_main(coverage_dir: Path):
@@ -74,10 +78,10 @@ def _run_dataset(
     coverage_main,
     command: list[str],
 ) -> int:
-    directory, invocation = _register(data_dir)
     dataset = f".coverage.{uuid.uuid4().hex}"
+    _register(data_dir, dataset, _program(command))
     data_file = data_dir / dataset
-    code = coverage_main(
+    return coverage_main(
         [
             "run",
             f"--data-file={data_file}",
@@ -86,11 +90,6 @@ def _run_dataset(
             *command,
         ]
     )
-    # The wrapped program's exit status says nothing about whether coverage
-    # saved its dataset; a completed run finalizes whenever the dataset exists.
-    if data_file.is_file():
-        _finalize(directory, invocation, dataset)
-    return code
 
 
 def _run(argv: list[str]) -> int:
