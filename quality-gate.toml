@@ -33,7 +33,12 @@ description = "Documentation and plans"
 [[rule]]
 pattern = "qg.py"
 class = "python"
-reason = "the single gate command"
+reason = "the entry point"
+
+[[rule]]
+pattern = "quality_gate/*.py"
+class = "python"
+reason = "the gate implementation, one module per concern"
 
 [[rule]]
 pattern = "tests/*.py"

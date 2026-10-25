@@ -2,7 +2,9 @@
 
 A reusable, offline code-quality gate any repository can run, built to keep AI-written code high
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
-configuration (`quality-gate.toml`); this repository gates itself with the same tool.
+configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
+implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `clones`, `cli`);
+`qg.py` is only the entry point.
 
 ## Principles
 

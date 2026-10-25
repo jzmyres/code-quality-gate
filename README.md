@@ -25,6 +25,12 @@ an Emacs Lisp CRAP adapter.
 No third-party Python packages are needed. The command is intended to run as `python3 -I qg.py`, so
 the consuming repository's modules cannot leak into it.
 
+The implementation lives in the `quality_gate/` package next to `qg.py`: `policy.py` loads and
+validates the configuration, `files.py` resolves the repository and runs inventory and hygiene,
+`tools.py` owns the pinned tool lock, installation and lookup, `clones.py` owns jscpd, SARIF and
+the clone baseline, and `cli.py` holds the argument parser, `check` and `main`. `qg.py` is only
+the entry point.
+
 ## Quick start in a consuming repository
 
 Add the gate as a submodule at `code-quality-gate/`, fetch the pinned tool once, write the configuration,
