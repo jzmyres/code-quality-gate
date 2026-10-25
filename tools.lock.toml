@@ -9,3 +9,10 @@ version = "0.17.0"
 url = "https://github.com/astral-sh/ruff/releases/download/0.17.0/ruff-x86_64-unknown-linux-gnu.tar.gz"
 sha256 = "c94fc1dc71f054d06d9f1149442dcb471516aa2b7d4b7e8124e05d082d4c91d3"
 binary = "ruff-x86_64-unknown-linux-gnu/ruff"
+
+[coverage]
+version = "7.16.2"
+url = "https://files.pythonhosted.org/packages/3f/0c/7a64e1ac90541a8edf50daef0914848011fb057a5bf55284a4811e21939a/coverage-7.16.2-py3-none-any.whl"
+sha256 = "11d28e9123a9156cb405d8d27b44256c9a58fb5decc2073a8f17862057e3aa0f"
+format = "wheel"
+binary = "coverage/__init__.py"

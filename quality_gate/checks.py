@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +15,7 @@ from typing import Any
 
 from . import gate_result
 from .clones import measure_clones
+from .coverage_tool import combine_coverage
 from .files import command_hygiene, validate_inventory
 from .policy import (
     CheckDef,
@@ -21,6 +24,8 @@ from .policy import (
     UnsupportedError,
     UsageError,
 )
+from .python_crap import measure_crap
+from .python_tests import coverage_prefix, expand_run, parse_test_count
 from .ratchet import (
     RatchetResult,
     evaluate,
@@ -50,9 +55,12 @@ class CheckResult:
     threshold: float | None = None
     baseline_path: Path | None = None
     ratchet: RatchetResult | None = None
+    measurement: dict[str, Any] | None = None
+    evidence: Path | None = None
+    temporary: Any = field(default=None, repr=False, compare=False)
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "id": self.id,
             "tier": self.tier,
             "enforcement": self.enforcement,
@@ -68,6 +76,9 @@ class CheckResult:
             ],
             "resolved_baseline_entries": list(self.resolved_baseline_entries),
         }
+        if self.measurement is not None:
+            document["measurement"] = self.measurement
+        return document
 
 
 def _select_files(
@@ -155,6 +166,29 @@ def _command_result(
         termination=termination,
         threshold=check.threshold,
         baseline_path=check.baseline,
+    )
+
+
+def _adapter_result(
+    check: CheckDef,
+    start: float,
+    outcome: str,
+    *,
+    budget_seconds: int,
+    termination: str = "exit",
+    **fields: Any,
+) -> CheckResult:
+    return CheckResult(
+        id=check.id,
+        tier=check.tier,
+        enforcement=check.enforcement,
+        adapter=check.adapter,
+        metric_version=check.metric_version,
+        outcome=outcome,
+        duration_seconds=time.monotonic() - start,
+        budget_seconds=budget_seconds,
+        termination=termination,
+        **fields,
     )
 
 
@@ -331,6 +365,237 @@ def _run_clones(
     return result
 
 
+def _print_output(prefix: str, combined: str) -> None:
+    if combined.strip():
+        print(combined.rstrip(), file=sys.stderr)
+
+
+def _run_python_tests(
+    root: Path,
+    check: CheckDef,
+    *,
+    prefix: str,
+) -> CheckResult:
+    assert check.python_tests is not None
+    spec = check.python_tests
+    start = time.monotonic()
+
+    def result(
+        outcome: str,
+        *,
+        termination: str = "exit",
+        **fields: Any,
+    ) -> CheckResult:
+        return _adapter_result(
+            check,
+            start,
+            outcome,
+            budget_seconds=spec.budget_seconds,
+            termination=termination,
+            **fields,
+        )
+
+    temporary = tempfile.TemporaryDirectory(prefix="qg-coverage-")
+    data_dir = Path(temporary.name) / "data"
+    try:
+        data_dir.mkdir()
+        python_prefix = coverage_prefix(root, data_dir)
+    except UnsupportedError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return result("unsupported")
+    except OSError as error:
+        print(f"{prefix}: cannot create coverage data directory: {error}", file=sys.stderr)
+        return result("error")
+
+    command = expand_run(spec.run, python_prefix)
+    environment = os.environ.copy()
+    environment["QG_PYTHON"] = json.dumps(python_prefix)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=spec.budget_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        combined = _combine(error.stdout, error.stderr)
+        print(
+            f"{prefix}: command exceeded its {spec.budget_seconds} second budget",
+            file=sys.stderr,
+        )
+        _print_output(prefix, combined)
+        return result("fail", termination="budget")
+    except OSError as error:
+        print(f"{prefix}: cannot run command: {error}", file=sys.stderr)
+        return result("error")
+
+    combined = _combine(completed.stdout, completed.stderr)
+    if completed.returncode < 0:
+        print(
+            f"{prefix}: command terminated by signal {-completed.returncode}",
+            file=sys.stderr,
+        )
+        _print_output(prefix, combined)
+        return result("fail", termination="signal")
+    if completed.returncode != 0:
+        count, _count_error = parse_test_count(spec, combined)
+        if count == 0:
+            print(
+                f"{prefix}: command exited {completed.returncode} and "
+                "reported 0 tests; zero tests is not a pass",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"{prefix}: command exited {completed.returncode}",
+                file=sys.stderr,
+            )
+        _print_output(prefix, combined)
+        return result("fail")
+
+    count, count_error = parse_test_count(spec, combined)
+    if count_error is not None:
+        print(f"{prefix}: {count_error}", file=sys.stderr)
+        _print_output(prefix, combined)
+        return result("unsupported")
+    assert count is not None
+    if count == 0:
+        print(
+            f"{prefix}: command reported 0 tests; zero tests is not a pass",
+            file=sys.stderr,
+        )
+        _print_output(prefix, combined)
+        return result("fail")
+
+    combined_file = Path(temporary.name) / "combined" / ".coverage"
+    try:
+        combine_coverage(data_dir, combined_file)
+    except UnsupportedError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return result("unsupported")
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return result("unsupported")
+
+    outcome = result(
+        "pass",
+        measurement={"tests": count},
+        evidence=combined_file,
+        temporary=temporary,
+    )
+    print(
+        f"{prefix}: passed ({count} tests, "
+        f"{outcome.duration_seconds:.2f}s)",
+        flush=True,
+    )
+    return outcome
+
+
+def _run_python_crap(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    files: list[str],
+    classes: dict[str, str],
+    *,
+    prefix: str,
+    prior: dict[str, CheckResult],
+) -> CheckResult:
+    assert check.python_crap is not None
+    spec = check.python_crap
+    start = time.monotonic()
+
+    def result(
+        outcome: str,
+        *,
+        ratchet: RatchetResult | None = None,
+        measurement: dict[str, Any] | None = None,
+    ) -> CheckResult:
+        return _adapter_result(
+            check,
+            start,
+            outcome,
+            budget_seconds=CLONE_BUDGET_SECONDS,
+            findings=ratchet.findings if ratchet is not None else [],
+            resolved_baseline_entries=(
+                ratchet.resolved if ratchet is not None else []
+            ),
+            threshold=check.threshold,
+            baseline_path=check.baseline,
+            ratchet=ratchet,
+            measurement=measurement,
+        )
+
+    selected, names = _select_files(config, check, files, classes)
+    if not selected:
+        class_text = ", ".join(names) or "none"
+        print(
+            f"{prefix}: no files selected (classes: {class_text}); "
+            "zero inputs is not a pass",
+            file=sys.stderr,
+        )
+        return result("fail")
+
+    required = prior.get(spec.requires)
+    if required is None or required.outcome != "pass":
+        print(
+            f"{prefix}: coverage unreliable: {spec.requires} did not pass",
+            file=sys.stderr,
+        )
+        return result("unsupported")
+    if required.evidence is None or not required.evidence.is_file():
+        print(
+            f"{prefix}: coverage unreliable: {spec.requires} produced no "
+            "combined coverage data",
+            file=sys.stderr,
+        )
+        return result("unsupported")
+
+    try:
+        measurement = measure_crap(root, selected, required.evidence)
+    except UnsupportedError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return result("unsupported")
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return result("error")
+    if measurement.failures:
+        for failure in measurement.failures:
+            print(f"{prefix}: {failure}", file=sys.stderr)
+        return result("fail")
+
+    try:
+        entries = load_baseline(check.baseline)
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return result("error")
+    assert check.threshold is not None
+    ratchet = evaluate(
+        measurement.findings,
+        entries,
+        threshold=check.threshold,
+        enforcement=check.enforcement,
+        prefix=prefix,
+        adapter=check.adapter,
+    )
+    outcome = result(
+        ratchet.outcome,
+        ratchet=ratchet,
+        measurement={"functions": len(measurement.findings)},
+    )
+    if ratchet.outcome == "pass":
+        noun = "function" if len(measurement.findings) == 1 else "functions"
+        print(
+            f"{prefix}: {len(measurement.findings)} {noun} within threshold",
+            flush=True,
+        )
+    return outcome
+
+
 def run_check(
     root: Path,
     config: Config,
@@ -339,20 +604,34 @@ def run_check(
     classes: dict[str, str],
     *,
     prefix: str,
+    prior: dict[str, CheckResult] | None = None,
 ) -> CheckResult:
     if check.adapter == "command":
         return _run_command(root, config, check, files, classes, prefix)
     if check.adapter == "clones":
         return _run_clones(root, config, check, files, classes, prefix)
+    if check.adapter == "python_tests":
+        return _run_python_tests(root, check, prefix=prefix)
+    if check.adapter == "python_crap":
+        return _run_python_crap(
+            root,
+            config,
+            check,
+            files,
+            classes,
+            prefix=prefix,
+            prior=prior or {},
+        )
     raise GateError(f"unsupported adapter {check.adapter!r}")
 
 
 def _skipped(check: CheckDef) -> CheckResult:
-    budget = (
-        check.command.budget_seconds
-        if check.command is not None
-        else CLONE_BUDGET_SECONDS
-    )
+    if check.command is not None:
+        budget = check.command.budget_seconds
+    elif check.python_tests is not None:
+        budget = check.python_tests.budget_seconds
+    else:
+        budget = CLONE_BUDGET_SECONDS
     return CheckResult(
         id=check.id,
         tier=check.tier,
@@ -410,25 +689,29 @@ def _check_command(
     hygiene_code = command_hygiene(root, config)
 
     results: list[CheckResult] = []
+    prior: dict[str, CheckResult] = {}
     for check in config.checks.values():
         if inventory_code != 0:
             print(
                 f"check: {check.id}: skipped because inventory failed",
                 file=sys.stderr,
             )
-            results.append(_skipped(check))
+            skipped = _skipped(check)
+            results.append(skipped)
+            prior[check.id] = skipped
             continue
         print(f"check: {check.id} ({check.adapter})", flush=True)
-        results.append(
-            run_check(
-                root,
-                config,
-                check,
-                files,
-                classes,
-                prefix=f"check: {check.id}",
-            )
+        outcome = run_check(
+            root,
+            config,
+            check,
+            files,
+            classes,
+            prefix=f"check: {check.id}",
+            prior=prior,
         )
+        results.append(outcome)
+        prior[check.id] = outcome
 
     prune_refused = False
     if prune_id is not None:

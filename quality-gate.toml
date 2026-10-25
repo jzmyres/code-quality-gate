@@ -13,12 +13,12 @@ required_tiers = [1]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones"]
+checks = ["ruff", "clones", "crap"]
 
 [classes.test]
 code = true
 description = "Python tests that execute the gate on fixture repositories"
-checks = ["ruff", "clones"]
+checks = ["ruff", "clones", "tests"]
 
 [classes.config]
 code = false
@@ -50,7 +50,7 @@ reason = "tests execute the gate against disposable fixture repositories"
 [[rule]]
 pattern = "Makefile"
 class = "build"
-reason = "runs Ruff, py_compile, the tests and the gate itself"
+reason = "the one check entry point"
 
 [[rule]]
 pattern = ".github/workflows/check.yml"
@@ -89,3 +89,18 @@ tier = 1
 enforcement = "enforced"
 min_tokens = 50
 baseline = "quality-gate-clones.toml"
+
+[checks.tests]
+adapter = "python_tests"
+tier = 1
+enforcement = "enforced"
+run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
+tests_pattern = "^Ran (\\d+) tests? in"
+
+[checks.crap]
+adapter = "python_crap"
+tier = 1
+enforcement = "enforced"
+requires = "tests"
+threshold = 6
+baseline = "quality-gate-crap.toml"

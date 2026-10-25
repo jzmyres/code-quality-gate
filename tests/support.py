@@ -73,6 +73,32 @@ BASE_FILES = {
     ".gitignore": "__pycache__/\n",
 }
 
+PYTHON_TEST_HEADER = (
+    "import pathlib\n"
+    "import sys\n"
+    "import unittest\n"
+    "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))\n"
+)
+
+PYTHON_COMMON_RULE_LINES = [
+    "",
+    "[[rule]]",
+    'pattern = "*.toml"',
+    'class = "config"',
+    'reason = "configuration"',
+    "",
+    "[[rule]]",
+    'pattern = "*.md"',
+    'class = "doc"',
+    'reason = "documentation"',
+    "",
+    "[[rule]]",
+    'pattern = ".gitignore"',
+    'class = "config"',
+    'reason = "ignore rules"',
+    "",
+]
+
 FAKE_JSCPD = """\
 #!@PYTHON@
 import json
@@ -309,6 +335,13 @@ class FixtureCase(unittest.TestCase):
             env.update(extra)
         return env
 
+    def python_prefix(self) -> list[str]:
+        """The gate's coverage prefix when QG_PYTHON exports one."""
+        configured = os.environ.get("QG_PYTHON")
+        if configured:
+            return json.loads(configured)
+        return [sys.executable, "-I"]
+
     def run_qg(
         self,
         *args: str,
@@ -318,7 +351,7 @@ class FixtureCase(unittest.TestCase):
         include_repo: bool = True,
         timeout: int = 120,
     ) -> subprocess.CompletedProcess[str]:
-        command = [sys.executable, "-I", str(QG)]
+        command = [*self.python_prefix(), str(QG)]
         if include_repo:
             command.extend(["--repo", str(repo or self.repo)])
         command.extend(args)

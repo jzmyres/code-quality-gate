@@ -4,8 +4,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import stat
 import tarfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from support import RUFF_VERSION, FixtureCase, output
@@ -58,6 +60,33 @@ class ToolsTests(FixtureCase):
                 archive.addfile(info, io.BytesIO(b"evil"))
         return path
 
+    def make_wheel(
+        self,
+        name: str = "tool.whl",
+        *,
+        files: dict[str, bytes] | None = None,
+        links: dict[str, str] | None = None,
+    ) -> Path:
+        path = self.base / name
+        contents = files
+        if contents is None:
+            contents = {
+                "pkg/__init__.py": b"VALUE = 1\n",
+                "pkg/mod.py": b"\n",
+            }
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for member, content in contents.items():
+                info = zipfile.ZipInfo(member)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o644) << 16
+                archive.writestr(info, content)
+            for member, target in (links or {}).items():
+                info = zipfile.ZipInfo(member)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(info, target)
+        return path
+
     def sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -68,17 +97,20 @@ class ToolsTests(FixtureCase):
         *,
         version: str = VERSION,
         binary: str = "jscpd",
+        archive_format: str | None = None,
         path: Path | None = None,
     ) -> Path:
         lock = path or (self.base / "lock.toml")
-        lock.write_text(
-            "[jscpd]\n"
-            f'version = "{version}"\n'
-            f"url = {json.dumps(url)}\n"
-            f'sha256 = "{digest}"\n'
-            f'binary = "{binary}"\n',
-            encoding="utf-8",
-        )
+        lines = [
+            "[jscpd]",
+            f'version = "{version}"',
+            f"url = {json.dumps(url)}",
+            f'sha256 = "{digest}"',
+        ]
+        if archive_format is not None:
+            lines.append(f'format = "{archive_format}"')
+        lines.append(f'binary = "{binary}"')
+        lock.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return lock
 
     def fetch(
@@ -104,6 +136,20 @@ class ToolsTests(FixtureCase):
 
     def assert_not_installed(self, tools: Path) -> None:
         self.assertFalse((tools / f"jscpd-{VERSION}").exists())
+
+    def fetch_wheel_refused(self, wheel: Path, needle: str) -> None:
+        lock = self.write_lock(
+            wheel.as_uri(),
+            self.sha256(wheel),
+            binary="pkg/__init__.py",
+            archive_format="wheel",
+        )
+        tools = self.base / "tools"
+        result = self.fetch(lock, tools)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn(needle, text)
+        self.assert_not_installed(tools)
 
     def fetch_ok(self, archive: Path) -> tuple[Path, object]:
         lock = self.write_lock(archive.as_uri(), self.sha256(archive))
@@ -308,6 +354,76 @@ class ToolsTests(FixtureCase):
         self.assertEqual(result.returncode, 2, text)
         self.assertIn("jscpd.sha256", text)
         self.assertIn("64-character", text)
+
+    def test_fetch_wheel_extracts_the_zip(self) -> None:
+        wheel = self.make_wheel()
+        lock = self.write_lock(
+            wheel.as_uri(),
+            self.sha256(wheel),
+            binary="pkg/__init__.py",
+            archive_format="wheel",
+        )
+        tools = self.base / "tools"
+        result = self.fetch(lock, tools)
+        self.assertEqual(result.returncode, 0, output(result))
+        installed = tools / f"jscpd-{VERSION}" / "pkg" / "__init__.py"
+        self.assertTrue(installed.is_file())
+        self.assertEqual(
+            installed.read_text(encoding="utf-8"), "VALUE = 1\n"
+        )
+        self.assertTrue(
+            (tools / f"jscpd-{VERSION}" / "pkg" / "mod.py").is_file()
+        )
+
+    def test_fetch_wheel_with_wrong_hash_installs_nothing(self) -> None:
+        wheel = self.make_wheel()
+        lock = self.write_lock(
+            wheel.as_uri(),
+            "0" * 64,
+            binary="pkg/__init__.py",
+            archive_format="wheel",
+        )
+        tools = self.base / "tools"
+        result = self.fetch(lock, tools)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("sha256 mismatch", text)
+        self.assert_not_installed(tools)
+
+    def test_fetch_wheel_refuses_path_traversal_member(self) -> None:
+        wheel = self.make_wheel(
+            files={
+                "../escape": b"evil\n",
+                "pkg/__init__.py": b"VALUE = 1\n",
+            }
+        )
+        self.fetch_wheel_refused(wheel, "unsafe archive member")
+        self.assertFalse((self.base / "escape").exists())
+
+    def test_fetch_wheel_refuses_absolute_member(self) -> None:
+        wheel = self.make_wheel(
+            files={
+                "/absolute-escape": b"evil\n",
+                "pkg/__init__.py": b"VALUE = 1\n",
+            }
+        )
+        self.fetch_wheel_refused(wheel, "unsafe archive member")
+
+    def test_fetch_wheel_refuses_symlink_member(self) -> None:
+        wheel = self.make_wheel(links={"pkg/link": "/etc/passwd"})
+        self.fetch_wheel_refused(wheel, "is a link")
+
+    def test_fetch_rejects_unknown_archive_format(self) -> None:
+        lock = self.write_lock(
+            "file:///tmp/x.zip",
+            "0" * 64,
+            archive_format="zip",
+        )
+        result = self.fetch(lock, self.base / "tools")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("jscpd.format", text)
+        self.assertIn("one of tar, wheel", text)
 
     def test_tools_path_prints_the_default_path(self) -> None:
         tools = self.base / "tools"

@@ -5,12 +5,14 @@ import hashlib
 import http.client
 import os
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -26,6 +28,7 @@ class Tool:
     url: str
     sha256: str
     binary: str
+    format: str = "tar"
 
 
 def _default_lock_path() -> Path:
@@ -86,12 +89,21 @@ def load_tools(lock: Path) -> dict[str, Tool]:
                 "a safe relative path",
                 _describe(binary),
             )
+        archive_format = raw.get("format", "tar")
+        if archive_format not in ("tar", "wheel"):
+            raise _tool_error(
+                lock,
+                f"{full_key}.format",
+                "one of tar, wheel",
+                _describe(archive_format),
+            )
         tools[name] = Tool(
             name=name,
             version=version,
             url=url,
             sha256=digest.lower(),
             binary=binary,
+            format=archive_format,
         )
     return tools
 
@@ -135,17 +147,21 @@ def _verify_sha256(tool: Tool, archive: Path) -> None:
         )
 
 
+def _unsafe_member(tool: Tool, name: str) -> GateError:
+    return GateError(
+        f"tools: {tool.name} {tool.version}: unsafe archive member "
+        f"{name!r}; nothing installed"
+    )
+
+
 def _member_path(member: tarfile.TarInfo, tool: Tool) -> PurePosixPath:
     path = PurePosixPath(member.name)
     if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: unsafe archive member "
-            f"{member.name!r}; nothing installed"
-        )
+        raise _unsafe_member(tool, member.name)
     return path
 
 
-def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
+def _extract_tar(archive_path: Path, destination: Path, tool: Tool) -> None:
     try:
         with tarfile.open(archive_path, "r:*") as archive:
             members = archive.getmembers()
@@ -184,6 +200,57 @@ def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
         raise GateError(
             f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"
         ) from error
+
+
+def _wheel_member_path(member: zipfile.ZipInfo, tool: Tool) -> PurePosixPath:
+    path = PurePosixPath(member.filename)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise _unsafe_member(tool, member.filename)
+    mode = member.external_attr >> 16
+    if stat.S_ISLNK(mode):
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: unsafe archive member "
+            f"{member.filename!r} is a link; nothing installed"
+        )
+    if member.is_dir() or stat.S_ISDIR(mode):
+        return path
+    file_type = stat.S_IFMT(mode)
+    if file_type not in (0, stat.S_IFREG):
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: unsafe archive member "
+            f"{member.filename!r} is not a regular file; nothing installed"
+        )
+    return path
+
+
+def _extract_wheel(archive_path: Path, destination: Path, tool: Tool) -> None:
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            for member in members:
+                _wheel_member_path(member, tool)
+            for member in members:
+                path = _wheel_member_path(member, tool)
+                if member.is_dir() or stat.S_ISDIR(member.external_attr >> 16):
+                    continue
+                target = destination.joinpath(*path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, target.open("wb") as stream:
+                    shutil.copyfileobj(source, stream)
+                mode = (member.external_attr >> 16) & 0o777
+                if mode:
+                    os.chmod(target, mode)
+    except (zipfile.BadZipFile, OSError, EOFError) as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"
+        ) from error
+
+
+def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
+    if tool.format == "wheel":
+        _extract_wheel(archive_path, destination, tool)
+    else:
+        _extract_tar(archive_path, destination, tool)
 
 
 def _fetch_tool(tool: Tool, tools_root: Path) -> None:
@@ -263,7 +330,7 @@ def command_tools_path(lock: Path, name: str) -> int:
     print(_tool_binary(tools[name], _tools_dir()))
     return 0
 
-def tool_binary(name: str) -> Path:
+def _pinned_tool(name: str) -> tuple[Path, Tool]:
     lock = _default_lock_path()
     tools = load_tools(lock)
     tool = tools.get(name)
@@ -273,6 +340,11 @@ def tool_binary(name: str) -> Path:
             f"{lock}: unknown tool {name!r} (pinned tools: {known}); "
             f"run '{TOOLS_FETCH}'"
         )
+    return lock, tool
+
+
+def tool_binary(name: str) -> Path:
+    _lock, tool = _pinned_tool(name)
     binary = _tool_binary(tool, _tools_dir())
     if not binary.is_file():
         raise UnsupportedError(
@@ -280,6 +352,19 @@ def tool_binary(name: str) -> Path:
             f"run '{TOOLS_FETCH}'"
         )
     return binary
+
+
+def installed_tool_dir(name: str) -> Path:
+    """The install directory of a pinned tool, proven by its binary file."""
+    _lock, tool = _pinned_tool(name)
+    directory = _tools_dir() / f"{tool.name}-{tool.version}"
+    binary = directory / tool.binary
+    if not binary.is_file():
+        raise UnsupportedError(
+            f"{name} {tool.version} is not installed at {binary}; "
+            f"run '{TOOLS_FETCH}'"
+        )
+    return directory
 
 
 def _jscpd_binary() -> Path:

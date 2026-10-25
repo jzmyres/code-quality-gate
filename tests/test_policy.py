@@ -224,6 +224,48 @@ class PolicyTests(FixtureCase):
             "a string",
         )
 
+    def test_python_tests_needs_a_tests_pattern(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.tests]\nadapter = "python_tests"\ntier = 1\n'
+            'enforcement = "enforced"\n'
+            'run = ["{python}", "-m", "unittest"]\n',
+            "checks.tests.tests_pattern",
+            "missing",
+        )
+
+    def test_python_tests_pattern_needs_one_capture_group(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.tests]\nadapter = "python_tests"\ntier = 1\n'
+            'enforcement = "enforced"\n'
+            'run = ["{python}", "-m", "unittest"]\n'
+            'tests_pattern = "Ran \\\\d+ tests"\n',
+            "checks.tests.tests_pattern",
+            "one capture group",
+            "0 capture groups",
+        )
+
+    def test_python_crap_requires_a_known_check(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.crap]\nadapter = "python_crap"\ntier = 1\n'
+            'enforcement = "enforced"\nrequires = "missing"\n'
+            'baseline = "crap.toml"\n',
+            "checks.crap.requires",
+            "unknown check 'missing'",
+        )
+
+    def test_python_crap_requires_a_python_tests_check(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.crap]\nadapter = "python_crap"\ntier = 1\n'
+            'enforcement = "enforced"\nrequires = "smoke"\n'
+            'baseline = "crap.toml"\n',
+            "checks.crap.requires",
+            "is a command check",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

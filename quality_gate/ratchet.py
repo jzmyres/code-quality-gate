@@ -19,6 +19,7 @@ class Finding:
     subject: str
     value: float
     location: str
+    measurement: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class FindingResult:
     location: str
     expired: bool = False
     error: str | None = None
+    measurement: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -55,6 +57,8 @@ class FindingResult:
         }
         if self.error is not None:
             result["error"] = self.error
+        if self.measurement is not None:
+            result["measurement"] = self.measurement
         return result
 
 
@@ -254,6 +258,12 @@ def _subject_label(subject: str, adapter: str, has_entry: bool) -> str:
     return subject
 
 
+def _display_number(value: float, adapter: str) -> str:
+    if adapter == "python_crap":
+        return f"{value:.1f}"
+    return _number(value)
+
+
 def _format_failure(
     prefix: str,
     finding: Finding,
@@ -274,9 +284,15 @@ def _format_failure(
         if expired and entry is not None and entry.expires is not None:
             detail += f" (baseline entry expired {entry.expires.isoformat()})"
     else:
-        detail = f"value {_number(finding.value)} exceeds threshold {_number(threshold)}"
+        detail = (
+            f"value {_display_number(finding.value, adapter)} exceeds "
+            f"threshold {_display_number(threshold, adapter)}"
+        )
         if entry is not None and not expired:
-            detail += f" and baseline bound {_number(entry.bound)}"
+            detail += (
+                " and baseline bound "
+                f"{_display_number(entry.bound, adapter)}"
+            )
         if expired and entry is not None and entry.expires is not None:
             detail += f" (baseline entry expired {entry.expires.isoformat()})"
     return f"{prefix}: {label}: {detail} at {finding.location}"
@@ -348,6 +364,7 @@ def evaluate(
             blocking=blocking,
             location=finding.location,
             expired=expired,
+            measurement=finding.measurement,
         )
         if finding.subject in empty_reason_subjects:
             result.blocking = enforcement == "enforced"

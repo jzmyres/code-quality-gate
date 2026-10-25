@@ -11,8 +11,10 @@ from typing import Any
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_MIN_TOKENS = 50
 DEFAULT_BUDGET_SECONDS = 600
+DEFAULT_TESTS_BUDGET_SECONDS = 900
+DEFAULT_CRAP_THRESHOLD = 6.0
 SUPPORTED_SCHEMA = 1
-SUPPORTED_ADAPTERS = ("command", "clones")
+SUPPORTED_ADAPTERS = ("command", "clones", "python_tests", "python_crap")
 COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement")
 TOP_LEVEL_KEYS = (
     "schema",
@@ -77,6 +79,20 @@ class CloneSpec:
 
 
 @dataclass(frozen=True)
+class PythonTestsSpec:
+    run: tuple[str, ...]
+    tests_pattern: str
+    tests_pattern_re: re.Pattern[str]
+    budget_seconds: int
+
+
+@dataclass(frozen=True)
+class PythonCrapSpec:
+    requires: str
+    baseline: Path
+
+
+@dataclass(frozen=True)
 class CheckDef:
     id: str
     adapter: str
@@ -85,6 +101,8 @@ class CheckDef:
     metric_version: str
     command: CommandSpec | None
     clones: CloneSpec | None
+    python_tests: PythonTestsSpec | None
+    python_crap: PythonCrapSpec | None
     threshold: float | None
     baseline: Path | None
 
@@ -231,6 +249,27 @@ def _integer(
     return value
 
 
+def _number(
+    parent: dict[str, Any],
+    key: str,
+    path: Path,
+    full_key: str,
+    *,
+    default: float | None = None,
+    minimum: float | None = None,
+) -> float:
+    if key not in parent:
+        if default is None:
+            raise _config_error(path, full_key, "a number", "missing")
+        return default
+    value = parent[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _config_error(path, full_key, "a number", _describe(value))
+    if minimum is not None and value < minimum:
+        raise _config_error(path, full_key, f"a number >= {minimum}", str(value))
+    return float(value)
+
+
 def _integer_list(
     parent: dict[str, Any], key: str, path: Path, full_key: str
 ) -> tuple[int, ...]:
@@ -346,6 +385,55 @@ def _parse_clones(
     return CloneSpec(min_tokens, baseline)
 
 
+def _parse_python_tests(
+    raw: dict[str, Any], path: Path, full_key: str
+) -> PythonTestsSpec:
+    run = _string_list(raw, "run", path, f"{full_key}.run")
+    if not run:
+        raise _config_error(
+            path, f"{full_key}.run", "a non-empty argument list", "an empty list"
+        )
+    pattern_text = _string(
+        raw, "tests_pattern", path, f"{full_key}.tests_pattern"
+    )
+    try:
+        pattern = re.compile(pattern_text, re.MULTILINE)
+    except re.error as error:
+        raise _config_error(
+            path,
+            f"{full_key}.tests_pattern",
+            "a valid regular expression",
+            str(error),
+        ) from error
+    if pattern.groups != 1:
+        raise _config_error(
+            path,
+            f"{full_key}.tests_pattern",
+            "a regular expression with one capture group",
+            f"{pattern.groups} capture groups",
+        )
+    budget = _integer(
+        raw,
+        "budget_seconds",
+        path,
+        f"{full_key}.budget_seconds",
+        default=DEFAULT_TESTS_BUDGET_SECONDS,
+        minimum=1,
+    )
+    return PythonTestsSpec(tuple(run), pattern_text, pattern, budget)
+
+
+def _parse_python_crap(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> PythonCrapSpec:
+    requires = _string(raw, "requires", path, f"{full_key}.requires")
+    baseline_name = _string(raw, "baseline", path, f"{full_key}.baseline")
+    baseline = Path(baseline_name)
+    if not baseline.is_absolute():
+        baseline = root / baseline
+    return PythonCrapSpec(requires, baseline)
+
+
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path
 ) -> dict[str, CheckDef]:
@@ -370,8 +458,17 @@ def _parse_checks(
             )
         if adapter == "command":
             allowed = (*COMMON_CHECK_KEYS, "run", "budget_seconds", "must_match")
-        else:
+        elif adapter == "clones":
             allowed = (*COMMON_CHECK_KEYS, "min_tokens", "baseline")
+        elif adapter == "python_tests":
+            allowed = (
+                *COMMON_CHECK_KEYS,
+                "run",
+                "tests_pattern",
+                "budget_seconds",
+            )
+        else:
+            allowed = (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
         _check_keys(raw, allowed, path, full_key)
         tier = _integer(
             raw, "tier", path, f"{full_key}.tier", minimum=1, maximum=4
@@ -386,16 +483,33 @@ def _parse_checks(
             )
         command: CommandSpec | None = None
         clones: CloneSpec | None = None
+        python_tests: PythonTestsSpec | None = None
+        python_crap: PythonCrapSpec | None = None
         baseline: Path | None = None
         threshold: float | None = None
         if adapter == "command":
             command = _parse_command(raw, path, full_key)
             metric_version = "command-exit/1"
-        else:
+        elif adapter == "clones":
             clones = _parse_clones(raw, root, path, full_key)
             baseline = clones.baseline
             threshold = 0
             metric_version = "jscpd-clone-occurrences/1"
+        elif adapter == "python_tests":
+            python_tests = _parse_python_tests(raw, path, full_key)
+            metric_version = "test-count/1"
+        else:
+            python_crap = _parse_python_crap(raw, root, path, full_key)
+            baseline = python_crap.baseline
+            threshold = _number(
+                raw,
+                "threshold",
+                path,
+                f"{full_key}.threshold",
+                default=DEFAULT_CRAP_THRESHOLD,
+                minimum=0,
+            )
+            metric_version = "python-lines/1"
         checks[name] = CheckDef(
             id=name,
             adapter=adapter,
@@ -404,9 +518,29 @@ def _parse_checks(
             metric_version=metric_version,
             command=command,
             clones=clones,
+            python_tests=python_tests,
+            python_crap=python_crap,
             threshold=threshold,
             baseline=baseline,
         )
+    for name, check in checks.items():
+        if check.python_crap is None:
+            continue
+        required = checks.get(check.python_crap.requires)
+        if required is None:
+            raise _config_error(
+                path,
+                f"checks.{name}.requires",
+                "the id of a python_tests check",
+                f"unknown check {check.python_crap.requires!r}",
+            )
+        if required.adapter != "python_tests":
+            raise _config_error(
+                path,
+                f"checks.{name}.requires",
+                "the id of a python_tests check",
+                f"{check.python_crap.requires!r} is a {required.adapter} check",
+            )
     return checks
 
 
