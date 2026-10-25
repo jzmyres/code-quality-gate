@@ -1,3 +1,5 @@
+schema = 1
+
 [code]
 patterns = ["*.py", "*.sh", "*.el"]
 shebangs = ["sh", "bash", "python*"]
@@ -5,18 +7,18 @@ shebangs = ["sh", "bash", "python*"]
 [hygiene]
 max_bytes = 10485760
 
-[clones]
-classes = ["python", "test"]
-min_tokens = 50
-baseline = "quality-gate-clones.toml"
+[levels]
+required_tiers = [1]
 
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
+checks = ["ruff", "clones"]
 
 [classes.test]
 code = true
 description = "Python tests that execute the gate on fixture repositories"
+checks = ["ruff", "clones"]
 
 [classes.config]
 code = false
@@ -69,3 +71,16 @@ reason = "repository ignore rules"
 pattern = "LICENSE"
 class = "doc"
 reason = "AGPL-3.0 licence text"
+
+[checks.ruff]
+adapter = "command"
+tier = 1
+enforcement = "enforced"
+run = ["{tool:ruff}", "check", "--no-cache", "{files}"]
+
+[checks.clones]
+adapter = "clones"
+tier = 1
+enforcement = "enforced"
+min_tokens = 50
+baseline = "quality-gate-clones.toml"

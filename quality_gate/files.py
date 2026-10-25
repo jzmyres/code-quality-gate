@@ -120,6 +120,37 @@ def validate_inventory(
     classes: dict[str, str] = {}
     violations: list[str] = []
     known_classes = ", ".join(sorted(config.classes)) or "none"
+    known_checks = ", ".join(config.checks) or "none"
+    exempt = {
+        (entry.class_name, entry.tier) for entry in config.not_applicable
+    }
+
+    for name, class_def in config.classes.items():
+        for check_id in class_def.checks:
+            if check_id not in config.checks:
+                violations.append(
+                    f"classes.{name}: unknown check {check_id!r} "
+                    f"(known checks: {known_checks})"
+                )
+        if not class_def.code:
+            continue
+        if not class_def.checks:
+            violations.append(
+                f"classes.{name}: code class lists no check "
+                "(expected at least one check id)"
+            )
+        for tier in config.required_tiers:
+            satisfied = any(
+                check_id in config.checks
+                and config.checks[check_id].tier == tier
+                and config.checks[check_id].enforcement == "enforced"
+                for check_id in class_def.checks
+            )
+            if not satisfied and (name, tier) not in exempt:
+                violations.append(
+                    f"classes.{name}: required tier {tier} has no enforced "
+                    "check and no not_applicable entry"
+                )
 
     for rule in config.rules:
         if not rule.pattern:

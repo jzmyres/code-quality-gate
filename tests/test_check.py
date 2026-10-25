@@ -15,7 +15,8 @@ class CheckTests(FixtureCase):
         self.assertIn("inventory: 4 files match 4 rules", text)
         self.assertIn("check: hygiene", text)
         self.assertIn("hygiene: 4 files within 10485760 bytes", text)
-        self.assertIn("check: passed (2 checks)", text)
+        self.assertIn("check: smoke (command)", text)
+        self.assertIn("check: passed (3 checks)", text)
 
     def test_check_reports_inventory_failure_and_still_runs_hygiene(self) -> None:
         self.add_file("mystery.txt", "x\n")
@@ -24,7 +25,8 @@ class CheckTests(FixtureCase):
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("inventory: mystery.txt", text)
         self.assertIn("hygiene: 5 files within", text)
-        self.assertIn("check: failed (inventory)", text)
+        self.assertIn("skipped because inventory failed", text)
+        self.assertIn("check: failed (inventory, smoke)", text)
 
     def test_check_reports_hygiene_failure(self) -> None:
         self.write_config(
@@ -46,9 +48,9 @@ class CheckTests(FixtureCase):
         result = self.run_qg("check", env=env)
         text = output(result)
         self.assertEqual(result.returncode, 0, text)
-        self.assertIn("check: clones", text)
-        self.assertIn("clones: 0 clones", text)
-        self.assertIn("check: passed (3 checks)", text)
+        self.assertIn("check: clones (clones)", text)
+        self.assertIn("check: clones: 0 clones", text)
+        self.assertIn("check: passed (4 checks)", text)
 
     def check_failure(self, env: dict[str, str], *needles: str) -> None:
         result = self.run_qg("check", env=env)
@@ -76,7 +78,7 @@ class CheckTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("file enumeration failed", text)
-        self.assertIn("check: failed (inventory, hygiene)", text)
+        self.assertIn("check: failed (inventory, hygiene, smoke)", text)
 
     def test_check_with_missing_config_exits_2(self) -> None:
         self.config_path.unlink()
@@ -91,8 +93,8 @@ class CheckTests(FixtureCase):
         env = {"QG_TOOLS_DIR": str(self.base / "empty-tools")}
         self.check_failure(
             env,
-            "clones: skipped because inventory failed",
-            "check: failed (inventory, clones)",
+            "check: clones: skipped because inventory failed",
+            "check: failed (inventory, smoke, clones)",
         )
 
 

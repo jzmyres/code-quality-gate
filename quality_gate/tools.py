@@ -14,7 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from .policy import GateError, UsageError, _describe, _string
+from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
 
@@ -263,16 +263,24 @@ def command_tools_path(lock: Path, name: str) -> int:
     print(_tool_binary(tools[name], _tools_dir()))
     return 0
 
-def _jscpd_binary() -> Path:
+def tool_binary(name: str) -> Path:
     lock = _default_lock_path()
     tools = load_tools(lock)
-    tool = tools.get("jscpd")
+    tool = tools.get(name)
     if tool is None:
-        raise GateError(f"{lock}: no [jscpd] tool is pinned")
+        known = ", ".join(sorted(tools)) or "none"
+        raise UnsupportedError(
+            f"{lock}: unknown tool {name!r} (pinned tools: {known}); "
+            f"run '{TOOLS_FETCH}'"
+        )
     binary = _tool_binary(tool, _tools_dir())
     if not binary.is_file():
-        raise GateError(
-            f"jscpd {tool.version} is not installed at {binary}; "
+        raise UnsupportedError(
+            f"{name} {tool.version} is not installed at {binary}; "
             f"run '{TOOLS_FETCH}'"
         )
     return binary
+
+
+def _jscpd_binary() -> Path:
+    return tool_binary("jscpd")

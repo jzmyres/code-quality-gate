@@ -1,4 +1,4 @@
-RUFF ?= /home/work/.local/share/spacemacs-tools/venv/bin/ruff
+RUFF ?= $(shell $(PYTHON) -I qg.py tools path ruff)
 PYTHON ?= python3
 
 SHELL := /bin/bash

@@ -3,3 +3,9 @@ version = "5.4.1"
 url = "https://github.com/kucherenko/jscpd/releases/download/v5.4.1/jscpd-linux-x64-gnu.tar.gz"
 sha256 = "f2017a17de2a8d5708f8354c6e7223f82da3dc6489675bce543ba00d9d529468"
 binary = "jscpd"
+
+[ruff]
+version = "0.17.0"
+url = "https://github.com/astral-sh/ruff/releases/download/0.17.0/ruff-x86_64-unknown-linux-gnu.tar.gz"
+sha256 = "c94fc1dc71f054d06d9f1149442dcb471516aa2b7d4b7e8124e05d082d4c91d3"
+binary = "ruff-x86_64-unknown-linux-gnu/ruff"

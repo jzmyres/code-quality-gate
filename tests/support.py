@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,15 +15,22 @@ from typing import Any
 GATE = Path(__file__).resolve().parent.parent
 QG = GATE / "qg.py"
 JSCPD_VERSION = "5.4.1"
+RUFF_VERSION = "0.17.0"
 
 BASE_CONFIG = """\
+schema = 1
+
 [code]
 patterns = ["*.py", "*.sh", "*.el"]
 shebangs = ["sh", "bash", "python*"]
 
+[levels]
+required_tiers = [1]
+
 [classes.python]
 code = true
 description = "Python source"
+checks = ["smoke"]
 
 [classes.doc]
 code = false
@@ -31,6 +39,12 @@ description = "Documentation"
 [classes.config]
 code = false
 description = "Configuration"
+
+[checks.smoke]
+adapter = "command"
+tier = 1
+enforcement = "enforced"
+run = ["python3", "-c", "pass"]
 
 [[rule]]
 pattern = "*.py"
@@ -90,27 +104,70 @@ sarif = json.loads(
 """
 
 
+def _add_check_to_class(text: str, class_name: str, check_id: str) -> str:
+    marker = f"[classes.{class_name}]"
+    if marker not in text:
+        block = (
+            f"[classes.{class_name}]\n"
+            "code = true\n"
+            'description = "Extra code class"\n'
+            f"checks = [{json.dumps(check_id)}]\n\n"
+        )
+        return text.replace("[classes.doc]", block + "[classes.doc]", 1)
+    start = text.index(marker)
+    following = re.search(r"\n\[", text[start + len(marker):])
+    end = start + len(marker) + (following.start() if following else len(text))
+    block = text[start:end]
+    if "checks =" in block:
+        def add(match: re.Match[str]) -> str:
+            values = [
+                item.strip()
+                for item in match.group(1).split(",")
+                if item.strip()
+            ]
+            values.append(json.dumps(check_id))
+            return "checks = [" + ", ".join(values) + "]"
+
+        block = re.sub(r"checks = \[([^\]]*)\]", add, block, count=1)
+    else:
+        block = (
+            block.rstrip("\n")
+            + f"\nchecks = [{json.dumps(check_id)}]\n"
+        )
+    return text[:start] + block + text[end:]
+
+
 def with_clones(
     classes: str = '["python"]',
     min_tokens: int = 50,
     baseline: str = "quality-gate-clones.toml",
+    *,
+    tier: int = 1,
+    enforcement: str = "enforced",
 ) -> str:
-    return (
-        BASE_CONFIG
-        + "\n[clones]\n"
-        + f"classes = {classes}\n"
-        + f"min_tokens = {min_tokens}\n"
-        + f'baseline = "{baseline}"\n'
+    text = BASE_CONFIG
+    for name in json.loads(classes):
+        text = _add_check_to_class(text, name, "clones")
+    return text + (
+        "\n[checks.clones]\n"
+        'adapter = "clones"\n'
+        f"tier = {tier}\n"
+        f'enforcement = "{enforcement}"\n'
+        f"min_tokens = {min_tokens}\n"
+        f'baseline = "{baseline}"\n'
     )
 
 
 def baseline_text(entries: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for entry in entries:
-        lines.append("[[clone]]")
-        lines.append(f'fingerprint = "{entry["fingerprint"]}"')
-        if "count" in entry:
-            lines.append(f'count = {entry["count"]}')
+        subject = entry.get("subject", entry.get("fingerprint", ""))
+        bound = entry.get("bound", entry.get("count", 1))
+        lines.append("[[entry]]")
+        lines.append(f'subject = "{subject}"')
+        lines.append(f"bound = {bound}")
+        if "expires" in entry:
+            lines.append(f'expires = {entry["expires"]}')
         if "files" in entry:
             files = ", ".join(f'"{item}"' for item in entry["files"])
             lines.append(f"files = [{files}]")
@@ -193,6 +250,35 @@ class FixtureCase(unittest.TestCase):
             errors="replace",
             check=True,
         )
+
+    def commit_all(self, message: str = "fixture") -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def parse_json(self, result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(
+                f"stdout is not one JSON document: {error}: "
+                f"{result.stdout!r} stderr={result.stderr!r}"
+            )
+
+    def check_by_id(
+        self, document: dict[str, Any], identifier: str
+    ) -> dict[str, Any]:
+        for check in document["checks"]:
+            if check["id"] == identifier:
+                return check
+        self.fail(f"no check {identifier!r} in {document['checks']!r}")
+
+    def run_json(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+        result = self.run_qg("check", "--json", *args, env=env)
+        return result, self.parse_json(result)
 
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         env = os.environ.copy()
@@ -297,6 +383,20 @@ class FixtureCase(unittest.TestCase):
         else:
             env["HOME"] = str(Path.home())
         return env
+
+    def ruff_binary(self) -> Path:
+        configured = os.environ.get("QG_TOOLS_DIR")
+        tools = (
+            Path(configured).expanduser()
+            if configured
+            else Path.home() / ".local/share/code-quality-gate/tools"
+        )
+        return (
+            tools
+            / f"ruff-{RUFF_VERSION}"
+            / "ruff-x86_64-unknown-linux-gnu"
+            / "ruff"
+        )
 
     def fake_git_failing_ls_files(self) -> dict[str, str]:
         bin_dir = self.base / "fake-bin"

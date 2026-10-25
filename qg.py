@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""code-quality-gate: inventory, hygiene, clone ratchet and pinned tools.
+"""code-quality-gate: policy checks, inventory, hygiene, ratchet and tools.
 
 Run as 'python3 -I qg.py [--repo DIR] COMMAND'.  DIR is the top level of
 a git work tree and its configuration is 'quality-gate.toml'.

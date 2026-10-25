@@ -84,11 +84,11 @@ class CloneGateTests(FixtureCase):
     def single_baseline(self, fingerprint: str, reason: str) -> dict[str, object]:
         entries = tomllib.loads(
             self.read_file("quality-gate-clones.toml")
-        )["clone"]
+        )["entry"]
         self.assertEqual(len(entries), 1)
         entry = entries[0]
-        self.assertEqual(entry["fingerprint"], fingerprint)
-        self.assertEqual(entry["count"], 1)
+        self.assertEqual(entry["subject"], fingerprint)
+        self.assertEqual(entry["bound"], 1)
         self.assertEqual(entry["reason"], reason)
         return entry
 
@@ -282,9 +282,14 @@ class CloneGateTests(FixtureCase):
         self.add_file("d.py", "print('d')\n")
         self.add_file("e.py", "print('e')\n")
         text = self.clone_failure(env, "new clone fp-new", prune=True)
-        self.single_baseline("fp1", "one accepted copy")
+        unchanged = tomllib.loads(
+            self.read_file("quality-gate-clones.toml")
+        )["entry"]
+        self.assertEqual(unchanged[0]["subject"], "fp1")
+        self.assertEqual(unchanged[0]["bound"], 1)
         self.assertNotIn("fp-new", self.read_file("quality-gate-clones.toml"))
         self.assertIn("occurs 2 times", text)
+        self.assertIn("prune refused", text)
 
     def test_prune_does_not_rewrite_with_an_empty_reason(self) -> None:
         env = self.clone_env(
@@ -312,7 +317,7 @@ class CloneGateTests(FixtureCase):
         result = self.run_qg("clones")
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
-        self.assertIn("[clones] is not configured", text)
+        self.assertIn("no check with adapter 'clones'", text)
 
     def test_invalid_inventory_blocks_clones(self) -> None:
         self.add_file("mystery.txt", "x\n")
@@ -320,28 +325,74 @@ class CloneGateTests(FixtureCase):
         self.clone_failure({}, "clones: inventory:", "mystery.txt")
 
     def test_no_files_in_clone_classes_fails(self) -> None:
-        self.write_config(
-            with_clones(classes='["empty"]').replace(
-                "[classes.python]",
-                '[classes.empty]\ncode = true\ndescription = "Empty"\n\n'
-                "[classes.python]",
-            )
+        self.write_config(with_clones(classes='["empty"]'))
+        self.clone_failure({}, "no files selected")
+
+    def test_expired_entry_no_longer_covers(self) -> None:
+        env = self.clone_env(
+            [("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])],
+            [
+                {
+                    "fingerprint": "fp1",
+                    "expires": "2000-01-01",
+                    "reason": "expired exception",
+                }
+            ],
         )
-        self.clone_failure({}, "no files in classes (empty)")
+        self.clone_failure(env, "expired baseline entry", "2000-01-01")
+
+    def test_check_prune_lowers_a_passing_baseline(self) -> None:
+        env = self.clone_env(
+            [("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])],
+            [
+                {
+                    "fingerprint": "fp1",
+                    "bound": 3,
+                    "files": ["a.py", "b.py"],
+                    "reason": "lower me",
+                }
+            ],
+        )
+        result = self.run_qg("check", "--prune", "clones", env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        entry = self.single_baseline("fp1", "lower me")
+        self.assertEqual(entry["files"], ["a.py", "b.py"])
+
+    def test_check_prune_refuses_while_the_check_fails(self) -> None:
+        env = self.clone_env(
+            [
+                ("fp1", [("a.py", 1, 8), ("b.py", 1, 8)]),
+                ("fp1", [("a.py", 1, 8), ("c.py", 1, 8)]),
+            ],
+            [{"fingerprint": "fp1", "bound": 1, "reason": "only one"}],
+        )
+        self.add_file("c.py", "print('c')\n")
+        before = self.read_file("quality-gate-clones.toml")
+        result = self.run_qg("check", "--prune", "clones", env=env)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("prune refused", text)
+        self.assertEqual(self.read_file("quality-gate-clones.toml"), before)
+
+    def test_check_prune_unknown_id_exits_2(self) -> None:
+        result = self.run_qg("check", "--prune", "mystery")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("unknown check 'mystery'", text)
 
     def test_invalid_baseline_toml_fails(self) -> None:
         env = self.clone_env([])
         self.add_file("quality-gate-clones.toml", "[clone\n")
         self.clone_failure(env, "invalid baseline")
 
-    def test_invalid_baseline_count_fails(self) -> None:
+    def test_invalid_baseline_bound_fails(self) -> None:
         env = self.clone_env([])
         self.add_file(
             "quality-gate-clones.toml",
-            '[[clone]]\nfingerprint = "fp1"\ncount = -1\n'
+            '[[entry]]\nsubject = "fp1"\nbound = "high"\n'
             'reason = "never valid"\n',
         )
-        self.clone_failure(env, "count", ">= 0")
+        self.clone_failure(env, "bound", "a number")
 
     def test_zero_count_rejects_an_occurrence(self) -> None:
         env = self.clone_env(
@@ -349,23 +400,30 @@ class CloneGateTests(FixtureCase):
             [{"fingerprint": "fp1", "count": 0, "reason": "nothing accepted"}],
         )
         self.clone_failure(
-            env, "occurs 1 time", "baseline count is 0"
+            env, "occurs 1 time", "baseline bound 0"
         )
 
     def test_real_jscpd_reports_elisp_and_bash_clone_pairs(self) -> None:
         self.write_config(
             """\
+schema = 1
+
 [code]
 patterns = ["*.el", "*.sh"]
 shebangs = ["sh", "bash"]
 
+[levels]
+required_tiers = [1]
+
 [classes.lisp]
 code = true
 description = "Emacs Lisp"
+checks = ["clones"]
 
 [classes.shell]
 code = true
 description = "Bash"
+checks = ["clones"]
 
 [classes.config]
 code = false
@@ -391,8 +449,10 @@ pattern = ".gitignore"
 class = "config"
 reason = "Ignore rules"
 
-[clones]
-classes = ["lisp", "shell"]
+[checks.clones]
+adapter = "clones"
+tier = 1
+enforcement = "enforced"
 min_tokens = 50
 baseline = "quality-gate-clones.toml"
 """

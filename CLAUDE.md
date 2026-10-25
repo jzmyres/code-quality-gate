@@ -3,8 +3,14 @@
 A reusable, offline code-quality gate any repository can run, built to keep AI-written code high
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
-implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `clones`, `cli`);
-`qg.py` is only the entry point.
+implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `ratchet`, `clones`,
+`checks`, `gate_result`, `cli`); `qg.py` is only the entry point.
+
+Policy declares `schema = 1`, code classes with their `checks`, and one `[checks.ID]` table per check
+(`command` or `clones`). Adapters measure subjects; the core in `ratchet.py` decides pass/fail, expiry,
+resolution and pruning. `check --json` writes one machine-readable result to stdout; human lines go to
+stderr. Start by reading `README.md`, then the module that owns the concern; tests execute the real
+command on disposable fixture repositories.
 
 ## Principles
 

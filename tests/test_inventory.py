@@ -30,7 +30,8 @@ class InventoryTests(FixtureCase):
         self.write_config(
             BASE_CONFIG.replace(
                 "[classes.python]",
-                '[classes.empty]\ncode = true\ndescription = "Empty"\n\n'
+                '[classes.empty]\ncode = true\ndescription = "Empty"\n'
+                'checks = ["smoke"]\n\n'
                 "[classes.python]",
             )
         )
@@ -223,7 +224,8 @@ class InventoryTests(FixtureCase):
 
     def test_missing_code_section_exits_2(self) -> None:
         self.write_config(
-            '[classes.python]\ncode = true\ndescription = "Python"\n'
+            'schema = 1\n[classes.python]\ncode = true\n'
+            'description = "Python"\nchecks = ["smoke"]\n'
         )
         result = self.run_qg("inventory")
         text = output(result)
@@ -271,7 +273,8 @@ class InventoryTests(FixtureCase):
 
     def test_missing_classes_section_exits_2(self) -> None:
         self.write_config(
-            '[code]\npatterns = ["*.py"]\nshebangs = ["python*"]\n'
+            'schema = 1\n[code]\npatterns = ["*.py"]\n'
+            'shebangs = ["python*"]\n'
         )
         result = self.run_qg("inventory")
         text = output(result)
@@ -394,7 +397,7 @@ class InventoryTests(FixtureCase):
         cases = [
             (
                 "code section is not a table",
-                'code = "x"\n',
+                'schema = 1\ncode = "x"\n',
                 "code:",
             ),
             (
@@ -414,12 +417,13 @@ class InventoryTests(FixtureCase):
             ),
             (
                 "classes is not a table",
-                'classes = "x"\n[code]\npatterns = []\nshebangs = []\n',
+                'schema = 1\nclasses = "x"\n'
+                "[code]\npatterns = []\nshebangs = []\n",
                 "classes:",
             ),
             (
                 "class entry is not a table",
-                'classes = { python = "x" }\n'
+                'schema = 1\nclasses = { python = "x" }\n'
                 "[code]\npatterns = []\nshebangs = []\n",
                 "classes.python",
             ),
@@ -434,31 +438,6 @@ class InventoryTests(FixtureCase):
                 "hygiene is not a table",
                 'hygiene = "x"\n' + BASE_CONFIG,
                 "hygiene:",
-            ),
-            (
-                "clones is not a table",
-                'clones = "x"\n' + BASE_CONFIG,
-                "clones:",
-            ),
-            (
-                "clones min_tokens is not an integer",
-                BASE_CONFIG
-                + '\n[clones]\nclasses = ["python"]\nmin_tokens = "x"\n'
-                'baseline = "quality-gate-clones.toml"\n',
-                "clones.min_tokens",
-            ),
-            (
-                "clones baseline is not a string",
-                BASE_CONFIG
-                + '\n[clones]\nclasses = ["python"]\nbaseline = 1\n',
-                "clones.baseline",
-            ),
-            (
-                "clones classes item is not a string",
-                BASE_CONFIG
-                + "\n[clones]\nclasses = [1]\n"
-                'baseline = "quality-gate-clones.toml"\n',
-                "clones.classes[0]",
             ),
             (
                 "class description missing",
@@ -489,20 +468,6 @@ class InventoryTests(FixtureCase):
                 ),
                 "rule[0].reason",
             ),
-            (
-                "clones classes missing",
-                BASE_CONFIG
-                + "\n[clones]\nmin_tokens = 50\n"
-                'baseline = "quality-gate-clones.toml"\n',
-                "clones.classes",
-            ),
-            (
-                "clones baseline empty",
-                BASE_CONFIG
-                + '\n[clones]\nclasses = ["python"]\nmin_tokens = 50\n'
-                'baseline = ""\n',
-                "clones.baseline",
-            ),
         ]
         for name, config, key in cases:
             with self.subTest(name=name):
@@ -513,52 +478,54 @@ class InventoryTests(FixtureCase):
                 self.assertIn(key, text)
                 self.assertIn("expected", text)
 
-    def test_clones_unknown_class_exits_2(self) -> None:
+    def test_check_tier_out_of_range_exits_2(self) -> None:
         self.write_config(
             BASE_CONFIG
-            + '\n[clones]\nclasses = ["mystery"]\nmin_tokens = 50\n'
-            'baseline = "quality-gate-clones.toml"\n'
+            + '\n[checks.bad]\nadapter = "command"\ntier = 5\n'
+            'enforcement = "enforced"\nrun = ["true"]\n'
         )
-        result = self.run_qg("clones")
+        result = self.run_qg("inventory")
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
-        self.assertIn("clones.classes", text)
-        self.assertIn("unknown class 'mystery'", text)
+        self.assertIn("checks.bad.tier", text)
+        self.assertIn("<= 4", text)
 
-    def test_clones_min_tokens_zero_exits_2(self) -> None:
+    def test_check_min_tokens_zero_exits_2(self) -> None:
         self.write_config(
             BASE_CONFIG
-            + '\n[clones]\nclasses = ["python"]\nmin_tokens = 0\n'
+            + '\n[checks.bad]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nmin_tokens = 0\n'
             'baseline = "quality-gate-clones.toml"\n'
         )
-        result = self.run_qg("clones")
+        result = self.run_qg("inventory")
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
-        self.assertIn("clones.min_tokens", text)
+        self.assertIn("checks.bad.min_tokens", text)
         self.assertIn(">= 1", text)
 
-    def test_clones_missing_baseline_exits_2(self) -> None:
+    def test_check_missing_baseline_exits_2(self) -> None:
         self.write_config(
             BASE_CONFIG
-            + '\n[clones]\nclasses = ["python"]\nmin_tokens = 50\n'
+            + '\n[checks.bad]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nmin_tokens = 50\n'
         )
-        result = self.run_qg("clones")
+        result = self.run_qg("inventory")
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
-        self.assertIn("clones.baseline", text)
+        self.assertIn("checks.bad.baseline", text)
         self.assertIn("missing", text)
 
-    def test_clones_classes_wrong_type_exits_2(self) -> None:
+    def test_check_unknown_key_exits_2(self) -> None:
         self.write_config(
             BASE_CONFIG
-            + '\n[clones]\nclasses = "python"\nmin_tokens = 50\n'
-            'baseline = "quality-gate-clones.toml"\n'
+            + '\n[checks.bad]\nadapter = "command"\ntier = 1\n'
+            'enforcement = "enforced"\nrun = ["true"]\nextra = 1\n'
         )
-        result = self.run_qg("clones")
+        result = self.run_qg("inventory")
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
-        self.assertIn("clones.classes", text)
-        self.assertIn("list of strings", text)
+        self.assertIn("checks.bad.extra", text)
+        self.assertIn("allowed keys", text)
 
     def test_no_command_exits_2(self) -> None:
         result = self.run_qg(include_repo=False)

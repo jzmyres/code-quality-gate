@@ -8,7 +8,7 @@ import tarfile
 import unittest
 from pathlib import Path
 
-from support import FixtureCase, output
+from support import RUFF_VERSION, FixtureCase, output
 
 VERSION = "9.9.9"
 
@@ -329,6 +329,22 @@ class ToolsTests(FixtureCase):
         self.assertEqual(
             result.stdout.strip(),
             str(tools / "jscpd-5.4.1" / "jscpd"),
+        )
+
+    def test_tools_path_prints_the_ruff_path(self) -> None:
+        tools = self.base / "tools"
+        result = self.run_qg(
+            "tools", "path", "ruff", env={"QG_TOOLS_DIR": str(tools)}
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(
+            result.stdout.strip(),
+            str(
+                tools
+                / f"ruff-{RUFF_VERSION}"
+                / "ruff-x86_64-unknown-linux-gnu"
+                / "ruff"
+            ),
         )
 
     def test_tools_path_unknown_name_exits_2(self) -> None:
