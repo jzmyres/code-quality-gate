@@ -53,6 +53,11 @@ class = "build"
 reason = "runs Ruff, py_compile, the tests and the gate itself"
 
 [[rule]]
+pattern = ".github/workflows/check.yml"
+class = "build"
+reason = "CI runs the self-check"
+
+[[rule]]
 pattern = "*.toml"
 class = "config"
 reason = "gate configuration and pinned tool data"

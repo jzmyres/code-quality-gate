@@ -1,0 +1,40 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Debian 13 ships Python 3.13, which satisfies the gate's 3.12 minimum.
+    container: debian:13
+    # Rule: smallest multiple of 5 minutes at least three times the measured check time.
+    # Local `make -k check` measured 9.3 s; 3 x 9.3 s = 27.9 s, so 5.
+    timeout-minutes: 5
+    env:
+      QG_TOOLS_DIR: /tmp/qg-tools
+    steps:
+      - name: Install check tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3 make git ca-certificates
+          python3 --version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Restore pinned tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.QG_TOOLS_DIR }}
+          key: debian13-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
+      - name: Fetch pinned tools
+        run: python3 -I qg.py tools fetch
+      - name: Run the gate
+        run: make -k check

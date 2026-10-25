@@ -307,6 +307,19 @@ skipping, when the tool is not installed. Command-check tests use the real comma
 runs only when the pinned ruff binary exists. `tools fetch` tests use fixture tarballs with `file://`
 URLs, including wrong hashes and unsafe archive members.
 
+## Continuous integration
+
+Every push to `main` and every pull request runs `.github/workflows/check.yml` on GitHub Actions;
+the workflow can also be dispatched manually. It runs in a Debian 13 container, restores the pinned
+tools cache keyed on `tools.lock.toml`, fetches any missing pinned tools, and runs `make -k check`:
+Ruff, `py_compile`, the test suite and the gate's self-check.
+
+Reproduce it locally with the same tools cache:
+
+    export QG_TOOLS_DIR=/tmp/qg-tools
+    python3 -I qg.py tools fetch
+    make -k check
+
 ## Planned later layers
 
 The core gate is deliberately language-agnostic; adapters measure and the core decides. The planned order
