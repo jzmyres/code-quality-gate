@@ -23,6 +23,9 @@ baseline entries and prune reporting; human lines go to stderr. A baseline start
 decision reports the gate evaluation. Start by reading `README.md` and `docs/SCHEMA.md`, then the module
 that owns the concern; tests execute the real command on disposable fixture repositories.
 
+The implementer agents' learned memory lives in `.agents/AGENTS.md`, written by the runner's reflection
+step and reviewed before landing.
+
 ## Principles
 
 * Simplest implementation that fully meets the current requirements; no speculative configuration,

@@ -43,7 +43,9 @@ jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage, `pytho
 coverage with `ast` complexity, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, and `cli.py` holds the
-argument parser and dispatch. `qg.py` is only the entry point.
+argument parser and dispatch. `qg.py` is only the entry point. The implementer agents' learned memory
+lives in `.agents/AGENTS.md`, written by the runner's reflection step after each batch and reviewed
+before landing.
 
 ## Quick start in a consuming repository
 

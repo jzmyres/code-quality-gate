@@ -63,9 +63,14 @@ class = "config"
 reason = "gate configuration and pinned tool data"
 
 [[rule]]
-pattern = "*.md"
+pattern = "[!.]*.md"
 class = "doc"
 reason = "documentation and plans"
+
+[[rule]]
+pattern = ".agents/**"
+class = "doc"
+reason = "implementer agents' learned memory, written by the runner's reflection step"
 
 [[rule]]
 pattern = ".gitignore"
