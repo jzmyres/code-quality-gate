@@ -12,10 +12,17 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from support import BASE_CONFIG, GATE, RUFF_VERSION, FixtureCase, output
 
-from quality_gate.tools import PayloadError, payload_digest
+from quality_gate.policy import UnsupportedError
+from quality_gate.tools import (
+    PayloadError,
+    lock_override,
+    payload_digest,
+    verify_tool_directory,
+)
 
 VERSION = "9.9.9"
 
@@ -683,29 +690,33 @@ class ToolUseVerificationTests(FixtureCase):
         )
         self.assertFalse(sentinel.exists())
 
-    @unittest.skipIf(
-        os.geteuid() == 0, "root can stat chmod 000 entries"
-    )
     def test_unreadable_tool_entry_is_unsupported_before_it_runs(self) -> None:
-        tools, installation, binary, sentinel, expected = self.ruff_tool()
+        _tools, installation, binary, _sentinel, expected = self.ruff_tool()
         destination = binary.parent
-        mode = destination.stat().st_mode & 0o777
-        destination.chmod(0o000)
-        self.addCleanup(destination.chmod, mode)
-        result, document = self.run_json(
-            env={"QG_TOOLS_DIR": str(tools)}
-        )
-        self.unsupported_check(
-            result,
-            document,
+        scandir = os.scandir
+
+        def unreadable(path: object) -> object:
+            if Path(path) == destination:
+                raise PermissionError("Permission denied")
+            return scandir(path)
+
+        with lock_override(
+            self.gate / "tools.lock.toml"
+        ), mock.patch(
+            "quality_gate.tools.os.scandir", side_effect=unreadable
+        ):
+            with self.assertRaises(UnsupportedError) as raised:
+                verify_tool_directory("ruff", installation)
+        message = str(raised.exception)
+        for needle in (
             f"ruff {RUFF_VERSION}",
             str(installation),
-            str(binary),
+            str(destination),
             expected,
             "Permission denied",
             "nothing from this install runs",
-        )
-        self.assertFalse(sentinel.exists())
+        ):
+            self.assertIn(needle, message)
 
     def test_modified_coverage_is_unsupported_before_it_runs(self) -> None:
         version = "7.16.2"
