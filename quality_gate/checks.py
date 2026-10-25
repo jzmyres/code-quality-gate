@@ -124,6 +124,14 @@ def _select_files(
     return selected, names
 
 
+def _class_text(names: list[str]) -> str:
+    return ", ".join(names) or "none"
+
+
+def _file_argument(name: str) -> str:
+    return f"./{name}" if name.startswith("-") else name
+
+
 def _expand_run(
     check: CheckDef, files: list[str]
 ) -> tuple[list[str], str | None]:
@@ -133,10 +141,7 @@ def _expand_run(
     lock = _default_lock_path()
     for argument in check.command.run:
         if argument == "{files}":
-            expanded.extend(
-                f"./{name}" if name.startswith("-") else name
-                for name in files
-            )
+            expanded.extend(map(_file_argument, files))
             continue
         match = re.fullmatch(r"\{tool:([^{}]+)\}", argument)
         if match is None:
@@ -228,7 +233,7 @@ def _run_command(
     start = time.monotonic()
     selected, names = _select_files(config, check, files, classes)
     if "{files}" in spec.run and not selected:
-        class_text = ", ".join(names) or "none"
+        class_text = _class_text(names)
         print(
             f"{prefix}: no files selected (classes: {class_text}); "
             "zero inputs is not a pass",
@@ -416,6 +421,17 @@ def _clone_result(
     )
 
 
+def _print_clone_summary(prefix: str, findings: list[Any]) -> None:
+    if findings:
+        noun = "clone" if len(findings) == 1 else "clones"
+        print(
+            f"{prefix}: {len(findings)} {noun} within baseline",
+            flush=True,
+        )
+    else:
+        print(f"{prefix}: 0 clones", flush=True)
+
+
 def _run_clones(
     root: Path,
     config: Config,
@@ -428,7 +444,7 @@ def _run_clones(
     start = time.monotonic()
     selected, names = _select_files(config, check, files, classes)
     if not selected:
-        class_text = ", ".join(names) or "none"
+        class_text = _class_text(names)
         print(
             f"{prefix}: no files selected (classes: {class_text}); "
             "zero inputs is not a pass",
@@ -490,14 +506,7 @@ def _run_clones(
         diagnostics=diagnostics,
     )
     if ratchet.satisfied:
-        if measurement.findings:
-            noun = "clone" if len(measurement.findings) == 1 else "clones"
-            print(
-                f"{prefix}: {len(measurement.findings)} {noun} within baseline",
-                flush=True,
-            )
-        else:
-            print(f"{prefix}: 0 clones", flush=True)
+        _print_clone_summary(prefix, measurement.findings)
     return result
 
 
@@ -558,6 +567,15 @@ def _tests_failed(
     )
 
 
+def _test_environment(python_prefix: list[str]) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in list(environment):
+        if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
+            del environment[name]
+    environment["QG_PYTHON"] = json.dumps(python_prefix)
+    return environment
+
+
 def _run_python_tests(
     root: Path,
     check: CheckDef,
@@ -605,11 +623,7 @@ def _run_python_tests(
         )
 
     command = expand_run(spec.run, python_prefix)
-    environment = os.environ.copy()
-    for name in list(environment):
-        if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
-            del environment[name]
-    environment["QG_PYTHON"] = json.dumps(python_prefix)
+    environment = _test_environment(python_prefix)
     run_result = run(
         command,
         cwd=root,
@@ -789,7 +803,7 @@ def _run_python_crap(
 
     selected, names = _select_files(config, check, files, classes)
     if not selected:
-        class_text = ", ".join(names) or "none"
+        class_text = _class_text(names)
         print(
             f"{prefix}: no files selected (classes: {class_text}); "
             "zero inputs is not a pass",

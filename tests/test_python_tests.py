@@ -1,15 +1,30 @@
 """Tests for the python_tests adapter and its QG_PYTHON contract."""
 from __future__ import annotations
 
+import contextlib
+import importlib
+import io
 import json
+import os
+import re
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from support import (
+    GATE,
     PYTHON_COMMON_RULE_LINES,
     PYTHON_TEST_HEADER,
     FixtureCase,
     output,
 )
+
+sys.path.insert(0, str(GATE))
+covrun = importlib.import_module("quality_gate.covrun")
+policy = importlib.import_module("quality_gate.policy")
+python_tests = importlib.import_module("quality_gate.python_tests")
 
 
 def tests_config(
@@ -239,6 +254,125 @@ class PythonTestsTests(FixtureCase):
             "tools fetch",
             env={"QG_TOOLS_DIR": str(self.base / "empty-tools")},
         )
+
+
+class CovrunTests(unittest.TestCase):
+    def test_usage_and_missing_coverage_are_reported(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(covrun._run([]), 2)
+        self.assertIn("expected DATA_DIR", stderr.getvalue())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing"
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                code = covrun._run(
+                    [
+                        "covrun.py",
+                        temporary,
+                        temporary,
+                        str(missing),
+                        "-c",
+                        "pass",
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("coverage is not installed", stderr.getvalue())
+
+    def test_run_writes_the_config_and_starts_coverage(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_main(arguments: list[str]) -> int:
+            calls.append(arguments)
+            return 7
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            data_dir = base / "data"
+            source_root = base / "root"
+            source_root.mkdir()
+            coverage_dir = base / "coverage"
+            coverage_dir.mkdir()
+            with mock.patch.dict(
+                os.environ, {"COVERAGE_TEST_OVERRIDE": "1"}
+            ), mock.patch.object(
+                covrun, "_coverage_main", return_value=(fake_main, None)
+            ), mock.patch.object(sys, "path", list(sys.path)):
+                code = covrun._run(
+                    [
+                        "covrun.py",
+                        str(data_dir),
+                        str(source_root),
+                        str(coverage_dir),
+                        "-c",
+                        "print(1)",
+                    ]
+                )
+            self.assertEqual(code, 7)
+            self.assertNotIn("COVERAGE_TEST_OVERRIDE", os.environ)
+            config_file = data_dir / "coverage.ini"
+            self.assertIn(
+                f"source =\n    {source_root}",
+                config_file.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(calls[0][0], "run")
+            self.assertIn("--parallel-mode", calls[0])
+            self.assertIn(f"--rcfile={config_file}", calls[0])
+            self.assertEqual(calls[0][-2:], ["-c", "print(1)"])
+
+
+class TestSummaryTests(unittest.TestCase):
+    def spec(
+        self,
+        tests_pattern: str = r"^Ran ([0-9]+) tests? in",
+        skipped_pattern: str | None = r"skipped=([0-9]+)",
+    ) -> policy.PythonTestsSpec:
+        return policy.PythonTestsSpec(
+            run=(),
+            tests_pattern=tests_pattern,
+            tests_pattern_re=re.compile(tests_pattern, re.MULTILINE),
+            skipped_pattern=skipped_pattern,
+            skipped_pattern_re=(
+                re.compile(skipped_pattern, re.MULTILINE)
+                if skipped_pattern is not None
+                else None
+            ),
+            budget_seconds=600,
+        )
+
+    def test_count_subtracts_skipped_and_reports_summary_errors(self) -> None:
+        count, error = python_tests.parse_test_count(
+            self.spec(), "Ran 3 tests in 0.01s\nskipped=1"
+        )
+        self.assertEqual((count, error), (2, None))
+        count, error = python_tests.parse_test_count(
+            self.spec(), "no summary"
+        )
+        self.assertIsNone(count)
+        self.assertIn("did not match", error)
+
+    def test_non_integer_counts_are_rejected(self) -> None:
+        ran, skipped, error = python_tests.parse_test_summary(
+            self.spec(tests_pattern=r"^Ran ([A-Za-z]+) tests? in"),
+            "Ran many tests in 0.01s",
+        )
+        self.assertEqual((ran, skipped), (None, None))
+        self.assertIn("tests_pattern", error)
+        self.assertIn("not a test count", error)
+
+        ran, skipped, error = python_tests.parse_test_summary(
+            self.spec(skipped_pattern=r"skipped=([A-Za-z]+)"),
+            "Ran 1 test in 0.01s\nskipped=many",
+        )
+        self.assertEqual((ran, skipped), (None, None))
+        self.assertIn("skipped_pattern", error)
+        self.assertIn("not a test count", error)
+
+    def test_more_skipped_than_ran_is_rejected(self) -> None:
+        ran, skipped, error = python_tests.parse_test_summary(
+            self.spec(), "Ran 1 test in 0.01s\nskipped=2"
+        )
+        self.assertEqual((ran, skipped), (None, None))
+        self.assertEqual(error, "skipped 2 tests but only 1 ran")
 
 
 if __name__ == "__main__":

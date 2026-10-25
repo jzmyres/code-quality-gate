@@ -365,6 +365,35 @@ class PythonCrapTests(FixtureCase):
         self.assertEqual(str(entry["expires"]), "2999-01-01")
         self.assertEqual(entry["bound"], 99)
 
+    def test_no_files_selected_fails(self) -> None:
+        self.add_default_test()
+        self.write_config(
+            crap_config()
+            .replace(
+                'checks = ["tests", "crap"]',
+                'checks = ["tests"]',
+            )
+            .replace(
+                "[classes.test]",
+                '[classes.empty]\ncode = true\n'
+                'description = "Empty"\nchecks = ["crap"]\n\n'
+                "[classes.test]",
+            )
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "fail")
+        self.assertIn("no files selected", result.stderr)
+        self.assertIn("zero inputs is not a pass", result.stderr)
+
+    def test_malformed_baseline_is_an_error(self) -> None:
+        self.add_default_test()
+        self.add_file("quality-gate-crap.toml", "[entry\n")
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("invalid baseline", result.stderr)
+
     def test_failed_tests_make_crap_unsupported(self) -> None:
         self.write_config(crap_config())
         self.add_tests(

@@ -21,59 +21,72 @@ def _fail(message: str) -> int:
     return 2
 
 
-if len(sys.argv) < 5:
-    sys.exit(
-        _fail(
-            "expected DATA_DIR SOURCE_ROOT COVERAGE_DIR and a Python command, "
-            "for example: covrun.py DIR ROOT COVERAGE -m unittest discover -s tests"
-        )
+def _usage() -> int:
+    return _fail(
+        "expected DATA_DIR SOURCE_ROOT COVERAGE_DIR and a Python command, "
+        "for example: covrun.py DIR ROOT COVERAGE -m unittest discover -s tests"
     )
 
-data_dir = Path(sys.argv[1])
-source_root = Path(sys.argv[2])
-coverage_dir = Path(sys.argv[3])
-command = sys.argv[4:]
 
-if not coverage_dir.is_dir():
-    sys.exit(
-        _fail(
-            f"coverage is not installed at {coverage_dir}; "
-            "run 'python3 -I qg.py tools fetch'"
-        )
+def _remove_overrides() -> None:
+    for name in list(os.environ):
+        if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
+            del os.environ[name]
+
+
+def _write_config(data_dir: Path, source_root: Path) -> Path:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    config_file = data_dir / "coverage.ini"
+    config_file.write_text(
+        "[run]\n"
+        "branch = False\n"
+        f"source =\n    {source_root}\n"
+        "[report]\n"
+        "exclude_lines =\n    pragma: no cover\n",
+        encoding="utf-8",
     )
+    os.environ["COVERAGE_RCFILE"] = str(config_file)
+    return config_file
 
-sys.path.insert(0, str(coverage_dir))
-# A consumer's coverage configuration must not change this metric: line
-# coverage only, with no branch measurement or omit rules of its own.
-for name in list(os.environ):
-    if name.startswith("COVERAGE_") and name != "COVERAGE_CORE":
-        del os.environ[name]
-os.environ["COVERAGE_CORE"] = "sysmon"
-data_dir.mkdir(parents=True, exist_ok=True)
-config_file = data_dir / "coverage.ini"
-config_file.write_text(
-    "[run]\n"
-    "branch = False\n"
-    f"source =\n    {source_root}\n"
-    "[report]\n"
-    "exclude_lines =\n    pragma: no cover\n",
-    encoding="utf-8",
-)
-os.environ["COVERAGE_RCFILE"] = str(config_file)
 
-try:
-    from coverage.cmdline import main as coverage_main
-except ImportError as error:
-    sys.exit(
-        _fail(
+def _coverage_main(coverage_dir: Path):
+    try:
+        from coverage.cmdline import main as coverage_main
+    except ImportError as error:
+        return None, (
             f"cannot import coverage from {coverage_dir}: {error}; "
             "run 'python3 -I qg.py tools fetch'"
         )
-    )
+    return coverage_main, None
 
-data_file = data_dir / ".coverage"
-sys.exit(
-    coverage_main(
+
+def _run(argv: list[str]) -> int:
+    if len(argv) < 5:
+        return _usage()
+    data_dir = Path(argv[1])
+    source_root = Path(argv[2])
+    coverage_dir = Path(argv[3])
+    command = argv[4:]
+    if not coverage_dir.is_dir():
+        return _fail(
+            f"coverage is not installed at {coverage_dir}; "
+            "run 'python3 -I qg.py tools fetch'"
+        )
+
+    sys.path.insert(0, str(coverage_dir))
+    # A consumer's coverage configuration must not change this metric: line
+    # coverage only, with no branch measurement or omit rules of its own.
+    _remove_overrides()
+    os.environ["COVERAGE_CORE"] = "sysmon"
+    config_file = _write_config(data_dir, source_root)
+
+    coverage_main, error = _coverage_main(coverage_dir)
+    if error is not None:
+        return _fail(error)
+    assert coverage_main is not None
+
+    data_file = data_dir / ".coverage"
+    return coverage_main(
         [
             "run",
             "--parallel-mode",
@@ -83,4 +96,7 @@ sys.exit(
             *command,
         ]
     )
-)
+
+
+if __name__ == "__main__":
+    sys.exit(_run(sys.argv))

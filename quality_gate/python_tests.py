@@ -33,6 +33,33 @@ def expand_run(run: tuple[str, ...], prefix: list[str]) -> list[str]:
     return expanded
 
 
+def _capture_count(
+    text: str, pattern: str, label: str
+) -> tuple[int | None, str | None]:
+    try:
+        return int(text), None
+    except ValueError:
+        return (
+            None,
+            f"{label}_pattern {pattern!r} captured "
+            f"{text!r}, which is not a test count",
+        )
+
+
+def _skipped_count(
+    spec: PythonTestsSpec, output: str
+) -> tuple[int | None, str | None]:
+    if spec.skipped_pattern_re is None:
+        return 0, None
+    match = spec.skipped_pattern_re.search(output)
+    if match is None:
+        return 0, None
+    assert spec.skipped_pattern is not None
+    return _capture_count(
+        match.group(1), spec.skipped_pattern, "skipped"
+    )
+
+
 def parse_test_summary(
     spec: PythonTestsSpec, output: str
 ) -> tuple[int | None, int | None, str | None]:
@@ -51,30 +78,14 @@ def parse_test_summary(
             f"ambiguous test summary: tests_pattern {spec.tests_pattern!r} "
             f"matched {len(matches)} times",
         )
-    text = matches[0].group(1)
-    try:
-        ran = int(text)
-    except ValueError:
-        return (
-            None,
-            None,
-            f"tests_pattern {spec.tests_pattern!r} captured "
-            f"{text!r}, which is not a test count",
-        )
-    skipped = 0
-    if spec.skipped_pattern_re is not None:
-        skipped_match = spec.skipped_pattern_re.search(output)
-        if skipped_match is not None:
-            skipped_text = skipped_match.group(1)
-            try:
-                skipped = int(skipped_text)
-            except ValueError:
-                return (
-                    None,
-                    None,
-                    f"skipped_pattern {spec.skipped_pattern!r} captured "
-                    f"{skipped_text!r}, which is not a test count",
-                )
+    ran, error = _capture_count(
+        matches[0].group(1), spec.tests_pattern, "tests"
+    )
+    if error is not None:
+        return None, None, error
+    skipped, error = _skipped_count(spec, output)
+    if error is not None:
+        return None, None, error
     if skipped > ran:
         return (
             None,

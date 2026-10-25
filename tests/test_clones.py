@@ -1,16 +1,24 @@
 """Tests for the duplicate-code ratchet, including the real jscpd binary."""
 from __future__ import annotations
 
+import importlib
+import sys
 import tomllib
 import unittest
+from pathlib import Path
 
 from support import (
+    GATE,
     FixtureCase,
     baseline_text,
     output,
     sarif_report,
     with_clones,
 )
+
+sys.path.insert(0, str(GATE))
+clones = importlib.import_module("quality_gate.clones")
+policy = importlib.import_module("quality_gate.policy")
 
 ELISP_SOURCE = """\
 ;;; sample.el --- file summary -*- lexical-binding: t; -*-
@@ -275,6 +283,63 @@ class CloneGateTests(FixtureCase):
             },
         )
         self.unsupported_clone(env, "not analysed", "b.py")
+
+    def test_malformed_jscpd_json_is_unsupported(self) -> None:
+        cases = [
+            ({"statistics": "x"}, "statistics is not an object"),
+            (
+                {"statistics": {"total": "x"}},
+                "statistics.total is not an object",
+            ),
+            (
+                {"statistics": {"total": {"sources": "2"}}},
+                "statistics.total.sources is not an integer",
+            ),
+            (
+                {"statistics": {"formats": "x", "total": {"sources": 1}}},
+                "not analysed",
+            ),
+            (
+                {
+                    "statistics": {
+                        "formats": {"python": "x"},
+                        "total": {"sources": 1},
+                    }
+                },
+                "not analysed",
+            ),
+            (
+                {
+                    "statistics": {
+                        "formats": {"python": {"sources": True}},
+                        "total": {"sources": 1},
+                    }
+                },
+                "not analysed",
+            ),
+            (
+                {
+                    "statistics": {
+                        "formats": {"python": {"sources": "2"}},
+                        "total": {"sources": 1},
+                    }
+                },
+                "not analysed",
+            ),
+            (
+                {
+                    "statistics": {
+                        "formats": {"python": {"sources": 2}},
+                        "total": {"sources": 1},
+                    }
+                },
+                "not analysed: a.py, b.py",
+            ),
+        ]
+        for report, needle in cases:
+            with self.subTest(report=report):
+                env = self.clone_env([], fake={"json_report": report})
+                self.unsupported_clone(env, needle)
 
     def test_invalid_sarif_is_unsupported(self) -> None:
         env = self.clone_env([], fake={})
@@ -617,6 +682,100 @@ tests_pattern = "^Ran (\\\\d+) tests? in"
             ),
             text,
         )
+
+
+class SarifLocationTests(unittest.TestCase):
+    root = Path("/repo")
+    report = Path("report.sarif")
+
+    def location(self, **physical: object) -> dict[str, object]:
+        return {"physicalLocation": physical}
+
+    def test_single_line_and_range(self) -> None:
+        single = self.location(
+            artifactLocation={"uri": "./a.py"},
+            region={"startLine": 3},
+        )
+        self.assertEqual(
+            clones._sarif_location(
+                single, self.root, "runs[0].results[0]", self.report
+            ),
+            "a.py:3",
+        )
+        same = self.location(
+            artifactLocation={"uri": "a.py"},
+            region={"startLine": 3, "endLine": 3},
+        )
+        self.assertEqual(
+            clones._sarif_location(
+                same, self.root, "runs[0].results[0]", self.report
+            ),
+            "a.py:3",
+        )
+        span = self.location(
+            artifactLocation={"uri": "a.py"},
+            region={"startLine": 3, "endLine": 4},
+        )
+        self.assertEqual(
+            clones._sarif_location(
+                span, self.root, "runs[0].results[0]", self.report
+            ),
+            "a.py:3-4",
+        )
+
+    def test_malformed_location_is_unsupported(self) -> None:
+        cases = [
+            ({}, "missing location data"),
+            ({"physicalLocation": "x"}, "missing location data"),
+            (
+                {"physicalLocation": {"artifactLocation": "x"}},
+                "missing location data",
+            ),
+            (
+                {"physicalLocation": {"artifactLocation": {"uri": 1}}},
+                "location uri is not a string",
+            ),
+            (
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "a.py"},
+                        "region": "x",
+                    }
+                },
+                "region is not an object",
+            ),
+            (
+                self.location(
+                    artifactLocation={"uri": "a.py"},
+                    region={"startLine": "3"},
+                ),
+                "startLine is not an integer",
+            ),
+            (
+                self.location(
+                    artifactLocation={"uri": "a.py"},
+                    region={"startLine": True},
+                ),
+                "startLine is not an integer",
+            ),
+            (
+                self.location(
+                    artifactLocation={"uri": "a.py"},
+                    region={"startLine": 3, "endLine": "4"},
+                ),
+                "endLine is not an integer",
+            ),
+        ]
+        for location, needle in cases:
+            with self.subTest(location=location):
+                with self.assertRaises(policy.UnsupportedError) as raised:
+                    clones._sarif_location(
+                        location,
+                        self.root,
+                        "runs[0].results[0]",
+                        self.report,
+                    )
+                self.assertIn(needle, str(raised.exception))
 
 
 if __name__ == "__main__":

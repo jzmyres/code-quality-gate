@@ -5,6 +5,7 @@ import contextlib
 import datetime
 import importlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -210,6 +211,31 @@ class RatchetTests(unittest.TestCase):
 
 
 class BaselineFileTests(unittest.TestCase):
+    def test_toml_value_covers_scalar_types(self) -> None:
+        self.assertEqual(ratchet._toml_value(True), "true")
+        self.assertEqual(ratchet._toml_value(False), "false")
+        self.assertEqual(ratchet._toml_value(2), "2")
+        self.assertEqual(ratchet._toml_value(2.5), "2.5")
+        self.assertEqual(
+            ratchet._toml_value(datetime.datetime(2026, 1, 2, 3, 4, 5)),
+            "2026-01-02T03:04:05",
+        )
+        self.assertEqual(
+            ratchet._toml_value(datetime.date(2026, 1, 2)), "2026-01-02"
+        )
+        self.assertEqual(
+            ratchet._toml_value("a\n"), json.dumps("a\n", ensure_ascii=False)
+        )
+        self.assertEqual(ratchet._toml_value(["a", "b"]), '["a", "b"]')
+
+    def test_toml_value_rejects_non_finite_and_unknown_values(self) -> None:
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaises(policy.GateError):
+                    ratchet._toml_value(value)
+        with self.assertRaises(policy.GateError):
+            ratchet._toml_value(object())
+
     def test_write_and_load_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "baseline.toml"

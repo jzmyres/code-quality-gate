@@ -94,6 +94,22 @@ def _git(root: Path, args: list[str], what: str) -> bytes:
     return result.stdout
 
 
+def _git_file(token: str) -> GitFile:
+    mode: str | None = None
+    name = token
+    if "\t" in token:
+        metadata, candidate = token.split("\t", 1)
+        fields = metadata.split()
+        if (
+            len(fields) == 3
+            and len(fields[0]) == 6
+            and fields[0].isdigit()
+        ):
+            mode = fields[0]
+            name = candidate
+    return GitFile(name, mode)
+
+
 def enumerate_entries(root: Path) -> list[GitFile]:
     raw = _git(
         root,
@@ -102,21 +118,8 @@ def enumerate_entries(root: Path) -> list[GitFile]:
     )
     entries: list[GitFile] = []
     for token in raw.decode("utf-8", "surrogateescape").split("\0"):
-        if not token:
-            continue
-        mode: str | None = None
-        name = token
-        if "\t" in token:
-            metadata, candidate = token.split("\t", 1)
-            fields = metadata.split()
-            if (
-                len(fields) == 3
-                and len(fields[0]) == 6
-                and fields[0].isdigit()
-            ):
-                mode = fields[0]
-                name = candidate
-        entries.append(GitFile(name, mode))
+        if token:
+            entries.append(_git_file(token))
     return sorted(entries, key=lambda entry: entry.path)
 
 

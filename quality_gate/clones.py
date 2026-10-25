@@ -81,6 +81,14 @@ def _read_report(report: Path) -> Any:
         raise _no_completed(report, f"invalid JSON: {error}") from error
 
 
+def _required_object(
+    value: object, report: Path, message: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _no_completed(report, message)
+    return value
+
+
 class CloneEvidenceError(UnsupportedError):
     """A jscpd run did not produce complete clone evidence."""
 
@@ -228,49 +236,71 @@ def _parse_sarif(report: Path, root: Path) -> list[Clone]:
     return clones
 
 
-def _selected_skipped(files: list[str], data: dict[str, Any]) -> list[str]:
+def _format_source(name: object, raw: object) -> int | None:
+    if not isinstance(name, str) or not isinstance(raw, dict):
+        return None
+    sources = raw.get("sources")
+    if isinstance(sources, bool) or not isinstance(sources, int):
+        return None
+    return sources
+
+
+def _format_sources(data: dict[str, Any]) -> dict[str, int] | None:
     statistics = data.get("statistics")
     if not isinstance(statistics, dict):
-        return list(files)
+        return None
     formats = statistics.get("formats")
     if not isinstance(formats, dict):
-        return list(files)
+        return None
     analyzed: dict[str, int] = {}
     for name, raw in formats.items():
-        if not isinstance(name, str) or not isinstance(raw, dict):
-            return list(files)
-        sources = raw.get("sources")
-        if isinstance(sources, bool) or not isinstance(sources, int):
-            return list(files)
+        sources = _format_source(name, raw)
+        if sources is None:
+            return None
         analyzed[name] = sources
+    return analyzed
+
+
+def _files_with_suffix(files: list[str], suffix: str) -> list[str]:
+    return [
+        name for name in files if Path(name).suffix.lower() == suffix
+    ]
+
+
+def _missing_formats(
+    files: list[str], analyzed: dict[str, int]
+) -> set[str]:
     selected = Counter(Path(name).suffix.lower() for name in files)
     candidates: set[str] = set()
     for suffix, count in selected.items():
         format_name = FORMAT_BY_SUFFIX.get(suffix)
-        if (
-            format_name is None
-            or analyzed.get(format_name, 0) < count
-        ):
-            candidates.update(
-                name
-                for name in files
-                if Path(name).suffix.lower() == suffix
-            )
+        if format_name is None or analyzed.get(format_name, 0) < count:
+            candidates.update(_files_with_suffix(files, suffix))
+    return candidates
+
+
+def _selected_skipped(files: list[str], data: dict[str, Any]) -> list[str]:
+    analyzed = _format_sources(data)
+    if analyzed is None:
+        return list(files)
+    candidates = _missing_formats(files, analyzed)
     if not candidates:
         candidates.update(files)
     return sorted(candidates)
 
 
 def _parse_jscpd_json(report: Path, files: list[str]) -> None:
-    data = _read_report(report)
-    if not isinstance(data, dict):
-        raise _no_completed(report, "expected a JSON object")
-    statistics = data.get("statistics")
-    if not isinstance(statistics, dict):
-        raise _no_completed(report, "statistics is not an object")
-    total = statistics.get("total")
-    if not isinstance(total, dict):
-        raise _no_completed(report, "statistics.total is not an object")
+    data = _required_object(
+        _read_report(report), report, "expected a JSON object"
+    )
+    statistics = _required_object(
+        data.get("statistics"), report, "statistics is not an object"
+    )
+    total = _required_object(
+        statistics.get("total"),
+        report,
+        "statistics.total is not an object",
+    )
     sources = total.get("sources")
     if isinstance(sources, bool) or not isinstance(sources, int):
         raise _no_completed(

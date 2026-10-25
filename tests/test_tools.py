@@ -237,6 +237,19 @@ class ToolsTests(FixtureCase):
         self.assertEqual(binary.read_text(encoding="utf-8"), "existing binary\n")
         self.assertIn("already installed", result.stdout)
 
+    def test_fetch_replaces_an_existing_broken_install(self) -> None:
+        archive = self.make_tarball()
+        tools = self.base / "tools"
+        destination = tools / f"jscpd-{VERSION}"
+        destination.mkdir(parents=True)
+        stale = destination / "stale.txt"
+        stale.write_text("stale\n", encoding="utf-8")
+        lock = self.write_lock(archive.as_uri(), self.sha256(archive))
+        result = self.fetch(lock, tools)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse(stale.exists())
+        self.assertTrue((destination / "jscpd").is_file())
+
     def test_fetch_allows_directory_members_and_nested_binary(self) -> None:
         archive = self.make_tarball(
             files={"pkg/jscpd": b"#!/bin/sh\necho nested\n"},

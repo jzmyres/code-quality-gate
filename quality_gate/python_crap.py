@@ -114,6 +114,14 @@ def _function_identity(
     return f"{prefix}{node.name}"
 
 
+def _start_line(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> int:
+    if node.decorator_list:
+        return node.decorator_list[0].lineno
+    return node.lineno
+
+
 def _collect_functions(
     nodes: list[ast.AST],
     prefix: str,
@@ -124,11 +132,7 @@ def _collect_functions(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_overload(node):
                 continue
-            start = (
-                node.decorator_list[0].lineno
-                if node.decorator_list
-                else node.lineno
-            )
+            start = _start_line(node)
             found.append(
                 MeasuredFunction(
                     identity=f"{path}:{_function_identity(node, prefix)}",
@@ -150,52 +154,71 @@ def _collect_functions(
             _collect_functions([child], prefix, path, found)
 
 
-def _walk_outside(node: ast.AST):
+def _argument_defaults(arguments: ast.arguments) -> list[ast.AST]:
+    return [
+        default
+        for default in [*arguments.defaults, *arguments.kw_defaults]
+        if default is not None
+    ]
+
+
+def _argument_annotations(arguments: ast.arguments) -> list[ast.AST]:
+    annotations: list[ast.AST] = []
+    for argument in [
+        *arguments.posonlyargs,
+        *arguments.args,
+        *arguments.kwonlyargs,
+        arguments.vararg,
+        arguments.kwarg,
+    ]:
+        if argument is not None and argument.annotation is not None:
+            annotations.append(argument.annotation)
+    return annotations
+
+
+def _function_outside_children(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    children = [*node.decorator_list]
+    children.extend(_argument_defaults(node.args))
+    children.extend(_argument_annotations(node.args))
+    if node.returns is not None:
+        children.append(node.returns)
+    return children
+
+
+def _class_outside_children(node: ast.ClassDef) -> list[ast.AST]:
+    return [
+        *node.decorator_list,
+        *node.bases,
+        *node.keywords,
+        *node.body,
+    ]
+
+
+def _outside_children(node: ast.AST) -> list[ast.AST]:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        yield node
-        for decorator in node.decorator_list:
-            yield from _walk_outside(decorator)
-        arguments = node.args
-        for default in [*arguments.defaults, *arguments.kw_defaults]:
-            if default is not None:
-                yield from _walk_outside(default)
-        for argument in [
-            *arguments.posonlyargs,
-            *arguments.args,
-            *arguments.kwonlyargs,
-            arguments.vararg,
-            arguments.kwarg,
-        ]:
-            if argument is not None and argument.annotation is not None:
-                yield from _walk_outside(argument.annotation)
-        if node.returns is not None:
-            yield from _walk_outside(node.returns)
-        return
+        return _function_outside_children(node)
     if isinstance(node, ast.Lambda):
-        yield node
-        for default in [*node.args.defaults, *node.args.kw_defaults]:
-            if default is not None:
-                yield from _walk_outside(default)
-        return
+        return _argument_defaults(node.args)
     if isinstance(node, ast.ClassDef):
-        yield node
-        for decorator in node.decorator_list:
-            yield from _walk_outside(decorator)
-        for base in node.bases:
-            yield from _walk_outside(base)
-        for keyword in node.keywords:
-            yield from _walk_outside(keyword)
-        for statement in node.body:
-            yield from _walk_outside(statement)
-        return
-    if (
+        return _class_outside_children(node)
+    return list(ast.iter_child_nodes(node))
+
+
+def _is_docstring(node: ast.AST) -> bool:
+    return (
         isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Constant)
         and isinstance(node.value.value, str)
-    ):
+    )
+
+
+def _walk_outside(node: ast.AST):
+    if _is_docstring(node):
         return
     yield node
-    for child in ast.iter_child_nodes(node):
+    for child in _outside_children(node):
         yield from _walk_outside(child)
 
 
@@ -215,25 +238,34 @@ def _outside_complexity(nodes: list[ast.AST]) -> int:
     return total
 
 
+def _node_lines(nodes: list[ast.AST]) -> list[int]:
+    lines: set[int] = set()
+    for node in nodes:
+        line = getattr(node, "lineno", 0)
+        if line > 0:
+            lines.add(line)
+    return sorted(lines)
+
+
+def _last_end_line(nodes: list[ast.AST], default: int) -> int:
+    ends: list[int] = []
+    for node in nodes:
+        node_end = getattr(node, "end_lineno", None)
+        if node_end is not None:
+            ends.append(node_end)
+    if not ends:
+        return default
+    return max(ends)
+
+
 def _module_subject(
     tree: ast.Module, relative: str
 ) -> MeasuredFunction | None:
     nodes = _outside_nodes(tree)
-    lines = sorted(
-        {
-            node.lineno
-            for node in nodes
-            if isinstance(node, ast.AST) and getattr(node, "lineno", 0) > 0
-        }
-    )
+    lines = _node_lines(nodes)
     if not lines:
         return None
-    ends = [
-        node.end_lineno
-        for node in nodes
-        if getattr(node, "end_lineno", None) is not None
-    ]
-    end = max(ends) if ends else lines[-1]
+    end = _last_end_line(nodes, lines[-1])
     return MeasuredFunction(
         identity=f"{relative}:<module>",
         path=relative,
@@ -274,6 +306,21 @@ def _duplicate_failures(functions: list[MeasuredFunction]) -> list[str]:
     return failures
 
 
+def _lines_in(values: list[int], allowed: set[int]) -> list[int]:
+    return [line for line in values if line in allowed]
+
+
+def _lines_between(
+    values: list[int], start: int, end: int
+) -> list[int]:
+    return [line for line in values if start <= line <= end]
+
+
+def _executed_count(lines: list[int], missing: list[int]) -> int:
+    missing_set = set(missing)
+    return sum(1 for line in lines if line not in missing_set)
+
+
 def _measure_one(
     function: MeasuredFunction,
     statements: list[int],
@@ -284,8 +331,8 @@ def _measure_one(
     # only the body's statements measure whether the tests exercised the function.
     if function.lines is not None:
         owned = set(function.lines)
-        lines = [line for line in statements if line in owned]
-        excluded_lines = [line for line in excluded if line in owned]
+        lines = _lines_in(statements, owned)
+        excluded_lines = _lines_in(excluded, owned)
     else:
         assert isinstance(
             function.node, (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -297,20 +344,13 @@ def _measure_one(
                 "body shares the def line; put the body on its own line",
             )
         body_start = function.node.body[0].lineno
-        lines = [
-            line
-            for line in statements
-            if body_start <= line <= function.end_line
-        ]
-        excluded_lines = [
-            line
-            for line in excluded
-            if body_start <= line <= function.end_line
-        ]
+        lines = _lines_between(statements, body_start, function.end_line)
+        excluded_lines = _lines_between(
+            excluded, body_start, function.end_line
+        )
     if not lines:
         return None, None, "no coverage statements in the measured span"
-    missing_set = set(missing)
-    executed = sum(1 for line in lines if line not in missing_set)
+    executed = _executed_count(lines, missing)
     coverage = executed / len(lines)
     crap = function.cc**2 * (1 - coverage) ** 3 + function.cc
     measurement = {
@@ -322,13 +362,9 @@ def _measure_one(
     return crap, measurement, None
 
 
-def measure_crap(
-    root: Path,
-    selected: list[str],
-    evidence: Path,
-    config_file: Path | None = None,
-) -> CrapMeasurement:
-    """Measure every function and outside-function subject in SELECTED."""
+def _parse_selected(
+    root: Path, selected: list[str]
+) -> tuple[dict[str, tuple[str, list[MeasuredFunction]]], list[str]]:
     failures: list[str] = []
     parsed: dict[str, tuple[str, list[MeasuredFunction]]] = {}
     for relative in selected:
@@ -345,6 +381,17 @@ def measure_crap(
             ) from error
         parsed[relative] = (source, functions)
         failures.extend(_duplicate_failures(functions))
+    return parsed, failures
+
+
+def measure_crap(
+    root: Path,
+    selected: list[str],
+    evidence: Path,
+    config_file: Path | None = None,
+) -> CrapMeasurement:
+    """Measure every function and outside-function subject in SELECTED."""
+    parsed, failures = _parse_selected(root, selected)
     if failures:
         return CrapMeasurement([], failures)
 

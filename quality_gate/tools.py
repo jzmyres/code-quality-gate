@@ -16,6 +16,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
@@ -54,6 +55,78 @@ def _safe_relative_binary(value: str) -> bool:
     return bool(path.parts) and not path.is_absolute() and ".." not in path.parts
 
 
+def _lock_version(lock: Path, name: str, raw: dict[str, Any]) -> str:
+    version = _string(raw, "version", lock, f"{name}.version")
+    if TOOL_COMPONENT.fullmatch(version) is None:
+        raise _tool_error(
+            lock,
+            f"{name}.version",
+            "a version matching [A-Za-z0-9][A-Za-z0-9._-]*",
+            _describe(version),
+        )
+    return version
+
+
+def _lock_digest(lock: Path, name: str, raw: dict[str, Any]) -> str:
+    digest = _string(raw, "sha256", lock, f"{name}.sha256")
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdefABCDEF" for character in digest
+    ):
+        raise _tool_error(
+            lock,
+            f"{name}.sha256",
+            "a 64-character hexadecimal SHA-256",
+            _describe(digest),
+        )
+    return digest
+
+
+def _lock_binary(lock: Path, name: str, raw: dict[str, Any]) -> str:
+    binary = _string(raw, "binary", lock, f"{name}.binary")
+    if not _safe_relative_binary(binary):
+        raise _tool_error(
+            lock,
+            f"{name}.binary",
+            "a safe relative path",
+            _describe(binary),
+        )
+    return binary
+
+
+def _lock_format(lock: Path, name: str, raw: dict[str, Any]) -> str:
+    archive_format = raw.get("format", "tar")
+    if archive_format not in ("tar", "wheel"):
+        raise _tool_error(
+            lock,
+            f"{name}.format",
+            "one of tar, wheel",
+            _describe(archive_format),
+        )
+    return archive_format
+
+
+def _parse_tool(lock: Path, name: str, raw: Any) -> Tool:
+    if not isinstance(raw, dict):
+        raise _tool_error(lock, name, "a table", _describe(raw))
+    for key in raw:
+        if key not in LOCK_KEYS:
+            raise _tool_error(
+                lock,
+                f"{name}.{key}",
+                f"a known key ({', '.join(LOCK_KEYS)}); "
+                "allowed keys: " + ", ".join(LOCK_KEYS),
+                "unknown key",
+            )
+    return Tool(
+        name=name,
+        version=_lock_version(lock, name, raw),
+        url=_string(raw, "url", lock, f"{name}.url"),
+        sha256=_lock_digest(lock, name, raw).lower(),
+        binary=_lock_binary(lock, name, raw),
+        format=_lock_format(lock, name, raw),
+    )
+
+
 def load_tools(lock: Path) -> dict[str, Tool]:
     try:
         with lock.open("rb") as stream:
@@ -69,68 +142,14 @@ def load_tools(lock: Path) -> dict[str, Tool]:
 
     tools: dict[str, Tool] = {}
     for name, raw in data.items():
-        full_key = name
         if TOOL_COMPONENT.fullmatch(name) is None:
             raise _tool_error(
                 lock,
-                full_key,
+                name,
                 "a tool name matching [A-Za-z0-9][A-Za-z0-9._-]*",
                 _describe(name),
             )
-        if not isinstance(raw, dict):
-            raise _tool_error(lock, full_key, "a table", _describe(raw))
-        for key in raw:
-            if key not in LOCK_KEYS:
-                raise _tool_error(
-                    lock,
-                    f"{full_key}.{key}",
-                    f"a known key ({', '.join(LOCK_KEYS)}); "
-                    "allowed keys: " + ", ".join(LOCK_KEYS),
-                    "unknown key",
-                )
-        version = _string(raw, "version", lock, f"{full_key}.version")
-        if TOOL_COMPONENT.fullmatch(version) is None:
-            raise _tool_error(
-                lock,
-                f"{full_key}.version",
-                "a version matching [A-Za-z0-9][A-Za-z0-9._-]*",
-                _describe(version),
-            )
-        url = _string(raw, "url", lock, f"{full_key}.url")
-        digest = _string(raw, "sha256", lock, f"{full_key}.sha256")
-        if len(digest) != 64 or any(
-            character not in "0123456789abcdefABCDEF" for character in digest
-        ):
-            raise _tool_error(
-                lock,
-                f"{full_key}.sha256",
-                "a 64-character hexadecimal SHA-256",
-                _describe(digest),
-            )
-        binary = _string(raw, "binary", lock, f"{full_key}.binary")
-        if not _safe_relative_binary(binary):
-            raise _tool_error(
-                lock,
-                f"{full_key}.binary",
-                "a safe relative path",
-                _describe(binary),
-            )
-        archive_format = raw.get("format", "tar")
-        if archive_format not in ("tar", "wheel"):
-            raise _tool_error(
-                lock,
-                f"{full_key}.format",
-                "one of tar, wheel",
-                _describe(archive_format),
-            )
-        tools[name] = Tool(
-            name=name,
-            version=version,
-            url=url,
-            sha256=digest.lower(),
-            binary=binary,
-            format=archive_format,
-        )
+        tools[name] = _parse_tool(lock, name, raw)
     return tools
 
 
@@ -279,7 +298,7 @@ def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
         _extract_tar(archive_path, destination, tool)
 
 
-def _fetch_tool(tool: Tool, tools_root: Path) -> None:
+def _install_target(tool: Tool, tools_root: Path) -> Path:
     destination = tools_root / f"{tool.name}-{tool.version}"
     root = tools_root.resolve()
     try:
@@ -295,6 +314,19 @@ def _fetch_tool(tool: Tool, tools_root: Path) -> None:
             f"{destination} resolves outside the tools directory {root}; "
             "nothing installed"
         )
+    return destination
+
+
+def _replace_destination(build: Path, destination: Path) -> None:
+    if destination.is_symlink() or destination.is_file():
+        destination.unlink()
+    elif destination.is_dir():
+        shutil.rmtree(destination)
+    os.replace(build, destination)
+
+
+def _fetch_tool(tool: Tool, tools_root: Path) -> None:
+    destination = _install_target(tool, tools_root)
     binary = _tool_binary(tool, tools_root)
     if binary.is_file():
         print(
@@ -321,11 +353,7 @@ def _fetch_tool(tool: Tool, tools_root: Path) -> None:
             mode = installed_binary.stat().st_mode & 0o777
             if not mode & 0o111:
                 os.chmod(installed_binary, mode | 0o111)
-            if destination.is_symlink() or destination.is_file():
-                destination.unlink()
-            elif destination.is_dir():
-                shutil.rmtree(destination)
-            os.replace(build, destination)
+            _replace_destination(build, destination)
     except OSError as error:
         raise GateError(
             f"tools: {tool.name} {tool.version}: cannot install: {error}"
