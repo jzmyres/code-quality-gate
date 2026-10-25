@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
-import os
+import time
 import unittest
+from pathlib import Path
 
 from support import (
     BASE_CONFIG,
@@ -11,6 +12,16 @@ from support import (
     _add_check_to_class,
     output,
 )
+
+
+def process_state(pid: int) -> str | None:
+    """Return a process's state letter from /proc, or None once it no longer exists."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    # The state follows the parenthesised command name, which may itself contain spaces.
+    return stat.rpartition(")")[2].split()[0]
 
 
 def with_command(
@@ -281,8 +292,14 @@ class CommandCheckTests(FixtureCase):
         self.assertEqual(check["execution"], "budget")
         self.assertIn("exceeded its 1 second budget", result.stderr)
         child_pid = int(pid_file.read_text(encoding="utf-8"))
-        with self.assertRaises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        # A killed grandchild is reparented to PID 1, which in a CI container may never reap it: a zombie is
+        # dead, so only a running state fails. Poll briefly for the kill to take effect.
+        deadline = time.monotonic() + 5
+        state = process_state(child_pid)
+        while state not in (None, "Z", "X") and time.monotonic() < deadline:
+            time.sleep(0.05)
+            state = process_state(child_pid)
+        self.assertIn(state, (None, "Z", "X"), f"grandchild {child_pid} still running (state {state})")
 
     def test_output_over_one_mib_is_capped_and_counted(self) -> None:
         run = json.dumps(
