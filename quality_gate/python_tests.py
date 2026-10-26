@@ -109,30 +109,3 @@ def summarize_matches(
             f"skipped {skipped} tests but only {ran} ran",
         )
     return ran, skipped, None
-
-
-def parse_test_summary(
-    spec: PythonTestsSpec, output: str
-) -> tuple[int | None, int | None, str | None]:
-    tests_matches = [
-        list(match.groups()) for match in spec.tests_pattern_re.finditer(output)
-    ]
-    skipped_matches = (
-        [
-            list(match.groups())
-            for match in spec.skipped_pattern_re.finditer(output)
-        ]
-        if spec.skipped_pattern_re is not None
-        else []
-    )
-    return summarize_matches(spec, tests_matches, skipped_matches)
-
-
-def parse_test_count(
-    spec: PythonTestsSpec, output: str
-) -> tuple[int | None, str | None]:
-    ran, skipped, error = parse_test_summary(spec, output)
-    if error is not None:
-        return None, error
-    assert ran is not None and skipped is not None
-    return ran - skipped, None

@@ -590,21 +590,24 @@ Thresholds, baseline bounds and measured values must be finite: a non-finite thr
 configuration error, and a non-finite measured value makes the check `unsupported`. JSON output is
 written with `allow_nan=False`.
 
-A finding passes when `value <= threshold` for a `max` metric (or `value >= threshold` for a
-`min` metric), or when a baseline entry for its subject exists, has not expired, has a non-empty
-reason, and is within its bound. Such a finding keeps its raw value and is reported with
-`covered_by_baseline = true`, `blocking = false`, and check `satisfied = true` even though its raw
-`outcome` may remain `fail`. A finding outside both fails, naming subject, value, threshold or bound,
-and location. A baseline that is absent means no exception is accepted; a file with only the header and
-no entries is allowed. For a `max` metric a missing entry accepts only 0; a `min` metric without an
-entry is unmeasured and fails until an entry exists.
+A `max` finding without a baseline entry passes at or below its threshold; an entry is needed only
+above it. A `min` metric needs an entry: without one it is unmeasured and fails, whatever its value.
+A finding above its `max` threshold passes when a baseline entry for its subject exists, has not
+expired, has a non-empty reason, and is within its bound; a `min` finding passes when such an entry
+exists and its value is at or above the entry's bound. Such a finding keeps its raw value and is
+reported with `covered_by_baseline = true`, `blocking = false`, and check `satisfied = true` even
+though its raw `outcome` may remain `fail`. A finding outside both fails, naming subject, value,
+threshold or bound, and location. A baseline that is absent means no exception is accepted; a file
+with only the header and no entries is allowed. For verification's `max` metrics, whose threshold is
+0, a missing entry therefore accepts only 0.
 
 Resolution requires a complete scan. Each adapter reports the subject domain it measured completely: for
-CRAP the selected files, and for clones the selected files each baseline entry names. An entry is
-resolved or pruned only when its subject lies in that domain and was not found above threshold. An
-entry outside the domain is reported as `unmeasured` in `unmeasured_baseline_entries` and kept; prune
-never drops it. A clone entry naming a file deleted from the repository resolves; one naming a file
-that still exists but was not selected stays unmeasured.
+CRAP the selected files, and for clones the selected files each baseline entry names. A `max` entry
+in that domain resolves when its subject was not found above the threshold; prune drops it. A `min`
+entry never resolves; prune raises its floor to the measured value. An entry outside the domain is
+reported as `unmeasured` in `unmeasured_baseline_entries` and kept; prune never drops it. A clone
+entry naming a file deleted from the repository resolves; one naming a file that still exists but was
+not selected stays unmeasured.
 
 `--prune` tightens each bound to the measured value (lowers a `max` ceiling, raises a `min` floor)
 and drops resolved entries. It never weakens a bound or adds an entry, and it refuses (exit 1, writing

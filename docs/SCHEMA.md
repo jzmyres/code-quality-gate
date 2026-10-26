@@ -159,9 +159,9 @@ The `verification` adapter measures verification loss. For each reused
 value `ran - skipped`) and `tests:CHECK:skipped` (direction `max`). For each
 selected Python file it records `exclusions:FILE:no-cover` (lines matching the
 `pragma: no cover` coverage exclusion) and `exclusions:FILE:noqa` (`# noqa`
-comments), both `max`. A missing baseline entry accepts only 0 for a `max`
-metric; a `min` metric without an entry is unmeasured and fails until an entry
-exists.
+comments), both `max`. These verification `max` metrics have threshold 0, so a
+missing baseline entry accepts only 0; a `min` metric without an entry is
+unmeasured and fails until an entry exists.
 
 ## Tool lock: `tools.lock.toml`
 
@@ -239,17 +239,17 @@ expires = 2026-12-31
   today; only a date before today expires.
 * Adapter metadata (for example clone `files`) is preserved by `--prune`.
 * An absent baseline means no exception is accepted. An existing file with
-  only the header is allowed. An absent entry accepts only 0 for a `max`
-  metric and leaves a `min` metric unmeasured.
+  only the header is allowed. A `max` metric without an entry passes at or
+  below its threshold. A `min` metric needs an entry: without one it is
+  unmeasured and fails.
 
 Resolution requires a complete scan. An adapter reports the subject domain it
 measured completely (the selected files for CRAP; for clones, the selected
-files each entry's `files` metadata names). An entry is resolved or pruned only
-when its subject lies in that domain and was not found outside its bound. A
-`max` entry inside its bound resolves and prune drops it; a `min` entry is
-kept and prune raises its floor to the measured value. An entry outside the
-domain is reported as `unmeasured` and kept; prune never drops it. A clone
-entry naming a file deleted from the repository resolves.
+files each entry's `files` metadata names). A `max` entry in that domain
+resolves when its subject was not found above the threshold; prune drops it. A
+`min` entry never resolves; prune raises its floor to the measured value. An
+entry outside the domain is reported as `unmeasured` and kept; prune never
+drops it. A clone entry naming a file deleted from the repository resolves.
 
 ## Result: `check --json`
 

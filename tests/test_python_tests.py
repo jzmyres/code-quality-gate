@@ -32,6 +32,7 @@ covrun = importlib.import_module("quality_gate.covrun")
 gate_tools = importlib.import_module("quality_gate.tools")
 policy = importlib.import_module("quality_gate.policy")
 python_tests = importlib.import_module("quality_gate.python_tests")
+regexrun = importlib.import_module("quality_gate.regexrun")
 runner = importlib.import_module("quality_gate.runner")
 
 
@@ -1095,19 +1096,28 @@ class TestSummaryTests(unittest.TestCase):
             budget_seconds=600,
         )
 
-    def test_count_subtracts_skipped_and_reports_summary_errors(self) -> None:
-        count, error = python_tests.parse_test_count(
+    def summarize(
+        self, spec: policy.PythonTestsSpec, output: str
+    ) -> tuple[int | None, int | None, str | None]:
+        patterns = {"tests": spec.tests_pattern}
+        if spec.skipped_pattern is not None:
+            patterns["skipped"] = spec.skipped_pattern
+        matches = regexrun.evaluate({"text": output, "patterns": patterns})
+        return python_tests.summarize_matches(
+            spec, matches["tests"], matches.get("skipped", [])
+        )
+
+    def test_summary_counts_skipped_and_reports_errors(self) -> None:
+        ran, skipped, error = self.summarize(
             self.spec(), "Ran 3 tests in 0.01s\nskipped=1"
         )
-        self.assertEqual((count, error), (2, None))
-        count, error = python_tests.parse_test_count(
-            self.spec(), "no summary"
-        )
-        self.assertIsNone(count)
+        self.assertEqual((ran, skipped, error), (3, 1, None))
+        ran, skipped, error = self.summarize(self.spec(), "no summary")
+        self.assertEqual((ran, skipped), (None, None))
         self.assertIn("did not match", error)
 
     def test_non_integer_counts_are_rejected(self) -> None:
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(tests_pattern=r"^Ran ([A-Za-z]+) tests? in"),
             "Ran many tests in 0.01s",
         )
@@ -1115,7 +1125,7 @@ class TestSummaryTests(unittest.TestCase):
         self.assertIn("tests_pattern", error)
         self.assertIn("not a test count", error)
 
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(skipped_pattern=r"skipped=([A-Za-z]+)"),
             "Ran 1 test in 0.01s\nskipped=many",
         )
@@ -1124,20 +1134,20 @@ class TestSummaryTests(unittest.TestCase):
         self.assertIn("not a test count", error)
 
     def test_ambiguous_skipped_summary_is_rejected(self) -> None:
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(), "Ran 2 tests in 0.1s\nskipped=0\nskipped=1"
         )
         self.assertEqual((ran, skipped), (None, None))
         self.assertIn("ambiguous skipped summary", error)
 
     def test_negative_counts_are_rejected(self) -> None:
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(skipped_pattern=r"skipped=(-?[0-9]+)"),
             "Ran 2 tests in 0.1s\nskipped=-1",
         )
         self.assertEqual((ran, skipped), (None, None))
         self.assertIn("not a test count", error)
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(tests_pattern=r"^Ran (-?[0-9]+) tests? in"),
             "Ran -1 test in 0.1s",
         )
@@ -1145,14 +1155,14 @@ class TestSummaryTests(unittest.TestCase):
         self.assertIn("not a test count", error)
 
     def test_an_absent_optional_capture_is_zero(self) -> None:
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(skipped_pattern=r"skipped(?:=([0-9]+))?"),
             "Ran 1 test in 0.1s\nskipped",
         )
         self.assertEqual((ran, skipped, error), (1, 0, None))
 
     def test_more_skipped_than_ran_is_rejected(self) -> None:
-        ran, skipped, error = python_tests.parse_test_summary(
+        ran, skipped, error = self.summarize(
             self.spec(), "Ran 1 test in 0.01s\nskipped=2"
         )
         self.assertEqual((ran, skipped), (None, None))
