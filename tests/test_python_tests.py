@@ -28,6 +28,7 @@ sys.path.insert(0, str(GATE))
 checks = importlib.import_module("quality_gate.checks")
 coverage_tool = importlib.import_module("quality_gate.coverage_tool")
 covrun = importlib.import_module("quality_gate.covrun")
+gate_tools = importlib.import_module("quality_gate.tools")
 policy = importlib.import_module("quality_gate.policy")
 python_tests = importlib.import_module("quality_gate.python_tests")
 runner = importlib.import_module("quality_gate.runner")
@@ -353,6 +354,52 @@ class PythonTestsTests(FixtureCase):
         self.assertEqual(list(destination.rglob("*.pyc")), [])
 
 
+class AuthorizedCoverageTests(FixtureCase):
+    def test_an_authorized_lock_reaches_the_coverage_runner(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.write_config(tests_config())
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER
+            + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        lock = (GATE / "tools.lock.toml").read_text(encoding="utf-8")
+        self.add_file("tools.lock.toml", lock)
+        self.commit_all()
+        revision = self.git("rev-parse", "HEAD").stdout.strip()
+
+        source = coverage_tool.coverage_installation()
+        tools = self.base / "tools"
+        destination = tools / source.name
+        shutil.copytree(source, destination, symlinks=True)
+        (destination / "authorized-upgrade.txt").write_text(
+            "authorized\n", encoding="utf-8"
+        )
+        payload = self.payload_digest(destination)
+        pinned = gate_tools.load_tools(GATE / "tools.lock.toml")["coverage"]
+        self.assertNotEqual(payload, pinned.payload_sha256)
+        changed = lock.replace(
+            f'payload_sha256 = "{pinned.payload_sha256}"',
+            f'payload_sha256 = "{payload}"',
+        )
+        self.assertNotEqual(changed, lock)
+        self.add_file("tools.lock.toml", changed)
+
+        result, document = self.run_json(
+            "--policy-from",
+            revision,
+            "--allow-protected",
+            "tools.lock.toml",
+            env={"QG_TOOLS_DIR": str(tools)},
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(document, "tests")
+        self.assertEqual(check["outcome"], "pass")
+        self.assertEqual(check["measurement"], {"tests": 1})
+
+
 class CovrunTests(unittest.TestCase):
     def test_usage_and_missing_coverage_are_reported(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
@@ -368,6 +415,8 @@ class CovrunTests(unittest.TestCase):
                         temporary,
                         temporary,
                         str(missing),
+                        "7.16.2",
+                        "0" * 64,
                         str(Path(temporary) / "config"),
                         str(Path(temporary) / "registry"),
                         "-c",
@@ -386,6 +435,9 @@ class CovrunTests(unittest.TestCase):
         self.source_root = self.base / "root"
         self.source_root.mkdir()
         self.coverage_dir = coverage_tool.coverage_installation()
+        self.coverage = gate_tools.load_tools(GATE / "tools.lock.toml")[
+            "coverage"
+        ]
         self.config_file = coverage_tool.write_coverage_config(
             self.data_dir, self.source_root
         )
@@ -397,6 +449,27 @@ class CovrunTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def prefix_arguments(self, coverage_dir: Path) -> list[str]:
+        return [
+            str(coverage_dir),
+            self.coverage.version,
+            self.coverage.payload_sha256,
+            str(self.config_file),
+            str(self.registry),
+        ]
+
+    def tampered(self, name: str, sentinel_name: str) -> tuple[Path, Path, Path]:
+        destination = self.base / name / self.coverage_dir.name
+        shutil.copytree(self.coverage_dir, destination, symlinks=True)
+        init = destination / "coverage" / "__init__.py"
+        init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
+        sentinel = self.base / sentinel_name
+        script = self.script(
+            "probe.py",
+            f"open({str(sentinel)!r}, 'w').write('ran\\n')\n",
+        )
+        return destination, sentinel, script
+
     def command(self, program: str, *arguments: str) -> list[str]:
         return [
             sys.executable,
@@ -404,9 +477,7 @@ class CovrunTests(unittest.TestCase):
             str(self.runner),
             str(self.data_dir),
             str(self.source_root),
-            str(self.coverage_dir),
-            str(self.config_file),
-            str(self.registry),
+            *self.prefix_arguments(self.coverage_dir),
             program,
             *arguments,
         ]
@@ -511,9 +582,7 @@ class CovrunTests(unittest.TestCase):
                     "covrun.py",
                     str(self.data_dir),
                     str(self.source_root),
-                    str(self.coverage_dir),
-                    str(self.config_file),
-                    str(self.registry),
+                    *self.prefix_arguments(self.coverage_dir),
                     "prog.py",
                     "--secret",
                 ]
@@ -572,14 +641,8 @@ class CovrunTests(unittest.TestCase):
         self.assertIn(document["dataset"], message)
 
     def test_run_refuses_tampered_coverage_before_it_is_imported(self) -> None:
-        destination = self.base / "tampered-run" / self.coverage_dir.name
-        shutil.copytree(self.coverage_dir, destination, symlinks=True)
-        init = destination / "coverage" / "__init__.py"
-        init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
-        sentinel = self.base / "ran-in-process"
-        script = self.script(
-            "probe.py",
-            f"open({str(sentinel)!r}, 'w').write('ran\\n')\n",
+        destination, sentinel, script = self.tampered(
+            "tampered-run", "ran-in-process"
         )
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             code = covrun._run(
@@ -587,9 +650,7 @@ class CovrunTests(unittest.TestCase):
                     "covrun.py",
                     str(self.data_dir),
                     str(self.source_root),
-                    str(destination),
-                    str(self.config_file),
-                    str(self.registry),
+                    *self.prefix_arguments(destination),
                     str(script),
                 ]
             )
@@ -599,15 +660,7 @@ class CovrunTests(unittest.TestCase):
         self.assertFalse(sentinel.exists())
 
     def test_tampered_coverage_is_refused_before_it_is_imported(self) -> None:
-        destination = self.base / "tampered-tools" / self.coverage_dir.name
-        shutil.copytree(self.coverage_dir, destination, symlinks=True)
-        init = destination / "coverage" / "__init__.py"
-        init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
-        sentinel = self.base / "ran"
-        script = self.script(
-            "probe.py",
-            f"open({str(sentinel)!r}, 'w').write('ran\\n')\n",
-        )
+        destination, sentinel, script = self.tampered("tampered-tools", "ran")
         result = subprocess.run(
             [
                 sys.executable,
@@ -615,9 +668,7 @@ class CovrunTests(unittest.TestCase):
                 str(self.runner),
                 str(self.data_dir),
                 str(self.source_root),
-                str(destination),
-                str(self.config_file),
-                str(self.registry),
+                *self.prefix_arguments(destination),
                 str(script),
             ],
             capture_output=True,

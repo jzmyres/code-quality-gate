@@ -175,17 +175,21 @@ instead of written.
 
 `python_tests` runs the consumer's own test command from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
-`covrun.py`, a fresh data directory, the source root, the pinned coverage install, the gate-owned
-coverage configuration path, and the registry directory. The adapter writes and every child uses one
+`covrun.py`, a fresh data directory, the source root, the pinned coverage install, that install's
+version and payload digest from the effective tool lock, the gate-owned coverage configuration path,
+and the registry directory. The adapter writes and every child uses one
 gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`, `source` the
 repository root, `exclude_lines` exactly the `pragma: no cover` expression) for collection,
 combination and analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
 `pyproject.toml` configuration is ignored, and every `COVERAGE_*` environment variable other than
 `COVERAGE_CORE` is removed before the test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
 --source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so
-`run` can name a script or `-m MODULE`; each invocation gets its own data file. `covrun.py` uses
-only the standard library and that verified coverage install, so it adds no gate package or gate
-repository path to the measured program's imports.
+`run` can name a script or `-m MODULE`; each invocation gets its own data file. `covrun.py` verifies
+the install against that version and payload digest with the same encoding `tools.py` uses, loading
+the shared verifier by path, so it starts no extra interpreter and adds no gate package or gate
+repository path to the measured program's imports. With `--policy-from`, the version and payload
+digest are the authorized effective lock's, so the parent and the coverage runner agree on an
+authorized coverage upgrade.
 
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:
@@ -295,9 +299,12 @@ other keys are configuration errors and a missing `payload_sha256` is a lock err
 is kept only when its payload digest matches the lock; otherwise `tools fetch` replaces it.
 
 Every later use of a tool recomputes the install's payload digest before the tool runs or is imported:
-Ruff and jscpd binaries, and the coverage package for collection and analysis. A mismatch or an invalid
-tree makes the check `unsupported`; the message names the tool, the install directory, and the expected
-and actual digests, and nothing from that install runs. Reinstall the pinned tools with `tools fetch`
+Ruff and jscpd binaries, and the coverage package for collection and analysis. The coverage adapter
+passes the effective lock's coverage version and payload digest to `covrun.py`, which verifies the
+install against them before importing it, so an authorized coverage upgrade is checked by the same
+descriptor in the parent and the child. A mismatch or an invalid tree makes the check `unsupported`; the
+message names the tool, the install directory, and the expected and actual digests, and nothing from
+that install runs. Reinstall the pinned tools with `tools fetch`
 after upgrading the gate. Existing installs made before payload pinning, or with a `__pycache__`
 directory, fail this verification and must be reinstalled with `tools fetch`.
 Imports of the installed coverage package run with bytecode writing disabled in the gate process,

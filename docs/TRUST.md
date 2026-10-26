@@ -110,6 +110,12 @@ Unauthorized changes to the policy file and the tools lock are ignored:
 classes, exemptions and pinned tool set, not the candidate's. The protected
 entry is reported as `ignored`.
 
+An authorized lock is the effective lock for the whole run. The coverage
+adapter passes that lock's coverage version and payload digest to each coverage
+invocation, and the invocations verify the install against them with the same
+payload encoding before importing it. An authorized coverage upgrade therefore
+does not fall back to the bundled pin.
+
 ### Any other protected path
 
 An unauthorized change to any other protected path makes the decision

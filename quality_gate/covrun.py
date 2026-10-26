@@ -3,43 +3,36 @@
 
 Invoked by the python_tests adapter, and exported through QG_PYTHON, as:
 
-    python -I covrun.py DATA_DIR SOURCE_ROOT COVERAGE_DIR CONFIG_FILE REGISTRY_DIR ARGS...
+    python -I covrun.py DATA_DIR SOURCE_ROOT COVERAGE_DIR VERSION PAYLOAD_SHA256
+        CONFIG_FILE REGISTRY_DIR ARGS...
 
 DATA_DIR receives one coverage dataset per invocation; SOURCE_ROOT is the
 measured repository root; COVERAGE_DIR is the install directory of the pinned
-coverage wheel; CONFIG_FILE is the gate-owned coverage configuration; and
+coverage wheel, which must match VERSION and PAYLOAD_SHA256 from the effective
+tool lock; CONFIG_FILE is the gate-owned coverage configuration; and
 REGISTRY_DIR receives the invocation records.  ARGS is a script or
 '-m MODULE' plus its arguments.  The adapter creates the configuration once
 and every child consumes it.
 
 This runner imports nothing from quality_gate: importing the gate would leave
 its package in the measured program's sys.modules and shadow the program's own
-package of the same name.
+package of the same name.  The payload verifier is loaded from its file by path
+for the same reason.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-import subprocess
 import sys
 import uuid
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-_VERIFY_INSTALL = """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from quality_gate.tools import verify_tool_directory
-
-try:
-    verify_tool_directory("coverage", Path(sys.argv[2]))
-except Exception as error:
-    print(error, file=sys.stderr)
-    sys.exit(2)
-"""
+_NOTHING_RUNS = (
+    "nothing from this install runs; run 'python3 -I qg.py tools fetch'"
+)
 
 
 class _RunError(Exception):
@@ -53,32 +46,44 @@ def _fail(message: str) -> int:
 
 def _usage() -> int:
     return _fail(
-        "expected DATA_DIR SOURCE_ROOT COVERAGE_DIR CONFIG_FILE REGISTRY_DIR "
-        "and a Python command, for example: "
-        "covrun.py DIR ROOT COVERAGE CONFIG REGISTRY -m unittest discover -s tests"
+        "expected DATA_DIR SOURCE_ROOT COVERAGE_DIR VERSION PAYLOAD_SHA256 "
+        "CONFIG_FILE REGISTRY_DIR and a Python command, for example: "
+        "covrun.py DIR ROOT COVERAGE VERSION PAYLOAD CONFIG REGISTRY "
+        "-m unittest discover -s tests"
     )
 
 
-def _verify_coverage(coverage_dir: Path) -> None:
-    # The gate imports coverage in the parent; verify the install again here
-    # without loading the gate into this interpreter.
-    root = Path(__file__).resolve().parent.parent
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-B",
-            "-c",
-            _VERIFY_INSTALL,
-            str(root),
-            str(coverage_dir),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+def _payload_verifier():
+    path = Path(__file__).with_name("payload.py")
+    spec = importlib.util.spec_from_file_location("_qg_payload_digest", path)
+    if spec is None or spec.loader is None:
+        raise _RunError(f"cannot load the payload verifier at {path}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except OSError as error:
         raise _RunError(
-            result.stderr.strip() or "cannot verify the coverage install"
+            f"cannot load the payload verifier at {path}: {error}"
+        ) from error
+    return module
+
+
+def _verify_coverage(
+    coverage_dir: Path, version: str, payload_sha256: str
+) -> None:
+    verifier = _payload_verifier()
+    try:
+        actual = verifier.payload_digest(coverage_dir)
+    except verifier.PayloadError as error:
+        raise _RunError(
+            f"coverage {version}: payload tree at {coverage_dir} is invalid: "
+            f"{error}; expected {payload_sha256}, got invalid; "
+            f"{_NOTHING_RUNS}"
+        ) from error
+    if actual != payload_sha256:
+        raise _RunError(
+            f"coverage {version}: payload digest mismatch at {coverage_dir}: "
+            f"expected {payload_sha256}, got {actual}; {_NOTHING_RUNS}"
         )
 
 
@@ -145,15 +150,17 @@ def _prepared(
     data_dir = Path(argv[1])
     source_root = Path(argv[2])
     coverage_dir = Path(argv[3])
-    config_file = Path(argv[4])
-    registry = Path(argv[5])
-    command = argv[6:]
+    version = argv[4]
+    payload_sha256 = argv[5]
+    config_file = Path(argv[6])
+    registry = Path(argv[7])
+    command = argv[8:]
     if not coverage_dir.is_dir():
         raise _RunError(
             f"coverage is not installed at {coverage_dir}; "
             "run 'python3 -I qg.py tools fetch'"
         )
-    _verify_coverage(coverage_dir)
+    _verify_coverage(coverage_dir, version, payload_sha256)
     if not config_file.is_file():
         raise _RunError(
             f"coverage configuration is missing at {config_file}; "
@@ -163,7 +170,7 @@ def _prepared(
 
 
 def _run(argv: list[str]) -> int:
-    if len(argv) < 7:
+    if len(argv) < 9:
         return _usage()
     # A consumer's coverage configuration must not change this metric: line
     # coverage only, with no branch measurement or omit rules of its own.

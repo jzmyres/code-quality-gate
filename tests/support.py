@@ -404,7 +404,7 @@ class FixtureCase(unittest.TestCase):
     def payload_digest(self, directory: Path) -> str:
         if str(GATE) not in sys.path:
             sys.path.insert(0, str(GATE))
-        from quality_gate.tools import payload_digest
+        from quality_gate.payload import payload_digest
 
         return payload_digest(directory)
 

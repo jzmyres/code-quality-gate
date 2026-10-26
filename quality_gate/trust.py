@@ -21,6 +21,7 @@ from typing import Any
 
 from . import tools as tools_module
 from .files import _type_name, git_argv
+from .payload import PayloadError, payload_digest
 from .policy import Config, ConfigError, GateError, UsageError, load_config
 from .ratchet import (
     BaselineEntry,
@@ -30,7 +31,7 @@ from .ratchet import (
     write_baseline,
 )
 from .runner import RunResult, run
-from .tools import _default_lock_path, _tools_dir, load_tools, payload_digest
+from .tools import _default_lock_path, _tools_dir, load_tools
 
 POLICY_NAME = "quality-gate.toml"
 LOCK_NAME = "tools.lock.toml"
@@ -756,7 +757,7 @@ def _tool_digest(tool: Any) -> str | None:
         return None
     try:
         return payload_digest(directory)
-    except GateError:
+    except PayloadError:
         return "invalid"
 
 
