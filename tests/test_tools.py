@@ -1,6 +1,7 @@
 """Tests for pinned tool fetching and path resolution."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -16,6 +17,7 @@ from unittest import mock
 
 from support import BASE_CONFIG, GATE, RUFF_VERSION, FixtureCase, output
 
+from quality_gate.cli import main
 from quality_gate.payload import PayloadError, payload_digest
 from quality_gate.policy import UnsupportedError
 from quality_gate.tools import lock_override, verify_tool_directory
@@ -508,6 +510,35 @@ class ToolsTests(FixtureCase):
         self.assertIn("nothing installed", text)
         self.assert_not_installed(tools)
         self.assertEqual(list(tools.iterdir()), [])
+
+    def test_fetch_unreadable_payload_exits_2(self) -> None:
+        archive = self.make_tarball()
+        lock = self.write_lock(
+            archive.as_uri(),
+            self.sha256(archive),
+            payload=self.archive_payload(archive),
+        )
+        tools = self.base / "tools"
+        scandir = os.scandir
+
+        def unreadable(path: object) -> object:
+            if isinstance(path, (str, os.PathLike)) and Path(path).name == "build":
+                raise PermissionError("Permission denied")
+            return scandir(path)
+
+        stderr = io.StringIO()
+        with mock.patch(
+            "quality_gate.payload.os.scandir", side_effect=unreadable
+        ), mock.patch.dict(os.environ, {"QG_TOOLS_DIR": str(tools)}):
+            with contextlib.redirect_stderr(stderr):
+                code = main(["tools", "fetch", "--lock", str(lock)])
+        text = stderr.getvalue()
+        self.assertEqual(code, 2, text)
+        self.assertIn("jscpd", text)
+        self.assertIn("build", text)
+        self.assertIn("Permission denied", text)
+        self.assertNotIn("Traceback", text)
+        self.assert_not_installed(tools)
 
     def test_fetch_bad_sha_format_exits_2(self) -> None:
         lock = self.write_lock("file:///tmp/x.tar.gz", "abc")

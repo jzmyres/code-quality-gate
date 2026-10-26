@@ -247,9 +247,11 @@ Resolution requires a complete scan. An adapter reports the subject domain it
 measured completely (the selected files for CRAP; for clones, the selected
 files each entry's `files` metadata names). A `max` entry in that domain
 resolves when its subject was not found above the threshold; prune drops it. A
-`min` entry never resolves; prune raises its floor to the measured value. An
-entry outside the domain is reported as `unmeasured` and kept; prune never
-drops it. A clone entry naming a file deleted from the repository resolves.
+measured `min` entry never resolves by itself; prune raises its floor to the
+measured value. Any subject absent from a completely measured domain resolves
+and is pruned, whatever its direction. An entry outside the domain is reported
+as `unmeasured` and kept; prune never drops it. A clone entry naming a file
+deleted from the repository resolves.
 
 ## Result: `check --json`
 

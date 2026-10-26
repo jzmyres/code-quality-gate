@@ -432,7 +432,13 @@ def _build_install(tool: Tool, temporary_path: Path) -> Path:
     mode = installed_binary.stat().st_mode & 0o777
     if not mode & 0o111:
         os.chmod(installed_binary, mode | 0o111)
-    actual = payload_digest(build)
+    try:
+        actual = payload_digest(build)
+    except PayloadError as error:
+        raise UsageError(
+            f"tools: {tool.name} {tool.version}: cannot read payload at "
+            f"{build}: {error}; nothing installed"
+        ) from error
     if actual != tool.payload_sha256:
         raise GateError(
             f"tools: {tool.name} {tool.version}: payload sha256 "
@@ -480,7 +486,7 @@ def command_tools_fetch(lock: Path) -> int:
             _fetch_tool(tools[name], tools_root)
         except GateError as error:
             print(error, file=sys.stderr)
-            return 1
+            return error.exit_code
     return 0
 
 
