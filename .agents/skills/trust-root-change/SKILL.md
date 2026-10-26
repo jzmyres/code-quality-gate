@@ -2,7 +2,7 @@
 name: trust-root-change
 description: Checklist for changing the gate's trust root, protected inputs, baseline merge, prune or run identity.
 verified: 2026-10-26
-commit: 580058a
+commit: d0dd33d
 paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, tests/test_trust.py, tests/test_verification.py
 ---
 
@@ -38,7 +38,8 @@ closure: the suite covers the probes below, but a new trust path needs its own a
 6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version and
    payload digest as arguments and loads the standard-library `payload.py` by file path, so the measured
    interpreter never imports `quality_gate` (QF7). Do not move that verifier into the package import graph or
-   start a nested verifier interpreter.
+   start a nested verifier interpreter. `payload.PayloadError` is a plain exception, not a `GateError`;
+   each caller that reads a payload catches it at its own boundary and converts it to that boundary's error.
 7. **Probe the cases.** Cover a replacement ref (`git replace A B`, checked with `git --no-replace-objects
    show A:FILE`), an `info/grafts` file, a candidate that omits a `min` floor, a malformed candidate baseline,
    a protected symlink, FIFO and symlinked parent, a prune through a symlinked parent, a protected file created
