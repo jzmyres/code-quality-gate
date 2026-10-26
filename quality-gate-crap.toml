@@ -27,11 +27,6 @@ bound = 12.155363374298286
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/checks.py:_run_python_tests"
-bound = 13.428531179564237
-reason = "above 6 after QF1 (2026-10-25); worklist"
-
-[[entry]]
 subject = "quality_gate/clones.py:_parse_sarif"
 bound = 21.166180758017493
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"

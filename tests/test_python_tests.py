@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -829,6 +830,250 @@ class CoverageDeadlineTests(unittest.TestCase):
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.outcome, "fail")
         self.assertIn("coverage combination exceeded", result.reason)
+
+
+class PythonTestsCheckHelperTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tests_pattern = r"^Ran ([0-9]+) tests? in"
+        skipped_pattern = r"skipped=([0-9]+)"
+        self.spec = policy.PythonTestsSpec(
+            run=(),
+            tests_pattern=tests_pattern,
+            tests_pattern_re=re.compile(tests_pattern, re.MULTILINE),
+            skipped_pattern=skipped_pattern,
+            skipped_pattern_re=re.compile(skipped_pattern, re.MULTILINE),
+            budget_seconds=600,
+        )
+        self.check = policy.CheckDef(
+            id="tests",
+            adapter="python_tests",
+            tier=1,
+            enforcement="enforced",
+            metric_version="test-count/1",
+            evidence=("tests",),
+            command=None,
+            clones=None,
+            python_tests=self.spec,
+            python_crap=None,
+            threshold=None,
+            baseline=None,
+        )
+
+    def counts(self, combined: str) -> tuple[object, object]:
+        return checks._tests_counts(
+            self.check,
+            self.spec,
+            0.0,
+            "check: tests",
+            combined,
+            runner.Diagnostics(),
+            time.monotonic() + 60,
+        )
+
+    def test_setup_returns_the_data_directory_and_prefix(self) -> None:
+        with mock.patch.object(
+            checks, "coverage_prefix", return_value=["prefix"]
+        ) as prefix:
+            setup = checks._tests_setup(
+                Path("/repo"), self.check, self.spec, 0.0, "check: tests"
+            )
+        assert not isinstance(setup, checks.CheckResult)
+        temporary, data_dir, python_prefix = setup
+        self.addCleanup(temporary.cleanup)
+        self.assertTrue(data_dir.is_dir())
+        self.assertEqual(python_prefix, ["prefix"])
+        prefix.assert_called_once_with(Path("/repo"), data_dir)
+
+    def setup_failure(self, error: Exception) -> checks.CheckResult:
+        with mock.patch.object(
+            checks, "coverage_prefix", side_effect=error
+        ), contextlib.redirect_stderr(io.StringIO()):
+            setup = checks._tests_setup(
+                Path("/repo"), self.check, self.spec, 0.0, "check: tests"
+            )
+        assert isinstance(setup, checks.CheckResult)
+        return setup
+
+    def test_setup_reports_an_unsupported_coverage_install(self) -> None:
+        setup = self.setup_failure(
+            policy.UnsupportedError("coverage is not installed")
+        )
+        self.assertEqual(setup.outcome, "unsupported")
+        self.assertEqual(setup.execution, "error")
+        self.assertEqual(setup.reason, "coverage is not installed")
+        self.assertEqual(
+            setup.diagnostics.error, "coverage is not installed"
+        )
+
+    def test_setup_reports_an_oserror_as_an_error(self) -> None:
+        setup = self.setup_failure(OSError("denied"))
+        self.assertEqual(setup.outcome, "error")
+        self.assertEqual(setup.execution, "error")
+        self.assertEqual(
+            setup.reason, "cannot create coverage data directory: denied"
+        )
+
+    def test_execution_failure_handles_each_unfinished_run(self) -> None:
+        cases = (
+            (
+                runner.RunResult(
+                    argv=(),
+                    execution="error",
+                    returncode=None,
+                    error="cannot start",
+                ),
+                "error",
+                "error",
+                "cannot start",
+            ),
+            (
+                runner.RunResult(
+                    argv=(), execution="budget", returncode=-15
+                ),
+                "fail",
+                "budget",
+                "command exceeded its 600 second budget",
+            ),
+            (
+                runner.RunResult(
+                    argv=(), execution="signal", returncode=-15
+                ),
+                "fail",
+                "signal",
+                "command terminated by signal 15",
+            ),
+        )
+        for run_result, outcome, execution, reason in cases:
+            with self.subTest(execution=run_result.execution):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    result = checks._tests_execution_failure(
+                        self.check,
+                        self.spec,
+                        run_result,
+                        runner.Diagnostics(),
+                        "",
+                        "check: tests",
+                        0.0,
+                    )
+            assert result is not None
+            self.assertEqual(result.outcome, outcome)
+            self.assertEqual(result.execution, execution)
+            self.assertEqual(result.reason, reason)
+
+    def test_execution_failure_ignores_a_completed_run(self) -> None:
+        run_result = runner.RunResult(
+            argv=(), execution="completed", returncode=1
+        )
+        self.assertIsNone(
+            checks._tests_execution_failure(
+                self.check,
+                self.spec,
+                run_result,
+                runner.Diagnostics(),
+                "",
+                "check: tests",
+                0.0,
+            )
+        )
+
+    def test_counts_returns_a_matching_failure(self) -> None:
+        with mock.patch.object(
+            checks, "_pattern_matches", return_value=(None, None)
+        ), contextlib.redirect_stderr(io.StringIO()):
+            counts, failure = self.counts("ignored")
+        self.assertIsNone(counts)
+        assert failure is not None
+        self.assertEqual(failure.outcome, "error")
+        self.assertEqual(failure.reason, "test summary matching failed")
+
+    def test_counts_marks_an_invalid_summary_unsupported(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            counts, failure = self.counts(
+                "Ran 1 test in 0.1s\nskipped=2"
+            )
+        self.assertIsNone(counts)
+        assert failure is not None
+        self.assertEqual(failure.outcome, "unsupported")
+        self.assertEqual(failure.reason, "skipped 2 tests but only 1 ran")
+
+    def test_counts_rejects_zero_executed_tests(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            counts, failure = self.counts(
+                "Ran 1 test in 0.1s\nskipped=1"
+            )
+        self.assertIsNone(counts)
+        assert failure is not None
+        self.assertEqual(failure.outcome, "fail")
+        self.assertEqual(failure.measurement, {"tests": 0})
+        self.assertEqual(
+            failure.reason,
+            "no test executed: 1 ran, 1 skipped; "
+            "zero tests is not a pass",
+        )
+
+    def test_counts_returns_the_executed_test_count(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            counts, failure = self.counts(
+                "Ran 3 tests in 0.1s\nskipped=1"
+            )
+        self.assertEqual(counts, (3, 1, 2))
+        self.assertIsNone(failure)
+
+    def test_evidence_reports_a_combination_after_the_deadline(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        data_dir = Path(temporary.name) / "data"
+        data_dir.mkdir()
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = checks._tests_evidence(
+                self.check,
+                self.spec,
+                0.0,
+                "check: tests",
+                temporary,
+                data_dir,
+                1,
+                0,
+                1,
+                runner.Diagnostics(),
+                0.0,
+            )
+        self.assertEqual(result.outcome, "fail")
+        self.assertEqual(result.execution, "budget")
+        self.assertIn("coverage combination exceeded", result.reason)
+
+    def test_evidence_builds_the_pass_result(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        data_dir = Path(temporary.name) / "data"
+        data_dir.mkdir()
+        with mock.patch.object(
+            checks, "_combine_tests_evidence", return_value=None
+        ), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            result = checks._tests_evidence(
+                self.check,
+                self.spec,
+                0.0,
+                "check: tests",
+                temporary,
+                data_dir,
+                3,
+                1,
+                2,
+                runner.Diagnostics(),
+                time.monotonic() + 60,
+            )
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.measurement, {"tests": 2})
+        self.assertEqual(result.tests_ran, 3)
+        self.assertEqual(result.tests_skipped, 1)
+        self.assertEqual(
+            result.evidence_path,
+            Path(temporary.name) / "combined" / ".coverage",
+        )
+        self.assertEqual(result.coverage_config, data_dir / "coverage.ini")
+        self.assertIs(result.temporary, temporary)
+        self.assertIn("passed (2 tests", stdout.getvalue())
 
 
 class TestSummaryTests(unittest.TestCase):

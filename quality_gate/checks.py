@@ -944,16 +944,13 @@ def _combine_tests_evidence(
     return None
 
 
-def _run_python_tests(
+def _tests_setup(
     root: Path,
     check: CheckDef,
-    *,
+    spec: Any,
+    start: float,
     prefix: str,
-) -> CheckResult:
-    assert check.python_tests is not None
-    spec = check.python_tests
-    start = time.monotonic()
-    deadline = start + spec.budget_seconds
+) -> tuple[tempfile.TemporaryDirectory, Path, list[str]] | CheckResult:
     temporary = tempfile.TemporaryDirectory(prefix="qg-coverage-")
     data_dir = Path(temporary.name) / "data"
     try:
@@ -982,17 +979,18 @@ def _run_python_tests(
             execution="error",
             diagnostics=Diagnostics(error=message),
         )
+    return temporary, data_dir, python_prefix
 
-    command = expand_run(spec.run, python_prefix)
-    environment = _test_environment(python_prefix)
-    run_result = run(
-        command,
-        cwd=root,
-        env=environment,
-        budget_seconds=max(0.0, deadline - time.monotonic()),
-    )
-    diagnostics = run_result.diagnostics()
-    combined = run_result.combined_text
+
+def _tests_execution_failure(
+    check: CheckDef,
+    spec: Any,
+    run_result: RunResult,
+    diagnostics: Diagnostics,
+    combined: str,
+    prefix: str,
+    start: float,
+) -> CheckResult | None:
     if run_result.execution == "error":
         return _tests_result(
             check,
@@ -1026,25 +1024,25 @@ def _run_python_tests(
             diagnostics=diagnostics,
             combined=combined,
         )
-    if run_result.returncode != 0:
-        return _tests_failed(
-            check,
-            spec,
-            run_result,
-            diagnostics,
-            combined,
-            prefix,
-            start,
-            deadline,
-        )
+    return None
 
+
+def _tests_counts(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    combined: str,
+    diagnostics: Diagnostics,
+    deadline: float,
+) -> tuple[tuple[int, int, int] | None, CheckResult | None]:
     ran, skipped, count_error, failure = _tests_summary(
         check, spec, start, prefix, combined, diagnostics, deadline
     )
     if failure is not None:
-        return failure
+        return None, failure
     if count_error is not None:
-        return _tests_result(
+        return None, _tests_result(
             check,
             spec,
             start,
@@ -1057,7 +1055,7 @@ def _run_python_tests(
     assert ran is not None and skipped is not None
     executed = ran - skipped
     if executed == 0:
-        return _tests_result(
+        return None, _tests_result(
             check,
             spec,
             start,
@@ -1068,7 +1066,22 @@ def _run_python_tests(
             measurement={"tests": 0},
             combined=combined,
         )
+    return (ran, skipped, executed), None
 
+
+def _tests_evidence(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    temporary: tempfile.TemporaryDirectory,
+    data_dir: Path,
+    ran: int,
+    skipped: int,
+    executed: int,
+    diagnostics: Diagnostics,
+    deadline: float,
+) -> CheckResult:
     combined_file = Path(temporary.name) / "combined" / ".coverage"
     config_file = coverage_config_path(data_dir)
     failure = _combine_tests_evidence(
@@ -1103,6 +1116,70 @@ def _run_python_tests(
         flush=True,
     )
     return outcome
+
+
+def _run_python_tests(
+    root: Path,
+    check: CheckDef,
+    *,
+    prefix: str,
+) -> CheckResult:
+    assert check.python_tests is not None
+    spec = check.python_tests
+    start = time.monotonic()
+    deadline = start + spec.budget_seconds
+    setup = _tests_setup(root, check, spec, start, prefix)
+    if isinstance(setup, CheckResult):
+        return setup
+    temporary, data_dir, python_prefix = setup
+
+    command = expand_run(spec.run, python_prefix)
+    environment = _test_environment(python_prefix)
+    run_result = run(
+        command,
+        cwd=root,
+        env=environment,
+        budget_seconds=max(0.0, deadline - time.monotonic()),
+    )
+    diagnostics = run_result.diagnostics()
+    combined = run_result.combined_text
+    failure = _tests_execution_failure(
+        check, spec, run_result, diagnostics, combined, prefix, start
+    )
+    if failure is not None:
+        return failure
+    if run_result.returncode != 0:
+        return _tests_failed(
+            check,
+            spec,
+            run_result,
+            diagnostics,
+            combined,
+            prefix,
+            start,
+            deadline,
+        )
+
+    counts, failure = _tests_counts(
+        check, spec, start, prefix, combined, diagnostics, deadline
+    )
+    if failure is not None:
+        return failure
+    assert counts is not None
+    ran, skipped, executed = counts
+    return _tests_evidence(
+        check,
+        spec,
+        start,
+        prefix,
+        temporary,
+        data_dir,
+        ran,
+        skipped,
+        executed,
+        diagnostics,
+        deadline,
+    )
 
 
 def _file_present(path: Path | None) -> bool:
