@@ -364,7 +364,7 @@ def write_baseline(
     *,
     check_id: str,
     metric_version: str,
-) -> None:
+) -> bytes | None:
     if not entries:
         try:
             path.unlink()
@@ -372,7 +372,7 @@ def write_baseline(
             pass
         except OSError as error:
             raise GateError(f"cannot remove empty baseline {path}: {error}") from error
-        return
+        return None
     lines = [
         f"check = {_toml_value(check_id)}",
         f"metric_version = {_toml_value(metric_version)}",
@@ -393,6 +393,7 @@ def write_baseline(
         for key in sorted(entry.extras):
             lines.append(f"{key} = {_toml_value(entry.extras[key])}")
         lines.append("")
+    text = "\n".join(lines)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, temporary = tempfile.mkstemp(
@@ -402,7 +403,7 @@ def write_baseline(
         raise GateError(f"cannot write baseline {path}: {error}") from error
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write("\n".join(lines))
+            stream.write(text)
         os.replace(temporary, path)
     except OSError as error:
         try:
@@ -410,6 +411,7 @@ def write_baseline(
         except OSError:
             pass
         raise GateError(f"cannot write baseline {path}: {error}") from error
+    return text.encode("utf-8")
 
 
 def _subject_label(subject: str, adapter: str, has_entry: bool) -> str:

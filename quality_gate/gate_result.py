@@ -5,19 +5,14 @@ import hashlib
 from pathlib import Path
 from typing import Any, Iterable
 
+from .files import git_argv
 from .runner import RunResult, run
 
 
 def _git(root: Path, args: list[str]) -> RunResult | None:
-    command = [
-        "git",
-        "-c",
-        f"safe.directory={root}",
-        "-C",
-        str(root),
-        *args,
-    ]
-    result = run(command, budget_seconds=600, capture_limit=None)
+    result = run(
+        git_argv(root, *args), budget_seconds=600, capture_limit=None
+    )
     if result.execution == "error":
         return None
     return result

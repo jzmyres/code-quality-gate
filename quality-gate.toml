@@ -10,6 +10,9 @@ max_bytes = 10485760
 [levels]
 required_tiers = [1]
 
+[protect]
+paths = ["ruff.toml"]
+
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
@@ -86,7 +89,7 @@ reason = "AGPL-3.0 licence text"
 adapter = "command"
 tier = 1
 enforcement = "enforced"
-run = ["{tool:ruff}", "check", "--no-cache", "{files}"]
+run = ["{tool:ruff}", "check", "--no-cache", "--config", "ruff.toml", "{files}"]
 
 [checks.clones]
 adapter = "clones"

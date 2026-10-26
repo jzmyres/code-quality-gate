@@ -11,6 +11,7 @@ import unittest
 
 from support import (
     BASE_CONFIG,
+    GATE,
     PYTHON_TEST_HEADER,
     FixtureCase,
     baseline_text,
@@ -19,6 +20,8 @@ from support import (
     with_clones,
 )
 from test_python_crap import crap_config
+
+from quality_gate.policy import load_config
 
 CLONE_FILES = ("a.py", "b.py")
 CLONES_HEADER = (
@@ -603,6 +606,81 @@ class IdentityTrustTests(TrustCase):
         result = self.run_qg("check", "--allow-protected", "ruff.toml")
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("--policy-from", result.stderr)
+
+
+class GitInvocationTests(TrustCase):
+    def test_configured_fsmonitor_never_runs(self) -> None:
+        revision = self.commit_revision()
+        marker = self.base / "fsmonitor-ran"
+        program = self.base / "fsmonitor.sh"
+        program.write_text(
+            "#!/bin/sh\n"
+            f"printf ran >> {json.dumps(str(marker))}\n",
+            encoding="utf-8",
+        )
+        program.chmod(0o755)
+        self.git("config", "core.fsmonitor", str(program))
+        result, _document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse(marker.exists(), "configured fsmonitor ran")
+        result = self.run_qg("check")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse(marker.exists(), "configured fsmonitor ran")
+
+
+class RepositoryPolicyTests(TrustCase):
+    def repository_config(self) -> str:
+        real = load_config(GATE)
+        run = list(real.checks["ruff"].command.run)
+        self.assertIn("--config", run)
+        self.assertEqual(run[run.index("--config") + 1], "ruff.toml")
+        lines = [
+            line
+            for line in BASE_CONFIG.splitlines()
+            if not line.startswith("tests_pattern = ")
+        ]
+        config = "\n".join(lines).replace(
+            'run = ["python3", "-c", "print(1)"]',
+            f"run = {json.dumps(run)}",
+        )
+        config = config.replace(
+            'checks = ["smoke"]', 'checks = ["smoke", "count"]'
+        )
+        count_run = json.dumps(
+            ["python3", "-c", "print('Ran 1 test in 0.01s')"]
+        )
+        count = (
+            "\n[checks.count]\n"
+            'adapter = "command"\n'
+            "tier = 1\n"
+            'enforcement = "enforced"\n'
+            f"run = {count_run}\n"
+            f"tests_pattern = {json.dumps('^Ran ([0-9]+) tests? in')}\n"
+        )
+        return with_protect(config, *real.protect_paths) + count
+
+    def test_candidate_ruff_configuration_is_refused(self) -> None:
+        real = load_config(GATE)
+        self.assertIn("ruff.toml", real.protect_paths)
+        ruff_config = (GATE / "ruff.toml").read_text(encoding="utf-8")
+        self.add_file("ruff.toml", ruff_config)
+        self.add_file("a.py", "import os\n")
+        self.write_config(self.repository_config())
+        revision = self.commit_revision()
+        self.add_file("ruff.toml", ruff_config + 'ignore = ["F401"]\n')
+        result, document = self.trust_json(
+            revision, env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        self.assertEqual(
+            self.protected(document, "ruff.toml")["status"], "blocked"
+        )
+        self.assertEqual(
+            self.check_by_id(document, "smoke")["outcome"],
+            "pass",
+            json.dumps(self.check_by_id(document, "smoke"), indent=2),
+        )
 
 
 if __name__ == "__main__":

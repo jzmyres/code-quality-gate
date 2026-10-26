@@ -32,17 +32,24 @@ class HygieneResult:
     execution: str = "completed"
 
 
+def git_argv(root: Path, *args: str) -> list[str]:
+    """The one invocation policy for git commands on a candidate repository."""
+    return [
+        "git",
+        "--no-replace-objects",
+        "-c",
+        f"safe.directory={root}",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        str(root),
+        *args,
+    ]
+
+
 def _git_toplevel(root: Path) -> str:
     result = run(
-        [
-            "git",
-            "-c",
-            f"safe.directory={root}",
-            "-C",
-            str(root),
-            "rev-parse",
-            "--show-toplevel",
-        ],
+        git_argv(root, "rev-parse", "--show-toplevel"),
         budget_seconds=600,
         capture_limit=None,
     )
@@ -86,8 +93,9 @@ def resolve_repo(value: str | None) -> Path:
 
 
 def _git(root: Path, args: list[str], what: str) -> bytes:
-    command = ["git", "-c", f"safe.directory={root}", "-C", str(root), *args]
-    result = run(command, budget_seconds=600, capture_limit=None)
+    result = run(
+        git_argv(root, *args), budget_seconds=600, capture_limit=None
+    )
     if result.execution == "error":
         raise GateError(f"{what} failed: {result.error}")
     if result.execution != "completed":

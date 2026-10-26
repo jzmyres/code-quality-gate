@@ -378,11 +378,13 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
   combined `digest`. The protected scope is enumerated again for
   `identity_after`, including ignored untracked files, and an added or removed
   path is a difference; a refused candidate path is recorded as `refused`.
-  `identity_after` is captured after the checks; a difference in any protected
-  input, tool payload or gate file makes the decision `error` (exit 2) naming
-  the changed input. The one exception is the baseline the gate itself rewrote
-  for a performed prune: that content is `REV`'s baseline tightened by the
-  measurement.
+  `identity_after` is captured after the checks and, when a prune was
+  performed, after that write. A difference in any protected input, tool
+  payload or gate file makes the decision `error` (exit 2) naming the changed
+  input, and a requested prune writes nothing. The one permitted difference is
+  the baseline the gate itself wrote for a performed prune: that path must
+  equal exactly the bytes the gate generated, which is `REV`'s baseline
+  tightened by the measurement.
 
 Check keys:
 

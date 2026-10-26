@@ -47,6 +47,10 @@ For every `--policy-from` run, the protected inputs are, in `REV`:
   paths = ["ruff.toml", "Makefile", ".github/workflows/*.yml", "tests/run_tests.py"]
   ```
 
+This repository's own policy protects `ruff.toml`, and its Ruff check names
+that file with `--config ruff.toml`, so a discovered configuration file
+elsewhere cannot change lint policy.
+
 A literal path is protected whether or not it exists. A glob is matched against
 the union of `REV`'s files and the candidate's tracked and untracked files, so
 a new candidate file under a protected glob is a protected input too. The
@@ -120,10 +124,15 @@ the run. The checks still run against the candidate and are reported in full.
 `REV`'s baseline tightened by the measurement: a `max` bound is lowered, a
 `min` floor is raised. It never adds an entry, loosens a bound, or keeps an
 entry that exists only in the candidate. A baseline path whose parent is a
-symlink inside the candidate is refused before the write. The gate's own prune
-write to that one baseline is the only protected-input change the after-run
-identity permits; the written content is derived from `REV` and the
-measurement, never from the candidate's loosened entries.
+symlink inside the candidate is refused before the write.
+
+The gate validates the run identity after the checks and before this write. A
+protected input that changed during the checks fails the run (exit 2) and
+nothing is pruned, so a check cannot weaken a baseline and have pruning keep
+the weakened value. After the write, the pruned path may differ from its
+pre-prune content only by exactly the bytes the gate generated; any other
+difference fails the run naming the path. The written content is derived from
+`REV` and the measurement, never from the candidate's loosened entries.
 
 ## Identity
 
@@ -136,14 +145,16 @@ Before any check runs, the gate records in `trust.identity_before`:
   (`qg.py` and every Python module under `quality_gate/`).
 
 It enumerates the protected scope again after the checks, including ignored
-untracked files, and records the same facts as `trust.identity_after`. Any
-protected path added, removed or changed under that scope, and any pinned tool
-payload or gate file whose recorded value changed during the run, makes the
-decision `error` (exit 2) with a message naming what changed. A missing tool
-install is recorded as `null`; a tree that has no payload digest is recorded
-as `invalid`; a candidate path that is refused as a non-regular file is
-recorded as `refused`. The gate's own prune write to the pruned baseline is
-exempt, as described above.
+untracked files, and compares those facts before any prune write. Any protected
+path added, removed or changed under that scope, and any pinned tool payload or
+gate file whose recorded value changed during the run, makes the decision
+`error` (exit 2) with a message naming what changed, and a requested prune
+writes nothing. Without a prune write `trust.identity_after` records that same
+snapshot; after a performed prune it records the identity captured once more
+after the write, where only the pruned path may differ and only by exactly the
+bytes the gate generated (see above). A missing tool install is recorded as
+`null`; a tree that has no payload digest is recorded as `invalid`; a candidate
+path that is refused as a non-regular file is recorded as `refused`.
 
 ## Result document
 

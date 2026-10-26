@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import tools as tools_module
-from .files import _type_name
+from .files import _type_name, git_argv
 from .policy import Config, ConfigError, GateError, UsageError, load_config
 from .ratchet import (
     BaselineEntry,
@@ -58,6 +58,10 @@ class ProtectedInput:
         return document
 
 
+def _blocked_paths(protected: list[ProtectedInput]) -> list[str]:
+    return [item.path for item in protected if item.status == "blocked"]
+
+
 @dataclass
 class Trust:
     root: Path
@@ -71,6 +75,9 @@ class Trust:
     )
     identity_before: dict[str, Any] | None = None
     identity_after: dict[str, Any] | None = None
+    identity_after_checks: dict[str, Any] | None = None
+    identity_problems: list[str] = field(default_factory=list)
+    prune_writes: dict[str, bytes | None] = field(default_factory=dict)
 
     def activate(self):
         return tools_module.lock_override(self.lock_path)
@@ -87,13 +94,36 @@ class Trust:
             "identity_after": self.identity_after,
         }
 
+    def before_prune(self) -> str | None:
+        """Refuse pruning when a protected input changed during the checks."""
+        after = _capture_identity(self)
+        self.identity_after_checks = after
+        self.identity_problems = _identity_problems(
+            self.identity_before or {}, after
+        )
+        return "; ".join(self.identity_problems) or None
+
+    def record_prune_write(
+        self, destination: Path, written: bytes | None
+    ) -> None:
+        try:
+            relative = destination.relative_to(self.root).as_posix()
+        except ValueError:
+            return
+        self.prune_writes[relative] = written
+
     def finish(
         self, code: int, document: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         after = _capture_identity(self)
-        exempt = _prune_exemption(self.config, document)
-        problems = _identity_problems(
-            self.identity_before or {}, after, exempt
+        start = self.identity_after_checks or self.identity_before or {}
+        problems = list(
+            dict.fromkeys(
+                [
+                    *self.identity_problems,
+                    *_identity_problems(start, after, self.prune_writes),
+                ]
+            )
         )
         self.identity_after = after
         document["schema"] = RESULT_SCHEMA
@@ -104,7 +134,7 @@ class Trust:
             document["decision"] = "error"
             document["error"] = message
             return 2, document
-        blocked = [item.path for item in self.protected if item.status == "blocked"]
+        blocked = _blocked_paths(self.protected)
         if blocked:
             print(
                 f"check: blocked: protected input changed without "
@@ -126,17 +156,7 @@ class _Input:
 
 def _git(root: Path, args: list[str]) -> RunResult:
     return run(
-        [
-            "git",
-            "--no-replace-objects",
-            "-c",
-            f"safe.directory={root}",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            str(root),
-            *args,
-        ],
+        git_argv(root, *args),
         budget_seconds=600,
         capture_limit=None,
     )
@@ -806,28 +826,36 @@ def checked_prune_path(root: Path, destination: Path) -> Path:
     return destination
 
 
-def _prune_destination(config: Config, check_id: str) -> str | None:
-    check = config.checks.get(check_id)
-    if check is None or check.baseline is None:
-        return None
-    destination = config.prune_paths.get(check_id, check.baseline)
-    try:
-        return destination.relative_to(config.root).as_posix()
-    except ValueError:
-        return None
+_UNWRITTEN = object()
 
 
-def _prune_exemption(
-    config: Config, document: dict[str, Any]
-) -> frozenset[str]:
-    prune = document.get("prune") or {}
-    if not prune.get("performed"):
-        return frozenset()
-    return frozenset(
-        path
-        for check_id in prune.get("requested") or []
-        if (path := _prune_destination(config, check_id)) is not None
+def _allowed_change(
+    old: Any, new: Any, written: Any
+) -> bool:
+    if written is _UNWRITTEN:
+        return old == new
+    old_entry = old or {}
+    new_entry = new or {}
+    return (
+        old_entry.get("rev_sha256") == new_entry.get("rev_sha256")
+        and new_entry.get("candidate_sha256") == _sha256(written)
     )
+
+
+def _protected_problems(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    writes: dict[str, bytes | None],
+) -> list[str]:
+    old = before.get("protected", {})
+    new = after.get("protected", {})
+    return [
+        f"protected input {name} changed during the run"
+        for name in sorted(set(old) | set(new))
+        if not _allowed_change(
+            old.get(name), new.get(name), writes.get(name, _UNWRITTEN)
+        )
+    ]
 
 
 def _section_problems(
@@ -835,7 +863,6 @@ def _section_problems(
     after: dict[str, Any],
     section: str,
     what: str,
-    exempt: frozenset[str] = frozenset(),
     *,
     files: bool = False,
 ) -> list[str]:
@@ -847,18 +874,17 @@ def _section_problems(
     return [
         f"{what} {name} changed during the run"
         for name in sorted(set(old) | set(new))
-        if name not in exempt and old.get(name) != new.get(name)
+        if old.get(name) != new.get(name)
     ]
 
 
 def _identity_problems(
     before: dict[str, Any],
     after: dict[str, Any],
-    exempt: frozenset[str] = frozenset(),
+    writes: dict[str, bytes | None] | None = None,
 ) -> list[str]:
-    protected = _section_problems(
-        before, after, "protected", "protected input", exempt
-    )
+    allow = writes or {}
+    protected = _protected_problems(before, after, allow)
     tools = _section_problems(before, after, "tools", "tool payload")
     gate = _section_problems(
         before, after, "gate", "gate file", files=True

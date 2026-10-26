@@ -18,7 +18,7 @@ from .coverage_tool import (
     combine_coverage,
     coverage_config_path,
 )
-from .files import hygiene_result, validate_inventory
+from .files import git_argv, hygiene_result, validate_inventory
 from .policy import (
     CheckDef,
     Config,
@@ -1643,17 +1643,6 @@ def _run_inventory(
     return 0, files, classes, [], "completed", time.monotonic() - start
 
 
-def _git_argv(root: Path, *args: str) -> list[str]:
-    return [
-        "git",
-        "-c",
-        f"safe.directory={root}",
-        "-C",
-        str(root),
-        *args,
-    ]
-
-
 def _prune_option_error(
     root: Path, config: Config, prune_id: str, message: str
 ) -> tuple[int, dict[str, Any]]:
@@ -1704,13 +1693,23 @@ def _run_policy_checks(
     return results
 
 
+def _record_prune(
+    trust: Any, destination: Path, written: bytes | None
+) -> None:
+    if trust is not None:
+        trust.record_prune_write(destination, written)
+
+
 def _write_pruned(
-    check: CheckDef, result: CheckResult, destination: Path
+    check: CheckDef,
+    result: CheckResult,
+    destination: Path,
+    trust: Any = None,
 ) -> tuple[bool, str | None]:
     existed = destination.exists()
     try:
         assert result.ratchet is not None
-        write_baseline(
+        written = write_baseline(
             destination,
             pruned_entries(result.ratchet),
             check_id=check.id,
@@ -1719,6 +1718,7 @@ def _write_pruned(
     except GateError as error:
         print(f"check: {check.id}: {error}", file=sys.stderr)
         return False, str(error)
+    _record_prune(trust, destination, written)
     if destination.exists():
         print(f"check: {check.id}: baseline updated at {destination}")
     elif existed:
@@ -1737,8 +1737,15 @@ def _prune_refusal(prune_id: str) -> dict[str, Any]:
 
 
 def _checked_prune_destination(
-    config: Config, prune_id: str, destination: Path
+    config: Config,
+    prune_id: str,
+    destination: Path,
+    trust: Any = None,
 ) -> tuple[Path | None, str | None]:
+    if trust is not None:
+        refusal = trust.before_prune()
+        if refusal is not None:
+            return None, refusal
     if prune_id not in config.prune_paths:
         return destination, None
     try:
@@ -1755,7 +1762,10 @@ def _prune_check_result(
 
 
 def _perform_prune(
-    config: Config, prune_id: str | None, results: list[CheckResult]
+    config: Config,
+    prune_id: str | None,
+    results: list[CheckResult],
+    trust: Any = None,
 ) -> dict[str, Any]:
     if prune_id is None:
         return {"requested": [], "performed": False, "reason": None}
@@ -1766,7 +1776,7 @@ def _perform_prune(
     assert check.baseline is not None
     destination = config.prune_paths.get(prune_id, check.baseline)
     destination, refusal = _checked_prune_destination(
-        config, prune_id, destination
+        config, prune_id, destination, trust
     )
     if destination is None:
         return {
@@ -1774,7 +1784,9 @@ def _perform_prune(
             "performed": False,
             "reason": refusal,
         }
-    performed, reason = _write_pruned(check, target, destination)
+    performed, reason = _write_pruned(
+        check, target, destination, trust
+    )
     return {
         "requested": [prune_id],
         "performed": performed,
@@ -1839,7 +1851,10 @@ def _result_document(
 
 
 def _check_command(
-    root: Path, config: Config, prune_id: str | None
+    root: Path,
+    config: Config,
+    prune_id: str | None,
+    trust: Any = None,
 ) -> tuple[int, dict[str, Any]]:
     if prune_id is not None:
         if prune_id not in config.checks:
@@ -1867,7 +1882,7 @@ def _check_command(
         duration_seconds=inventory_duration,
         messages=inventory_messages,
         execution=inventory_execution,
-        argv=_git_argv(
+        argv=git_argv(
             root, "ls-files", "-s", "-z", "-co", "--exclude-standard"
         ),
     )
@@ -1885,7 +1900,7 @@ def _check_command(
         duration_seconds=time.monotonic() - hygiene_start,
         messages=hygiene.messages,
         execution=hygiene.execution,
-        argv=_git_argv(
+        argv=git_argv(
             root, "ls-files", "-z", "-c", "-i", "--exclude-standard"
         ),
     )
@@ -1895,7 +1910,7 @@ def _check_command(
         _run_policy_checks(root, config, files, classes, inventory_code)
     )
     obligations = gate_result.obligations(config, results)
-    prune_document = _perform_prune(config, prune_id, results)
+    prune_document = _perform_prune(config, prune_id, results, trust)
     prune_failed = prune_id is not None and not prune_document["performed"]
 
     decision = gate_result.decision(results, obligations)
@@ -1922,12 +1937,16 @@ def _check_command(
 
 
 def _run_check_document(
-    root: Path, config: Config, prune_id: str | None, json_output: bool
+    root: Path,
+    config: Config,
+    prune_id: str | None,
+    json_output: bool,
+    trust: Any = None,
 ) -> tuple[int, dict[str, Any]]:
     if not json_output:
-        return _check_command(root, config, prune_id)
+        return _check_command(root, config, prune_id, trust)
     with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_id)
+        return _check_command(root, config, prune_id, trust)
 
 
 def command_check(
@@ -1946,7 +1965,7 @@ def command_check(
         try:
             with trust.activate():
                 code, document = _run_check_document(
-                    root, config, prune_id, json_output
+                    root, config, prune_id, json_output, trust
                 )
             code, document = trust.finish(code, document)
         finally:

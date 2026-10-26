@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 
 from support import (
@@ -101,6 +102,25 @@ def verification_config(
     )
     lines.extend(PYTHON_COMMON_RULE_LINES)
     return "\n".join(lines)
+
+
+def rewriting_config(rewrite: str) -> str:
+    """A verification policy with a command check that runs before the tests."""
+    text = verification_config()
+    block = (
+        "[checks.rewrite]\n"
+        'adapter = "command"\n'
+        "tier = 1\n"
+        'enforcement = "enforced"\n'
+        f"run = {json.dumps([sys.executable, '-c', rewrite])}\n"
+        f"tests_pattern = {json.dumps(r'(\d+)')}\n"
+        "\n"
+    )
+    text = text.replace("[checks.tests]", block + "[checks.tests]")
+    return text.replace(
+        'checks = ["tests", "verification"]',
+        'checks = ["rewrite", "tests", "verification"]',
+    )
 
 
 def verification_baseline(entries: list[dict[str, object]]) -> str:
@@ -316,6 +336,7 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         noqa: int,
         floor: int,
         ceiling: int,
+        config: str | None = None,
     ) -> str:
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")
@@ -330,7 +351,9 @@ class VerificationTrustTests(FindingMixin, TrustCase):
                 for index in range(tests)
             ),
         )
-        self.write_config(verification_config())
+        self.write_config(
+            verification_config() if config is None else config
+        )
         self.add_file(
             BASELINE,
             verification_baseline(
@@ -443,6 +466,35 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         entry = self.protected(document, BASELINE)
         self.assertEqual(entry["status"], "tightened")
         self.bounds(document, (1, 2), (4, 3))
+
+    def test_check_rewriting_an_authorized_floor_then_prune_fails(self) -> None:
+        weakened = verification_baseline([executed_entry(1)])
+        rewrite = (
+            "import pathlib; "
+            f"pathlib.Path({BASELINE!r}).write_text({weakened!r}); "
+            "print(1)"
+        )
+        revision = self.prepare(
+            tests=1,
+            noqa=0,
+            floor=2,
+            ceiling=0,
+            config=rewriting_config(rewrite),
+        )
+        result, document = self.trust_json(
+            revision,
+            "--allow-protected",
+            BASELINE,
+            "--prune",
+            "verification",
+            env=self.default_tool_env(),
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn(BASELINE, document["error"])
+        self.assertIn("changed during the run", document["error"])
+        self.assertFalse(document["prune"]["performed"])
+        self.assertEqual(self.read_file(BASELINE), weakened)
 
 
 if __name__ == "__main__":

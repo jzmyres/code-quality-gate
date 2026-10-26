@@ -372,7 +372,9 @@ tier 1 unsatisfied and rejects. Tier 2 needs `properties` or `fuzzing`; tiers 3 
 `prune` reports `requested` (the requested check ids), `performed` and `reason`. `check --prune ID`
 runs the same checks, then prunes only check `ID` when it is satisfied; an unknown id or a check without
 a baseline exits 2. A refused or failed prune writes nothing, makes the command exit 1, and leaves
-`decision` reporting the gate evaluation.
+`decision` reporting the gate evaluation. Under `--policy-from`, the run identity is validated after
+the checks and before the write, and after the write the pruned path may differ only by the exact
+bytes the gate generated; any other difference is an identity error (exit 2).
 
 The decision is `error` (exit 2) for invalid policy, usage or configuration, `rejected` (exit 1) when
 inventory, hygiene, any enforced check or any obligation is not satisfied, `accepted_with_exceptions`
@@ -391,11 +393,12 @@ a removed `min` floor keeps `REV`'s entry, added or loosened entries are ignored
 candidate baseline keeps every `REV` entry. Protected candidate paths must be regular files reached
 without following a symlink. An unauthorized change to another protected path makes the decision
 `blocked` (exit 1), while `--allow-protected PATH` accepts a reviewed replacement and reports it as
-authorized. The gate records protected-input, tool-payload and gate-program digests before and after the
-checks, re-enumerating the protected scope (including ignored untracked files); an added, removed or
-changed protected path makes the decision `error` (exit 2). It refuses to run from a gate program inside
-the candidate root. The full contract is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in
-[`docs/SCHEMA.md`](docs/SCHEMA.md).
+authorized. The gate records protected-input, tool-payload and gate-program digests before the checks,
+again after them before a prune write, and once more after a prune write, re-enumerating the
+protected scope (including ignored untracked files); an added, removed or changed protected path makes
+the decision `error` (exit 2). A performed prune may change its baseline path only by exactly the bytes
+the gate generated. It refuses to run from a gate program inside the candidate root. The full contract
+is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in [`docs/SCHEMA.md`](docs/SCHEMA.md).
 
 ### Exit codes
 
@@ -445,7 +448,7 @@ and the allowed keys. The complete shape is:
     adapter = "command"                   # command, clones, python_tests or python_crap
     tier = 1                              # 1-4
     enforcement = "enforced"              # enforced or advisory
-    run = ["{tool:ruff}", "check", "--no-cache", "{files}"]
+    run = ["{tool:ruff}", "check", "--no-cache", "--config", "ruff.toml", "{files}"]
     budget_seconds = 600                  # optional; this is the default
     must_match = "Success"                # optional regular expression on combined output
     # tests_pattern = "^Ran (\\d+) tests? in"  # optional; makes evidence tests
@@ -541,7 +544,9 @@ Notes:
   tightening lowers it) or `min` (the value must not fall below its bound and tightening raises it).
 * `[protect] paths` is a list of repository-relative paths or `fnmatch` globs that `--policy-from`
   treats as protected inputs. The list always comes from `REV`, so a candidate cannot unprotect a path;
-  without `--policy-from` it is parsed and ignored.
+  without `--policy-from` it is parsed and ignored. The example protects `ruff.toml` and its Ruff check
+  passes `--config ruff.toml`: a candidate cannot weaken lint policy, and Ruff cannot discover a
+  different configuration file elsewhere.
 
 ## The generic ratchet
 
