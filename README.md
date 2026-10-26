@@ -384,14 +384,18 @@ and exit 2. An argument containing NUL is a configuration error.
 ### Trust root
 
 `check --policy-from REV` evaluates the working tree against `REV`'s policy, baselines and tools lock,
-and `REV`'s `[protect] paths`, instead of the candidate's copies. An unauthorized candidate baseline
-edit can only tighten (remove entries or lower bounds); added or raised entries are ignored. An
-unauthorized change to
-another protected path makes the decision `blocked` (exit 1), while `--allow-protected PATH` accepts a
-reviewed replacement and reports it as authorized. The gate records protected-input, tool-payload and
-gate-program digests before and after the checks; a change makes the decision `error` (exit 2). It
-refuses to run from a gate program inside the candidate root. The full contract is
-[`docs/TRUST.md`](docs/TRUST.md); the result fields are in `docs/SCHEMA.md`.
+and `REV`'s `[protect] paths`, instead of the candidate's copies. Trusted Git reads ignore
+replacement refs and candidate-configured fsmonitors, and a repository with an `info/grafts` file is
+refused. An unauthorized candidate baseline edit can only tighten: a removed `max` entry takes effect,
+a removed `min` floor keeps `REV`'s entry, added or loosened entries are ignored, and a malformed
+candidate baseline keeps every `REV` entry. Protected candidate paths must be regular files reached
+without following a symlink. An unauthorized change to another protected path makes the decision
+`blocked` (exit 1), while `--allow-protected PATH` accepts a reviewed replacement and reports it as
+authorized. The gate records protected-input, tool-payload and gate-program digests before and after the
+checks, re-enumerating the protected scope (including ignored untracked files); an added, removed or
+changed protected path makes the decision `error` (exit 2). It refuses to run from a gate program inside
+the candidate root. The full contract is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in
+[`docs/SCHEMA.md`](docs/SCHEMA.md).
 
 ### Exit codes
 
@@ -665,4 +669,4 @@ bounded/proof) add adapters without reworking the core. The next metric layer is
   coverage through an Emacs batch helper, since Emacs Lisp has no maintained standalone CRAP tool.
 
 Every layer uses the same rule: a new exception is a hand-written baseline entry with a reason, and
-pruning only removes resolved entries or lowers bounds.
+pruning only removes resolved entries or tightens bounds.

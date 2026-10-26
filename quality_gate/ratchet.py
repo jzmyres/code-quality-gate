@@ -379,7 +379,8 @@ def write_baseline(
         "",
         "# Reasoned ratchet baseline: each entry accepts a measured subject up to",
         "# its bound, for the stated reason. Add entries by hand; --prune only",
-        "# lowers bounds and removes resolved entries.",
+        "# tightens bounds (lowers a max bound, raises a min bound) and removes",
+        "# resolved entries.",
         "",
     ]
     for entry in entries:

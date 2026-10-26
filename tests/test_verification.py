@@ -408,6 +408,30 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         )
         self.bounds(document, (1, 2), (3, 2))
 
+    def test_candidate_removed_floor_keeps_the_trusted_entry(self) -> None:
+        revision = self.prepare(tests=2, noqa=2, floor=2, ceiling=2)
+        self.add_file(
+            BASELINE,
+            verification_baseline(
+                [exclusion_entry("pkg/mod.py", "noqa", 2)]
+            ),
+        )
+        result, document = self.trust_json(
+            revision, env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted_with_exceptions")
+        check = self.check_by_id(document, "verification")
+        self.assertTrue(check["satisfied"])
+        entry = self.protected(document, BASELINE)
+        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual(
+            entry["ignored_entries"], ["tests:tests:executed"]
+        )
+        finding = self.finding(check, "tests:tests:executed")
+        self.assertEqual(finding["bound"], 2)
+        self.assertNotIn("error", finding)
+
     def test_candidate_raised_floor_and_lowered_ceiling_are_applied(
         self,
     ) -> None:

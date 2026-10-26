@@ -367,18 +367,22 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
 * `policy_from` is the full commit id `REV` resolved to.
 * `protected` has one entry per protected input. `path` is
   repository-relative; `rev_sha256` and `candidate_sha256` are lowercase
-  SHA-256 hex or null when the file is absent. `status` is `unchanged`,
+  SHA-256 hex or null when the file is absent (in `identity_after`, `refused`
+  means the candidate path is not a regular file). `status` is `unchanged`,
   `tightened`, `ignored`, `authorized` or `blocked`. A baseline entry also
   carries `ignored_entries`, the subjects whose candidate entry was ignored.
 * `identity_before` and `identity_after` record `REV`'s commit id, each
   protected input's two SHA-256 values, every pinned tool's
   `payload_sha256` (or null when not installed, or `invalid` when the tree has
   no digest), and the gate program's own per-file SHA-256 values plus one
-  combined `digest`. `identity_after` is captured after the checks; a
-  difference in any protected input, tool payload or gate file makes the
-  decision `error` (exit 2) naming the changed input. The one exception is the
-  baseline the gate itself rewrote for a performed prune: that content is
-  `REV`'s baseline lowered by the measurement.
+  combined `digest`. The protected scope is enumerated again for
+  `identity_after`, including ignored untracked files, and an added or removed
+  path is a difference; a refused candidate path is recorded as `refused`.
+  `identity_after` is captured after the checks; a difference in any protected
+  input, tool payload or gate file makes the decision `error` (exit 2) naming
+  the changed input. The one exception is the baseline the gate itself rewrote
+  for a performed prune: that content is `REV`'s baseline tightened by the
+  measurement.
 
 Check keys:
 

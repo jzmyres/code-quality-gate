@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 
 from support import (
@@ -177,6 +179,87 @@ class BaselineTrustTests(TrustCase):
         )
         self.assert_clone_fails_tightened(result, document)
 
+    def test_malformed_candidate_baseline_keeps_trusted_entries(self) -> None:
+        self.write_clones_baseline(bound=5)
+        revision = self.commit_revision()
+        self.add_file("quality-gate-clones.toml", "not = [valid\n")
+        result, document = self.trust_json(revision, env=self.clone_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("candidate baseline ignored", result.stderr)
+        entry = self.protected(document, "quality-gate-clones.toml")
+        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual(entry["ignored_entries"], [])
+        self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
+
+    def test_prune_through_a_symlinked_parent_is_refused(self) -> None:
+        self.write_config(with_clones(baseline="cfg/clones.toml"))
+        self.add_file(
+            "cfg/clones.toml",
+            baseline_text(
+                [
+                    {
+                        "subject": "fp1",
+                        "bound": 5,
+                        "files": list(CLONE_FILES),
+                        "reason": "reviewed mirror",
+                    }
+                ]
+            ),
+        )
+        revision = self.commit_revision()
+        outside = self.base / "outside"
+        outside.mkdir()
+        target = outside / "clones.toml"
+        (self.repo / "cfg" / "clones.toml").replace(target)
+        (self.repo / "cfg").rmdir()
+        (self.repo / "cfg").symlink_to(outside)
+        before = target.read_text(encoding="utf-8")
+        result, _document = self.trust_json(
+            revision, "--prune", "clones", env=self.clone_env()
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("cfg/clones.toml", result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+
+    def test_prune_refuses_a_parent_symlinked_during_the_run(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir()
+        sentinel = outside / "clones.toml"
+        sentinel.write_text("sentinel\n", encoding="utf-8")
+        writer = (
+            "import pathlib, shutil; "
+            "shutil.rmtree('cfg'); "
+            f"pathlib.Path('cfg').symlink_to({str(outside)!r}); "
+            "print(1)"
+        )
+        self.write_config(
+            with_clones(baseline="cfg/clones.toml").replace(
+                'run = ["python3", "-c", "print(1)"]',
+                f'run = [{json.dumps(sys.executable)}, "-c", '
+                f'{json.dumps(writer)}]',
+            )
+        )
+        self.add_file(
+            "cfg/clones.toml",
+            baseline_text(
+                [
+                    {
+                        "subject": "fp1",
+                        "bound": 5,
+                        "files": list(CLONE_FILES),
+                        "reason": "reviewed mirror",
+                    }
+                ]
+            ),
+        )
+        revision = self.commit_revision()
+        result, document = self.trust_json(
+            revision, "--prune", "clones", env=self.clone_env()
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertFalse(document["prune"]["performed"])
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel\n")
+
     def test_prune_writes_revisions_baseline_lowered(self) -> None:
         self.write_clones_baseline(bound=5)
         revision = self.commit_revision()
@@ -267,6 +350,73 @@ class PolicyTrustTests(TrustCase):
         entry = self.protected(document, "quality-gate.toml")
         self.assertEqual(entry["status"], "authorized")
 
+    def test_replacement_ref_cannot_change_the_policy(self) -> None:
+        failing = BASE_CONFIG.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            'run = ["python3", "-c", "import sys; sys.exit(1)"]',
+        )
+        self.write_config(failing)
+        revision = self.commit_revision()
+        self.write_config(BASE_CONFIG)
+        self.commit_all()
+        replacement = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("replace", revision, replacement)
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(
+            self.check_by_id(document, "smoke")["outcome"], "fail"
+        )
+
+    def test_graft_file_is_refused(self) -> None:
+        revision = self.commit_revision()
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        graft = info / "grafts"
+        graft.write_text("", encoding="utf-8")
+        result = self.run_qg("check", "--policy-from", revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(str(graft), result.stderr)
+
+    def test_protected_symlink_is_refused(self) -> None:
+        revision = self.commit_ruff_revision()
+        target = self.base / "outside.toml"
+        target.write_text("line-length = 200\n", encoding="utf-8")
+        (self.repo / "ruff.toml").unlink()
+        (self.repo / "ruff.toml").symlink_to(target)
+        result = self.run_qg("check", "--policy-from", revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("ruff.toml", result.stderr)
+
+    def test_protected_fifo_is_refused_without_blocking(self) -> None:
+        revision = self.commit_ruff_revision()
+        (self.repo / "ruff.toml").unlink()
+        os.mkfifo(self.repo / "ruff.toml")
+        started = time.monotonic()
+        result = self.run_qg(
+            "check", "--policy-from", revision, timeout=5
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("ruff.toml", result.stderr)
+        self.assertLess(elapsed, 5)
+
+    def test_protected_symlinked_parent_is_refused(self) -> None:
+        self.write_config(with_protect(BASE_CONFIG, "cfg/ruff.toml"))
+        self.add_file("cfg/ruff.toml", "line-length = 100\n")
+        revision = self.commit_revision()
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "ruff.toml").write_text(
+            "line-length = 200\n", encoding="utf-8"
+        )
+        (self.repo / "cfg" / "ruff.toml").unlink()
+        (self.repo / "cfg").rmdir()
+        (self.repo / "cfg").symlink_to(outside)
+        result = self.run_qg("check", "--policy-from", revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("cfg/ruff.toml", result.stderr)
+
     def test_removed_check_is_ignored(self) -> None:
         revision = self.commit_revision()
         self.write_config(
@@ -348,6 +498,34 @@ class IdentityTrustTests(TrustCase):
             trust["identity_after"]["protected"]["ruff.toml"][
                 "candidate_sha256"
             ],
+        )
+
+    def test_protected_file_created_during_the_run_is_error(self) -> None:
+        writer = (
+            "import pathlib; "
+            "pathlib.Path('generated').mkdir(); "
+            "pathlib.Path('generated/new.txt').write_text('x\\n'); "
+            "print(1)"
+        )
+        self.add_file(".gitignore", "__pycache__/\ngenerated/\n")
+        self.write_config(
+            with_protect(BASE_CONFIG, "generated/*.txt").replace(
+                'run = ["python3", "-c", "print(1)"]',
+                f'run = [{json.dumps(sys.executable)}, "-c", '
+                f'{json.dumps(writer)}]',
+            )
+        )
+        revision = self.commit_revision()
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("generated/new.txt", document["error"])
+        trust = document["trust"]
+        self.assertNotIn(
+            "generated/new.txt", trust["identity_before"]["protected"]
+        )
+        self.assertIn(
+            "generated/new.txt", trust["identity_after"]["protected"]
         )
 
     def test_missing_revision_exits_two(self) -> None:

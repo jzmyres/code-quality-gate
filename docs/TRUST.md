@@ -54,9 +54,17 @@ protected list always comes from `REV`; a candidate policy cannot unprotect a
 path.
 
 `REV`'s versions of protected inputs are read from Git objects
-(`git cat-file`), never from the working tree. Candidate versions are read
-from the working tree only to compare them with `REV`, to apply an allowed
-tightening, or after the caller authorizes the path.
+(`git cat-file blob`), never from the working tree. Every Git command the
+trust root runs ignores replacement refs (`--no-replace-objects`) and
+candidate-configured fsmonitors, and a candidate repository with a graft file
+(`info/grafts` under its Git directory) is refused. Candidate versions are
+read from the working tree only to compare them with `REV`, to apply an
+allowed tightening, or after the caller authorizes the path.
+
+A protected path in the candidate must be a regular file reached without
+following a symlink: a symlink, a FIFO or another non-regular file, or a
+symlink among the path's parent components inside the candidate, is refused
+(exit 2) with a message naming the path before anything is read.
 
 ## Effective inputs
 
@@ -66,20 +74,22 @@ For each protected input whose candidate content differs from `REV`:
 
 Baselines tighten only:
 
-* an entry the candidate removes takes effect;
-* an entry whose bound the candidate lowers takes effect (the lower bound and
-  an earlier expiry are used);
-* an entry the candidate adds, a bound it raises, an expiry it later removes,
+* a candidate removal takes effect for a `max` entry, and is ignored for a
+  `min` floor: the removed entry keeps `REV`'s bound;
+* an entry whose bound the candidate tightens takes effect (a lower `max`
+  bound or a higher `min` bound, with an earlier expiry);
+* an entry the candidate adds, a bound it loosens, an expiry it later removes,
   reasons it changes and metadata it changes are ignored, and `REV`'s entry is
   used;
-* a candidate baseline that cannot be parsed is ignored in full, and `REV`'s
-  baseline is used.
+* a candidate baseline that cannot be parsed is ignored in full, and every
+  `REV` entry is used unchanged.
 
 The entry set used for the run is therefore `REV`'s entries with candidate
-removals and lower bounds applied. The entries whose candidate form was ignored
-are listed in the protected input's `ignored_entries`. A baseline that only
-tightens is `tightened`; one whose differences were all ignored is
-`ignored`; identical content is `unchanged`.
+removals of `max` entries and tightened bounds applied. The entries whose
+candidate form was ignored, including a removed `min` floor, are listed in the
+protected input's `ignored_entries`. A baseline that only tightens is
+`tightened`; one whose differences were all ignored is `ignored`; identical
+content is `unchanged`.
 
 ### Authorized paths
 
@@ -107,11 +117,13 @@ the run. The checks still run against the candidate and are reported in full.
 ## Prune under `--policy-from`
 
 `check --prune ID --policy-from REV` writes the effective baseline, which is
-`REV`'s baseline lowered by the measurement. It never adds an entry, raises a
-bound, or keeps an entry that exists only in the candidate. The gate's own
-prune write to that one baseline is the only protected-input change the
-after-run identity permits; the written content is derived from `REV` and the
-measurement, never from the candidate's weakened entries.
+`REV`'s baseline tightened by the measurement: a `max` bound is lowered, a
+`min` floor is raised. It never adds an entry, loosens a bound, or keeps an
+entry that exists only in the candidate. A baseline path whose parent is a
+symlink inside the candidate is refused before the write. The gate's own prune
+write to that one baseline is the only protected-input change the after-run
+identity permits; the written content is derived from `REV` and the
+measurement, never from the candidate's loosened entries.
 
 ## Identity
 
@@ -123,12 +135,15 @@ Before any check runs, the gate records in `trust.identity_before`:
 * a digest and per-file SHA-256 of the gate program's own files
   (`qg.py` and every Python module under `quality_gate/`).
 
-It records the same facts after the checks as `trust.identity_after`. Any
-protected input, pinned tool payload or gate file whose recorded value changed
-during the run makes the decision `error` (exit 2) with a message naming what
-changed. A missing tool install is recorded as `null`; a tree that has no
-payload digest is recorded as `invalid`. The gate's own prune write to the
-pruned baseline is exempt, as described above.
+It enumerates the protected scope again after the checks, including ignored
+untracked files, and records the same facts as `trust.identity_after`. Any
+protected path added, removed or changed under that scope, and any pinned tool
+payload or gate file whose recorded value changed during the run, makes the
+decision `error` (exit 2) with a message naming what changed. A missing tool
+install is recorded as `null`; a tree that has no payload digest is recorded
+as `invalid`; a candidate path that is refused as a non-regular file is
+recorded as `refused`. The gate's own prune write to the pruned baseline is
+exempt, as described above.
 
 ## Result document
 

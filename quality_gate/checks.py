@@ -42,6 +42,7 @@ from .ratchet import (
 )
 from .runner import Diagnostics, RunResult, run
 from .tools import load_tools, tool_binary, _default_lock_path
+from .trust import checked_prune_path
 from .verification import measure_verification
 
 
@@ -1735,17 +1736,44 @@ def _prune_refusal(prune_id: str) -> dict[str, Any]:
     return {"requested": [prune_id], "performed": False, "reason": reason}
 
 
+def _checked_prune_destination(
+    config: Config, prune_id: str, destination: Path
+) -> tuple[Path | None, str | None]:
+    if prune_id not in config.prune_paths:
+        return destination, None
+    try:
+        return checked_prune_path(config.root, destination), None
+    except UsageError as error:
+        print(f"check: {prune_id}: {error}", file=sys.stderr)
+        return None, str(error)
+
+
+def _prune_check_result(
+    results: list[CheckResult], prune_id: str
+) -> CheckResult:
+    return next(item for item in results if item.id == prune_id)
+
+
 def _perform_prune(
     config: Config, prune_id: str | None, results: list[CheckResult]
 ) -> dict[str, Any]:
     if prune_id is None:
         return {"requested": [], "performed": False, "reason": None}
-    target = next(item for item in results if item.id == prune_id)
+    target = _prune_check_result(results, prune_id)
     check = config.checks[prune_id]
     if not target.is_satisfied() or target.ratchet is None:
         return _prune_refusal(prune_id)
     assert check.baseline is not None
     destination = config.prune_paths.get(prune_id, check.baseline)
+    destination, refusal = _checked_prune_destination(
+        config, prune_id, destination
+    )
+    if destination is None:
+        return {
+            "requested": [prune_id],
+            "performed": False,
+            "reason": refusal,
+        }
     performed, reason = _write_pruned(check, target, destination)
     return {
         "requested": [prune_id],

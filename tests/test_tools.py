@@ -782,6 +782,20 @@ class PayloadDigestTests(unittest.TestCase):
     def test_digest_is_stable_across_runs(self) -> None:
         self.assertEqual(payload_digest(self.root), payload_digest(self.root))
 
+    def test_digest_matches_a_fixed_oracle(self) -> None:
+        root = self.base / "oracle"
+        (root / "z").mkdir(parents=True)
+        (root / "z" / "run").write_text("#!/bin/sh\n", encoding="utf-8")
+        (root / "z" / "run").chmod(0o755)
+        (root / "b").write_text("b\n", encoding="utf-8")
+        (root / "a").write_text("a\n", encoding="utf-8")
+        (root / "café").write_text("unicode\n", encoding="utf-8")
+        os.symlink("a", root / "link")
+        self.assertEqual(
+            payload_digest(root),
+            "e8cc7b3130018e2512cf76bb62e016b1f53a4e28ee6dff70162937f15ad08d11",
+        )
+
     def test_one_changed_byte_changes_the_digest(self) -> None:
         before = payload_digest(self.root)
         (self.root / "pkg" / "tool").write_text("two\n", encoding="utf-8")

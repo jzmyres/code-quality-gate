@@ -6,9 +6,12 @@ candidate's copy of an input another program reads or executes.
 """
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
+import os
 import posixpath
+import stat
 import sys
 import tempfile
 import tomllib
@@ -17,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import tools as tools_module
+from .files import _type_name
 from .policy import Config, ConfigError, GateError, UsageError, load_config
 from .ratchet import (
     BaselineEntry,
@@ -59,6 +63,7 @@ class Trust:
     root: Path
     revision: str
     config: Config
+    rev_config: Config
     protected: list[ProtectedInput]
     lock_path: Path
     temporary: list[tempfile.TemporaryDirectory[str]] = field(
@@ -121,7 +126,17 @@ class _Input:
 
 def _git(root: Path, args: list[str]) -> RunResult:
     return run(
-        ["git", "-c", f"safe.directory={root}", "-C", str(root), *args],
+        [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            f"safe.directory={root}",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(root),
+            *args,
+        ],
         budget_seconds=600,
         capture_limit=None,
     )
@@ -129,6 +144,25 @@ def _git(root: Path, args: list[str]) -> RunResult:
 
 def _git_detail(result: RunResult) -> str:
     return result.stderr_text.strip() or f"git exited {result.returncode}"
+
+
+def _refuse_graft(root: Path) -> None:
+    result = _git(
+        root,
+        ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"],
+    )
+    if result.execution != "completed" or result.returncode != 0:
+        raise UsageError(
+            f"{root}: --policy-from: cannot locate the git directory: "
+            f"{_git_detail(result)}"
+        )
+    graft = Path(result.stdout_text.strip())
+    if os.path.lexists(graft):
+        raise UsageError(
+            f"{graft}: --policy-from: expected no graft file in the "
+            "candidate repository, got a graft that can rewrite the "
+            "trusted history"
+        )
 
 
 def _commit(root: Path, revision: str) -> str:
@@ -147,7 +181,7 @@ def _commit(root: Path, revision: str) -> str:
 
 
 def _rev_bytes(root: Path, revision: str, relative: str) -> bytes | None:
-    result = _git(root, ["cat-file", "-p", f"{revision}:{relative}"])
+    result = _git(root, ["cat-file", "blob", f"{revision}:{relative}"])
     if result.execution != "completed":
         raise UsageError(
             f"{root}: cannot read {relative} at {revision}: "
@@ -169,9 +203,9 @@ def _tree_files(root: Path, revision: str) -> list[str]:
 
 
 def _candidate_files(root: Path) -> list[str]:
-    result = _git(
-        root, ["ls-files", "-z", "-c", "-o", "--exclude-standard"]
-    )
+    # The protected scope includes ignored untracked files, so no
+    # --exclude-standard here.
+    result = _git(root, ["ls-files", "-z", "-c", "-o"])
     if result.execution != "completed" or result.returncode != 0:
         raise UsageError(
             f"{root}: cannot list the candidate: {_git_detail(result)}"
@@ -182,14 +216,90 @@ def _candidate_files(root: Path) -> list[str]:
     ]
 
 
-def _candidate_bytes(root: Path, relative: str) -> bytes | None:
-    path = root / relative
+def _candidate_error(path: Path, detail: str) -> UsageError:
+    return UsageError(
+        f"{path}: protected input: expected a regular file inside the "
+        f"candidate, got {detail}"
+    )
+
+
+def _kind_name(mode: int) -> str:
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    name = _type_name(mode)
+    return f"a {name}" if name else "a non-regular file"
+
+
+def _parent_mode(path: Path) -> int | None:
     try:
-        if path.is_file() or path.is_symlink():
-            return path.read_bytes()
-    except OSError:
+        return path.lstat().st_mode
+    except FileNotFoundError:
         return None
-    return None
+    except OSError as error:
+        raise _candidate_error(path, str(error)) from error
+
+
+def _candidate_parent(root: Path, relative: str) -> Path | None:
+    current = root
+    for part in PurePosixPath(relative).parts[:-1]:
+        current = current / part
+        mode = _parent_mode(current)
+        if mode is None:
+            return None
+        if stat.S_ISLNK(mode):
+            raise _candidate_error(
+                root / relative, f"a symlinked parent {current}"
+            )
+        if not stat.S_ISDIR(mode):
+            return None
+    return current
+
+
+def _open_candidate(path: Path) -> int | None:
+    try:
+        return os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise _candidate_error(path, "a symlink") from error
+        raise _candidate_error(path, str(error)) from error
+
+
+def _read_regular(path: Path) -> bytes | None:
+    handle = _open_candidate(path)
+    if handle is None:
+        return None
+    try:
+        mode = os.fstat(handle).st_mode
+        if not stat.S_ISREG(mode):
+            raise _candidate_error(path, _kind_name(mode))
+        with os.fdopen(handle, "rb") as stream:
+            handle = -1
+            return stream.read()
+    finally:
+        if handle >= 0:
+            os.close(handle)
+
+
+def _candidate_path(root: Path, relative: str) -> Path | None:
+    path = _safe_join(root, relative)
+    if path is None:
+        raise _candidate_error(
+            root / relative, "a path outside the candidate"
+        )
+    if _candidate_parent(root, relative) is None:
+        return None
+    return path
+
+
+def _candidate_bytes(root: Path, relative: str) -> bytes | None:
+    path = _candidate_path(root, relative)
+    if path is None:
+        return None
+    return _read_regular(path)
 
 
 def _sha256(data: bytes | None) -> str | None:
@@ -240,14 +350,19 @@ def _baseline_names(config: Config) -> set[str]:
     return names
 
 
+def _protected_scope(
+    root: Path, revision: str, config: Config
+) -> set[str]:
+    paths = {POLICY_NAME, LOCK_NAME} | _baseline_names(config)
+    return paths | _expand_protect(config.protect_paths, root, revision)
+
+
 def _protected_inputs(
     root: Path, revision: str, config: Config
 ) -> dict[str, _Input]:
     baselines = _baseline_names(config)
-    paths = {POLICY_NAME, LOCK_NAME} | baselines
-    paths |= _expand_protect(config.protect_paths, root, revision)
     inputs: dict[str, _Input] = {}
-    for path in sorted(paths):
+    for path in sorted(_protected_scope(root, revision, config)):
         if path == POLICY_NAME:
             kind = "policy"
         elif path == LOCK_NAME:
@@ -422,6 +537,23 @@ def _merge_entry(
     return entry, False, _entry_differs(entry, chosen)
 
 
+def _merge_revision_entry(
+    entry: BaselineEntry,
+    remaining: dict[str, BaselineEntry],
+    check: Any,
+) -> tuple[list[BaselineEntry], list[str], bool]:
+    chosen = remaining.pop(entry.subject, None)
+    direction = _merge_direction(check, entry.subject)
+    if chosen is None:
+        if direction == "min":
+            return [entry], [entry.subject], False
+        return [], [], True
+    merged_entry, tightened, ignored = _merge_entry(
+        entry, chosen, direction
+    )
+    return [merged_entry], [entry.subject] if ignored else [], tightened
+
+
 def _merge_entries(
     revision: list[BaselineEntry],
     candidate: list[BaselineEntry],
@@ -432,17 +564,12 @@ def _merge_entries(
     ignored: list[str] = []
     tightened = False
     for entry in revision:
-        chosen = remaining.pop(entry.subject, None)
-        if chosen is None:
-            tightened = True
-            continue
-        merged_entry, entry_tightened, entry_ignored = _merge_entry(
-            entry, chosen, _merge_direction(check, entry.subject)
+        entries, subjects, entry_tightened = _merge_revision_entry(
+            entry, remaining, check
         )
+        merged.extend(entries)
+        ignored.extend(subjects)
         tightened = tightened or entry_tightened
-        if entry_ignored:
-            ignored.append(entry.subject)
-        merged.append(merged_entry)
     ignored.extend(sorted(remaining))
     return merged, tuple(ignored), tightened
 
@@ -482,6 +609,33 @@ def _baseline_status(
     return "ignored"
 
 
+def _merged_baseline(
+    temporary: Path,
+    root: Path,
+    revision: str,
+    relative: str,
+    check: Any,
+    item: _Input,
+) -> tuple[Path, str, tuple[str, ...]]:
+    revision_entries = _rev_entries(
+        temporary, root, revision, relative, check
+    )
+    candidate_entries, invalid = _candidate_entries(
+        temporary, root, relative, check
+    )
+    if invalid:
+        merged, ignored, tightened = revision_entries, (), False
+    else:
+        merged, ignored, tightened = _merge_entries(
+            revision_entries, candidate_entries, check
+        )
+    return (
+        _write_merged(temporary, merged, check),
+        _baseline_status(item, tightened, invalid),
+        ignored,
+    )
+
+
 def _apply_baselines(
     root: Path,
     revision: str,
@@ -504,22 +658,15 @@ def _apply_baselines(
         item = inputs[relative]
         if relative in allowed:
             checks[name] = replace(check, baseline=root / relative)
+            prune_paths[name] = root / relative
             statuses[relative] = _declared_status(item, allowed)
             continue
-        revision_entries = _rev_entries(
-            temporary, root, revision, relative, check
+        path, status, ignored = _merged_baseline(
+            temporary, root, revision, relative, check, item
         )
-        candidate_entries, invalid = _candidate_entries(
-            temporary, root, relative, check
-        )
-        merged, ignored, tightened = _merge_entries(
-            revision_entries, candidate_entries, check
-        )
-        checks[name] = replace(
-            check, baseline=_write_merged(temporary, merged, check)
-        )
+        checks[name] = replace(check, baseline=path)
         prune_paths[name] = root / relative
-        statuses[relative] = _baseline_status(item, tightened, invalid)
+        statuses[relative] = status
         ignored_entries[relative] = ignored
     return (
         replace(config, root=root, checks=checks, prune_paths=prune_paths),
@@ -607,15 +754,27 @@ def _tool_identity(lock: Path) -> dict[str, Any]:
     }
 
 
+def _candidate_identity_sha256(
+    root: Path, relative: str
+) -> str | None:
+    try:
+        return _sha256(_candidate_bytes(root, relative))
+    except UsageError:
+        return "refused"
+
+
 def _capture_identity(trust: Trust) -> dict[str, Any]:
+    scope = _protected_scope(trust.root, trust.revision, trust.rev_config)
     protected = {
-        item.path: {
-            "rev_sha256": item.rev_sha256,
-            "candidate_sha256": _sha256(
-                _candidate_bytes(trust.root, item.path)
+        path: {
+            "rev_sha256": _sha256(
+                _rev_bytes(trust.root, trust.revision, path)
+            ),
+            "candidate_sha256": _candidate_identity_sha256(
+                trust.root, path
             ),
         }
-        for item in trust.protected
+        for path in sorted(scope)
     }
     return {
         "revision": trust.revision,
@@ -623,6 +782,28 @@ def _capture_identity(trust: Trust) -> dict[str, Any]:
         "tools": _tool_identity(trust.lock_path),
         "gate": _gate_identity(Path(__file__).resolve().parent.parent),
     }
+
+
+def checked_prune_path(root: Path, destination: Path) -> Path:
+    """Refuse a prune write that would leave the candidate."""
+    try:
+        relative = destination.relative_to(root).as_posix()
+    except ValueError:
+        raise UsageError(
+            f"{destination}: prune: expected a path inside the candidate "
+            f"root {root}"
+        ) from None
+    _candidate_parent(root, relative)
+    try:
+        mode = destination.lstat().st_mode
+    except OSError:
+        return destination
+    if not stat.S_ISREG(mode):
+        raise UsageError(
+            f"{destination}: prune: expected a regular file inside the "
+            f"candidate, got {_kind_name(mode)}"
+        )
+    return destination
 
 
 def _prune_destination(config: Config, check_id: str) -> str | None:
@@ -710,6 +891,7 @@ def prepare_trust(
 ) -> Trust:
     root = root.resolve()
     _refuse_inside(root)
+    _refuse_graft(root)
     revision = _commit(root, revision_text)
     revision_dir = tempfile.TemporaryDirectory(prefix="qg-rev-")
     merge_dir = tempfile.TemporaryDirectory(prefix="qg-merge-")
@@ -755,6 +937,7 @@ def prepare_trust(
         root=root,
         revision=revision,
         config=config,
+        rev_config=rev_config,
         protected=protected,
         lock_path=lock_path,
         temporary=temporary,
