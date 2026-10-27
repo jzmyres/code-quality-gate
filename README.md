@@ -187,7 +187,9 @@ combination and analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
 `run` can name a script or `-m MODULE`; each invocation gets its own data file. `covrun.py` verifies
 the install against that version and payload digest with the same encoding `tools.py` uses, loading
 the shared verifier by path, so it starts no extra interpreter and adds no gate package or gate
-repository path to the measured program's imports. With `--policy-from`, the version and payload
+repository path to the measured program's imports. Two tests hold that invariant: one runs the
+runner with a measured script that reports every `quality_gate` module in its `sys.modules`, and
+one parses `covrun.py` for a `quality_gate` import. With `--policy-from`, the version and payload
 digest are the authorized effective lock's, so the parent and the coverage runner agree on an
 authorized coverage upgrade.
 

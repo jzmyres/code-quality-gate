@@ -1,6 +1,7 @@
 """Tests for the python_tests adapter and its QG_PYTHON contract."""
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib
 import io
@@ -534,6 +535,43 @@ class CovrunTests(unittest.TestCase):
         data = coverage.CoverageData(str(self.base / "combined" / ".coverage"))
         data.read()
         self.assertIn(2, data.lines(str(candidate)) or [])
+
+    def test_measured_program_has_no_quality_gate_module(self) -> None:
+        report = self.base / "modules.json"
+        script = self.script(
+            "probe.py",
+            "import json\n"
+            "import sys\n"
+            "names = sorted(\n"
+            "    name for name in sys.modules\n"
+            "    if name == 'quality_gate'\n"
+            "    or name.startswith('quality_gate.')\n"
+            ")\n"
+            f"open({str(report)!r}, 'w', encoding='utf-8')"
+            ".write(json.dumps(names))\n",
+        )
+        result = self.run_program(str(script))
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(
+            json.loads(report.read_text(encoding="utf-8")), []
+        )
+        _record, document = self.registration()
+        self.assertTrue((self.data_dir / document["dataset"]).is_file())
+
+    def test_source_has_no_quality_gate_import(self) -> None:
+        tree = ast.parse(self.runner.read_text(encoding="utf-8"))
+        imported: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.append(node.module or "")
+        offenders = [
+            name
+            for name in imported
+            if name == "quality_gate" or name.startswith("quality_gate.")
+        ]
+        self.assertEqual(offenders, [])
 
     def start(self, program: str) -> subprocess.Popen[str]:
         return subprocess.Popen(
