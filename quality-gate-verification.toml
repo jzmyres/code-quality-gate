@@ -8,12 +8,7 @@ metric_version = "verification/1"
 
 [[entry]]
 subject = "tests:tests:executed"
-bound = 371
-reason = "measured at adoption (M2c, 2026-10-25)"
-
-[[entry]]
-subject = "exclusions:qg.py:noqa"
-bound = 1
+bound = 400
 reason = "measured at adoption (M2c, 2026-10-25)"
 
 [[entry]]

@@ -632,6 +632,8 @@ This repository gates itself with `quality-gate.toml`:
 * the `python` class lists `ruff`, `clones`, `tests` and `crap`; the `test` class lists
   `ruff`, `clones` and `tests`;
 * `ruff` runs the pinned binary through `{tool:ruff}` with `--no-cache` on the inventory's Python files;
+  its `ruff.toml` selects `E`, `F`, `W`, `B` and `RUF100`, which reports a `# noqa` directive that
+  suppresses no diagnostic, so an unused suppression is itself a lint finding;
 * `clones` uses jscpd with `min_tokens = 50` and the generic baseline format;
 * `tests` runs the gate's own unittest suite under the pinned coverage wheel;
 * `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
