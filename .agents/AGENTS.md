@@ -18,9 +18,9 @@ each batch and reviewed before landing. Context for those agents, never rules: C
 - **Tests counted by the verification ratchet must not depend on the user running them.** CI runs as root, where
   `chmod 000` denies nothing; QF8 replaced that test with an in-process patch of
   `quality_gate.payload.os.scandir` (QF11 moved the payload walk there). The baseline floors
-  `tests:tests:executed` at 371 and has no `skipped` entry, so a `skipIf`/`skipUnless` about root, permissions
+  `tests:tests:executed` at 400 and has no `skipped` entry, so a `skipIf`/`skipUnless` about root, permissions
   or OS adds a skip and fails CI; patch the call instead.
-  [verified 2026-10-26 @ 2b71580; paths: tests/test_tools.py, quality_gate/payload.py, quality_gate/verification.py, quality-gate-verification.toml, .github/workflows/check.yml]
+  [verified 2026-10-27 @ d044e1b; paths: tests/test_tools.py, quality_gate/payload.py, quality_gate/verification.py, quality-gate-verification.toml, .github/workflows/check.yml]
 
 - **A CRAP baseline entry does not waive the spec's CRAP 6 for a changed function.** The baseline keeps the
   gate green while the spec still requires every new or changed function at 6 or below;
@@ -57,4 +57,16 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   `pruned_entries` then drops it. A measured `min` entry never resolves by itself; `_min_verdict` only handles a
   measured minimum. QF14 corrected `docs/SCHEMA.md` and README to say this. When changing resolution, docs or
   tests, probe a complete domain with an absent entry, not only measured findings.
-  [verified 2026-10-26 @ 2b71580; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
+  [verified 2026-10-27 @ d044e1b; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
+
+- **Pruning a verification baseline tightens every measured entry in that check.** QF15 removed `qg.py`'s
+  dead `# noqa: E402` and ran `python3 -I qg.py check --prune verification`; the prune dropped the resolved
+  `exclusions:qg.py:noqa` entry and also raised `tests:tests:executed` from 371 to the measured 400. Keep that
+  extra tightening and rerun `make -k check` after the baseline changes; do not hand-revert it to the old
+  floor. Use the prune to change an existing bound; a new exception still enters by hand with a reason.
+  [verified 2026-10-27 @ d044e1b; paths: qg.py, quality_gate/ratchet.py, quality_gate/verification.py, quality-gate-verification.toml]
+
+- **Copy only the working files for a disposable demo.** `cp -a` of this clone fails on `.git/objects` with
+  `preserving permissions ... Invalid argument` and leaves a partial copy. Copy the files the command needs
+  with `cp -R --no-preserve=mode,ownership`, or exclude `.git`; the read-only `.git` is not needed there.
+  [verified 2026-10-27 @ d044e1b; paths: none]
