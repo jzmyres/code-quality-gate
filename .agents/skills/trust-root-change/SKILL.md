@@ -1,9 +1,9 @@
 ---
 name: trust-root-change
 description: Checklist for changing the gate's trust root, protected inputs, baseline merge, prune or run identity.
-verified: 2026-10-26
-commit: 2b71580
-paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, tests/test_trust.py, tests/test_verification.py
+verified: 2026-10-28
+commit: 76be052
+paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, tests/test_trust.py, tests/test_verification.py
 ---
 
 # Changing the trust root
@@ -28,13 +28,16 @@ closure: the suite covers the probes below, but a new trust path needs its own a
 4. **Respect metric direction in the merge.** `_merge_revision_entry` keeps a trusted `min` floor when the
    candidate omits it, applies a candidate removal only for `max`, and preserves every trusted entry when the
    candidate baseline cannot be parsed. A merge that parses a bad candidate as empty or drops floors loosens the
-   ratchet.
-5. **Identity and prune.** `_capture_identity` runs before the checks; when a prune is requested,
-   `Trust.before_prune` captures it again after the checks and must find no difference before anything is
-   written. `_write_pruned` records exactly the bytes `write_baseline` returned with
-   `Trust.record_prune_write`, and `Trust.finish` allows that write to change only the path's
-   `candidate_sha256` to the digest of those bytes; every other difference fails the run naming the path. Do
-   not reintroduce a path-wide or per-check exemption.
+   ratchet. The merged tuple goes on `CheckDef.effective_baseline`; `checks._baseline_entries` returns it
+   first, and no check passes a baseline path to a child process. An authorized policy's new baseline is read
+   from the candidate, but still validated before the checks.
+5. **Identity and prune.** `_capture_identity` runs before the checks and records `protected`,
+   `effective_inputs` (policy, lock, tool pins and each effective baseline digest), `tools` and `gate`; when
+   a prune is requested, `Trust.before_prune` captures it again after the checks and must find no difference
+   in any of those sections before anything is written. `_write_pruned` records exactly the bytes
+   `write_baseline` returned with `Trust.record_prune_write`, and `Trust.finish` allows that write to change
+   only the path's `candidate_sha256` to the digest of those bytes; every other difference fails the run
+   naming the path. Do not reintroduce a path-wide or per-check exemption.
 6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version and
    payload digest as arguments and loads the standard-library `payload.py` by file path, so the measured
    interpreter never imports `quality_gate` (QF7). Do not move that verifier into the package import graph or
