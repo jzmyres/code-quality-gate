@@ -76,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluate the working tree against REV's policy and inputs",
     )
     check.add_argument(
+        "--changed-from",
+        metavar="REV",
+        help="also reject threshold violations on lines changed since REV",
+    )
+    check.add_argument(
         "--allow-protected",
         metavar="PATH",
         action="append",
@@ -131,6 +136,7 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         config,
         json_output=args.json,
         prune_id=args.prune,
+        changed_from=args.changed_from,
     )
 
 
@@ -153,6 +159,7 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         json_output=args.json,
         prune_id=args.prune,
         trust=trust,
+        changed_from=args.changed_from,
     )
 
 

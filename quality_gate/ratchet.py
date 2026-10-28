@@ -16,11 +16,27 @@ from .policy import GateError, UnsupportedError, _describe
 
 
 @dataclass(frozen=True)
+class Location:
+    path: str
+    start_line: int
+    end_line: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {"path": self.path, "start_line": self.start_line, "end_line": self.end_line}
+
+    def __str__(self) -> str:
+        if self.start_line == self.end_line:
+            return f"{self.path}:{self.start_line}"
+        return f"{self.path}:{self.start_line}-{self.end_line}"
+
+
+@dataclass(frozen=True)
 class Finding:
     subject: str
     value: float
     location: str
     measurement: dict[str, Any] | None = None
+    locations: tuple[Location, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +102,9 @@ class FindingResult:
     expired: bool = False
     error: str | None = None
     measurement: dict[str, Any] | None = None
+    locations: tuple[Location, ...] | None = None
+    on_changed_lines: bool | None = None
+    change_scope_evaluated: bool = False
 
     def to_json(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -103,6 +122,12 @@ class FindingResult:
             result["error"] = self.error
         if self.measurement is not None:
             result["measurement"] = self.measurement
+        result["locations"] = (
+            [location.to_json() for location in self.locations]
+            if self.locations is not None else None
+        )
+        if self.change_scope_evaluated:
+            result["on_changed_lines"] = self.on_changed_lines
         return result
 
 
@@ -654,6 +679,7 @@ def _missing_min(
         expired=False,
         error=reason,
         measurement=finding.measurement,
+        locations=finding.locations,
     )
     return _Verdict(
         result=result,
@@ -698,6 +724,7 @@ def _finding_result(
         covered_by_baseline=valid_entry,
         expired=expired,
         measurement=finding.measurement,
+        locations=finding.locations,
     )
     if finding.subject in empty_reason_subjects:
         result.blocking = enforcement == "enforced"

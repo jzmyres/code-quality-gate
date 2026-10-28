@@ -17,7 +17,7 @@ from .policy import (
     GateError,
     UnsupportedError,
 )
-from .ratchet import Finding, pruned_entries, write_baseline
+from .ratchet import Finding, Location, pruned_entries, write_baseline
 from .runner import Diagnostics, run
 from .tools import _jscpd_binary
 
@@ -116,7 +116,8 @@ class CloneMeasurement:
 @dataclass(frozen=True)
 class Clone:
     fingerprint: str
-    locations: tuple[str, ...]
+    locations: tuple[Location, ...]
+    complete: bool
 
 
 def _sarif_path(uri: str, root: Path) -> str:
@@ -140,9 +141,9 @@ def _sarif_path(uri: str, root: Path) -> str:
     return path
 
 
-def _sarif_location(
-    location: dict[str, Any], root: Path, where: str, report: Path
-) -> str:
+def _sarif_fields(
+    location: dict[str, Any], where: str, report: Path
+) -> tuple[Any, Any, Any, Any]:
     try:
         physical = location["physicalLocation"]
         artifact = physical["artifactLocation"]
@@ -152,32 +153,63 @@ def _sarif_location(
         raise _no_completed(
             report, f"{where}: missing location data"
         ) from error
+    return physical, artifact, uri, region
+
+
+def _validate_sarif_fields(
+    physical: Any, artifact: Any, uri: Any, region: Any, where: str, report: Path
+) -> None:
     if not isinstance(physical, dict) or not isinstance(artifact, dict):
         raise _no_completed(report, f"{where}: location is not an object")
     if not isinstance(uri, str):
         raise _no_completed(report, f"{where}: location uri is not a string")
     if not isinstance(region, dict):
         raise _no_completed(report, f"{where}: region is not an object")
-    start = region.get("startLine")
+
+
+def _sarif_integer(value: Any, name: str, where: str, report: Path) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _no_completed(report, f"{where}: {name} is not an integer")
+    return value
+
+
+def _sarif_lines(region: dict[str, Any], where: str, report: Path) -> tuple[int, int]:
+    start = _sarif_integer(region.get("startLine"), "startLine", where, report)
     end = region.get("endLine", start)
-    if isinstance(start, bool) or not isinstance(start, int):
-        raise _no_completed(
-            report, f"{where}: startLine is not an integer"
-        )
     if end is None:
         end = start
-    if isinstance(end, bool) or not isinstance(end, int):
-        raise _no_completed(
-            report, f"{where}: endLine is not an integer"
-        )
-    path = _sarif_path(uri, root)
-    if start == end:
-        return f"{path}:{start}"
-    return f"{path}:{start}-{end}"
+    return start, _sarif_integer(end, "endLine", where, report)
 
 
-def _parse_sarif(report: Path, root: Path) -> list[Clone]:
-    data = _read_report(report)
+def _sarif_range(
+    location: dict[str, Any], root: Path, where: str, report: Path
+) -> Location:
+    physical, artifact, uri, region = _sarif_fields(location, where, report)
+    _validate_sarif_fields(physical, artifact, uri, region, where, report)
+    start, end = _sarif_lines(region, where, report)
+    return Location(_sarif_path(uri, root), start, end)
+
+
+def _sarif_location(
+    location: dict[str, Any], root: Path, where: str, report: Path
+) -> str:
+    return str(_sarif_range(location, root, where, report))
+
+
+def _complete_range(raw: dict[str, Any], location: Location) -> bool:
+    region = raw["physicalLocation"].get("region", {})
+    path = Path(location.path)
+    return (
+        region.get("endLine") is not None
+        and location.start_line > 0
+        and location.end_line >= location.start_line
+        and bool(location.path)
+        and not path.is_absolute()
+        and ".." not in path.parts
+    )
+
+
+def _sarif_run(data: Any, report: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise _no_completed(report, "expected a JSON object")
     runs = data.get("runs")
@@ -186,6 +218,10 @@ def _parse_sarif(report: Path, root: Path) -> list[Clone]:
     run = runs[0]
     if not isinstance(run, dict):
         raise _no_completed(report, "runs[0] is not an object")
+    return run
+
+
+def _sarif_results(run: dict[str, Any], report: Path) -> list[Any]:
     tool = run.get("tool")
     driver = tool.get("driver") if isinstance(tool, dict) else None
     if (
@@ -196,44 +232,70 @@ def _parse_sarif(report: Path, root: Path) -> list[Clone]:
     results = run.get("results")
     if not isinstance(results, list):
         raise _no_completed(report, "runs[0].results is not a list")
-    clones: list[Clone] = []
-    for result_index, result in enumerate(results):
-        where = f"runs[0].results[{result_index}]"
-        if not isinstance(result, dict):
-            raise _no_completed(report, f"{where} is not an object")
-        fingerprints = result.get("partialFingerprints")
-        fingerprint = (
-            fingerprints.get("jscpdCloneHash/v1")
-            if isinstance(fingerprints, dict)
-            else None
+    return results
+
+
+def _sarif_fingerprint(result: dict[str, Any], where: str, report: Path) -> str:
+    fingerprints = result.get("partialFingerprints")
+    fingerprint = (
+        fingerprints.get("jscpdCloneHash/v1")
+        if isinstance(fingerprints, dict)
+        else None
+    )
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise _no_completed(
+            report,
+            f"{where} has no "
+            'partialFingerprints["jscpdCloneHash/v1"]',
         )
-        if not isinstance(fingerprint, str) or not fingerprint:
-            raise _no_completed(
-                report,
-                f"{where} has no "
-                'partialFingerprints["jscpdCloneHash/v1"]',
-            )
-        locations = result.get("locations")
-        related = result.get("relatedLocations", [])
-        if not isinstance(locations, list) or not isinstance(related, list):
-            raise _no_completed(
-                report, f"{where} has malformed locations"
-            )
-        formatted: list[str] = []
-        seen: set[str] = set()
-        for location in [*locations, *related]:
-            if not isinstance(location, dict):
-                raise _no_completed(
-                    report, f"{where} has a non-object location"
-                )
-            text = _sarif_location(location, root, where, report)
-            if text not in seen:
-                seen.add(text)
-                formatted.append(text)
-        if not formatted:
-            raise _no_completed(report, f"{where} has no locations")
-        clones.append(Clone(fingerprint, tuple(formatted)))
-    return clones
+    return fingerprint
+
+
+def _sarif_location_list(result: dict[str, Any], where: str, report: Path) -> list[Any]:
+    locations = result.get("locations")
+    related = result.get("relatedLocations", [])
+    if not isinstance(locations, list) or not isinstance(related, list):
+        raise _no_completed(report, f"{where} has malformed locations")
+    return [*locations, *related]
+
+
+def _sarif_raw_location(location: Any, root: Path, where: str, report: Path) -> Location:
+    if not isinstance(location, dict):
+        raise _no_completed(report, f"{where} has a non-object location")
+    return _sarif_range(location, root, where, report)
+
+
+def _sarif_locations(
+    locations: list[Any], root: Path, where: str, report: Path
+) -> tuple[tuple[Location, ...], bool]:
+    formatted: list[Location] = []
+    seen: set[Location] = set()
+    complete = True
+    for location in locations:
+        span = _sarif_raw_location(location, root, where, report)
+        complete &= _complete_range(location, span)
+        if span not in seen:
+            seen.add(span)
+            formatted.append(span)
+    if not formatted:
+        raise _no_completed(report, f"{where} has no locations")
+    return tuple(formatted), complete and len(formatted) >= 2
+
+
+def _sarif_clone(result: Any, index: int, root: Path, report: Path) -> Clone:
+    where = f"runs[0].results[{index}]"
+    if not isinstance(result, dict):
+        raise _no_completed(report, f"{where} is not an object")
+    fingerprint = _sarif_fingerprint(result, where, report)
+    raw_locations = _sarif_location_list(result, where, report)
+    locations, complete = _sarif_locations(raw_locations, root, where, report)
+    return Clone(fingerprint, locations, complete)
+
+
+def _parse_sarif(report: Path, root: Path) -> list[Clone]:
+    run = _sarif_run(_read_report(report), report)
+    results = _sarif_results(run, report)
+    return [_sarif_clone(result, index, root, report) for index, result in enumerate(results)]
 
 
 def _format_source(name: object, raw: object) -> int | None:
@@ -429,18 +491,34 @@ def _run_jscpd(
         return clones, diagnostics, result.execution
 
 
-def _clone_findings(clones: list[Clone]) -> list[Finding]:
+def _complete_clone_locations(clones: list[Clone], selected: set[str]) -> bool:
+    return all(clone.complete for clone in clones) and all(
+        location.path in selected for clone in clones for location in clone.locations
+    )
+
+
+def _clone_finding(fingerprint: str, actual: list[Clone], selected: set[str]) -> Finding:
+    spans = _clone_spans(actual)
+    locations = "; ".join(map(str, spans))
+    return Finding(
+        fingerprint, len(actual), locations,
+        locations=spans if _complete_clone_locations(actual, selected) else None,
+    )
+
+
+def _clone_spans(clones: list[Clone]) -> tuple[Location, ...]:
+    return tuple(location for clone in clones for location in clone.locations)
+
+
+def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
     occurrences: dict[str, list[Clone]] = {}
     for clone in clones:
         occurrences.setdefault(clone.fingerprint, []).append(clone)
-    findings: list[Finding] = []
-    for fingerprint in sorted(occurrences):
-        actual = occurrences[fingerprint]
-        locations = "; ".join(
-            location for clone in actual for location in clone.locations
-        )
-        findings.append(Finding(fingerprint, len(actual), locations))
-    return findings
+    selected = set(files)
+    return [
+        _clone_finding(fingerprint, occurrences[fingerprint], selected)
+        for fingerprint in sorted(occurrences)
+    ]
 
 
 def measure_clones(
@@ -468,7 +546,7 @@ def measure_clones(
     except GateError as error:
         return CloneMeasurement([], Diagnostics(), "error", str(error), False)
     return CloneMeasurement(
-        _clone_findings(clones), diagnostics, execution
+        _clone_findings(clones, files), diagnostics, execution
     )
 
 

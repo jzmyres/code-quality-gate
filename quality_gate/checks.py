@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import gate_result
+from .changes import apply_changes, changed_lines, location_coverage, resolve_revision
 from .clones import measure_clones
 from .coverage_tool import (
     combine_coverage,
@@ -81,6 +82,8 @@ class CheckResult:
     coverage_config: Path | None = None
     temporary: Any = field(default=None, repr=False, compare=False)
     configuration_error: bool = False
+    change_scoped_failure: bool = False
+    incomplete_locations: bool = False
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:
@@ -111,10 +114,24 @@ class CheckResult:
             "resolved_baseline_entries": list(self.resolved_baseline_entries),
             "unmeasured_baseline_entries": list(self.unmeasured_baseline_entries),
             "reason": self.reason,
+            "location_coverage": self._location_coverage(),
         }
         if self.measurement is not None:
             document["measurement"] = self.measurement
         return document
+
+    def _location_coverage(self) -> str:
+        coverage = location_coverage(self.adapter)
+        if coverage == "complete" and _incomplete_locations(self):
+            return "partial"
+        return coverage
+
+
+def _incomplete_locations(result: CheckResult) -> bool:
+    return result.incomplete_locations or (
+        result.ratchet is not None
+        and any(item.locations is None for item in result.ratchet.findings)
+    )
 
 
 def _select_files(
@@ -1936,7 +1953,7 @@ def _enforced_failures(results: list[CheckResult]) -> list[str]:
         result.id
         for result in results
         if result.kind == "check"
-        and result.enforcement == "enforced"
+        and (result.enforcement == "enforced" or result.change_scoped_failure)
         and not result.is_satisfied()
     ]
 
@@ -2087,7 +2104,9 @@ def _check_command(
     config: Config,
     prune_id: str | None,
     trust: Any = None,
+    changed_from: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    revision = resolve_revision(root, changed_from) if changed_from is not None else None
     problem = _prune_request_problem(config, prune_id)
     if problem is not None:
         assert prune_id is not None
@@ -2095,7 +2114,12 @@ def _check_command(
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
     results.extend(_run_policy_checks(root, config, files, classes, code))
-    return _finalize_check(root, config, results, prune_id, trust)
+    if revision is not None:
+        apply_changes(results, changed_lines(root, revision, files))
+    exit_code, document = _finalize_check(root, config, results, prune_id, trust)
+    if revision is not None:
+        document["changed_from"] = revision
+    return exit_code, document
 
 
 def _run_check_document(
@@ -2104,11 +2128,12 @@ def _run_check_document(
     prune_id: str | None,
     json_output: bool,
     trust: Any = None,
+    changed_from: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     if not json_output:
-        return _check_command(root, config, prune_id, trust)
+        return _check_command(root, config, prune_id, trust, changed_from)
     with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_id, trust)
+        return _check_command(root, config, prune_id, trust, changed_from)
 
 
 def command_check(
@@ -2118,16 +2143,17 @@ def command_check(
     json_output: bool = False,
     prune_id: str | None = None,
     trust: Any = None,
+    changed_from: str | None = None,
 ) -> int:
     if trust is None:
         code, document = _run_check_document(
-            root, config, prune_id, json_output
+            root, config, prune_id, json_output, changed_from=changed_from
         )
     else:
         try:
             with trust.activate():
                 code, document = _run_check_document(
-                    root, config, prune_id, json_output, trust
+                    root, config, prune_id, json_output, trust, changed_from
                 )
             code, document = trust.finish(code, document)
         finally:

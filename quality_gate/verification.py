@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .coverage_tool import PRAGMA_NO_COVER
 from .policy import GateError
-from .ratchet import Finding
+from .ratchet import Finding, Location
 
 
 NO_COVER = re.compile(PRAGMA_NO_COVER)
@@ -58,11 +58,13 @@ def measure_exclusions(relative: str, source: str) -> list[Finding]:
             f"exclusions:{relative}:no-cover",
             len(no_cover),
             _location(relative, no_cover),
+            locations=tuple(Location(relative, line, line) for line in no_cover),
         ),
         Finding(
             f"exclusions:{relative}:noqa",
             len(noqa),
             _location(relative, noqa),
+            locations=tuple(Location(relative, line, line) for line in noqa),
         ),
     ]
 

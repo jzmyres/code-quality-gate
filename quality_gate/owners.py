@@ -21,7 +21,7 @@ from .owners_match import Occurrence, covered
 from .owners_python import python_code, python_events
 from .owners_shell import shell_events
 from .policy import ConfigError, GateError, _check_keys, _config_error, _string, _string_list
-from .ratchet import Finding
+from .ratchet import Finding, Location
 from .runner import run
 
 
@@ -445,6 +445,7 @@ def _finding(rule: OwnerRule, relative: str, pattern: Pattern, hits: list[Occurr
             "lines": lines,
             "text_fallback": pattern.kind == "text-regex",
         },
+        tuple(Location(relative, line, line) for line in lines),
     )
 
 

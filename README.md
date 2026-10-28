@@ -450,6 +450,7 @@ The default tools directory is shared by every repository using the gate on this
     python3 -I qg.py check --prune clones
     python3 -I qg.py check --policy-from REV
     python3 -I qg.py check --policy-from REV --allow-protected ruff.toml
+    python3 -I qg.py check --changed-from REV
 
 `check` runs inventory and hygiene (built in, always), then every configured check in policy order. It
 prints progress on stdout and failures on stderr. When inventory fails, configured checks are reported
@@ -460,20 +461,22 @@ any check starts.
 The result schema is `2`; a `--policy-from` result is schema `3` and adds `trust` (see below). Its
 top-level keys are `schema`, `gate_version`, `revision`, `dirty`, `policy_sha256`, `decision`,
 `checks`, `obligations` and `prune`; a `decision = "error"` document also has `error`.
+With `--changed-from`, `changed_from` is the full resolved commit id.
 
 `checks` contains inventory, hygiene and every configured check, in that order. Each check has `id`,
 `kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
 `evidence` (the evidence names the adapter produces), `metric_version`, `execution`, `outcome`,
 `satisfied`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
-`resolved_baseline_entries`, `unmeasured_baseline_entries` and `reason` (a structured explanation of
+`resolved_baseline_entries`, `unmeasured_baseline_entries`, `location_coverage` and `reason` (a structured explanation of
 a non-passing adapter verdict, null otherwise); a measuring check may also carry a `measurement`
 object (for example `{"tests": 12}`).
 
 `execution` is `completed`, `budget`, `signal` or `error`. `outcome` is the adapter's raw verdict:
 `pass`, `fail`, `unsupported` or `error`; later tier-3 adapters add `proved`, `no_counterexample` and
 `unknown`. `satisfied` is true when the policy obligation is met after baselines and enforcement: a
-finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = true`, and an advisory
-check never blocks. Missing evidence is `unsupported`, never `pass`. A check has one absolute
+finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = true`. Advisory checks
+do not block the whole-tree judgement. With `--changed-from`, a located threshold violation on changed
+lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. A check has one absolute
 deadline: the command, its pattern matching, coverage combination and analysis share the configured
 budget, and an overrun reports `execution = "budget"` with the diagnostics collected so far.
 
@@ -485,10 +488,57 @@ it. Check output is captured up to 1 MiB; later bytes are counted and discarded.
 never has to parse stderr to learn why a check failed.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
-`baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location` and `expired`; baseline
+`baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`, `locations` and `expired`; baseline
 errors carry `error`, and CRAP findings carry a `measurement` with `cc`, `statements`, `executed` and
 `excluded_lines`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
 bound fails.
+
+### New and changed lines
+
+`check --changed-from REV` runs the same full-tree gate and ratchets, then adds a stricter judgement:
+every threshold violation with complete source locations that overlaps an added or modified line fails,
+even if a baseline covers the subject. This applies to advisory checks too. A passing measurement is
+never rejected by this rule. An unchanged violation may still be accepted by its baseline, and all
+whole-tree failures continue to fail. A check with a changed-line violation cannot be pruned.
+
+`REV` must resolve to a commit. Git compares that commit to the current worktree, including changes
+already committed after `REV`, staged and unstaged changes, and every stageable untracked file. New
+files have all their lines marked as added. The gate compares the raw base blobs and worktree bytes in
+an isolated temporary directory, so index flags and candidate Git clean filters cannot hide edits.
+This also treats line-ending changes as changes. It uses a zero-context textual diff without
+rename detection: a moved block is judged at the added lines Git identifies at its new location.
+For files with lone carriage returns, line endings are normalized for the diff so its line numbers
+match the source readers; a change consisting only of line endings marks the whole file as changed.
+If an adapter reports a finding through a symlink, a new or retargeted link marks its source lines as
+new. An unchanged link to an inventoried file uses the target's changed lines; a target outside that
+inventory cannot be compared and its finding is reported as not change-scoped.
+Git's line matching decides which lines count as additions, and a deletion alone adds no lines. Ignored
+untracked files and deleted files are outside inventory. A bad revision or failed diff exits 2.
+
+The `python_crap`, `owners` and `clones` adapters provide complete locations: respectively the entire
+function range (including decorators), every occurrence line, and both ranges of every clone in a
+fingerprint group. CRAP's module subject uses the span from its first to last outside-function node;
+that conservative span can include intervening functions. Verification supplies every suppression
+line, but its test-count metrics have no source location. Command checks, Python test results, inventory
+and hygiene have no complete source locations. These unlocated checks and metrics retain their normal
+whole-tree judgement and are reported as **not change-scoped**. Clone evidence missing a range or one
+of the two locations is also reported as not change-scoped for that finding.
+
+Each result's `location_coverage` is `complete`, `partial` or `none`. A finding's `locations` is an
+array of `{path, start_line, end_line}` ranges, or null when its locations are incomplete. With
+`--changed-from`, `on_changed_lines` is true or false for a comparable measurement and null when its
+locations or symlink target cannot be compared. `covered_by_baseline` still describes the whole-tree ratchet; it may be true alongside
+`blocking = true` when a violation is on changed lines.
+
+A consumer runner should pass the batch base from its own trusted context as both the policy and
+change comparison base, using a gate program extracted from that base outside the candidate:
+
+    python3 -I /path/to/trusted-gate/qg.py --repo "$candidate" check --json \
+        --policy-from "$batch_base" --changed-from "$batch_base"
+
+The harness's trusted gate already knows the batch base. An older trusted gate without this option
+cannot enforce it; enable the flag when the trusted base includes this implementation. `--changed-from`
+alone does not make candidate policy or baselines trusted; use `--policy-from` for that purpose.
 
 `obligations` has one entry per code class and required tier with `class`, `tier`, `status`
 (`satisfied`, `exempted` or `unsatisfied`), `required` (the evidence names the tier demands), `checks`
@@ -506,7 +556,8 @@ the checks and before the write, and after the write the pruned path may differ 
 bytes the gate generated; any other difference is an identity error (exit 2).
 
 The decision is `error` (exit 2) for invalid policy, usage or configuration, `rejected` (exit 1) when
-inventory, hygiene, any enforced check or any obligation is not satisfied, `accepted_with_exceptions`
+inventory, hygiene, any enforced check or any obligation is not satisfied, or a located threshold
+violation is on changed lines, `accepted_with_exceptions`
 (exit 0) when every obligation and enforced check is satisfied but at least one finding passes only through
 a baseline entry or an advisory check does not pass, and `accepted` (exit 0) otherwise. With `--json`,
 usage errors (unknown options, bad arguments) still write one error document with `decision = "error"`
@@ -538,7 +589,7 @@ is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in [`docs/SCHEMA.md`]
 * `2` - missing or invalid configuration (including a baseline header that does not match the policy or
   two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
   git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
-  `--policy-from` revision, a gate program inside the candidate, or a protected input, tool payload or
+  `--policy-from` or `--changed-from` revision, a gate program inside the candidate, or a protected input, tool payload or
   gate file that changed during the run.
 
 ## Configuration

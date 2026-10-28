@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .coverage_tool import import_coverage
 from .policy import GateError
-from .ratchet import Finding
+from .ratchet import Finding, Location
 
 
 @dataclass(frozen=True)
@@ -548,17 +548,44 @@ def _parse_selected(
     return parsed, failures
 
 
-def measure_crap(
-    root: Path,
-    selected: list[str],
-    evidence: Path,
-    config_file: Path | None = None,
-) -> CrapMeasurement:
-    """Measure every function and outside-function subject in SELECTED."""
-    parsed, failures = _parse_selected(root, selected)
-    if failures:
-        return CrapMeasurement([], failures)
+def _analyse_functions(
+    functions: list[MeasuredFunction], statements: list[int], excluded: list[int],
+    missing: list[int], executed_lines: list[int], findings: list[Finding], failures: list[str],
+) -> None:
+    for function in functions:
+        value, measurement, problem = _measure_one(
+            function, statements, excluded, missing, executed_lines
+        )
+        if problem is not None:
+            failures.append(
+                f"{function.identity}: unmeasured ({problem} at "
+                f"{function.path}:{function.start_line}-{function.end_line})"
+            )
+            continue
+        assert value is not None and measurement is not None
+        findings.append(Finding(
+            function.identity, value, f"{function.path}:{function.start_line}-{function.end_line}",
+            measurement, (Location(function.path, function.start_line, function.end_line),),
+        ))
 
+
+def _analyse_file(
+    cover: Any, root: Path, relative: str, functions: list[MeasuredFunction],
+    findings: list[Finding], failures: list[str],
+) -> None:
+    if not functions:
+        return
+    filename = str(root / relative)
+    _filename, statements, excluded, missing, _formatted = cover.analysis2(filename)
+    _analyse_functions(
+        functions, statements, excluded, missing, _executed_lines(cover, filename), findings, failures,
+    )
+
+
+def _analyse_coverage(
+    root: Path, selected: list[str], evidence: Path, config_file: Path | None,
+    parsed: dict[str, tuple[str, list[MeasuredFunction]]], failures: list[str],
+) -> list[Finding]:
     if not evidence.is_file():
         raise GateError(f"combined coverage data is missing at {evidence}")
     coverage = import_coverage()
@@ -571,39 +598,25 @@ def measure_crap(
         cover.load()
         for relative in selected:
             _source, functions = parsed[relative]
-            if not functions:
-                continue
-            _filename, statements, excluded, missing, _formatted = (
-                cover.analysis2(str(root / relative))
-            )
-            executed_lines = _executed_lines(
-                cover, str(root / relative)
-            )
-            for function in functions:
-                value, measurement, problem = _measure_one(
-                    function, statements, excluded, missing, executed_lines
-                )
-                if problem is not None:
-                    failures.append(
-                        f"{function.identity}: unmeasured ({problem} at "
-                        f"{function.path}:{function.start_line}-"
-                        f"{function.end_line})"
-                    )
-                    continue
-                assert value is not None and measurement is not None
-                findings.append(
-                    Finding(
-                        function.identity,
-                        value,
-                        f"{function.path}:{function.start_line}-"
-                        f"{function.end_line}",
-                        measurement,
-                    )
-                )
+            _analyse_file(cover, root, relative, functions, findings, failures)
     except (coverage.CoverageException, OSError) as error:
         raise GateError(
             f"cannot analyse coverage data at {evidence}: {error}"
         ) from error
+    return findings
+
+
+def measure_crap(
+    root: Path,
+    selected: list[str],
+    evidence: Path,
+    config_file: Path | None = None,
+) -> CrapMeasurement:
+    """Measure every function and outside-function subject in SELECTED."""
+    parsed, failures = _parse_selected(root, selected)
+    if failures:
+        return CrapMeasurement([], failures)
+    findings = _analyse_coverage(root, selected, evidence, config_file, parsed, failures)
     if failures:
         return CrapMeasurement([], failures)
     findings.sort(key=lambda item: item.subject)

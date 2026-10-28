@@ -382,6 +382,56 @@ and is pruned, whatever its direction. An entry outside the domain is reported
 as `unmeasured` and kept; prune never drops it. A clone entry naming a file
 deleted from the repository resolves.
 
+## Change-scoped enforcement
+
+`check --changed-from REV` preserves the full-tree checks and ratchets and adds
+a judgement for threshold violations on added or modified worktree lines. A
+located violation that overlaps those lines blocks regardless of baseline or
+whether the check is advisory. A measurement at or within its threshold does
+not fail this extra judgement. Unchanged violations remain subject to the
+ordinary ratchet; a check with a changed-line violation cannot be pruned.
+
+`REV` must resolve to a commit. Git compares that commit to the current
+worktree, including committed, staged and unstaged changes and stageable
+untracked files. Every line of an inventory file absent from the base is new.
+The gate compares raw base blobs with worktree bytes in an isolated temporary
+directory, so index flags and candidate Git clean filters cannot hide edits.
+Line-ending changes are changes. The gate runs a zero-context textual Git
+diff with rename detection off. Files containing lone carriage returns are
+normalized for line numbering; if only their line endings differ, all lines
+are marked changed.
+For a finding through a symlink, a new or retargeted link marks all its source
+lines new. An unchanged link to an inventoried file uses the target's changed
+lines; a target outside that inventory cannot be compared and the finding is
+reported as not change-scoped.
+Moved code is judged where Git reports added lines; Git's alignment determines
+which lines those are. A deletion alone adds no lines. Ignored untracked files
+and deleted files are not in inventory. A bad revision or failed diff is a
+usage error (exit 2).
+
+CRAP supplies the full function or lambda range including decorators. Its
+outside-function module subject uses the span of its first through last
+outside-function node, which can also include intervening functions. Owners
+supply every occurrence line. Clones supply both ranges of every clone in a
+fingerprint group. Verification supplies every suppression line, while its
+test-count metrics have no source location. Command checks, Python tests,
+inventory and hygiene have no complete source locations. Unlocated checks and
+metrics retain their ordinary whole-tree judgement and are reported as
+`not change-scoped`; clone findings with missing or incomplete ranges are also
+reported this way. Locations are inclusive and repository-relative.
+
+A consumer runner passes its externally selected batch base to both options,
+using a trusted gate program outside the candidate:
+
+```
+python3 -I /path/to/trusted-gate/qg.py --repo "$candidate" check --json \
+    --policy-from "$batch_base" --changed-from "$batch_base"
+```
+
+The harness's trusted gate already knows the batch base. The trusted base must
+contain this option before a runner can use it. `--changed-from` by itself
+does not establish a trusted policy or baseline.
+
 ## Result: `check --json`
 
 ```json
@@ -418,6 +468,7 @@ deleted from the repository resolves.
       "resolved_baseline_entries": [],
       "unmeasured_baseline_entries": [],
       "reason": null,
+      "location_coverage": "none",
       "measurement": {"tests": 12}
     }
   ],
@@ -453,6 +504,8 @@ Top-level keys:
 * `obligations` - one entry per code class and required tier.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
+* `changed_from` - the full resolved commit id, present only when
+  `--changed-from` was requested and the comparison succeeded.
 * `trust` - present only on a `--policy-from` result; see below.
 * `error` - present only on a `decision = "error"` document.
 
@@ -531,20 +584,30 @@ Check keys:
   `unknown`.
 * `satisfied` - whether the policy obligation is met after baselines and
   enforcement. A baseline-covered violation keeps `outcome = "fail"` and sets
-  `satisfied = true`; an advisory check never creates a blocking obligation.
+  `satisfied = true` unless it is on changed lines. An advisory check does not
+  block the whole-tree judgement; a located threshold violation on changed
+  lines blocks even when the check is advisory.
 * `duration_seconds`, `budget_seconds` (null for built-ins).
 * `diagnostics` - `argv` (array or null), `exit_code` (integer or null),
   `signal` (integer or null), `output_bytes`, `output_tail` (at most 4 KiB),
   `output_truncated`, and `error` when execution failed. Check subprocess
   output is captured up to 1 MiB; later bytes are counted and discarded.
 * `findings`, `resolved_baseline_entries`, `unmeasured_baseline_entries`.
+* `location_coverage` - `complete`, `partial` or `none` for the check's
+  violations. Verification is partial because test counts have no location;
+  a clone finding without complete ranges or a finding through an uncomparable
+  symlink makes its check partial.
 * `reason` - a structured explanation of a non-passing adapter verdict
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
-`baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`
-and `expired`. Baseline errors carry `error`; CRAP findings carry
+`baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`,
+`locations` and `expired`. `locations` is an array of objects with `path`,
+`start_line` and `end_line`, or null when the source locations are incomplete.
+With `--changed-from`, `on_changed_lines` is a boolean for a finding with
+complete, comparable locations and null otherwise. A baseline-covered finding may have
+`blocking = true` when it violates its threshold on changed lines. Baseline errors carry `error`; CRAP findings carry
 `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
 
 Obligation status is `satisfied`, `exempted` (with `reason`) or
@@ -552,7 +615,8 @@ Obligation status is `satisfied`, `exempted` (with `reason`) or
 the checks that counted.
 
 The decision is `rejected` when inventory or hygiene fails, when an enforced
-check is not satisfied, or when any obligation is `unsatisfied`.
+check is not satisfied, when any obligation is `unsatisfied`, or when a located
+threshold violation is on changed lines under `--changed-from`.
 `accepted_with_exceptions` means every obligation and enforced check is
 satisfied, but a baseline exception or a non-passing advisory check exists.
 `blocked` (exit 1, trust runs only) means an unauthorized protected path other
