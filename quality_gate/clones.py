@@ -18,7 +18,14 @@ from .policy import (
     UnsupportedError,
 )
 from .ratchet import Finding, Location, pruned_entries, write_baseline
-from .runner import Diagnostics, run
+from .runner import (
+    Diagnostics,
+    analysis_step,
+    mark_step,
+    record_diagnostics,
+    remaining_budget,
+    run,
+)
 from .tools import _jscpd_binary
 
 
@@ -466,12 +473,15 @@ def _run_jscpd(
     with tempfile.TemporaryDirectory(prefix="qg-clones-") as temporary:
         output = Path(temporary)
         config = output / "jscpd-config.json"
-        config.write_text("{}", encoding="utf-8")
-        command = _jscpd_command(
-            binary, files, min_tokens, max_bytes, output, config
+        analysis_step("clone setup", _write_clone_config, config)
+        command = analysis_step(
+            "clone command preparation", _jscpd_command,
+            binary, files, min_tokens, max_bytes, output, config,
         )
-        result = run(command, cwd=root, budget_seconds=600)
+        mark_step("jscpd")
+        result = run(command, cwd=root, budget_seconds=remaining_budget(600))
         diagnostics = result.diagnostics()
+        record_diagnostics(diagnostics)
         _raise_jscpd_failure(result, diagnostics)
         sarif = output / "jscpd-report.sarif"
         json_report = output / "jscpd-report.json"
@@ -481,8 +491,9 @@ def _run_jscpd(
                 diagnostics=diagnostics,
             )
         try:
-            _parse_jscpd_json(json_report, files)
-            clones = _parse_sarif(sarif, root)
+            clones = analysis_step(
+                "clone report analysis", _parse_reports, json_report, sarif, root, files
+            )
         except UnsupportedError as error:
             raise CloneEvidenceError(
                 str(error),
@@ -510,6 +521,15 @@ def _clone_spans(clones: list[Clone]) -> tuple[Location, ...]:
     return tuple(location for clone in clones for location in clone.locations)
 
 
+def _write_clone_config(config: Path) -> None:
+    config.write_text("{}", encoding="utf-8")
+
+
+def _parse_reports(json_report: Path, sarif: Path, root: Path, files: list[str]) -> list[Clone]:
+    _parse_jscpd_json(json_report, files)
+    return _parse_sarif(sarif, root)
+
+
 def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
     occurrences: dict[str, list[Clone]] = {}
     for clone in clones:
@@ -528,7 +548,7 @@ def measure_clones(
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> CloneMeasurement:
     try:
-        binary = _jscpd_binary()
+        binary = analysis_step("clone tool preparation", _jscpd_binary)
     except UnsupportedError as error:
         return CloneMeasurement([], Diagnostics(), "error", str(error), True)
     try:
@@ -546,7 +566,7 @@ def measure_clones(
     except GateError as error:
         return CloneMeasurement([], Diagnostics(), "error", str(error), False)
     return CloneMeasurement(
-        _clone_findings(clones, files), diagnostics, execution
+        analysis_step("clone findings", _clone_findings, clones, files), diagnostics, execution
     )
 
 

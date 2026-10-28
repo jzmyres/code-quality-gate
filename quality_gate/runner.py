@@ -10,19 +10,270 @@ diagnostics.
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import io
 import os
+import pickle
 import selectors
 import signal
 import subprocess
+import sys
 import time
+import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 
 CAPTURE_LIMIT = 1024 * 1024
 TAIL_LIMIT = 4096
 GRACE_SECONDS = 5.0
 _PIPE_READ = 65536
+
+
+class StepTimeout(Exception):
+    """An in-process step exceeded the check deadline."""
+
+
+class WorkerError(Exception):
+    """A supervised analysis worker failed without returning a result."""
+
+
+@dataclass
+class CheckDeadline:
+    started: float
+    seconds: float
+    step: str = "check setup"
+    diagnostics: Any = None
+
+    @property
+    def deadline(self) -> float:
+        return self.started + self.seconds
+
+
+_check_deadline: contextvars.ContextVar[CheckDeadline | None] = (
+    contextvars.ContextVar("check_deadline", default=None)
+)
+
+
+@contextlib.contextmanager
+def check_deadline(started: float, seconds: float):
+    scope = CheckDeadline(started, seconds)
+    token = _check_deadline.set(scope)
+    try:
+        yield scope
+    finally:
+        _check_deadline.reset(token)
+
+
+def remaining_budget(seconds: float) -> float:
+    scope = _check_deadline.get()
+    if scope is None:
+        return seconds
+    return max(0.0, min(seconds, scope.deadline - time.monotonic()))
+
+
+def check_time() -> None:
+    scope = _check_deadline.get()
+    if scope is not None and time.monotonic() >= scope.deadline:
+        raise StepTimeout(scope.step)
+
+
+def record_diagnostics(diagnostics: Any) -> None:
+    scope = _check_deadline.get()
+    if scope is not None:
+        scope.diagnostics = diagnostics
+
+
+def mark_step(step: str) -> None:
+    scope = _check_deadline.get()
+    if scope is not None:
+        scope.step = step
+
+
+def _current_coverage() -> Any:
+    module = sys.modules.get("coverage")
+    return module.Coverage.current() if module is not None else None
+
+
+def _start_worker_coverage() -> Any:
+    current = _current_coverage()
+    if current is None:
+        return None
+    # A fork has its own memory. Record its real execution separately, then
+    # send it back to the already-active collector in the parent.
+    module = sys.modules["coverage"]
+    child = module.Coverage(
+        data_file=None,
+        config_file=False,
+        source=current.get_option("run:source"),
+        branch=current.get_option("run:branch"),
+        include=current.get_option("run:include"),
+        omit=current.get_option("run:omit"),
+    )
+    child.start()
+    return child
+
+
+def _finish_worker_coverage(child: Any) -> tuple[bool, dict[str, Any]] | None:
+    if child is None:
+        return None
+    child.stop()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="No data was collected.*")
+        data = child.get_data()
+    return _coverage_snapshot(data)
+
+
+def _coverage_snapshot(data: Any) -> tuple[bool, dict[str, Any]] | None:
+    arcs = data.has_arcs()
+    recorded = {
+        name: (data.arcs(name) if arcs else data.lines(name))
+        for name in data.measured_files()
+    }
+    recorded = {name: lines for name, lines in recorded.items() if lines}
+    return (arcs, recorded) if recorded else None
+
+
+def _merge_worker_coverage(snapshot: tuple[bool, dict[str, Any]] | None) -> None:
+    if snapshot is None:
+        return
+    current = _current_coverage()
+    if current is None:
+        return
+    arcs, recorded = snapshot
+    if arcs:
+        current.get_data().add_arcs(recorded)
+    else:
+        current.get_data().add_lines(recorded)
+
+
+def _worker_payload(function: Callable[..., Any], args: tuple[Any, ...]) -> bytes:
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        coverage = _start_worker_coverage()
+        try:
+            success, result = True, function(*args)
+        except BaseException as error:
+            success, result = False, error
+        snapshot = _finish_worker_coverage(coverage)
+    response = (success, result, stdout.getvalue(), stderr.getvalue(), snapshot)
+    try:
+        return pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as error:
+        failure = WorkerError(f"cannot return worker result: {error}")
+        return pickle.dumps((False, failure, stdout.getvalue(), stderr.getvalue(), snapshot))
+
+
+def _worker(write_fd: int, function: Callable[..., Any], args: tuple[Any, ...]) -> None:
+    try:
+        os.setsid()
+        payload = memoryview(_worker_payload(function, args))
+        while payload:
+            payload = payload[os.write(write_fd, payload):]
+    finally:
+        os._exit(0)
+
+
+def _stop_worker(pid: int) -> None:
+    finished, _status = os.waitpid(pid, os.WNOHANG)
+    if finished:
+        return
+    _signal_group(pid, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+
+
+def _read_worker(read_fd: int, deadline: float, step: str) -> bytes:
+    data = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(read_fd, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StepTimeout(step)
+            if not selector.select(remaining):
+                continue
+            chunk = os.read(read_fd, _PIPE_READ)
+            if not chunk:
+                break
+            data.extend(chunk)
+    return bytes(data)
+
+
+def _decode_worker(data: bytes, step: str) -> Any:
+    try:
+        success, result, stdout, stderr, snapshot = pickle.loads(data)
+    except Exception as error:
+        raise WorkerError(f"{step} worker returned invalid data: {error}") from error
+    _merge_worker_coverage(snapshot)
+    sys.stdout.write(stdout)
+    sys.stderr.write(stderr)
+    if not success:
+        raise result
+    return result
+
+
+def _worker_result(read_fd: int, pid: int, deadline: float, step: str) -> Any:
+    data = _read_worker(read_fd, deadline, step)
+    _pid, status = os.waitpid(pid, 0)
+    if status != 0 or not data:
+        raise WorkerError(f"{step} worker exited without a result")
+    return _decode_worker(data, step)
+
+
+def _step_deadline(step: str, deadline: float | None) -> float | None:
+    scope = _check_deadline.get()
+    if scope is not None:
+        scope.step = step
+        return min(deadline, scope.deadline) if deadline is not None else scope.deadline
+    return deadline
+
+
+def _worker_pipe(step: str) -> tuple[int, int]:
+    try:
+        return os.pipe()
+    except OSError as error:
+        raise WorkerError(f"cannot start {step} worker: {error}") from error
+
+
+def _start_worker(step: str, function: Callable[..., Any], args: tuple[Any, ...]) -> tuple[int, int]:
+    read_fd, write_fd = _worker_pipe(step)
+    try:
+        pid = os.fork()
+    except OSError as error:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise WorkerError(f"cannot start {step} worker: {error}") from error
+    if pid == 0:
+        os.close(read_fd)
+        _worker(write_fd, function, args)
+    os.close(write_fd)
+    return read_fd, pid
+
+
+def _supervise(step: str, function: Callable[..., Any], args: tuple[Any, ...], deadline: float) -> Any:
+    read_fd, pid = _start_worker(step, function, args)
+    try:
+        return _worker_result(read_fd, pid, deadline, step)
+    except BaseException:
+        with contextlib.suppress(ChildProcessError):
+            _stop_worker(pid)
+        raise
+    finally:
+        os.close(read_fd)
+
+
+def analysis_step(
+    step: str, function: Callable[..., Any], *args: Any, deadline: float | None = None
+) -> Any:
+    """Run a synchronous step in a killable worker under the remaining deadline."""
+    deadline = _step_deadline(step, deadline)
+    if deadline is None:
+        return function(*args)
+    if time.monotonic() >= deadline:
+        raise StepTimeout(step)
+    return _supervise(step, function, args, deadline)
 
 
 @dataclass
@@ -223,13 +474,12 @@ def _read_ready(
         fd = key.fd
         name = key.data
         stream = streams[name]
-        while (chunk := _read_chunk(fd)) is not None:
-            if chunk:
-                capture.add(name, chunk)
-                continue
+        chunk = _read_chunk(fd)
+        if chunk:
+            capture.add(name, chunk)
+        elif chunk == b"":
             selector.unregister(fd)
             stream.close()
-            break
 
 
 def _finished(
@@ -301,6 +551,10 @@ def run(
     grace_seconds: float = GRACE_SECONDS,
 ) -> RunResult:
     """Run ARGV in its own process group within BUDGET_SECONDS."""
+    if _check_deadline.get() is not None:
+        check_time()
+        budget_seconds = remaining_budget(budget_seconds)
+        grace_seconds = 0.0
     argv_tuple = tuple(argv)
     started = time.monotonic()
     deadline = started + max(0.0, budget_seconds)

@@ -120,6 +120,24 @@ class CommandCheckTests(FixtureCase):
         self.assertGreaterEqual(check["duration_seconds"], 0)
         self.assertIn("exceeded its 1 second budget", result.stderr)
 
+    def test_continuous_output_is_stopped_at_the_check_deadline(self) -> None:
+        program = (
+            "import os, signal\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "data = b'x' * 65536\n"
+            "while True:\n"
+            "    os.write(1, data)\n"
+        )
+        self.write_config(with_command(json.dumps(["python3", "-c", program]), budget=1))
+        started = time.monotonic()
+        result, check = self.failed_lint()
+        self.assertEqual(check["outcome"], "fail")
+        self.assertEqual(check["execution"], "budget")
+        self.assertGreater(check["diagnostics"]["output_bytes"], 1024 * 1024)
+        self.assertIn("deadline:", check["reason"])
+        self.assertIn("elapsed:", check["reason"])
+        self.assertLess(time.monotonic() - started, 3.0, result.stderr[-1000:])
+
     def test_must_match_passes_on_combined_output(self) -> None:
         self.write_config(
             with_command(

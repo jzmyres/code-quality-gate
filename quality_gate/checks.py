@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,18 @@ from .ratchet import (
     pruned_entries,
     write_baseline,
 )
-from .runner import Diagnostics, RunResult, run
+from .runner import (
+    Diagnostics,
+    RunResult,
+    StepTimeout,
+    WorkerError,
+    analysis_step,
+    check_deadline,
+    check_time,
+    mark_step,
+    record_diagnostics,
+    run,
+)
 from .tools import current_tools, tool_binary
 from .trust import checked_prune_path
 from .verification import measure_verification
@@ -52,6 +64,11 @@ from .verification import measure_verification
 
 CLONE_BUDGET_SECONDS = 600
 REGEX_RUNNER = Path(__file__).with_name("regexrun.py")
+
+
+def _budget_detail(reason: str, start: float, budget: float) -> str:
+    elapsed = time.monotonic() - start
+    return f"{reason} (timeout; deadline: {budget:g} seconds; elapsed: {elapsed:.3f} seconds)"
 
 
 @dataclass
@@ -212,6 +229,8 @@ def _check_result(
     budget_seconds: int | None = None,
     **fields: Any,
 ) -> CheckResult:
+    if execution != "budget":
+        check_time()
     return CheckResult(
         id=check.id,
         kind="check",
@@ -240,15 +259,19 @@ def _evaluate_ratchet(
     assert check.threshold is not None
     try:
         return (
-            evaluate(
-                findings,
-                entries,
-                threshold=check.threshold,
-                enforcement=check.enforcement,
-                prefix=prefix,
-                adapter=check.adapter,
-                domain=domain,
-                direction=check.direction,
+            analysis_step(
+                "ratchet evaluation",
+                partial(
+                    evaluate,
+                    findings,
+                    entries,
+                    threshold=check.threshold,
+                    enforcement=check.enforcement,
+                    prefix=prefix,
+                    adapter=check.adapter,
+                    domain=domain,
+                    direction=check.direction,
+                ),
             ),
             None,
         )
@@ -279,7 +302,9 @@ def _expanded_or_failure(
     start: float,
 ) -> tuple[list[str] | None, CheckResult | None]:
     try:
-        expanded, unsupported = _expand_run(check, selected)
+        expanded, unsupported = analysis_step(
+            "command preparation", _expand_run, check, selected
+        )
     except UsageError as error:
         return None, _command_failure(
             check,
@@ -375,22 +400,25 @@ def _command_patterns(spec: Any) -> dict[str, str]:
 def _pattern_matches(
     patterns: dict[str, str], text: str, budget_seconds: float
 ) -> tuple[dict[str, Any] | None, RunResult | None]:
+    deadline = time.monotonic() + max(0.0, budget_seconds)
     with tempfile.TemporaryDirectory(prefix="qg-regex-") as temporary:
         job = Path(temporary) / "job.json"
-        job.write_text(
-            json.dumps({"text": text, "patterns": patterns}),
-            encoding="utf-8",
-        )
+        analysis_step("output matching preparation", _write_pattern_job, job, patterns, text)
+        mark_step("output matching")
         result = run(
             [sys.executable, "-I", str(REGEX_RUNNER), str(job)],
-            budget_seconds=budget_seconds,
+            budget_seconds=max(0.0, deadline - time.monotonic()),
         )
     if result.execution != "completed" or result.returncode != 0:
         return None, result
     try:
-        return json.loads(result.stdout_text), result
+        return analysis_step("output matching analysis", json.loads, result.stdout_text), result
     except ValueError:
         return None, result
+
+
+def _write_pattern_job(job: Path, patterns: dict[str, str], text: str) -> None:
+    job.write_text(json.dumps({"text": text, "patterns": patterns}), encoding="utf-8")
 
 
 def _pattern_failure(
@@ -434,8 +462,9 @@ def _tests_measurement(
 ) -> tuple[dict[str, Any] | None, CheckResult | None]:
     if spec.tests_pattern_re is None:
         return None, None
-    ran, skipped, count_error = summarize_matches(
-        spec, matches.get("tests", []), matches.get("skipped", [])
+    ran, skipped, count_error = analysis_step(
+        "test count analysis", summarize_matches,
+        spec, matches.get("tests", []), matches.get("skipped", []),
     )
     if count_error is not None:
         return None, _command_failure(
@@ -529,7 +558,9 @@ def _run_command(
     assert check.command is not None
     spec = check.command
     start = time.monotonic()
-    selected, names = _select_files(config, check, files, classes)
+    selected, names = analysis_step(
+        "file selection", _select_files, config, check, files, classes
+    )
     if "{files}" in spec.run and not selected:
         return _command_failure(
             check,
@@ -546,12 +577,14 @@ def _run_command(
         return failure
     assert expanded is not None
     deadline = start + spec.budget_seconds
+    mark_step("command")
     result = run(
         expanded,
         cwd=root,
         budget_seconds=max(0.0, deadline - time.monotonic()),
     )
     diagnostics = result.diagnostics()
+    record_diagnostics(diagnostics)
     failure = _termination_failure(
         check, spec, start, prefix, result, diagnostics
     )
@@ -604,8 +637,14 @@ def _ratchet_result(
         ratchet=ratchet,
         measurement=measurement,
         diagnostics=diagnostics or Diagnostics(),
-        reason=_ratchet_reason(ratchet, reason),
+        reason=_ratchet_reason(ratchet, _ratchet_budget_reason(reason, execution, start)),
     )
+
+
+def _ratchet_budget_reason(reason: str | None, execution: str, start: float) -> str | None:
+    if execution == "budget" and reason is not None and "deadline:" not in reason:
+        return _budget_detail(reason, start, CLONE_BUDGET_SECONDS)
+    return reason
 
 
 def _ratchet_error(
@@ -693,7 +732,9 @@ def _run_clones(
 ) -> CheckResult:
     assert check.clones is not None
     start = time.monotonic()
-    selected, names = _select_files(config, check, files, classes)
+    selected, names = analysis_step(
+        "file selection", _select_files, config, check, files, classes
+    )
     if not selected:
         class_text = _class_text(names)
         print(
@@ -714,19 +755,23 @@ def _run_clones(
         check.clones.min_tokens,
         config.max_bytes,
     )
+    return _finish_clones(check, start, prefix, measurement, selected, files)
+
+
+def _finish_clones(
+    check: CheckDef,
+    start: float,
+    prefix: str,
+    measurement: Any,
+    selected: list[str],
+    files: list[str],
+) -> CheckResult:
     diagnostics = measurement.diagnostics
+    record_diagnostics(diagnostics)
     if measurement.error is not None:
-        print(f"{prefix}: {measurement.error}", file=sys.stderr)
-        return _clone_result(
-            check,
-            start,
-            outcome=_clone_outcome(measurement),
-            execution=measurement.execution,
-            diagnostics=diagnostics,
-            reason=measurement.error,
-        )
+        return _clone_failure(check, start, prefix, measurement)
     try:
-        entries = _baseline_entries(check)
+        entries = analysis_step("baseline loading", _baseline_entries, check)
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _clone_result(
@@ -737,12 +782,25 @@ def _run_clones(
             diagnostics=diagnostics,
             reason=str(error),
         )
+    return _clone_ratchet(check, start, prefix, measurement, entries, selected, files)
+
+
+def _clone_ratchet(
+    check: CheckDef,
+    start: float,
+    prefix: str,
+    measurement: Any,
+    entries: list[Any],
+    selected: list[str],
+    files: list[str],
+) -> CheckResult:
+    diagnostics = measurement.diagnostics
     ratchet, failure = _evaluate_ratchet(
         measurement.findings,
         entries,
         check,
         prefix,
-        _clone_domain(entries, selected, files),
+        analysis_step("clone domain analysis", _clone_domain, entries, selected, files),
     )
     if ratchet is None:
         return _clone_result(
@@ -763,6 +821,17 @@ def _run_clones(
     if ratchet.satisfied:
         _print_clone_summary(prefix, measurement.findings)
     return result
+
+
+def _clone_failure(check: CheckDef, start: float, prefix: str, measurement: Any) -> CheckResult:
+    reason = measurement.error
+    if measurement.execution == "budget":
+        reason = _budget_detail(reason, start, CLONE_BUDGET_SECONDS)
+    print(f"{prefix}: {reason}", file=sys.stderr)
+    return _clone_result(
+        check, start, outcome=_clone_outcome(measurement), execution=measurement.execution,
+        diagnostics=measurement.diagnostics, reason=reason,
+    )
 
 
 def _print_output(prefix: str, combined: str) -> None:
@@ -792,6 +861,8 @@ def _tests_result(
     combined: str | None = None,
     **fields: Any,
 ) -> CheckResult:
+    if execution == "budget":
+        reason = _budget_detail(reason, start, spec.budget_seconds)
     print(f"{prefix}: {reason}", file=sys.stderr)
     if combined is not None:
         _print_output(prefix, combined)
@@ -855,8 +926,9 @@ def _tests_summary(
                 diagnostics=diagnostics,
             ),
         )
-    ran, skipped, error = summarize_matches(
-        spec, matches.get("tests", []), matches.get("skipped", [])
+    ran, skipped, error = analysis_step(
+        "test count analysis", summarize_matches,
+        spec, matches.get("tests", []), matches.get("skipped", []),
     )
     return ran, skipped, error, None
 
@@ -936,18 +1008,16 @@ def _combine_tests_evidence(
     deadline: float,
 ) -> CheckResult | None:
     reason = "coverage combination exceeded the remaining budget"
-    if time.monotonic() >= deadline:
-        return _tests_result(
-            check,
-            spec,
-            start,
-            prefix,
-            reason,
-            execution="budget",
-            diagnostics=diagnostics,
-        )
     try:
-        combine_coverage(data_dir, combined_file, config_file)
+        analysis_step(
+            "coverage combination", combine_coverage,
+            data_dir, combined_file, config_file, deadline=deadline,
+        )
+    except StepTimeout:
+        return _tests_result(
+            check, spec, start, prefix, reason,
+            execution="budget", diagnostics=diagnostics,
+        )
     except (UnsupportedError, GateError) as error:
         return _tests_result(
             check,
@@ -956,16 +1026,6 @@ def _combine_tests_evidence(
             prefix,
             f"coverage combination failed: {error}",
             outcome="unsupported",
-            diagnostics=diagnostics,
-        )
-    if time.monotonic() >= deadline:
-        return _tests_result(
-            check,
-            spec,
-            start,
-            prefix,
-            reason,
-            execution="budget",
             diagnostics=diagnostics,
         )
     return None
@@ -982,7 +1042,9 @@ def _tests_setup(
     data_dir = Path(temporary.name) / "data"
     try:
         data_dir.mkdir()
-        python_prefix = coverage_prefix(root, data_dir)
+        python_prefix = analysis_step(
+            "coverage setup", coverage_prefix, root, data_dir
+        )
     except UnsupportedError as error:
         return _tests_result(
             check,
@@ -1162,6 +1224,7 @@ def _run_python_tests(
 
     command = expand_run(spec.run, python_prefix)
     environment = _test_environment(python_prefix)
+    mark_step("test command")
     run_result = run(
         command,
         cwd=root,
@@ -1169,6 +1232,7 @@ def _run_python_tests(
         budget_seconds=max(0.0, deadline - time.monotonic()),
     )
     diagnostics = run_result.diagnostics()
+    record_diagnostics(diagnostics)
     combined = run_result.combined_text
     failure = _tests_execution_failure(
         check, spec, run_result, diagnostics, combined, prefix, start
@@ -1250,11 +1314,21 @@ def _crap_measure(
     prefix: str,
 ) -> tuple[Any | None, CheckResult | None]:
     try:
-        measurement = measure_crap(
+        measurement = analysis_step(
+            "CRAP analysis", measure_crap,
             root,
             selected,
             evidence_path,
             config_path,
+            deadline=start + CLONE_BUDGET_SECONDS,
+        )
+    except StepTimeout:
+        reason = _budget_detail(
+            "CRAP analysis exceeded the remaining budget", start, CLONE_BUDGET_SECONDS
+        )
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        return None, _ratchet_result(
+            check, start, "fail", execution="budget", reason=reason
         )
     except UnsupportedError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
@@ -1283,9 +1357,9 @@ def _run_python_crap(
     assert check.python_crap is not None
     spec = check.python_crap
     start = time.monotonic()
-    deadline = start + CLONE_BUDGET_SECONDS
-
-    selected, names = _select_files(config, check, files, classes)
+    selected, names = analysis_step(
+        "file selection", _select_files, config, check, files, classes
+    )
     if not selected:
         class_text = _class_text(names)
         reason = (
@@ -1295,8 +1369,8 @@ def _run_python_crap(
         print(f"{prefix}: {reason}", file=sys.stderr)
         return _ratchet_result(check, start, "fail", reason=reason)
 
-    evidence_path, config_path, failure_diagnostics, message = _crap_required(
-        prior, spec, prefix
+    evidence_path, config_path, failure_diagnostics, message = analysis_step(
+        "coverage evidence validation", _crap_required, prior, spec, prefix
     )
     if message is not None:
         return _ratchet_result(
@@ -1319,12 +1393,6 @@ def _run_python_crap(
     if failure is not None:
         return failure
     assert measurement is not None
-    if time.monotonic() >= deadline:
-        reason = "analysis exceeded the remaining budget"
-        print(f"{prefix}: {reason}", file=sys.stderr)
-        return _ratchet_result(
-            check, start, "fail", execution="budget", reason=reason
-        )
     if measurement.failures:
         for failure in measurement.failures:
             print(f"{prefix}: {failure}", file=sys.stderr)
@@ -1340,7 +1408,7 @@ def _run_python_crap(
         )
 
     try:
-        entries = _baseline_entries(check)
+        entries = analysis_step("baseline loading", _baseline_entries, check)
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _ratchet_result(
@@ -1455,8 +1523,10 @@ def _verification_selection(
     start: float,
     prefix: str,
 ) -> tuple[list[str] | None, CheckResult | None]:
-    selected, names = _select_files(config, check, files, classes)
-    python_files = _verification_files(selected)
+    selected, names = analysis_step(
+        "file selection", _select_files, config, check, files, classes
+    )
+    python_files = analysis_step("Python file selection", _verification_files, selected)
     if python_files:
         return python_files, None
     class_text = _class_text(names)
@@ -1476,7 +1546,7 @@ def _verification_findings(
     start: float,
     prefix: str,
 ) -> list[Any] | CheckResult:
-    counts, problem = _verification_counts(check, prior)
+    counts, problem = analysis_step("verification test counts", _verification_counts, check, prior)
     if problem is not None:
         print(f"{prefix}: {problem}", file=sys.stderr)
         return _ratchet_result(
@@ -1488,7 +1558,16 @@ def _verification_findings(
         )
     assert counts is not None
     try:
-        return measure_verification(root, files, counts)
+        return analysis_step(
+            "verification analysis", measure_verification, root, files, counts,
+            deadline=start + CLONE_BUDGET_SECONDS,
+        )
+    except StepTimeout:
+        reason = _budget_detail(
+            "verification analysis exceeded the remaining budget", start, CLONE_BUDGET_SECONDS
+        )
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        return _ratchet_result(check, start, "fail", execution="budget", reason=reason)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
 
@@ -1519,7 +1598,7 @@ def _verification_entries(
 ) -> tuple[list[Any] | None, CheckResult | None]:
     try:
         return (
-            _baseline_entries(check),
+            analysis_step("baseline loading", _baseline_entries, check),
             None,
         )
     except GateError as error:
@@ -1537,7 +1616,8 @@ def _verification_ratchet(
         return failure
     assert entries is not None
     ratchet, failure = _evaluate_ratchet(
-        findings, entries, check, prefix, _verification_domain(findings)
+        findings, entries, check, prefix,
+        analysis_step("verification domain analysis", _verification_domain, findings),
     )
     if ratchet is None:
         return _ratchet_result(
@@ -1675,8 +1755,64 @@ def run_check(
         "owners",
     ):
         raise GateError(f"unsupported adapter {check.adapter!r}")
-    return _adapter_runner(
-        root, config, check, files, classes, prefix, prior or {}
+    return _run_check_with_deadline(root, config, check, files, classes, prefix, prior or {})
+
+
+def _check_budget(check: CheckDef) -> float:
+    if check.command is not None:
+        return check.command.budget_seconds
+    if check.python_tests is not None:
+        return check.python_tests.budget_seconds
+    return CLONE_BUDGET_SECONDS
+
+
+def _run_check_with_deadline(
+    root: Path,
+    config: Config,
+    check: CheckDef,
+    files: list[str],
+    classes: dict[str, str],
+    prefix: str,
+    prior: dict[str, CheckResult],
+) -> CheckResult:
+    budget = _check_budget(check)
+    start = time.monotonic()
+    with check_deadline(start, budget) as scope:
+        try:
+            result = _adapter_runner(
+                root, config, check, files, classes, prefix, prior
+            )
+        except (StepTimeout, WorkerError) as error:
+            failure = error
+        else:
+            failure = None
+    if failure is None:
+        return result
+    return _deadline_failure(check, prefix, start, budget, scope.diagnostics, failure)
+
+
+def _deadline_failure(
+    check: CheckDef,
+    prefix: str,
+    start: float,
+    budget: float,
+    diagnostics: Diagnostics | None,
+    failure: StepTimeout | WorkerError,
+) -> CheckResult:
+    if isinstance(failure, StepTimeout):
+        reason = _budget_detail(
+            f"{failure} exceeded the remaining budget", start, budget
+        )
+        execution = "budget"
+        outcome = "fail"
+    else:
+        reason = str(failure)
+        execution = "error"
+        outcome = "error"
+    print(f"{prefix}: {reason}", file=sys.stderr)
+    return _check_result(
+        check, start, outcome, execution=execution, budget_seconds=budget,
+        diagnostics=diagnostics or Diagnostics(error=reason), reason=reason,
     )
 
 

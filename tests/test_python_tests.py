@@ -997,7 +997,10 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             assert result is not None
             self.assertEqual(result.outcome, outcome)
             self.assertEqual(result.execution, execution)
-            self.assertEqual(result.reason, reason)
+            self.assertTrue(result.reason.startswith(reason))
+            if execution == "budget":
+                self.assertIn("deadline:", result.reason)
+                self.assertIn("elapsed:", result.reason)
 
     def test_execution_failure_ignores_a_completed_run(self) -> None:
         run_result = runner.RunResult(

@@ -476,15 +476,20 @@ object (for example `{"tests": 12}`).
 `unknown`. `satisfied` is true when the policy obligation is met after baselines and enforcement: a
 finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = true`. Advisory checks
 do not block the whole-tree judgement. With `--changed-from`, a located threshold violation on changed
-lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. A check has one absolute
-deadline: the command, its pattern matching, coverage combination and analysis share the configured
-budget, and an overrun reports `execution = "budget"` with the diagnostics collected so far.
+lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. Each check has one
+absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
+baseline loading and ratchet evaluation. Command and Python test checks use their configured budgets;
+clone, CRAP and verification checks each have 600 seconds. Synchronous analysis runs in supervised workers
+that are stopped at the deadline. An overrun reports `outcome = "fail"` and `execution = "budget"`, names
+the step, deadline and elapsed time, and retains the subprocess diagnostics collected so far.
 
 `diagnostics` carries `argv`, `exit_code` or `signal`, `output_bytes`, `output_tail` (at most 4 KiB),
 `output_truncated` and, when execution failed, `error`. Every subprocess the gate starts (git
 enumeration and identity, command checks, jscpd and test runs) uses one bounded runner: it starts its own
-process group, terminates the whole group at the budget (SIGTERM, then SIGKILL after 5 seconds) and reaps
-it. Check output is captured up to 1 MiB; later bytes are counted and discarded. A consumer therefore
+process group, terminates the whole group and reaps it. At a check deadline it sends SIGTERM followed
+immediately by SIGKILL; subprocesses outside checks have a five-second grace before SIGKILL. Process
+termination and reaping can add a small amount of time after the deadline. Check output is captured up
+to 1 MiB; later bytes are counted and discarded. A consumer therefore
 never has to parse stderr to learn why a check failed.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
