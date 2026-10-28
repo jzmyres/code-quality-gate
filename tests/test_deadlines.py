@@ -23,6 +23,7 @@ policy = importlib.import_module("quality_gate.policy")
 runner = importlib.import_module("quality_gate.runner")
 ratchet = importlib.import_module("quality_gate.ratchet")
 clones = importlib.import_module("quality_gate.clones")
+owners = importlib.import_module("quality_gate.owners")
 
 
 class AnalysisDeadlineTests(unittest.TestCase):
@@ -52,6 +53,13 @@ class AnalysisDeadlineTests(unittest.TestCase):
         time.sleep(20)
         self.finished.touch()
 
+    def owners_spec(self) -> object:
+        rule = owners.OwnerRule(
+            "single-owner", "one implementation", ("source.py",),
+            (owners.Pattern("python-call", "peak"),), (),
+        )
+        return owners.OwnersSpec(self.root / "baseline", (rule,))
+
     def check_def(self, adapter: str) -> object:
         return policy.CheckDef(
             id=adapter, adapter="python_crap" if adapter == "crap" else adapter,
@@ -68,6 +76,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
                 if adapter == "verification" else None
             ),
             threshold=6, baseline=self.root / "baseline",
+            owners=self.owners_spec() if adapter == "owners" else None,
         )
 
     def prior_tests(self) -> object:
@@ -133,6 +142,25 @@ class AnalysisDeadlineTests(unittest.TestCase):
         with mock.patch.object(checks, "measure_verification", side_effect=self.stall):
             result, elapsed = self.run_adapter("verification")
         self.assert_timeout(result, "verification analysis", elapsed)
+
+    def test_owners_analysis_is_stopped_while_running(self) -> None:
+        with mock.patch.object(checks, "measure_owners", side_effect=self.stall):
+            result, elapsed = self.run_adapter("owners")
+        self.assert_timeout(result, "owners analysis", elapsed)
+
+    def test_owners_baseline_loading_is_stopped_while_running(self) -> None:
+        with mock.patch.object(checks, "measure_owners", return_value=[]):
+            with mock.patch.object(checks, "_baseline_entries", side_effect=self.stall):
+                result, elapsed = self.run_adapter("owners")
+        self.assert_timeout(result, "baseline loading", elapsed)
+
+    def test_normal_owners_run_passes(self) -> None:
+        (self.root / "source.py").write_text("peak()\n", encoding="utf-8")
+        result, _elapsed = self.run_adapter("owners")
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.execution, "completed")
+        self.assertTrue(result.is_satisfied())
+        self.assertEqual(result.findings, [])
 
     def test_baseline_loading_is_stopped_while_running(self) -> None:
         findings = [ratchet.Finding("tests:tests:executed", 1, "test summary")]

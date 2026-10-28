@@ -292,6 +292,9 @@ static check; a separate test check is still needed for the tier 1 tests obligat
 its implementation files, explains why, and specifies forbidden patterns. A matching occurrence
 outside an owner is a violation unless an `allow` pattern covers that occurrence. The rules are in the
 protected policy; the named baseline is protected just like other baselines under `--policy-from`.
+The owners check has one absolute 600-second deadline covering its inventory scan, baseline loading and
+ratchet evaluation; each synchronous phase runs in a supervised worker, so an overrun is stopped at the
+deadline and reported as a timeout naming the phase that was running.
 
 Patterns are inline tables with `kind`, `value`, and optional `paths`, a non-empty array of
 repository-relative `fnmatch` globs. `paths` limits where that pattern can match. Use it when a broad
@@ -479,7 +482,7 @@ do not block the whole-tree judgement. With `--changed-from`, a located threshol
 lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. Each check has one
 absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
 baseline loading and ratchet evaluation. Command and Python test checks use their configured budgets;
-clone, CRAP and verification checks each have 600 seconds. Synchronous analysis runs in supervised workers
+clone, CRAP, verification and owners checks each have 600 seconds. Synchronous analysis runs in supervised workers
 that are stopped at the deadline. An overrun reports `outcome = "fail"` and `execution = "budget"`, names
 the step, deadline and elapsed time, and retains the subprocess diagnostics collected so far.
 

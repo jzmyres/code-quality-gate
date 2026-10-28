@@ -1685,8 +1685,8 @@ def _run_owners(root: Path, check: CheckDef, files: list[str], prefix: str) -> C
     assert check.owners is not None
     start = time.monotonic()
     try:
-        findings = measure_owners(root, files, check.owners)
-        entries = _baseline_entries(check)
+        findings = analysis_step("owners analysis", measure_owners, root, files, check.owners)
+        entries = analysis_step("baseline loading", _baseline_entries, check)
     except GateError as error:
         return _owners_error(check, start, prefix, error)
     _owners_report(findings)
