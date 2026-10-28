@@ -49,3 +49,28 @@ jobs:
         run: python3 -I qg.py tools fetch
       - name: Run the gate
         run: make -k check
+
+  mutation:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    # Mutations run the complete suite for each decision, with four isolated copies at a time.
+    timeout-minutes: 90
+    env:
+      QG_TOOLS_DIR: /tmp/qg-tools
+    steps:
+      - name: Install test tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 make git ca-certificates
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Restore pinned tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.QG_TOOLS_DIR }}
+          key: ubuntu2404-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
+      - name: Fetch pinned tools
+        run: python3 -I qg.py tools fetch
+      - name: Mutation-test gate decisions
+        run: make mutation

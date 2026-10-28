@@ -785,6 +785,30 @@ obligations and exemptions, diagnostics, baseline identity and domain rules, pru
 round-trips, the bounded runner's group kill and output cap, JSON usage errors, and the trust root's
 baseline, policy, protected-path, prune and identity rules.
 
+## Mutation-testing the gate
+
+`make mutation` runs the gate's own complete unittest suite against isolated copies of its code.
+It freezes the source and tests once, requires a passing unmodified suite, then runs one targeted
+mutation per copy. The declared
+decisions in `tests/mutate_gate.py` cover baseline bounds, threshold and expiry comparisons,
+verification floors, prune refusal and exit status, gate decisions, trust-root identity and protection,
+and single-owner checks. They use comparison flips, boolean negation, an opposite boolean return,
+and removal of a raise. This is a selected set of faults, not an exhaustive measurement of every
+possible change.
+
+Each copied module reports a marker when it is loaded. A mutant is killed only when the same complete
+test suite runs, loads that mutant, and fails an assertion without test execution or import errors.
+Survivors, timeouts, missing markers, skipped tests, suite errors, invalid decisions and a failing
+unmodified suite all fail the command. Each suite has a 900-second limit; independent mutant copies
+run concurrently and their results are printed in declaration order. The slow mutation run is separate
+from `make check` and uses the same pinned tools cache as the ordinary tests.
+
+To protect another decision, add a named `Decision` to the list with its module, function, operator,
+exact source expression or statement, and a reason. The target must identify exactly one applicable
+node in that function; missing functions, ambiguous targets and decisions that yield no mutation fail
+closed. Add a test that would fail for that fault, then run `make mutation` to confirm the mutant is
+killed.
+
 ## Continuous integration
 
 Every push to `main` and every pull request runs `.github/workflows/check.yml` on GitHub Actions;
@@ -792,13 +816,14 @@ the workflow can also be dispatched manually. A matrix runs the job in `debian:1
 and in `ubuntu:24.04` with Python 3.12, the two supported interpreter versions. It restores the pinned
 tools cache keyed on the image and `tools.lock.toml`, fetches any missing pinned tools (including the
 coverage wheel), and runs `make -k check`, which is the gate's self-check: Ruff, clones, the test suite
-under coverage and Python CRAP.
+under coverage and Python CRAP. A separate Ubuntu job runs `make mutation`.
 
 Reproduce it locally with the same tools cache:
 
     export QG_TOOLS_DIR=/tmp/qg-tools
     python3 -I qg.py tools fetch
     make -k check
+    make mutation
 
 ## Planned later layers
 

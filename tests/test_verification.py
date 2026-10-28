@@ -243,6 +243,21 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(executed["value"], 1)
         self.assertTrue(executed["covered_by_baseline"])
 
+    def test_verification_ceiling_accepts_the_bound_and_rejects_an_increase(self) -> None:
+        self.add_tests(1)
+        self.add_file("pkg/mod.py", noqa_source(1))
+        self.write_verification_baseline([executed_entry(1), exclusion_entry("pkg/mod.py", "noqa", 1)])
+        result, document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted_with_exceptions")
+        self.assertTrue(self.finding(check, "exclusions:pkg/mod.py:noqa")["covered_by_baseline"])
+
+        self.add_file("pkg/mod.py", noqa_source(2))
+        result, _document, check = self.failed_verification()
+        finding = self.finding(check, "exclusions:pkg/mod.py:noqa")
+        self.assertEqual((finding["value"], finding["bound"]), (2, 1))
+        self.assertIn("baseline bound 1", result.stderr)
+
     def test_added_no_cover_pragma_fails(self) -> None:
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])

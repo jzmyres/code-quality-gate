@@ -21,6 +21,7 @@ from support import (
 )
 from test_python_crap import crap_config
 
+from quality_gate import trust
 from quality_gate.policy import load_config
 
 CLONE_FILES = ("a.py", "b.py")
@@ -470,6 +471,32 @@ class PolicyTrustTests(TrustCase):
         self.change_ruff()
         result, document = self.trust_json(revision)
         self.assert_blocked(result, document)
+
+
+class IdentityDecisionTests(unittest.TestCase):
+    def test_trust_identity_comparison_detects_only_changed_gate_and_tool_files(self) -> None:
+        before = {
+            "tools": {"ruff": {"payload_sha256": "old"}},
+            "gate": {"files": {"qg.py": "old", "unchanged.py": "same"}},
+        }
+        after = {
+            "tools": {"ruff": {"payload_sha256": "new"}},
+            "gate": {"files": {"qg.py": "new", "unchanged.py": "same"}},
+        }
+        self.assertEqual(trust._identity_problems(before, before), [])
+        self.assertEqual(
+            trust._identity_problems(before, after),
+            ["tool payload ruff changed during the run", "gate file qg.py changed during the run"],
+        )
+
+    def test_trust_prune_identity_allows_only_the_exact_generated_bytes(self) -> None:
+        before = {"rev_sha256": "revision", "candidate_sha256": "old"}
+        written = b"trusted, tightened baseline"
+        after = {"rev_sha256": "revision", "candidate_sha256": trust._sha256(written)}
+        other = {"rev_sha256": "revision", "candidate_sha256": trust._sha256(b"altered")}
+        self.assertTrue(trust._allowed_change(before, after, written))
+        self.assertFalse(trust._allowed_change(before, other, written))
+        self.assertFalse(trust._allowed_change(before, {**after, "rev_sha256": "changed"}, written))
 
 
 class IdentityTrustTests(TrustCase):

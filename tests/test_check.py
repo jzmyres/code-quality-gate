@@ -12,6 +12,10 @@ checks = importlib.import_module("quality_gate.checks")
 
 
 class CheckTests(FixtureCase):
+    def test_prune_exit_rejects_refusal_even_when_the_gate_was_accepted(self) -> None:
+        self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": False}), 1)
+        self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": True}), 0)
+
     def test_check_runs_inventory_and_hygiene(self) -> None:
         result = self.run_qg("check")
         text = output(result)

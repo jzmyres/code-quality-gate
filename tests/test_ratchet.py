@@ -184,6 +184,7 @@ class RatchetTests(unittest.TestCase):
                 ("same", 3, "accepted", None),
             ],
         )
+        self.assertTrue(result.satisfied, "a satisfied ratchet is required before pruning")
         pruned = ratchet.pruned_entries(result)
         self.assertEqual([entry.bound for entry in pruned], [1, 3])
 
@@ -196,6 +197,7 @@ class RatchetTests(unittest.TestCase):
             ],
             threshold=6,
         )
+        self.assertTrue(result.satisfied, "a satisfied ratchet is required before pruning")
         self.assertEqual(ratchet.pruned_entries(result), [])
 
     def test_prune_refuses_while_the_check_fails(self) -> None:
@@ -249,6 +251,7 @@ class RatchetTests(unittest.TestCase):
             ],
             direction="min",
         )
+        self.assertTrue(result.satisfied, "a satisfied ratchet is required before pruning")
         pruned = ratchet.pruned_entries(result)
         self.assertEqual([entry.bound for entry in pruned], [7, 3])
 
