@@ -523,8 +523,9 @@ untracked files and deleted files are outside inventory. A bad revision or faile
 The `python_crap`, `owners` and `clones` adapters provide complete locations: respectively the entire
 function range (including decorators), every occurrence line, and both ranges of every clone in a
 fingerprint group. CRAP's module subject uses the span from its first to last outside-function node;
-that conservative span can include intervening functions. Verification supplies every suppression
-line, but its test-count metrics have no source location. Command checks, Python test results, inventory
+that conservative span can include intervening functions. Verification supplies every inline and
+file-wide suppression line, one location per directive, but its test-count metrics have no source
+location. Command checks, Python test results, inventory
 and hygiene have no complete source locations. These unlocated checks and metrics retain their normal
 whole-tree judgement and are reported as **not change-scoped**. Clone evidence missing a range or one
 of the two locations is also reported as not change-scoped for that finding.

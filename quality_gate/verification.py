@@ -119,6 +119,9 @@ def measure_exclusions(relative: str, source: str) -> list[Finding]:
             f"exclusions:{relative}:file-suppression",
             len(file_suppressions),
             _file_suppression_location(relative, file_suppressions),
+            locations=tuple(
+                Location(relative, line, line) for line, _ in file_suppressions
+            ),
         ),
     ]
 

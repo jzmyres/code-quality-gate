@@ -344,6 +344,10 @@ class VerificationTests(FindingMixin, FixtureCase):
         result, _document, check = self.failed_verification()
         finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
         self.assertEqual(finding["value"], 5)
+        self.assertEqual(
+            [location["start_line"] for location in finding["locations"]],
+            [1, 2, 3, 3, 4],
+        )
         self.assertIn("# ruff: NoQa", result.stderr)
 
     def test_file_directive_in_string_is_not_a_suppression(self) -> None:

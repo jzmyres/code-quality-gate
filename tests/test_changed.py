@@ -225,6 +225,59 @@ class ChangedVerificationTests(FixtureCase):
         )
         self.commit_all()
 
+    def prepare_file_suppression(self) -> None:
+        self.add_file("pkg/mod.py", "# ruff: noqa: E501\nA = 1\n")
+        self.add_file(
+            "quality-gate-verification.toml",
+            verification_baseline([
+                executed_entry(1),
+                exclusion_entry("pkg/mod.py", "file-suppression", 1),
+            ]),
+        )
+        self.commit_all("file suppression")
+
+    def file_suppression(self, document):
+        check = self.check_by_id(document, "verification")
+        finding = next(
+            item for item in check["findings"]
+            if item["subject"] == "exclusions:pkg/mod.py:file-suppression"
+        )
+        return check, finding
+
+    def run_plain_then_changed(self):
+        env = self.default_tool_env()
+        plain, _ = self.run_json(env=env)
+        self.assertEqual(plain.returncode, 0, output(plain))
+        return self.run_json("--changed-from", "HEAD", env=env)
+
+    def test_replaced_file_suppression_fails_only_with_the_flag(self) -> None:
+        self.prepare_file_suppression()
+        self.add_file("pkg/mod.py", "# ruff: noqa\nA = 1\n")
+        result, document = self.run_plain_then_changed()
+        self.assertEqual(result.returncode, 1, output(result))
+        _check, finding = self.file_suppression(document)
+        self.assertEqual((finding["value"], finding["bound"]), (1, 1))
+        self.assertTrue(finding["covered_by_baseline"])
+        self.assertTrue(finding["blocking"])
+        self.assertTrue(finding["on_changed_lines"])
+        self.assertEqual(finding["locations"], [
+            {"path": "pkg/mod.py", "start_line": 1, "end_line": 1},
+        ])
+        self.assertIn("pkg/mod.py:1", result.stderr)
+
+    def test_untouched_file_suppression_passes_with_the_flag(self) -> None:
+        self.prepare_file_suppression()
+        self.add_file("README.md", "# changed\n")
+        result, document = self.run_json(
+            "--changed-from", "HEAD", env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        _check, finding = self.file_suppression(document)
+        self.assertFalse(finding["on_changed_lines"])
+        self.assertEqual(finding["locations"], [
+            {"path": "pkg/mod.py", "start_line": 1, "end_line": 1},
+        ])
+
     def test_later_suppression_replacement_is_not_hidden_by_first_or_count(self) -> None:
         self.add_file("pkg/mod.py", "A = 1  # noqa: E501\nB = 3  # noqa: E701\n")
         env = self.default_tool_env()
