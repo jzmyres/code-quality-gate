@@ -1,6 +1,7 @@
 """Tests for --policy-from: protected inputs, effective inputs and identity."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import time
 import unittest
+from dataclasses import replace
 
 from support import (
     BASE_CONFIG,
@@ -23,6 +25,7 @@ from test_python_crap import crap_config
 
 from quality_gate import trust
 from quality_gate.policy import load_config
+from quality_gate.trust import prepare_trust
 
 CLONE_FILES = ("a.py", "b.py")
 CLONES_HEADER = (
@@ -59,6 +62,34 @@ class TrustCase(FixtureCase):
         return self.run_json(
             "--policy-from", revision, *args, env=env
         )
+
+    def merge_attack(self, check: str, forged: str) -> str:
+        """Candidate code overwrites the historical merged-baseline path."""
+        name = hashlib.sha256(f"merged\0{check}".encode()).hexdigest()[:16]
+        return (
+            "        import os, pathlib, tempfile\n"
+            "        for directory in pathlib.Path(tempfile.gettempdir()).glob('qg-merge-*'):\n"
+            f"            (directory / {name + '.toml'!r}).write_text({forged!r})\n"
+            "            pathlib.Path(os.environ['QG_ATTACK_MARKER']).write_text('written')\n"
+            "        self.assertTrue(True)\n"
+        )
+
+    def attack_env(self) -> dict[str, str]:
+        temporary = self.base / "attack-temp"
+        temporary.mkdir(exist_ok=True)
+        env = self.default_tool_env()
+        env.update({
+            "TMPDIR": str(temporary),
+            "QG_ATTACK_MARKER": str(self.base / "attack-marker"),
+        })
+        return env
+
+    def attacked_check(self, revision: str, name: str) -> dict[str, object]:
+        result, document = self.trust_json(revision, env=self.attack_env())
+        self.assertTrue((self.base / "attack-marker").exists(), output(result))
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        return self.check_by_id(document, name)
 
     def protected(
         self, document: dict[str, object], path: str
@@ -194,6 +225,27 @@ class BaselineTrustTests(TrustCase):
         self.assertEqual(entry["status"], "ignored")
         self.assertEqual(entry["ignored_entries"], [])
         self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
+
+    def test_changed_effective_baseline_fails_identity_before_prune(self) -> None:
+        self.write_clones_baseline()
+        revision = self.commit_revision()
+        trust = prepare_trust(self.repo, revision, [])
+        self.addCleanup(trust.close)
+        check = trust.config.checks["clones"]
+        self.assertIsNotNone(check.effective_baseline)
+        entry = check.effective_baseline[0]
+        trust.config.checks["clones"] = replace(
+            check, effective_baseline=(replace(entry, bound=99),)
+        )
+        refusal = trust.before_prune()
+        self.assertIn(
+            "effective input baseline quality-gate-clones.toml", refusal
+        )
+        key = "baseline quality-gate-clones.toml"
+        self.assertNotEqual(
+            trust.identity_before["effective_inputs"][key],
+            trust.identity_after_checks["effective_inputs"][key],
+        )
 
     def test_prune_through_a_symlinked_parent_is_refused(self) -> None:
         self.write_config(with_clones(baseline="cfg/clones.toml"))
@@ -335,6 +387,42 @@ class PolicyTrustTests(TrustCase):
         self.assertEqual(finding["threshold"], 6.0)
         entry = self.protected(document, "quality-gate.toml")
         self.assertEqual(entry["status"], "ignored")
+
+    def test_candidate_test_cannot_raise_merged_crap_baseline(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.add_file("pkg/__init__.py", "")
+        self.add_file(
+            "pkg/new.py",
+            "def three(value):\n"
+            "    if value:\n"
+            "        if value > 1:\n"
+            "            return 1\n"
+            "    return 2\n",
+        )
+        entry = {"subject": "pkg/new.py:three", "bound": 8, "reason": "reviewed"}
+        trusted = baseline_text(
+            [entry], check="crap", metric_version="python-lines/1"
+        )
+        forged = baseline_text(
+            [{**entry, "bound": 100}], check="crap", metric_version="python-lines/1"
+        )
+        self.write_config(crap_config())
+        self.add_file("quality-gate-crap.toml", trusted)
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_attack(self):\n"
+            + self.merge_attack("crap", forged),
+        )
+        revision = self.commit_revision()
+        check = self.attacked_check(revision, "crap")
+        finding = next(
+            item for item in check["findings"]
+            if item["subject"] == "pkg/new.py:three"
+        )
+        self.assertEqual(finding["value"], 12)
+        self.assertEqual(finding["bound"], 8)
+        self.assertTrue(finding["blocking"])
 
     def test_authorized_policy_replacement_is_used(self) -> None:
         revision = self.commit_revision()
@@ -500,6 +588,72 @@ class IdentityDecisionTests(unittest.TestCase):
 
 
 class IdentityTrustTests(TrustCase):
+    def test_temporary_lock_rewrite_cannot_change_tool_pins(self) -> None:
+        self.add_file(
+            "tools.lock.toml", (self.gate / "tools.lock.toml").read_bytes()
+        )
+        modify = (
+            "import pathlib, tempfile; "
+            "path = next(pathlib.Path(tempfile.gettempdir()).glob('qg-merge-*/rev-tools.lock.toml')); "
+            "path.with_suffix('.saved').write_bytes(path.read_bytes()); "
+            "path.write_text(path.read_text().replace('[ruff]', '[untrusted]')); "
+            "print(1)"
+        )
+        restore = (
+            "import pathlib, tempfile; "
+            "path = next(pathlib.Path(tempfile.gettempdir()).glob('qg-merge-*/rev-tools.lock.toml')); "
+            "path.write_bytes(path.with_suffix('.saved').read_bytes())"
+        )
+        config = BASE_CONFIG.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(modify)}]',
+        )
+        config += (
+            '\n[checks.tool]\nadapter = "command"\ntier = 1\n'
+            'enforcement = "enforced"\nrun = ["{tool:ruff}", "--version"]\n'
+            '\n[checks.restore]\nadapter = "command"\ntier = 1\n'
+            'enforcement = "enforced"\n'
+            f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(restore)}]\n'
+        )
+        self.write_config(config)
+        revision = self.commit_revision()
+        result, document = self.trust_json(revision, env=self.attack_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.check_by_id(document, "tool")["outcome"], "pass")
+        self.assertEqual(
+            document["trust"]["identity_before"],
+            document["trust"]["identity_after"],
+        )
+
+    def test_effective_tool_lock_changed_during_the_run_is_error(self) -> None:
+        self.add_file(
+            "tools.lock.toml", (self.gate / "tools.lock.toml").read_bytes()
+        )
+        writer = (
+            "import pathlib, tempfile; "
+            "paths = list(pathlib.Path(tempfile.gettempdir()).glob('qg-merge-*/rev-tools.lock.toml')); "
+            "assert paths; "
+            "paths[0].write_text(paths[0].read_text() + '\\n# changed\\n'); "
+            "print(1)"
+        )
+        self.write_config(
+            BASE_CONFIG.replace(
+                'run = ["python3", "-c", "print(1)"]',
+                f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(writer)}]',
+            )
+        )
+        revision = self.commit_revision()
+        result, document = self.trust_json(revision, env=self.attack_env())
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("effective input tool lock", document["error"])
+        self.assertIn("tools.lock.toml", document["error"])
+        before = document["trust"]["identity_before"]["effective_inputs"]
+        after = document["trust"]["identity_after"]["effective_inputs"]
+        self.assertNotEqual(
+            before["tool lock tools.lock.toml"], after["tool lock tools.lock.toml"]
+        )
+
     def test_protected_file_changed_during_the_run_is_error(self) -> None:
         writer = (
             "import pathlib; "

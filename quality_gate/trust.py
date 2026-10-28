@@ -9,13 +9,14 @@ from __future__ import annotations
 import errno
 import fnmatch
 import hashlib
+import json
 import os
 import posixpath
 import stat
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -28,10 +29,9 @@ from .ratchet import (
     load_baseline,
     subject_direction,
     tighter_bound,
-    write_baseline,
 )
 from .runner import RunResult, run
-from .tools import _default_lock_path, _tools_dir, load_tools
+from .tools import Tool, _default_lock_path, _tools_dir, load_tools
 
 POLICY_NAME = "quality-gate.toml"
 LOCK_NAME = "tools.lock.toml"
@@ -71,6 +71,7 @@ class Trust:
     rev_config: Config
     protected: list[ProtectedInput]
     lock_path: Path
+    lock_tools: dict[str, Tool]
     temporary: list[tempfile.TemporaryDirectory[str]] = field(
         default_factory=list
     )
@@ -81,7 +82,12 @@ class Trust:
     prune_writes: dict[str, bytes | None] = field(default_factory=dict)
 
     def activate(self):
-        return tools_module.lock_override(self.lock_path)
+        return tools_module.lock_override(self.lock_path, self.lock_tools)
+
+    @property
+    def policy_sha256(self) -> str | None:
+        assert self.identity_before is not None
+        return self.identity_before["effective_inputs"][f"policy {POLICY_NAME}"]
 
     def close(self) -> None:
         for directory in reversed(self.temporary):
@@ -459,7 +465,7 @@ def _policy_config(
     if item.rev_sha256 == item.candidate_sha256:
         return rev_config, "unchanged"
     if POLICY_NAME in allowed:
-        return load_config(root), "authorized"
+        return load_config(root, validate_headers=False), "authorized"
     return rev_config, "ignored"
 
 
@@ -604,20 +610,6 @@ def _check_baseline_name(check: Any, config_root: Path) -> str | None:
         return None
 
 
-def _write_merged(
-    temporary: Path, entries: list[BaselineEntry], check: Any
-) -> Path:
-    name = hashlib.sha256(f"merged\0{check.id}".encode()).hexdigest()[:16]
-    path = temporary / f"{name}.toml"
-    write_baseline(
-        path,
-        entries,
-        check_id=check.id,
-        metric_version=check.metric_version,
-    )
-    return path
-
-
 def _baseline_status(
     item: _Input, tightened: bool, invalid: bool
 ) -> str:
@@ -637,7 +629,7 @@ def _merged_baseline(
     relative: str,
     check: Any,
     item: _Input,
-) -> tuple[Path, str, tuple[str, ...]]:
+) -> tuple[list[BaselineEntry], str, tuple[str, ...]]:
     revision_entries = _rev_entries(
         temporary, root, revision, relative, check
     )
@@ -651,10 +643,24 @@ def _merged_baseline(
             revision_entries, candidate_entries, check
         )
     return (
-        _write_merged(temporary, merged, check),
+        merged,
         _baseline_status(item, tightened, invalid),
         ignored,
     )
+
+
+def _required_candidate_entries(
+    temporary: Path, root: Path, relative: str, check: Any
+) -> list[BaselineEntry]:
+    raw = _candidate_bytes(root, relative)
+    if raw is None:
+        return []
+    try:
+        return _entries_from_bytes(temporary, "authorized", raw, check)
+    except GateError as error:
+        raise UsageError(
+            f"{relative}: expected a valid effective baseline, got {error}"
+        ) from error
 
 
 def _apply_baselines(
@@ -667,28 +673,32 @@ def _apply_baselines(
     temporary: Path,
 ) -> tuple[Config, dict[str, str], dict[str, tuple[str, ...]]]:
     rev_names = _baseline_names(rev_config)
+    _baseline_names(config)
     checks: dict[str, Any] = {}
     prune_paths: dict[str, Path] = {}
     statuses: dict[str, str] = {}
     ignored_entries: dict[str, tuple[str, ...]] = {}
     for name, check in config.checks.items():
         relative = _check_baseline_name(check, config.root)
-        if relative is None or relative not in rev_names:
+        if relative is None:
             checks[name] = check
             continue
-        item = inputs[relative]
-        if relative in allowed:
-            checks[name] = replace(check, baseline=root / relative)
-            prune_paths[name] = root / relative
-            statuses[relative] = _declared_status(item, allowed)
-            continue
-        path, status, ignored = _merged_baseline(
-            temporary, root, revision, relative, check, item
+        if relative not in rev_names or relative in allowed:
+            entries = _required_candidate_entries(
+                temporary, root, relative, check
+            )
+            if relative in rev_names:
+                statuses[relative] = _declared_status(inputs[relative], allowed)
+        else:
+            entries, status, ignored = _merged_baseline(
+                temporary, root, revision, relative, check, inputs[relative]
+            )
+            statuses[relative] = status
+            ignored_entries[relative] = ignored
+        checks[name] = replace(
+            check, baseline=root / relative, effective_baseline=tuple(entries)
         )
-        checks[name] = replace(check, baseline=path)
         prune_paths[name] = root / relative
-        statuses[relative] = status
-        ignored_entries[relative] = ignored
     return (
         replace(config, root=root, checks=checks, prune_paths=prune_paths),
         statuses,
@@ -761,11 +771,7 @@ def _tool_digest(tool: Any) -> str | None:
         return "invalid"
 
 
-def _tool_identity(lock: Path) -> dict[str, Any]:
-    try:
-        tools = load_tools(lock)
-    except UsageError as error:
-        return {"error": str(error)}
+def _tool_identity(tools: dict[str, Tool]) -> dict[str, Any]:
     return {
         name: {
             "version": tool.version,
@@ -784,8 +790,49 @@ def _candidate_identity_sha256(
         return "refused"
 
 
+def _file_identity_sha256(path: Path) -> str | None:
+    try:
+        return _sha256(_read_regular(path))
+    except UsageError:
+        return "refused"
+
+
+def _object_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _effective_identity(trust: Trust) -> dict[str, str | None]:
+    inputs = {
+        f"policy {POLICY_NAME}": _file_identity_sha256(trust.config.path),
+        f"tool lock {LOCK_NAME}": _file_identity_sha256(trust.lock_path),
+        "tool pins": _object_sha256(
+            {name: asdict(tool) for name, tool in trust.lock_tools.items()}
+        ),
+    }
+    for check in trust.config.checks.values():
+        if check.effective_baseline is None:
+            continue
+        relative = _check_baseline_name(check, trust.root)
+        inputs[f"baseline {relative}"] = _object_sha256(
+            {
+                "check": check.id,
+                "metric_version": check.metric_version,
+                "entries": [asdict(entry) for entry in check.effective_baseline],
+            }
+        )
+    return inputs
+
+
 def _capture_identity(trust: Trust) -> dict[str, Any]:
     scope = _protected_scope(trust.root, trust.revision, trust.rev_config)
+    scope |= _baseline_names(trust.config)
     protected = {
         path: {
             "rev_sha256": _sha256(
@@ -800,7 +847,8 @@ def _capture_identity(trust: Trust) -> dict[str, Any]:
     return {
         "revision": trust.revision,
         "protected": protected,
-        "tools": _tool_identity(trust.lock_path),
+        "effective_inputs": _effective_identity(trust),
+        "tools": _tool_identity(trust.lock_tools),
         "gate": _gate_identity(Path(__file__).resolve().parent.parent),
     }
 
@@ -886,11 +934,14 @@ def _identity_problems(
 ) -> list[str]:
     allow = writes or {}
     protected = _protected_problems(before, after, allow)
+    effective = _section_problems(
+        before, after, "effective_inputs", "effective input"
+    )
     tools = _section_problems(before, after, "tools", "tool payload")
     gate = _section_problems(
         before, after, "gate", "gate file", files=True
     )
-    return protected + tools + gate
+    return protected + effective + tools + gate
 
 
 def _refuse_inside(root: Path) -> None:
@@ -945,7 +996,7 @@ def prepare_trust(
     lock_path, lock_status = _effective_lock(
         root, revision, inputs, allowed_paths, Path(merge_dir.name)
     )
-    load_tools(lock_path)
+    lock_tools = load_tools(lock_path)
     statuses = dict(baseline_statuses)
     statuses[POLICY_NAME] = policy_status
     statuses[LOCK_NAME] = lock_status
@@ -967,6 +1018,7 @@ def prepare_trust(
         rev_config=rev_config,
         protected=protected,
         lock_path=lock_path,
+        lock_tools=lock_tools,
         temporary=temporary,
     )
     trust.identity_before = _capture_identity(trust)

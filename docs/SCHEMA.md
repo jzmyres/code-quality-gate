@@ -535,6 +535,12 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
           "candidate_sha256": "d29f..."
         }
       },
+      "effective_inputs": {
+        "policy quality-gate.toml": "5a37...",
+        "tool lock tools.lock.toml": "8c51...",
+        "tool pins": "a43d...",
+        "baseline quality-gate-clones.toml": "e137..."
+      },
       "tools": {
         "ruff": {"version": "0.17.0", "payload_sha256": "720b..."}
       },
@@ -556,16 +562,17 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
   `tightened`, `ignored`, `authorized` or `blocked`. A baseline entry also
   carries `ignored_entries`, the subjects whose candidate entry was ignored.
 * `identity_before` and `identity_after` record `REV`'s commit id, each
-  protected input's two SHA-256 values, every pinned tool's
+  protected input's two SHA-256 values, the effective policy, tool lock, tool
+  pins and each in-memory baseline under `effective_inputs`, every pinned tool's
   `payload_sha256` (or null when not installed, or `invalid` when the tree has
   no digest), and the gate program's own per-file SHA-256 values plus one
   combined `digest`. The protected scope is enumerated again for
   `identity_after`, including ignored untracked files, and an added or removed
   path is a difference; a refused candidate path is recorded as `refused`.
   `identity_after` is captured after the checks and, when a prune was
-  performed, after that write. A difference in any protected input, tool
-  payload or gate file makes the decision `error` (exit 2) naming the changed
-  input, and a requested prune writes nothing. The one permitted difference is
+  performed, after that write. A difference in any protected or effective
+  input, tool payload or gate file makes the decision `error` (exit 2) naming
+  the changed input, and a requested prune writes nothing. The one permitted difference is
   the baseline the gate itself wrote for a performed prune: that path must
   equal exactly the bytes the gate generated, which is `REV`'s baseline
   tightened by the measurement.
@@ -622,8 +629,8 @@ satisfied, but a baseline exception or a non-passing advisory check exists.
 `blocked` (exit 1, trust runs only) means an unauthorized protected path other
 than the policy, a baseline or the tools lock differs from `REV`; the checks
 still ran and are reported. `error` (exit 2) is invalid policy, usage,
-configuration, or a protected input, tool payload or gate file that changed
-during the run.
+configuration, or a protected input, effective input, tool payload or gate
+file that changed during the run.
 
 `execution` does not change the decision: a budget or signal makes the raw
 outcome fail, and policy satisfaction then decides acceptance. A prune that is

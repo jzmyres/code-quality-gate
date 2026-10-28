@@ -46,6 +46,7 @@ class Tool:
 
 
 _LOCK_OVERRIDE: Path | None = None
+_LOCK_TOOLS: dict[str, Tool] | None = None
 
 
 def _default_lock_path() -> Path:
@@ -55,15 +56,18 @@ def _default_lock_path() -> Path:
 
 
 @contextlib.contextmanager
-def lock_override(path: Path | None):
-    """Use PATH as the tool lock for the duration of the block."""
-    global _LOCK_OVERRIDE
+def lock_override(path: Path | None, tools: dict[str, Tool] | None = None):
+    """Use PATH and its captured tool definitions for the duration of the block."""
+    global _LOCK_OVERRIDE, _LOCK_TOOLS
     previous = _LOCK_OVERRIDE
+    previous_tools = _LOCK_TOOLS
     _LOCK_OVERRIDE = path
+    _LOCK_TOOLS = tools
     try:
         yield
     finally:
         _LOCK_OVERRIDE = previous
+        _LOCK_TOOLS = previous_tools
 
 
 def _tools_dir() -> Path:
@@ -189,6 +193,14 @@ def load_tools(lock: Path) -> dict[str, Tool]:
             )
         tools[name] = _parse_tool(lock, name, raw)
     return tools
+
+
+def current_tools() -> tuple[Path, dict[str, Tool]]:
+    """Return the active lock and the definitions fixed for this run."""
+    if _LOCK_OVERRIDE is not None and _LOCK_TOOLS is not None:
+        return _LOCK_OVERRIDE, dict(_LOCK_TOOLS)
+    lock = _default_lock_path()
+    return lock, load_tools(lock)
 
 
 def _tool_binary(tool: Tool, tools_root: Path) -> Path:
@@ -507,8 +519,7 @@ def command_tools_path(lock: Path, name: str) -> int:
     return 0
 
 def _pinned_tool(name: str) -> tuple[Path, Tool]:
-    lock = _default_lock_path()
-    tools = load_tools(lock)
+    lock, tools = current_tools()
     tool = tools.get(name)
     if tool is None:
         known = ", ".join(sorted(tools)) or "none"

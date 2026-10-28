@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 
@@ -344,6 +345,121 @@ class VerificationTests(FindingMixin, FixtureCase):
 
 
 class VerificationTrustTests(FindingMixin, TrustCase):
+    def test_candidate_test_cannot_lower_merged_verification_floor(self) -> None:
+        forged = verification_baseline([executed_entry(1)])
+        revision = self.prepare(tests=2, noqa=0, floor=2, ceiling=0)
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_attack(self):\n"
+            + self.merge_attack("verification", forged),
+        )
+        check = self.attacked_check(revision, "verification")
+        finding = self.finding(check, "tests:tests:executed")
+        self.assertEqual((finding["value"], finding["bound"]), (1, 2))
+        self.assertTrue(finding["blocking"])
+
+    def test_normal_trust_run_records_effective_baseline(self) -> None:
+        revision = self.prepare(tests=2, noqa=0, floor=2, ceiling=0)
+        result, document = self.trust_json(revision, env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted")
+        self.assertTrue(self.check_by_id(document, "verification")["satisfied"])
+        identity = document["trust"]["identity_before"]
+        self.assertEqual(identity, document["trust"]["identity_after"])
+        self.assertIn("baseline " + BASELINE, identity["effective_inputs"])
+
+    def test_authorized_baseline_rewrite_and_restore_keeps_snapshot(self) -> None:
+        trusted = verification_baseline([
+            executed_entry(2), exclusion_entry("pkg/mod.py", "noqa", 0)
+        ])
+        forged = verification_baseline([executed_entry(1)])
+        restore = (
+            f"import pathlib; pathlib.Path({BASELINE!r}).write_text({trusted!r})"
+        )
+        config = verification_config() + (
+            '\n[checks.restore]\nadapter = "command"\ntier = 1\n'
+            'enforcement = "enforced"\n'
+            f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(restore)}]\n'
+        )
+        revision = self.prepare(
+            tests=2, noqa=0, floor=2, ceiling=0, config=config
+        )
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_attack(self):\n"
+            f"        pathlib.Path({BASELINE!r}).write_text({forged!r})\n"
+            "        self.assertTrue(True)\n",
+        )
+        result, document = self.trust_json(
+            revision, "--allow-protected", BASELINE, env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        check = self.check_by_id(document, "verification")
+        self.assertEqual(self.finding(check, "tests:tests:executed")["bound"], 2)
+        self.assertEqual(
+            document["trust"]["identity_before"],
+            document["trust"]["identity_after"],
+        )
+
+    def test_authorized_policy_new_baseline_is_snapshotted(self) -> None:
+        revision = self.prepare(tests=2, noqa=0, floor=2, ceiling=0)
+        new_baseline = "new-verification.toml"
+        trusted = verification_baseline([executed_entry(2)])
+        forged = verification_baseline([executed_entry(1)])
+        self.write_config(verification_config(baseline=new_baseline))
+        self.add_file(new_baseline, trusted)
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_attack(self):\n"
+            f"        pathlib.Path({new_baseline!r}).write_text({forged!r})\n"
+            "        self.assertTrue(True)\n",
+        )
+        result, document = self.trust_json(
+            revision, "--allow-protected", "quality-gate.toml",
+            env=self.default_tool_env(),
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(new_baseline, document["error"])
+        check = self.check_by_id(document, "verification")
+        finding = self.finding(check, "tests:tests:executed")
+        self.assertEqual((finding["value"], finding["bound"]), (1, 2))
+        self.assertIn(
+            "baseline " + new_baseline,
+            document["trust"]["identity_before"]["effective_inputs"],
+        )
+
+    def test_authorized_policy_refuses_a_new_baseline_fifo(self) -> None:
+        revision = self.prepare(tests=1, noqa=0, floor=1, ceiling=0)
+        self.write_config(verification_config(baseline="new-verification.toml"))
+        os.mkfifo(self.repo / "new-verification.toml")
+        result = self.run_qg(
+            "check", "--policy-from", revision,
+            "--allow-protected", "quality-gate.toml", timeout=5,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("new-verification.toml", result.stderr)
+        self.assertIn("FIFO", result.stderr)
+
+    def test_malformed_authorized_baseline_is_refused_before_checks(self) -> None:
+        marker = self.base / "ran"
+        rewrite = f"import pathlib; pathlib.Path({str(marker)!r}).touch(); print(1)"
+        revision = self.prepare(
+            tests=1, noqa=0, floor=1, ceiling=0,
+            config=rewriting_config(rewrite),
+        )
+        self.add_file(BASELINE, "not valid TOML [\n")
+        result = self.run_qg(
+            "check", "--policy-from", revision, "--allow-protected", BASELINE,
+            env=self.default_tool_env(),
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("valid effective baseline", result.stderr)
+        self.assertFalse(marker.exists())
+
     def prepare(
         self,
         *,
@@ -510,6 +626,8 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         self.assertIn("changed during the run", document["error"])
         self.assertFalse(document["prune"]["performed"])
         self.assertEqual(self.read_file(BASELINE), weakened)
+        check = self.check_by_id(document, "verification")
+        self.assertEqual(self.finding(check, "tests:tests:executed")["bound"], 2)
 
 
 if __name__ == "__main__":

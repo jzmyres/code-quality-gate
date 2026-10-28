@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .owners import OwnersSpec
+    from .ratchet import BaselineEntry
 
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
@@ -133,6 +134,7 @@ class CheckDef:
     verification: VerificationSpec | None = None
     direction: str = "max"
     owners: OwnersSpec | None = None
+    effective_baseline: tuple[BaselineEntry, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -823,7 +825,7 @@ def _parse_check(
 
 
 def _parse_checks(
-    data: dict[str, Any], root: Path, path: Path
+    data: dict[str, Any], root: Path, path: Path, *, validate_headers: bool = True
 ) -> dict[str, CheckDef]:
     raw_checks = _optional_table(data, "checks", path, "checks")
     if raw_checks is None:
@@ -831,7 +833,7 @@ def _parse_checks(
     checks: dict[str, CheckDef] = {}
     for name, raw in raw_checks.items():
         checks[name] = _parse_check(name, raw, root, path, checks)
-    _validate_baselines(checks, path)
+    _validate_baselines(checks, path, validate_headers=validate_headers)
     return checks
 
 
@@ -903,7 +905,9 @@ def _check_baseline_header(
             )
 
 
-def _validate_baselines(checks: dict[str, CheckDef], path: Path) -> None:
+def _validate_baselines(
+    checks: dict[str, CheckDef], path: Path, *, validate_headers: bool = True
+) -> None:
     owners: dict[Path, str] = {}
     for name, check in checks.items():
         if check.baseline is None:
@@ -918,7 +922,8 @@ def _validate_baselines(checks: dict[str, CheckDef], path: Path) -> None:
                 f"{check.baseline} is also used by checks.{owner}",
             )
         owners[key] = name
-        _check_baseline_header(check.baseline, name, check)
+        if validate_headers:
+            _check_baseline_header(check.baseline, name, check)
 
 
 def _parse_levels(
@@ -1021,7 +1026,7 @@ def _parse_protect(data: dict[str, Any], path: Path) -> tuple[str, ...]:
 
 
 def _config_from_data(
-    root: Path, path: Path, data: dict[str, Any]
+    root: Path, path: Path, data: dict[str, Any], *, validate_headers: bool = True
 ) -> Config:
     _check_keys(data, TOP_LEVEL_KEYS, path, "")
     schema = _declared_schema(data, path)
@@ -1034,7 +1039,7 @@ def _config_from_data(
     classes = _parse_classes(data, path)
     rules = _parse_rules(data, path)
     max_bytes = _parse_hygiene(data, path)
-    checks = _parse_checks(data, root, path)
+    checks = _parse_checks(data, root, path, validate_headers=validate_headers)
     required_tiers = _parse_levels(data, path)
     not_applicable = _parse_not_applicable(data, classes, path)
     protect_paths = _parse_protect(data, path)
@@ -1055,7 +1060,7 @@ def _config_from_data(
     )
 
 
-def load_config(root: Path) -> Config:
+def load_config(root: Path, *, validate_headers: bool = True) -> Config:
     path = root / "quality-gate.toml"
     try:
         with path.open("rb") as stream:
@@ -1070,4 +1075,4 @@ def load_config(root: Path) -> Config:
         ) from error
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise ConfigError(f"{path}: expected valid TOML, got {error}") from error
-    return _config_from_data(root, path, data)
+    return _config_from_data(root, path, data, validate_headers=validate_headers)

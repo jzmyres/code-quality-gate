@@ -36,6 +36,7 @@ from .python_tests import (
     summarize_matches,
 )
 from .ratchet import (
+    BaselineEntry,
     Domain,
     RatchetResult,
     evaluate,
@@ -44,7 +45,7 @@ from .ratchet import (
     write_baseline,
 )
 from .runner import Diagnostics, RunResult, run
-from .tools import load_tools, tool_binary, _default_lock_path
+from .tools import current_tools, tool_binary
 from .trust import checked_prune_path
 from .verification import measure_verification
 
@@ -155,6 +156,18 @@ def _class_text(names: list[str]) -> str:
     return ", ".join(names) or "none"
 
 
+def _baseline_entries(check: CheckDef) -> list[BaselineEntry]:
+    if check.effective_baseline is not None:
+        return list(check.effective_baseline)
+    assert check.baseline is not None
+    return load_baseline(
+        check.baseline,
+        check_id=check.id,
+        metric_version=check.metric_version,
+        allowed_extras=("files",) if check.adapter == "clones" else (),
+    )
+
+
 def _file_argument(name: str) -> str:
     return f"./{name}" if name.startswith("-") else name
 
@@ -165,7 +178,6 @@ def _expand_run(
     assert check.command is not None
     expanded: list[str] = []
     tools = None
-    lock = _default_lock_path()
     for argument in check.command.run:
         if argument == "{files}":
             expanded.extend(map(_file_argument, files))
@@ -176,7 +188,7 @@ def _expand_run(
             continue
         name = match.group(1)
         if tools is None:
-            tools = load_tools(lock)
+            _lock, tools = current_tools()
         if name not in tools:
             known = ", ".join(sorted(tools)) or "none"
             return (
@@ -714,12 +726,7 @@ def _run_clones(
             reason=measurement.error,
         )
     try:
-        entries = load_baseline(
-            check.baseline,
-            check_id=check.id,
-            metric_version=check.metric_version,
-            allowed_extras=("files",),
-        )
+        entries = _baseline_entries(check)
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _clone_result(
@@ -1333,11 +1340,7 @@ def _run_python_crap(
         )
 
     try:
-        entries = load_baseline(
-            check.baseline,
-            check_id=check.id,
-            metric_version=check.metric_version,
-        )
+        entries = _baseline_entries(check)
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _ratchet_result(
@@ -1516,11 +1519,7 @@ def _verification_entries(
 ) -> tuple[list[Any] | None, CheckResult | None]:
     try:
         return (
-            load_baseline(
-                check.baseline,
-                check_id=check.id,
-                metric_version=check.metric_version,
-            ),
+            _baseline_entries(check),
             None,
         )
     except GateError as error:
@@ -1981,13 +1980,17 @@ def _result_document(
     results: list[CheckResult],
     obligations: list[dict[str, Any]],
     prune: dict[str, Any],
+    trust: Any = None,
 ) -> dict[str, Any]:
     return {
         "schema": 2,
         "gate_version": gate_result.gate_version(),
         "revision": gate_result.consumer_revision(root),
         "dirty": gate_result.consumer_dirty(root),
-        "policy_sha256": gate_result.policy_sha256(config.path),
+        "policy_sha256": (
+            trust.policy_sha256 if trust is not None
+            else gate_result.policy_sha256(config.path)
+        ),
         "decision": decision,
         "checks": [result.to_json() for result in results],
         "obligations": obligations,
@@ -2092,7 +2095,7 @@ def _finalize_check(
     _print_decision(decision, configuration_error, results, obligations)
     exit_code = _decision_exit_code(decision, prune_id, prune_document)
     document = _result_document(
-        root, config, decision, results, obligations, prune_document
+        root, config, decision, results, obligations, prune_document, trust
     )
     if configuration_error is not None:
         document["error"] = configuration_error

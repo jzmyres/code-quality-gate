@@ -72,6 +72,13 @@ symlink among the path's parent components inside the candidate, is refused
 
 ## Effective inputs
 
+Before any candidate check command runs, the gate validates and fixes the
+effective policy, tool pins and every baseline in its own process. The merged
+baseline entries, including an authorized replacement or a baseline introduced
+by an authorized policy, are held in memory and supplied directly to the
+checks. Candidate commands cannot change the entries by editing a temporary
+file or the original baseline. No baseline file is passed to a child process.
+
 For each protected input whose candidate content differs from `REV`:
 
 ### Baseline files
@@ -146,21 +153,33 @@ Before any check runs, the gate records in `trust.identity_before`:
 
 * `REV`'s commit id;
 * each protected input's `REV` and candidate SHA-256 (stored per path);
+* the effective policy and tool lock file SHA-256, a digest of the captured
+  tool pins, and a digest of each effective baseline held in memory;
 * each pinned tool's actual install-tree payload digest (the M2a encoding); and
 * a digest and per-file SHA-256 of the gate program's own files
   (`qg.py` and every Python module under `quality_gate/`).
 
 It enumerates the protected scope again after the checks, including ignored
 untracked files, and compares those facts before any prune write. Any protected
-path added, removed or changed under that scope, and any pinned tool payload or
-gate file whose recorded value changed during the run, makes the decision
-`error` (exit 2) with a message naming what changed, and a requested prune
-writes nothing. Without a prune write `trust.identity_after` records that same
+path added, removed or changed under that scope, any effective input whose
+recorded value changed, and any pinned tool payload or gate file that changed
+during the run makes the decision `error` (exit 2) with a message naming what
+changed, and a requested prune writes nothing. The identity also tracks the
+candidate source of a baseline introduced by an authorized policy. Without a
+prune write `trust.identity_after` records that same
 snapshot; after a performed prune it records the identity captured once more
 after the write, where only the pruned path may differ and only by exactly the
 bytes the gate generated (see above). A missing tool install is recorded as
 `null`; a tree that has no payload digest is recorded as `invalid`; a candidate
 path that is refused as a non-regular file is recorded as `refused`.
+
+The `effective_inputs` identity maps `policy quality-gate.toml` and
+`tool lock tools.lock.toml` to file SHA-256 values and `tool pins` to the
+captured tool definitions' digest. Each `baseline PATH` value is the SHA-256
+of UTF-8 JSON containing the check id, metric version, and validated entries
+in order, including bounds, reasons, expiry and metadata. JSON object keys are
+sorted, separators are `,` and `:`, dates are ISO strings, and non-ASCII text
+is encoded directly. The same encoding is used for the `tool pins` digest.
 
 ## Result document
 
@@ -183,6 +202,12 @@ A trust run writes result `schema = 3` and adds:
     "identity_before": {
       "revision": "8dbb703...",
       "protected": {"quality-gate-clones.toml": {"rev_sha256": "c2a2...", "candidate_sha256": "d29f..."}},
+      "effective_inputs": {
+        "policy quality-gate.toml": "5a37...",
+        "tool lock tools.lock.toml": "8c51...",
+        "tool pins": "a43d...",
+        "baseline quality-gate-clones.toml": "e137..."
+      },
       "tools": {"ruff": {"version": "0.17.0", "payload_sha256": "720b..."}},
       "gate": {"digest": "...", "files": {"qg.py": "...", "quality_gate/checks.py": "..."}}
     },
