@@ -1686,7 +1686,7 @@ def _run_owners(root: Path, check: CheckDef, files: list[str], prefix: str) -> C
     start = time.monotonic()
     try:
         findings = measure_owners(root, files, check.owners)
-        entries = load_baseline(check.baseline, check_id=check.id, metric_version=check.metric_version)
+        entries = _baseline_entries(check)
     except GateError as error:
         return _owners_error(check, start, prefix, error)
     _owners_report(findings)
