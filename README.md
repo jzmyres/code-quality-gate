@@ -308,16 +308,19 @@ Gitlinks and symlinks are not read, and symlinked parents are refused.
 | `python-import` | An imported module, including `from MODULE import ...`. |
 | `python-argv` | A Python list or tuple whose first element is the literal string `value`, when passed as the first argument of a call or returned from a builder. |
 | `python-script` | The literal script argument of a Python or shell interpreter in such a literal argv list. |
-| `shell-command` | An unquoted command word, including after `|`, `&&`, `;` and `$(`. A path also matches its basename. |
-| `shell-script` | An unquoted script argument after an interpreter and its options, such as `python3 -I peak-window.py`. |
+| `shell-command` | An unquoted command word, including after `|`, `&&` and `;`; a command substitution's commands are scanned apart from the enclosing command. A path also matches its basename. |
+| `shell-script` | An unquoted script argument after an interpreter and its options, such as `python3 -I peak-window.py`; a shell's short `-c` (alone or in a cluster such as `-ec`) starts a command string instead. |
 | `text-regex` | A Python regular expression over code with comments and quoted strings masked; a last resort, identified as `text-regex` in findings. |
 
 Python matching parses the AST and never matches text inside a comment or ordinary string. An argv
 pattern deliberately inspects literal **elements** of a list or tuple passed directly to a call or
 returned by a builder, not a data list assigned to a variable or text that merely looks like a list.
 Shell matching skips comments, quoted words and here-document bodies; commands in
-`$(...)` are scanned, including inside double quotes. Interpreter patterns require literal words;
-`-c` and `-m` do not name a script. Text patterns mask Python and shell comments and strings with their
+`$(...)` are scanned separately, including inside double quotes, while the substitution stays an
+argument of the enclosing command. Interpreter patterns require literal words. A shell's short `-c`
+(alone or in a cluster such as `-ec`) and Python's `-c` and `-m` name a command string or module, not
+a script; shell long options such as `--norc` do not, and an option that takes an operand consumes it,
+such as `--rcfile FILE`. Text patterns mask Python and shell comments and strings with their
 language tokenizers. For other text they mask quoted strings, `#` and `//` line comments, `/* ... */`
 block comments, and, in `.el` files, `;` comments. Use a more specific pattern when those conventions do
 not describe the file. Regular expressions run in a bounded child process; only non-empty matches

@@ -26,41 +26,71 @@ def covered(forbidden: Occurrence, allowed: Occurrence) -> bool:
     return False
 
 
-def interpreter(word: str) -> bool:
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+_PYTHONS = re.compile(r"python[0-9]+(?:\.[0-9]+)*")
+_SHELL_OPERANDS = frozenset({"o", "O"})
+_PYTHON_OPERANDS = frozenset({"W", "X"})
+_SHELL_LONG_OPERANDS = frozenset({"--rcfile", "--init-file"})
+
+
+def _kind(word: str) -> str | None:
     name = PurePosixPath(word).name
-    return name in {"sh", "bash", "dash", "zsh", "ksh", "python"} or bool(
-        re.fullmatch(r"python[0-9]+(?:\.[0-9]+)*", name)
-    )
-
-
-def _no_script_option(value: str, python: bool) -> bool:
-    return value.startswith(("-c", "-m")) or (not python and "c" in value[1:])
+    if name in _SHELLS:
+        return "shell"
+    if name == "python" or _PYTHONS.fullmatch(name):
+        return "python"
+    return None
 
 
 def _is_operand(value: str) -> bool:
     return not value.startswith("-") or value == "-"
 
 
-def _consumes_option(value: str, python: bool) -> bool:
-    return value in (("-W", "-X") if python else ("-o", "-O"))
+def _long_step(value: str, kind: str) -> int:
+    name, attached, _operand = value.partition("=")
+    if kind == "shell" and name in _SHELL_LONG_OPERANDS and not attached:
+        return 2
+    return 1
 
 
-def _option_step(value: str | None, python: bool) -> int:
+def _command_option(letter: str, kind: str) -> bool:
+    return letter == "c" or (kind == "python" and letter == "m")
+
+
+def _operand_width(letters: str, position: int, operands: frozenset[str]) -> int:
+    if letters[position] not in operands:
+        return 0
+    return 2 if position + 1 == len(letters) else 1
+
+
+def _short_step(value: str, kind: str) -> int:
+    letters = value[1:]
+    operands = _SHELL_OPERANDS if kind == "shell" else _PYTHON_OPERANDS
+    for position, letter in enumerate(letters):
+        if _command_option(letter, kind):
+            return -1
+        width = _operand_width(letters, position, operands)
+        if width:
+            return width
+    return 1
+
+
+def _option_step(value: str | None, kind: str) -> int:
     if value is None:
         return -1
     if _is_operand(value):
         return 0
-    if _no_script_option(value, python):
-        return -1
-    return 1 + int(_consumes_option(value, python))
+    if value.startswith("--"):
+        return _long_step(value, kind)
+    return _short_step(value, kind)
 
 
-def _script_position(words: list[str | None], python: bool) -> int | None:
+def _script_position(words: list[str | None], kind: str) -> int | None:
     index = 1
     while index < len(words):
         if words[index] == "--":
             return index + 1
-        step = _option_step(words[index], python)
+        step = _option_step(words[index], kind)
         if step < 0:
             return None
         if step == 0:
@@ -74,10 +104,12 @@ def _valid_script(words: list[str | None], index: int | None) -> bool:
 
 
 def script_index(words: list[str | None]) -> int | None:
-    if not words or words[0] is None or not interpreter(words[0]):
+    if not words or words[0] is None:
         return None
-    python = PurePosixPath(words[0]).name.startswith("python")
-    index = _script_position(words, python)
+    kind = _kind(words[0])
+    if kind is None:
+        return None
+    index = _script_position(words, kind)
     if not _valid_script(words, index):
         return None
     return index

@@ -203,6 +203,52 @@ class PatternTests(OwnerCase):
         self.add_file("other.sh", "bash -- peak-window.py\n")
         self.assert_rejected("other.sh:1: shell-script:peak-window.py")
 
+    def test_substitution_commands_keep_the_outer_command_apart(self) -> None:
+        self.add_file("owner.sh", "python3 -I copied-window.py\n")
+        self.add_file(
+            "other.sh",
+            'echo "$(date)" python3 -I copied-window.py\n'
+            "echo $(date) python3 -I copied-window.py\n",
+        )
+        self.set_rule(rule([pattern("shell-command", "python3")], owner="owner.sh"), shell=True)
+        self.assert_pass()
+        self.add_file("other.sh", "echo $(python3 -I copied-window.py)\n")
+        check = self.assert_rejected("other.sh:1: shell-command:python3")
+        self.assertEqual(check["findings"][0]["value"], 1)
+        self.add_file("other.sh", "value=$(date) python3 -I copied-window.py\n")
+        check = self.assert_rejected("other.sh:1: shell-command:python3")
+        self.assertEqual(check["findings"][0]["value"], 1)
+
+    def test_shell_options_distinguish_command_strings_from_rc_files(self) -> None:
+        self.add_file("owner.sh", "bash --norc private.sh\n")
+        self.add_file("clean.sh", "bash -c private.sh\nbash -ec private.sh\n")
+        self.set_rule(rule([pattern("shell-script", "private.sh")], owner="owner.sh"), shell=True)
+        self.assert_pass()
+        self.add_file(
+            "other.sh", "bash --norc private.sh\nbash --rcfile x private.sh\n"
+        )
+        check = self.assert_rejected("other.sh:1: shell-script:private.sh")
+        self.assertEqual(check["findings"][0]["value"], 2)
+        self.assertEqual(check["findings"][0]["measurement"]["lines"], [1, 2])
+
+    def test_python_argv_shell_options_distinguish_command_strings_from_rc_files(self) -> None:
+        self.add_file("a.py", "subprocess.run(['bash', '--norc', 'private.sh'])\n")
+        self.add_file(
+            "clean.py",
+            "subprocess.run(['bash', '-c', 'private.sh'])\n"
+            "subprocess.run(['bash', '-ec', 'private.sh'])\n"
+            "subprocess.run(['bash', '--rcfile', 'x', '-c', 'private.sh'])\n",
+        )
+        self.set_rule(rule([pattern("python-script", "private.sh")]))
+        self.assert_pass()
+        self.add_file(
+            "other.py",
+            "subprocess.run(['bash', '--norc', 'private.sh'])\n"
+            "subprocess.run(['bash', '--rcfile', 'x', 'private.sh'])\n",
+        )
+        check = self.assert_rejected("other.py:1: python-script:private.sh")
+        self.assertEqual(check["findings"][0]["value"], 2)
+
     def test_python_script_pattern_distinguishes_script_from_later_argument(self) -> None:
         self.add_file("a.py", "subprocess.run(['python3', '-I', 'peak-window.py'])\n")
         self.add_file(

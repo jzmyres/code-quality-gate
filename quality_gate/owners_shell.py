@@ -21,6 +21,17 @@ class Token:
     assignment: bool = False
 
 
+def _shifted(token: Token, offset: int, line_offset: int) -> Token:
+    return Token(
+        token.value,
+        token.start + offset,
+        token.end + offset,
+        token.line + line_offset,
+        token.operator,
+        token.assignment,
+    )
+
+
 def _skip_quote(source: str, index: int) -> int:
     quote = source[index]
     index += 1
@@ -80,7 +91,7 @@ class _Scanner:
         self.tokens: list[Token] = []
         self.heredocs: list[tuple[str, bool]] = []
         self.expect_heredoc: str | None = None
-        self.substitutions: list[Token] = []
+        self.substitutions: list[list[Token]] = []
 
     def blank(self, start: int, end: int) -> None:
         for index in range(start, end):
@@ -102,23 +113,11 @@ class _Scanner:
     def substitution(self, start: int) -> int:
         end = _substitution_end(self.source, start, self.relative)
         inner = start + 2
-        scanner = _Scanner(self.relative, self.source[inner:end])
-        tokens, code = scanner.scan()
+        tokens, code, nested = _Scanner(self.relative, self.source[inner:end]).scan()
         line_offset = bisect.bisect_left(self.lines, inner) - 1
-        self.substitutions.append(Token("$(", start, inner, line_offset + 1, True))
+        self.substitutions.append([_shifted(token, inner, line_offset) for token in tokens])
         self.substitutions.extend(
-            Token(
-                token.value,
-                token.start + inner,
-                token.end + inner,
-                token.line + line_offset,
-                token.operator,
-                token.assignment,
-            )
-            for token in tokens
-        )
-        self.substitutions.append(
-            Token(")", end, end + 1, bisect.bisect_left(self.lines, end), True)
+            [_shifted(token, inner, line_offset) for token in group] for group in nested
         )
         self.mask[inner:end] = code
         return end + 1
@@ -155,7 +154,7 @@ class _Scanner:
 
     def _word_boundary(self, index: int) -> bool:
         char = self.source[index]
-        return char.isspace() or char in "|&;()<>" or self.source.startswith("$(", index)
+        return char.isspace() or char in "|&;()<>" or self.source.startswith("$((", index)
 
     def _word_part(self, index: int) -> tuple[int, bool]:
         char = self.source[index]
@@ -164,6 +163,8 @@ class _Scanner:
         if char == "\\":
             self.blank(index, min(index + 2, len(self.source)))
             return index + 2, False
+        if self.source.startswith("$(", index):
+            return self.substitution(index), False
         return index + 1, char != "$"
 
     def _word_end(self, index: int) -> tuple[int, bool]:
@@ -187,8 +188,6 @@ class _Scanner:
         raw = self.source[start:index]
         self._record_heredoc(raw)
         self.add(raw if literal else None, start, index, assignment=bool(_ASSIGNMENT.match(raw)))
-        self.tokens.extend(self.substitutions)
-        self.substitutions.clear()
         return index
 
     def _heredoc(self, index: int, delimiter: str, strip_tabs: bool) -> int:
@@ -231,9 +230,6 @@ class _Scanner:
             end = _substitution_end(self.source, index, self.relative) + 1
             self.add(None, index, end)
             return end
-        if self.source.startswith("$(", index):
-            self.add("$(", index, index + 2, operator=True)
-            return index + 2
         if self.source[index] in "|&;()<>":
             return self.operator(index)
         return self.word(index)
@@ -258,16 +254,16 @@ class _Scanner:
             return index + 1
         return self._code_token(index)
 
-    def scan(self) -> tuple[list[Token], str]:
+    def scan(self) -> tuple[list[Token], str, list[list[Token]]]:
         index = 0
         while index < len(self.source):
             index = self._advance(index)
-        return self.tokens, "".join(self.mask)
+        return self.tokens, "".join(self.mask), self.substitutions
 
 
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 _RESERVED = {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!", "{", "}"}
-_SEPARATORS = {"\n", "|", "||", "&&", "&", ";", ";;", "$(", "(", ")"}
+_SEPARATORS = {"\n", "|", "||", "&&", "&", ";", ";;", "(", ")"}
 _REDIRECTS = {"<", ">", "<<", "<<-", ">>", ">&", "<&", "&>", "&>>"}
 
 
@@ -350,6 +346,9 @@ def _command_events(command: list[Token]) -> list[Occurrence]:
 
 
 def shell_events(relative: str, source: str) -> tuple[list[Occurrence], str]:
-    tokens, code = _Scanner(relative, source).scan()
-    events = [event for command in _commands(tokens) for event in _command_events(command)]
+    tokens, code, substitutions = _Scanner(relative, source).scan()
+    commands = _commands(tokens)
+    for group in substitutions:
+        commands.extend(_commands(group))
+    events = [event for command in commands for event in _command_events(command)]
     return events, code
