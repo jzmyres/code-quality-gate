@@ -386,11 +386,25 @@ def _instrument(source: str, marker: Path, token: str) -> str:
         else:
             break
     lines = source.splitlines(keepends=True)
-    marker_code = (
-        f"\nwith open({str(marker)!r}, 'a', encoding='utf-8') as _qg_mutation_marker:\n"
-        f"    _qg_mutation_marker.write({token!r} + '\\n')\n"
+    preamble = (
+        "\n"
+        "import json as _qg_mutation_json, sys as _qg_mutation_sys, "
+        "traceback as _qg_mutation_traceback\n"
+        f"_qg_mutation_marker = {str(marker)!r}\n"
+        f"_qg_mutation_token = {token!r}\n"
+        "def _qg_mutation_record(event, detail=''):\n"
+        "    with open(_qg_mutation_marker, 'a', encoding='utf-8') as _qg_mutation_file:\n"
+        "        record = {'token': _qg_mutation_token, 'event': event, 'detail': detail}\n"
+        "        _qg_mutation_file.write(_qg_mutation_json.dumps(record) + '\\n')\n"
+        "_qg_mutation_record('loaded')\n"
+        "def _qg_mutation_hook(exc_type, exc, tb):\n"
+        "    detail = ''.join(_qg_mutation_traceback.format_exception(exc_type, exc, tb))\n"
+        "    _qg_mutation_record('failure', detail)\n"
+        "    _qg_mutation_sys.__excepthook__(exc_type, exc, tb)\n"
+        "_qg_mutation_sys.excepthook = _qg_mutation_hook\n"
     )
-    return "".join(lines[:prefix]) + marker_code + "".join(lines[prefix:])
+    trailer = "\n_qg_mutation_record('imported')\n"
+    return "".join(lines[:prefix]) + preamble + "".join(lines[prefix:]) + trailer
 
 
 def _prepare(source_root: Path, decisions: tuple[Decision, ...]) -> list[tuple[Decision, str]]:
@@ -446,7 +460,6 @@ def _suite(root: Path, tests: str, report_path: Path) -> int:
     report = {
         "ids": result.ids,
         "failures": [test.id() for test, _ in result.failures],
-        "failure_traces": [trace for _, trace in result.failures],
         "fixture_failures": result.fixture_failures,
         "errors": [f"{test.id()}: {trace[-5000:]}" for test, trace in result.errors],
         "skipped": [test.id() for test, _ in result.skipped],
@@ -498,7 +511,6 @@ def _run_suite(root: Path, tests: str, work: Path, timeout: float, driver: Path)
         fields = (
             "ids",
             "failures",
-            "failure_traces",
             "fixture_failures",
             "errors",
             "skipped",
@@ -510,8 +522,6 @@ def _run_suite(root: Path, tests: str, work: Path, timeout: float, driver: Path)
             for key in fields
         ):
             raise ValueError("invalid suite report")
-        if len(result["failures"]) != len(result["failure_traces"]):
-            raise ValueError("incomplete failure report")
     except (OSError, UnicodeError, ValueError) as error:
         return "error", {}, f"missing or invalid suite report: {error}; exit {process.returncode}; {tail}"
     if process.returncode not in (0, 1) or bool(process.returncode) != bool(
@@ -522,9 +532,6 @@ def _run_suite(root: Path, tests: str, work: Path, timeout: float, driver: Path)
         return "error", result, "test execution, setup, or import error: " + "\n".join(result["errors"][:3])
     if result["fixture_failures"]:
         return "error", result, "test setup or cleanup failure: " + ", ".join(result["fixture_failures"][:3])
-    for trace in result["failure_traces"]:
-        if trace.count("Traceback (most recent call last):") > 1:
-            return "error", result, "subprocess execution or import error: " + trace[-5000:]
     if result["skipped"] or result["expected_failures"] or result["unexpected_successes"]:
         return "error", result, "suite has skipped, expected-failure, or unexpected-success tests"
     if not result["ids"]:
@@ -538,6 +545,32 @@ def _copy(source_root: Path, destination: Path) -> None:
         destination,
         ignore=shutil.ignore_patterns(".git", ".worktrees", "__pycache__", "*.pyc", ".ruff_cache"),
     )
+
+
+def _marker_events(marker: Path, token: str) -> list[dict]:
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+    events = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get("token") == token
+            and event.get("event") in ("loaded", "imported", "failure")
+            and isinstance(event.get("detail"), str)
+        ):
+            events.append(event)
+    return events
+
+
+def _marker_failure(events: list[dict]) -> str | None:
+    failures = [event["detail"] for event in events if event["event"] == "failure"]
+    return failures[-1][-5000:] if failures else None
 
 
 def _one(
@@ -558,10 +591,16 @@ def _one(
         token = decision.name + ":" + hashlib.sha256(mutated.encode("utf-8")).hexdigest()
         (root / decision.module).write_text(_instrument(mutated, marker, token), encoding="utf-8")
         status, result, detail = _run_suite(root, tests, base, timeout, driver)
+        events = _marker_events(marker, token)
+        failure = _marker_failure(events)
+        if failure is not None:
+            return Outcome(decision.name, "error", "mutant import or execution failure: " + failure)
         if status in ("error", "timed out"):
             return Outcome(decision.name, status, detail)
-        if not marker.is_file() or token not in marker.read_text(encoding="utf-8").splitlines():
+        if not any(event["event"] == "loaded" for event in events):
             return Outcome(decision.name, "error", "mutated module was not shown to be loaded by the suite")
+        if not any(event["event"] == "imported" for event in events):
+            return Outcome(decision.name, "error", "mutated module did not complete import")
         if result["ids"] != baseline_ids:
             return Outcome(decision.name, "error", "mutant did not run the same tests as the passing suite")
         if status == "failed":

@@ -862,12 +862,15 @@ and single-owner checks. They use comparison flips, boolean negation, an opposit
 and removal of a raise. This is a selected set of faults, not an exhaustive measurement of every
 possible change.
 
-Each copied module reports a marker when it is loaded. A mutant is killed only when the same complete
-test suite runs, loads that mutant, and fails an assertion without test execution or import errors.
-Survivors, timeouts, missing markers, skipped tests, suite errors, invalid decisions and a failing
-unmodified suite all fail the command. Each suite has a 900-second limit; independent mutant copies
-run concurrently and their results are printed in declaration order. The slow mutation run is separate
-from `make check` and uses the same pinned tools cache as the ordinary tests.
+Each copied module records its own run in a marker file: a line when the import starts, one when
+the import completes, and one when an exception escapes, with its traceback, including in child
+processes that import the module. A mutant is killed only when the same complete test suite runs,
+loads and imports that mutant, and fails an assertion while the marker file records no import or
+execution failure; assertion text is never inspected. Survivors, timeouts, a missing or incomplete
+marker, a recorded import or execution failure, skipped tests, suite errors, invalid decisions and a
+failing unmodified suite all fail the command. Each suite has a 900-second limit; independent mutant
+copies run concurrently and their results are printed in declaration order. The slow mutation run is
+separate from `make check` and uses the same pinned tools cache as the ordinary tests.
 
 To protect another decision, add a named `Decision` to the list with its module, function, operator,
 exact source expression or statement, and a reason. The target must identify exactly one applicable

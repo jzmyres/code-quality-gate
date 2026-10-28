@@ -158,6 +158,51 @@ class MutationRunnerTests(unittest.TestCase):
         self.assertEqual(report.outcomes[0].status, "error")
         self.assertIn("setup", report.outcomes[0].detail)
 
+    def test_subprocess_return_code_fixture_import_error_is_not_a_kill(self) -> None:
+        self.source(
+            "def decision():\n    if True:\n        return 'yes'\n"
+            "    raise ImportError('broken child import')\nVALUE = decision()\n"
+        )
+        self.write_tests(
+            "import pathlib, subprocess, sys, unittest\n"
+            "class TestDecision(unittest.TestCase):\n"
+            "    def test_import(self):\n"
+            "        root = str(pathlib.Path(__file__).resolve().parent.parent)\n"
+            "        code = 'import sys; sys.path.insert(0, sys.argv[1]); import sample.decision'\n"
+            "        result = subprocess.run([sys.executable, '-I', '-c', code, root], "
+            "capture_output=True, text=True)\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+        )
+        report = self.run_fixture(self.decision("child_import_code", "decision", "True", operator="negate"))
+        self.assertFalse(report.passed)
+        self.assertEqual(report.outcomes[0].status, "error")
+        self.assertIn("ImportError", report.outcomes[0].detail)
+
+    def test_subprocess_return_code_fixture_execution_error_is_not_a_kill(self) -> None:
+        self.source(
+            "def decision():\n    if False:\n        raise RuntimeError('broken child execution')\n"
+            "    return 'yes'\n"
+        )
+        self.write_tests(
+            "import pathlib, subprocess, sys, unittest\n"
+            "class TestDecision(unittest.TestCase):\n"
+            "    def test_run(self):\n"
+            "        root = str(pathlib.Path(__file__).resolve().parent.parent)\n"
+            "        code = (\n"
+            "            'import sys; sys.path.insert(0, sys.argv[1]); '\n"
+            "            'from sample.decision import decision; print(decision())'\n"
+            "        )\n"
+            "        result = subprocess.run([sys.executable, '-I', '-c', code, root], "
+            "capture_output=True, text=True)\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+        )
+        report = self.run_fixture(
+            self.decision("child_execution_code", "decision", "False", operator="negate")
+        )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.outcomes[0].status, "error")
+        self.assertIn("RuntimeError", report.outcomes[0].detail)
+
     def test_subprocess_import_error_is_not_counted_as_a_kill(self) -> None:
         self.source(
             "def decision():\n    if True:\n        return 'yes'\n"
