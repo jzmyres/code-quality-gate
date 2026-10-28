@@ -287,6 +287,129 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(finding["bound"], None)
         self.assertIn("exclusions:pkg/mod.py:noqa", result.stderr)
 
+    def test_added_ruff_file_noqa_fails_with_and_without_codes(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        for directive in (
+            "# ruff: noqa",
+            "# ruff: noqa: E501",
+            "#\u00a0ruff:\u00a0noqa:\u00a0E501",
+        ):
+            with self.subTest(directive=directive):
+                self.add_file("pkg/mod.py", f"{directive}\nVALUE = 1\n")
+                result, _document, check = self.failed_verification()
+                finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
+                self.assertEqual(finding["value"], 1)
+                self.assertEqual(finding["bound"], None)
+                self.assertEqual(self.finding(check, "exclusions:pkg/mod.py:noqa")["value"], 0)
+                self.assertIn("pkg/mod.py:1", result.stderr)
+                self.assertIn(directive, result.stderr)
+
+    def test_replacing_inline_noqa_with_file_noqa_fails_and_refuses_prune(self) -> None:
+        self.add_tests(1)
+        self.add_file("pkg/mod.py", noqa_source(2))
+        self.write_verification_baseline([
+            executed_entry(1), exclusion_entry("pkg/mod.py", "noqa", 2)
+        ])
+        result, _document, _check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+
+        original_baseline = self.read_file(BASELINE)
+        self.add_file("pkg/mod.py", "# ruff: noqa\nVALUE_0 = 0\nVALUE_1 = 1\n")
+        result, document, check = self.failed_verification("--prune", "verification")
+        self.assertEqual(self.finding(check, "exclusions:pkg/mod.py:file-suppression")["value"], 1)
+        self.assertIn("exclusions:pkg/mod.py:noqa", check["resolved_baseline_entries"])
+        self.assertFalse(document["prune"]["performed"])
+        self.assertEqual(self.read_file(BASELINE), original_baseline)
+        self.assertIn("# ruff: noqa", result.stderr)
+
+    def test_file_suppression_syntax_and_multiple_directives(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/mod.py",
+            "# note # ruff: NoQa: E501 # ruff: noqa: F401\n"
+            "# flake8 : NOQA: E501\n"
+            "# FLAKE8=NoQA # ruff: noqa: F401\n"
+            "# ruff: file-ignore[F401, E501]\n"
+            "# RUFF: noqa\n"
+            "# ruff: noquality\n"
+            "# ruff: noqa:\n"
+            "# ruff: file-ignore[]\n"
+            "VALUE = 1  # ruff: noqa\n"
+            "if True:\n"
+            "    # ruff: file-ignore[F401]\n"
+            "    pass\n",
+        )
+        result, _document, check = self.failed_verification()
+        finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
+        self.assertEqual(finding["value"], 5)
+        self.assertIn("# ruff: NoQa", result.stderr)
+
+    def test_file_directive_in_string_is_not_a_suppression(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/mod.py",
+            'A = "# ruff: noqa"\n'
+            "B = '# flake8: noqa'\n"
+            'C = """\n# ruff: noqa: E501\n# ruff: file-ignore[F401]\n"""\n'
+            "D = '# isort: skip_file'\n",
+        )
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.finding(check, "exclusions:pkg/mod.py:file-suppression")["value"], 0)
+        self.assertEqual(self.finding(check, "exclusions:pkg/mod.py:noqa")["value"], 0)
+
+    def test_isort_file_skips_count_on_comment_tokens(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/mod.py",
+            "# isort: skip_file\n"
+            "# ruff: isort: skip_file\n"
+            "VALUE = 1  # isort:skip_file\n",
+        )
+        result, _document, check = self.failed_verification()
+        finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
+        self.assertEqual(finding["value"], 3)
+        self.assertIn("pkg/mod.py:1", result.stderr)
+        self.assertIn("isort: skip_file", result.stderr)
+        self.assertEqual(self.finding(check, "exclusions:pkg/mod.py:noqa")["value"], 0)
+
+    def test_baselined_file_suppression_passes_and_removal_resolves(self) -> None:
+        self.add_tests(1)
+        self.add_file("pkg/mod.py", "# ruff: noqa\nVALUE = 1\n")
+        self.write_verification_baseline([
+            executed_entry(1), exclusion_entry("pkg/mod.py", "file-suppression", 1)
+        ])
+        result, document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted_with_exceptions")
+        finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
+        self.assertTrue(finding["covered_by_baseline"])
+        self.assertEqual(finding["baseline_reason"], ADOPTION_REASON)
+
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        result, document, check = self.run_verification("--prune", "verification")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("exclusions:pkg/mod.py:file-suppression", check["resolved_baseline_entries"])
+        self.assertTrue(document["prune"]["performed"])
+        self.assertNotIn('subject = "exclusions:pkg/mod.py:file-suppression"', self.read_file(BASELINE))
+
+    def test_file_suppression_requires_a_nonempty_baseline_reason(self) -> None:
+        self.add_tests(1)
+        self.add_file("pkg/mod.py", "# flake8: noqa\nVALUE = 1\n")
+        entry = exclusion_entry("pkg/mod.py", "file-suppression", 1)
+        entry["reason"] = ""
+        self.write_verification_baseline([executed_entry(1), entry])
+        result, _document, check = self.failed_verification()
+        self.assertEqual(
+            self.finding(check, "exclusions:pkg/mod.py:file-suppression")["error"],
+            "empty baseline reason",
+        )
+        self.assertIn("empty reason", result.stderr)
+
     def test_prune_raises_the_executed_floor(self) -> None:
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])
@@ -345,6 +468,25 @@ class VerificationTests(FindingMixin, FixtureCase):
 
 
 class VerificationTrustTests(FindingMixin, TrustCase):
+    def test_candidate_cannot_authorize_a_file_suppression(self) -> None:
+        revision = self.prepare(tests=1, noqa=2, floor=1, ceiling=2)
+        self.add_file("pkg/mod.py", "# ruff: noqa\nVALUE_0 = 0\nVALUE_1 = 1\n")
+        self.add_file(BASELINE, verification_baseline([
+            executed_entry(1),
+            exclusion_entry("pkg/mod.py", "noqa", 2),
+            exclusion_entry("pkg/mod.py", "file-suppression", 1),
+        ]))
+        result, document = self.trust_json(revision, env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        entry = self.protected(document, BASELINE)
+        self.assertIn("exclusions:pkg/mod.py:file-suppression", entry["ignored_entries"])
+        check = self.check_by_id(document, "verification")
+        finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
+        self.assertEqual((finding["value"], finding["bound"]), (1, None))
+        self.assertTrue(finding["blocking"])
+        self.assertIn("exclusions:pkg/mod.py:noqa", check["resolved_baseline_entries"])
+
     def test_candidate_test_cannot_lower_merged_verification_floor(self) -> None:
         forged = verification_baseline([executed_entry(1)])
         revision = self.prepare(tests=2, noqa=0, floor=2, ceiling=0)

@@ -159,10 +159,22 @@ The `verification` adapter measures verification loss. For each reused
 `python_tests` check it records `tests:CHECK:executed` (direction `min`,
 value `ran - skipped`) and `tests:CHECK:skipped` (direction `max`). For each
 selected Python file it records `exclusions:FILE:no-cover` (lines matching the
-`pragma: no cover` coverage exclusion) and `exclusions:FILE:noqa` (`# noqa`
-comments), both `max`. These verification `max` metrics have threshold 0, so a
-missing baseline entry accepts only 0; a `min` metric without an entry is
-unmeasured and fails until an entry exists.
+`pragma: no cover` coverage exclusion), `exclusions:FILE:noqa` (inline `# noqa`
+comments), and `exclusions:FILE:file-suppression` (file-wide lint suppression
+directives), all `max`. File-wide directives include Ruff's `# ruff: noqa`,
+with or without codes, `# ruff: file-ignore[...]`, Flake8's `# flake8: noqa`
+forms, and isort's `# isort: skip_file` (also recognized by Ruff). Each directive
+contributes one to the file-wide count, separate from the inline count. The lint
+directives are recognized in comment tokens using their directive syntax;
+matching text inside a string does not count. The file-wide finding's location
+includes the first directive and its line.
+
+These verification `max` metrics have threshold 0, so a missing baseline entry
+accepts only 0; a `min` metric without an entry is unmeasured and fails until an
+entry exists. A file-wide suppression needs its own baseline entry with a
+non-empty reason, and the entry resolves when the count returns to 0. Replacing
+inline `noqa` comments with a file-wide directive therefore still fails unless
+the file-wide subject is covered.
 
 ### Single-owner rules
 

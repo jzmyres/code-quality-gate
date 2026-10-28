@@ -718,8 +718,14 @@ Notes:
   the classes that list it.
 * A `verification` check needs a `baseline` path. Its optional `requires` names an earlier
   `python_tests` check; without it every earlier `python_tests` check is reused. It measures executed
-  tests (a `min` floor), skipped tests, `pragma: no cover` lines and `# noqa` comments for the selected
-  files, without running the tests again.
+  tests (a `min` floor), skipped tests, `pragma: no cover` lines, inline `# noqa` comments and file-wide
+  lint suppressions for the selected Python files, without running the tests again. File-wide directives
+  are counted separately as `exclusions:FILE:file-suppression`: Ruff's `# ruff: noqa`, with or without
+  codes, `# ruff: file-ignore[...]`, Flake8's `# flake8: noqa` forms, and isort's `# isort: skip_file`
+  (also recognized by Ruff). Directives are recognized in comment tokens, so text inside strings does
+  not count. An added file-wide suppression fails unless a baseline entry with a non-empty reason covers
+  its count; removing all such suppressions from the file resolves that entry. Replacing inline
+  suppressions with a file-wide directive cannot use the inline baseline entry.
 * An `owners` check needs a `baseline` and declared rules. Its full-inventory scope, pattern forms,
   allowances and examples are described under [Single-owner rules](#single-owner-rules).
 * A check's optional `direction` is `max` (the default: the value must not exceed its bound and
@@ -812,9 +818,9 @@ This repository gates itself with `quality-gate.toml`:
 * `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
   requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
   and a worklist reason;
-* `verification` reuses the `tests` counts and measures `# noqa` and `pragma: no cover` lines in the
-  Python source; `quality-gate-verification.toml` floors the executed tests and ceilings the skips and
-  exclusions measured at adoption;
+* `verification` reuses the `tests` counts and measures inline `# noqa`, file-wide lint suppressions and
+  `pragma: no cover` lines in the Python source; `quality-gate-verification.toml` floors the executed
+  tests and ceilings the skips and exclusions measured at adoption;
 * `levels.required_tiers = [1]` makes tier 1 mandatory for both code classes; the `tests` check
   provides the required `tests` evidence and each class's obligation is reported as satisfied.
 
