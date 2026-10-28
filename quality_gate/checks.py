@@ -19,9 +19,11 @@ from .coverage_tool import (
     coverage_config_path,
 )
 from .files import git_argv, hygiene_result, validate_inventory
+from .owners import measure_owners
 from .policy import (
     CheckDef,
     Config,
+    ConfigError,
     GateError,
     UnsupportedError,
     UsageError,
@@ -78,6 +80,7 @@ class CheckResult:
     evidence_path: Path | None = None
     coverage_config: Path | None = None
     temporary: Any = field(default=None, repr=False, compare=False)
+    configuration_error: bool = False
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:
@@ -1562,6 +1565,43 @@ def _run_verification(
     return _verification_ratchet(check, measured, prefix, start)
 
 
+def _owners_report(findings: list[Any]) -> None:
+    for finding in findings:
+        details = finding.measurement
+        assert details is not None
+        path = finding.location.rsplit(":", 1)[0]
+        owners = ", ".join(details["owners"])
+        for line in details["lines"]:
+            print(
+                f"owners: {details['rule']}: {path}:{line}: "
+                f"{details['pattern']} outside its owners ({owners})",
+                file=sys.stderr,
+            )
+
+
+def _owners_error(check: CheckDef, start: float, prefix: str, error: GateError) -> CheckResult:
+    result = _ratchet_error(check, start, prefix, error)
+    result.configuration_error = isinstance(error, ConfigError)
+    return result
+
+
+def _run_owners(root: Path, check: CheckDef, files: list[str], prefix: str) -> CheckResult:
+    assert check.owners is not None
+    start = time.monotonic()
+    try:
+        findings = measure_owners(root, files, check.owners)
+        entries = load_baseline(check.baseline, check_id=check.id, metric_version=check.metric_version)
+    except GateError as error:
+        return _owners_error(check, start, prefix, error)
+    _owners_report(findings)
+    ratchet, failure = _evaluate_ratchet(findings, entries, check, prefix, Domain.all("the full inventory"))
+    if ratchet is None:
+        return _ratchet_result(check, start, failure or "error", reason=failure)
+    if ratchet.satisfied:
+        print(f"{prefix}: {len(findings)} subjects within baseline", flush=True)
+    return _ratchet_result(check, start, ratchet.outcome, ratchet=ratchet)
+
+
 def _adapter_runner(
     root: Path,
     config: Config,
@@ -1587,6 +1627,8 @@ def _adapter_runner(
             prefix=prefix,
             prior=prior,
         )
+    if check.adapter == "owners":
+        return _run_owners(root, check, files, prefix)
     return _run_verification(
         root,
         config,
@@ -1614,6 +1656,7 @@ def run_check(
         "python_tests",
         "python_crap",
         "verification",
+        "owners",
     ):
         raise GateError(f"unsupported adapter {check.adapter!r}")
     return _adapter_runner(
@@ -1838,6 +1881,14 @@ def _prune_check_result(
     return next(item for item in results if item.id == prune_id)
 
 
+def _prune_allowed(results: list[CheckResult], target: CheckResult) -> bool:
+    return (
+        not any(result.configuration_error for result in results)
+        and target.is_satisfied()
+        and target.ratchet is not None
+    )
+
+
 def _perform_prune(
     config: Config,
     prune_id: str | None,
@@ -1848,7 +1899,7 @@ def _perform_prune(
         return {"requested": [], "performed": False, "reason": None}
     target = _prune_check_result(results, prune_id)
     check = config.checks[prune_id]
-    if not target.is_satisfied() or target.ratchet is None:
+    if not _prune_allowed(results, target):
         return _prune_refusal(prune_id)
     assert check.baseline is not None
     destination = config.prune_paths.get(prune_id, check.baseline)
@@ -1927,23 +1978,20 @@ def _result_document(
     }
 
 
-def _check_command(
-    root: Path,
-    config: Config,
-    prune_id: str | None,
-    trust: Any = None,
-) -> tuple[int, dict[str, Any]]:
-    if prune_id is not None:
-        if prune_id not in config.checks:
-            message = (
-                f"check: unknown check {prune_id!r}; known checks: "
-                f"{', '.join(config.checks) or 'none'}"
-            )
-            return _prune_option_error(root, config, prune_id, message)
-        if config.checks[prune_id].baseline is None:
-            message = f"check: {prune_id}: no baseline to prune"
-            return _prune_option_error(root, config, prune_id, message)
+def _prune_request_problem(config: Config, prune_id: str | None) -> str | None:
+    if prune_id is None:
+        return None
+    if prune_id not in config.checks:
+        return (
+            f"check: unknown check {prune_id!r}; known checks: "
+            f"{', '.join(config.checks) or 'none'}"
+        )
+    if config.checks[prune_id].baseline is None:
+        return f"check: {prune_id}: no baseline to prune"
+    return None
 
+
+def _inventory_check(root: Path, config: Config) -> tuple[CheckResult, list[str], dict[str, str], int]:
     print("check: inventory", flush=True)
     (
         inventory_code,
@@ -1953,7 +2001,7 @@ def _check_command(
         inventory_execution,
         inventory_duration,
     ) = _run_inventory(root, config)
-    inventory_result = _builtin_result(
+    result = _builtin_result(
         "inventory",
         ok=inventory_code == 0,
         duration_seconds=inventory_duration,
@@ -1964,6 +2012,10 @@ def _check_command(
         ),
     )
 
+    return result, files, classes, inventory_code
+
+
+def _hygiene_check(root: Path, config: Config) -> CheckResult:
     print("check: hygiene", flush=True)
     hygiene_start = time.monotonic()
     hygiene = hygiene_result(root, config)
@@ -1971,7 +2023,7 @@ def _check_command(
         print(message, file=sys.stderr)
     if hygiene.ok:
         print(hygiene.summary)
-    hygiene_result_entry = _builtin_result(
+    return _builtin_result(
         "hygiene",
         ok=hygiene.ok,
         duration_seconds=time.monotonic() - hygiene_start,
@@ -1982,16 +2034,13 @@ def _check_command(
         ),
     )
 
-    results = [inventory_result, hygiene_result_entry]
-    results.extend(
-        _run_policy_checks(root, config, files, classes, inventory_code)
-    )
-    obligations = gate_result.obligations(config, results)
-    prune_document = _perform_prune(config, prune_id, results, trust)
-    prune_failed = prune_id is not None and not prune_document["performed"]
-
-    decision = gate_result.decision(results, obligations)
-    if decision == "rejected":
+def _print_decision(
+    decision: str, configuration_error: str | None,
+    results: list[CheckResult], obligations: list[dict[str, Any]],
+) -> None:
+    if decision == "error":
+        print(f"check: error: {configuration_error}", file=sys.stderr)
+    elif decision == "rejected":
         print(
             f"check: failed "
             f"({', '.join(_failure_names(results, obligations))})",
@@ -2005,12 +2054,48 @@ def _check_command(
     else:
         print(f"check: passed ({len(results)} checks)", flush=True)
 
-    exit_code = 0 if decision in ("accepted", "accepted_with_exceptions") else 1
-    if prune_failed:
-        exit_code = 1
-    return exit_code, _result_document(
+
+
+def _decision_exit_code(decision: str, prune_id: str | None, prune: dict[str, Any]) -> int:
+    if decision == "error":
+        return 2
+    if decision not in ("accepted", "accepted_with_exceptions"):
+        return 1
+    return 1 if prune_id is not None and not prune["performed"] else 0
+
+
+def _finalize_check(
+    root: Path, config: Config, results: list[CheckResult],
+    prune_id: str | None, trust: Any,
+) -> tuple[int, dict[str, Any]]:
+    obligations = gate_result.obligations(config, results)
+    prune_document = _perform_prune(config, prune_id, results, trust)
+    configuration_error = next((result.reason for result in results if result.configuration_error), None)
+    decision = "error" if configuration_error is not None else gate_result.decision(results, obligations)
+    _print_decision(decision, configuration_error, results, obligations)
+    exit_code = _decision_exit_code(decision, prune_id, prune_document)
+    document = _result_document(
         root, config, decision, results, obligations, prune_document
     )
+    if configuration_error is not None:
+        document["error"] = configuration_error
+    return exit_code, document
+
+
+def _check_command(
+    root: Path,
+    config: Config,
+    prune_id: str | None,
+    trust: Any = None,
+) -> tuple[int, dict[str, Any]]:
+    problem = _prune_request_problem(config, prune_id)
+    if problem is not None:
+        assert prune_id is not None
+        return _prune_option_error(root, config, prune_id, problem)
+    inventory, files, classes, code = _inventory_check(root, config)
+    results = [inventory, _hygiene_check(root, config)]
+    results.extend(_run_policy_checks(root, config, files, classes, code))
+    return _finalize_check(root, config, results, prune_id, trust)
 
 
 def _run_check_document(

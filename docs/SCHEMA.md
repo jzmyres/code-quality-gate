@@ -138,6 +138,7 @@ Each adapter declares the evidence it produces:
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
 | `verification` | none |
+| `owners` | `static` |
 
 A code class has one obligation per required tier:
 
@@ -162,6 +163,134 @@ selected Python file it records `exclusions:FILE:no-cover` (lines matching the
 comments), both `max`. These verification `max` metrics have threshold 0, so a
 missing baseline entry accepts only 0; a `min` metric without an entry is
 unmeasured and fails until an entry exists.
+
+### Single-owner rules
+
+An `owners` check has `tier = 1`, `enforcement = "enforced"`, a `baseline`
+path, and a non-empty array `[[checks.ID.rule]]`. It has `static` evidence,
+metric version `owners/1`, direction `max`, and threshold 0. Each rule requires
+a unique non-empty `name`, a non-empty `reason`, one or more distinct
+repository-relative `owners` file paths, and a non-empty `forbid` array of
+patterns. `allow` is an optional array of patterns. Owner paths are literal
+files, not globs, and must be enumerated regular files. Each pattern is a table
+with a non-empty `kind` and `value`, and optional `paths`, a non-empty list of
+repository-relative `fnmatch` globs. Within either array, pattern kind and
+value must be unique. No `paths` means that the pattern applies everywhere.
+Unknown keys, kinds, invalid regexes, non-max directions and other malformed
+policy values are configuration errors.
+
+Every regular file in the inventory is examined, whether tracked, stageable
+untracked, changed, unchanged, or assigned to a class that does not list the
+check. Inventory symlinks and gitlinks are not read; a symlinked parent is
+refused. Pattern paths restrict which matches count. All forbids and allows
+must match at least once in the applicable files, including owners; a missing
+owner or a stale forbid or allow is a configuration error (exit 2) naming the
+rule and the item. A matching forbid outside an owner is a violation unless a
+matching allow covers that particular occurrence.
+
+| Pattern kind | Meaning of `value` |
+|---|---|
+| `python-call` | Exact called name or dotted attribute in Python's AST. |
+| `python-import` | Exact imported module, including the module in a `from` import. |
+| `python-argv` | First string literal in a Python list or tuple passed as a call's first argument or returned from a builder. |
+| `python-script` | Literal script argument following a recognized interpreter and options in such a literal argv list. |
+| `shell-command` | Unquoted shell command word; a path also matches its basename. |
+| `shell-script` | Unquoted script argument of an interpreter, including after options such as `-I`. |
+| `text-regex` | Python regular expression over masked code; this last-resort form is marked in the finding. |
+
+Python AST patterns ignore comments and strings except for the literal argv
+elements they inspect. Shell tokenization ignores comments, quoted words and
+here-document bodies and finds commands after `|`, `&&`, `;` and `$(`,
+including a substitution inside double quotes. `-c` and `-m` do not identify a
+script. Text patterns use Python or shell tokenization to mask comments and
+strings; other text uses a common lexer that masks quoted strings, `#` and
+`//` comments, `/* ... */` comments, and `.el` semicolon comments. Regexes run
+in a bounded child; only non-empty matches count. Syntactic matching cannot resolve aliases, evaluate
+computed argv, or detect arbitrary semantic duplication.
+
+An allow covers a Python forbid in the same call or import; a call nested in
+the outer call's first argument can also cover that outer call. Shell allows
+cover forbids in the same simple command. A text allow must contain the
+forbidden text match. An unrelated occurrence on the same line does not cover
+a forbid. For example, the following rules allow the two peak-helper callers
+while flagging a different script in the selected callers or an illustrative
+duplicate of the hour computation:
+
+```toml
+[checks.architecture]
+adapter = "owners"
+tier = 1
+enforcement = "enforced"
+baseline = "owners-baseline.toml"
+
+[[checks.architecture.rule]]
+name = "peak-window"
+reason = "the helper owns the peak-window decision"
+owners = ["peak-window.py"]
+forbid = [
+  { kind = "shell-command", value = "python3", paths = ["dsh-implement.sh", "opencode.sh"] },
+  { kind = "python-argv", value = "python3", paths = ["agent-usage.py", "opencode.py"] },
+  { kind = "text-regex", value = 'hour\s*>=\s*17', paths = ["*.py", "*.sh"] },
+]
+allow = [
+  { kind = "shell-script", value = "peak-window.py" },
+  { kind = "python-script", value = "peak-window.py" },
+]
+```
+
+`python3 -I peak-window.py` and
+`subprocess.run(["python3", "-I", "peak-window.py"])` are allowed.
+`python3 -I copied-window.py` in a listed shell file, `now.hour >= 17`, and
+`(( hour >= 17 ))` outside the owner are violations. The path scopes are
+necessary when the same interpreter is also used for unrelated concerns.
+
+The Git rule below instead makes a literal argv builder the owner:
+
+```toml
+[checks.architecture]
+adapter = "owners"
+tier = 1
+enforcement = "enforced"
+baseline = "owners-baseline.toml"
+
+[[checks.architecture.rule]]
+name = "git"
+reason = "files.git_argv owns candidate Git invocation options"
+owners = ["quality_gate/files.py"]
+forbid = [{ kind = "python-argv", value = "git" }]
+```
+
+The returned list in `files.git_argv` matches inside the owner. A caller
+using `run(git_argv(root, "status"))` contains no literal Git argv and passes;
+`subprocess.run(["git", "status"])` elsewhere violates the rule. No `allow`
+is needed for the safe call.
+
+A subject is the compact JSON array `[rule, path, kind, value]`, without a
+line number, using JSON ASCII escapes for non-ASCII characters. Its value is
+the number of uncovered occurrences, and its
+location and `measurement.lines` report current line numbers.
+`measurement.rule`, `pattern`, `owners` and `text_fallback` describe the
+finding. Every occurrence is also printed as
+`owners: RULE: PATH:LINE: PATTERN outside its owners (OWNERS)`. A baseline
+exception for the Git example uses the generic reasoned ratchet:
+
+```toml
+check = "architecture"
+metric_version = "owners/1"
+
+[[entry]]
+subject = '["git","bypass.py","python-argv","git"]'
+bound = 1
+reason = "legacy invocation pending migration"
+```
+
+Removing the occurrence resolves the entry; adding another exceeds its bound,
+and pruning only tightens or removes entries. The scan's domain is the entire
+inventory. Policy rules and the baseline are protected inputs in a trust run.
+Do not self-adopt this adapter in the batch that adds it: a runner executes the
+trusted gate from the batch base, and an older gate rejects the unknown
+adapter before acceptance. Adopt it in a later batch based on a revision that
+already contains the adapter.
 
 ## Tool lock: `tools.lock.toml`
 
@@ -229,7 +358,7 @@ expires = 2026-12-31
 * `subject` is the measured thing. Adapters use clone fingerprints, Python
   function identities such as `PATH:Qualified.name`, `PATH:<lambda@LINE>`
   for a lambda outside every function, or `PATH:<module>` for code outside
-  every function.
+  every function, and `owners` uses `[rule, path, kind, value]` as compact JSON.
 * `bound` must be finite and is compared unrounded. For a `max` metric it
   is the largest accepted value; for a `min` metric it is the smallest. Exactly
   at the bound passes.
@@ -445,7 +574,7 @@ gate evaluation.
   schema number.
 * Metric versions: `command-exit/1`, `test-count/1`,
   `jscpd-clone-occurrences/1`, `python-lines/1`, `verification/1`,
-  `inventory/1`, `hygiene/1`.
+  `owners/1`, `inventory/1`, `hygiene/1`.
 
 The following proposals in the historical plans are superseded and are not part
 of the version-2 contract:

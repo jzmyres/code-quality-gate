@@ -6,7 +6,10 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .owners import OwnersSpec
 
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
@@ -21,6 +24,7 @@ SUPPORTED_ADAPTERS = (
     "python_tests",
     "python_crap",
     "verification",
+    "owners",
 )
 COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement", "direction")
 TOP_LEVEL_KEYS = (
@@ -128,6 +132,7 @@ class CheckDef:
     baseline: Path | None
     verification: VerificationSpec | None = None
     direction: str = "max"
+    owners: OwnersSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -563,6 +568,7 @@ class _ParsedSpec:
     threshold: float | None = None
     metric_version: str = ""
     evidence: tuple[str, ...] = ()
+    owners: OwnersSpec | None = None
 
 
 def _command_spec(
@@ -634,6 +640,21 @@ def _verification_spec(
     )
 
 
+def _owners_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> _ParsedSpec:
+    from .owners import parse_owners
+
+    spec = parse_owners(raw, root, path, full_key)
+    return _ParsedSpec(
+        owners=spec,
+        baseline=spec.baseline,
+        threshold=0,
+        metric_version="owners/1",
+        evidence=("static",),
+    )
+
+
 def _adapter_spec(
     adapter: str, raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> _ParsedSpec:
@@ -645,6 +666,8 @@ def _adapter_spec(
         return _python_tests_spec(raw, root, path, full_key)
     if adapter == "python_crap":
         return _python_crap_spec(raw, root, path, full_key)
+    if adapter == "owners":
+        return _owners_spec(raw, root, path, full_key)
     return _verification_spec(raw, root, path, full_key)
 
 
@@ -670,6 +693,8 @@ def _allowed_keys(adapter: str) -> tuple[str, ...]:
         )
     if adapter == "python_crap":
         return (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
+    if adapter == "owners":
+        return (*COMMON_CHECK_KEYS, "baseline", "rule")
     return (*COMMON_CHECK_KEYS, "requires", "baseline")
 
 
@@ -747,6 +772,19 @@ def _check_header(
     return adapter, tier, enforcement
 
 
+def _validate_owners_header(
+    adapter: str, tier: int, enforcement: str, direction: str, path: Path, full_key: str
+) -> None:
+    if adapter != "owners":
+        return
+    if tier != 1 or enforcement != "enforced":
+        raise _config_error(
+            path, full_key, "an enforced tier 1 owners check", f"tier {tier}, {enforcement}"
+        )
+    if direction != "max":
+        raise _config_error(path, f"{full_key}.direction", "max", direction)
+
+
 def _parse_check(
     name: str,
     raw: Any,
@@ -761,6 +799,8 @@ def _parse_check(
         raise _config_error(path, full_key, "a table", _describe(raw))
     adapter, tier, enforcement = _check_header(raw, path, full_key)
     parts = _adapter_spec(adapter, raw, root, path, full_key)
+    direction = _parse_direction(raw, path, full_key)
+    _validate_owners_header(adapter, tier, enforcement, direction, path, full_key)
     check = CheckDef(
         id=name,
         adapter=adapter,
@@ -775,7 +815,8 @@ def _parse_check(
         threshold=parts.threshold,
         baseline=parts.baseline,
         verification=parts.verification,
-        direction=_parse_direction(raw, path, full_key),
+        direction=direction,
+        owners=parts.owners,
     )
     _validate_requires(checks, name, _required_check(parts), path)
     return check

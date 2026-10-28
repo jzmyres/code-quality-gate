@@ -7,11 +7,6 @@ metric_version = "python-lines/1"
 # resolved entries.
 
 [[entry]]
-subject = "quality_gate/checks.py:_check_command"
-bound = 12.0320560981718
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/checks.py:_expand_run"
 bound = 8
 reason = "above 6 after QF1 (2026-10-25); worklist"
