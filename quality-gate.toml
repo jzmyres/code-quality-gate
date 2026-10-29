@@ -23,6 +23,11 @@ code = true
 description = "Python tests that execute the gate on fixture repositories"
 checks = ["ruff", "clones", "tests", "verification"]
 
+[classes.elisp]
+code = true
+description = "Emacs Lisp measurement helpers exercised by fixture tests"
+checks = ["tests"]
+
 [classes.config]
 code = false
 description = "Configuration, lock files and ignore rules"
@@ -44,6 +49,11 @@ reason = "the entry point"
 pattern = "quality_gate/*.py"
 class = "python"
 reason = "the gate implementation, one module per concern"
+
+[[rule]]
+pattern = "quality_gate/elisp/*.el"
+class = "elisp"
+reason = "the gate's Emacs Lisp measurement helpers"
 
 [[rule]]
 pattern = "tests/*.py"

@@ -23,13 +23,14 @@ The gate is deliberately narrow. It owns the orchestration no maintained tool ow
   the adapter's raw outcome and policy satisfaction, and carries diagnostics, obligations and prune
   reporting; `--policy-from` adds a `trust` object and result schema 3.
 
-Tier 1 now includes Python tests and per-function CRAP scores; the next metric layer is an Emacs Lisp
-CRAP adapter.
+Tier 1 includes Python tests, per-function Python CRAP scores, and Emacs Lisp tests with Edebug
+coverage. The next metric layer is an Emacs Lisp CRAP adapter.
 
 ## Requirements
 
 * Python 3.12 or later (the command uses `tomllib` and coverage uses `sys.monitoring`).
 * Git.
+* Emacs 29.1 or later for the Emacs Lisp adapters.
 * The pinned jscpd binary in the tools cache for clone checks.
 * The pinned ruff binary in the tools cache for this repository's own command check.
 * The pinned coverage 7.16.2 wheel in the tools cache for the Python adapters.
@@ -43,7 +44,8 @@ the configuration, `adapters.py` declares every adapter once in its descriptor a
 supported-adapter registry, `files.py` resolves the repository and runs inventory and hygiene,
 `tools.py` owns the pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning,
 `clones.py` measures jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage,
-`python_crap.py` joins coverage with `ast` complexity, `verification.py` measures test counts and source
+`python_crap.py` joins coverage with `ast` complexity, `elisp_tests.py` and
+`elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `verification.py` measures test counts and source
 exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
@@ -235,6 +237,42 @@ matches more than once (`ambiguous test summary`), `skipped_pattern` matches mor
 installed. On `pass` the adapter combines the registered coverage datasets and keeps the combined data
 as the evidence for checks that require it. Pattern matching runs in an interruptible child bounded by
 the check's remaining budget, together with coverage combination.
+
+### Emacs Lisp tests
+
+    [checks.legacy-tests]
+    adapter = "elisp_tests"
+    tier = 1
+    enforcement = "enforced"
+    suite = "tests/config-tests.el"       # required repository-relative file
+    load_path = ["lisp", "emacs/lisp"]    # optional repository-relative directories, in order
+    emacs = "emacs"                       # optional command on PATH or path; the default
+    budget_seconds = 900                  # optional; the default
+
+`elisp_tests` requires Emacs 29.1 or later. The suite must be a regular file, and every `load_path`
+entry must be a directory in the repository. Unknown keys and invalid configuration are errors. The
+adapter instruments the files of every class listing the check with Edebug, preserving each file's
+`load-file-name` context; a class may be empty. The suite itself must not be instrumented. A temporary,
+renamed copy of the gate's child helper does the measuring, so the original helper may be among the
+measured files without replacing the active measuring code.
+
+The suite must load its tests and call `ert-run-tests-batch-and-exit` exactly once, as a suite ending
+in `suite-guard-run` does. The helper intercepts that call and records ERT's statistics without exiting;
+the suite runs once, in that same child Emacs. Expected ERT results count as passed, unexpected results
+as failed, and skipped tests are counted separately. A passing check requires an exit status of zero,
+a valid result, at least one executed test (`selected - skipped`), and no unexpected results.
+
+A failed test names the test and its printed ERT condition. Zero executed tests, a missing or repeated
+batch call, errors instrumenting a file or loading the suite, and an expired budget fail the check;
+a timeout reports `execution = "budget"`. A missing Emacs command or a child that exits, crashes or
+writes an invalid result without completing a valid measurement is `unsupported`. Errors identify the
+input, and invalid-result messages state what was expected and found.
+
+The check reports `emacs_version`, normalized `test_results`, and `definitions` in JSON; the human
+report includes the Emacs version. Each definition entry, including generated lambda symbols, gives its
+repository-relative file, character position, total stop points and reached stop points. This evidence
+is retained for a later check that requires it, including when a passing result is restored from a
+reuse store. A changed Emacs executable or other recorded input invalidates reuse.
 
 ### Python CRAP
 
@@ -498,7 +536,7 @@ finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = t
 do not block the whole-tree judgement. With `--changed-from`, a located threshold violation on changed
 lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. Each check has one
 absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
-baseline loading and ratchet evaluation. Command and Python test checks use their configured budgets;
+baseline loading and ratchet evaluation. Command, Python test and Emacs Lisp test checks use their configured budgets;
 clone, CRAP, verification and owners checks each have 600 seconds. Synchronous analysis runs in supervised workers
 that are stopped at the deadline. An overrun reports `outcome = "fail"` and `execution = "budget"`, names
 the step, deadline and elapsed time, and retains the subprocess diagnostics collected so far.
@@ -725,7 +763,7 @@ and the allowed keys. The complete shape is:
     adapter = "verification"
     tier = 1
     enforcement = "enforced"
-    requires = "tests"                    # optional; earlier python_tests check(s)
+    requires = "tests"                    # optional; an earlier test-producing check
     baseline = "quality-gate-verification.toml"
 
     [protect]                             # optional; used only with --policy-from
@@ -779,8 +817,10 @@ Notes:
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the
   policy, and a `baseline` path. Its `threshold` defaults to 6 and must be finite. Its files come from
   the classes that list it.
+* An `elisp_tests` check needs a repository-relative `suite` file; `load_path`, `emacs` and
+  `budget_seconds` are optional. Its measured files come from the classes that list it.
 * A `verification` check needs a `baseline` path. Its optional `requires` names an earlier
-  `python_tests` check; without it every earlier `python_tests` check is reused. It measures executed
+  test-producing check; without it every earlier test-producing check is used. It measures executed
   tests (a `min` floor), skipped tests, `pragma: no cover` lines, inline `# noqa` comments and file-wide
   lint suppressions for the selected Python files, without running the tests again. File-wide directives
   are counted separately as `exclusions:FILE:file-suppression`: Ruff's `# ruff: noqa`, with or without
@@ -912,7 +952,7 @@ It freezes the source and tests once, requires a passing unmodified suite, then 
 mutation per copy. The declared
 decisions in `tests/mutate_gate.py` cover baseline bounds, threshold and expiry comparisons,
 verification floors, prune refusal and exit status, gate decisions, trust-root identity and protection,
-and single-owner checks. They use comparison flips, boolean negation, an opposite boolean return,
+single-owner checks, and the rule that an ERT run must execute a test. They use comparison flips, boolean negation, an opposite boolean return,
 and removal of a raise. This is a selected set of faults, not an exhaustive measurement of every
 possible change.
 

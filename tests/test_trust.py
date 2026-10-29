@@ -588,6 +588,26 @@ class IdentityDecisionTests(unittest.TestCase):
 
 
 class IdentityTrustTests(TrustCase):
+    def test_gate_elisp_helper_changed_during_check_is_an_identity_error(self) -> None:
+        helper = self.gate / "quality_gate/elisp/qg-elisp-child.el"
+        writer = ("import pathlib; "
+                  f"p = pathlib.Path({str(helper)!r}); "
+                  "p.write_text(p.read_text() + '\\n;; changed\\n'); print(1)")
+        self.write_config(BASE_CONFIG.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(writer)}]',
+        ))
+        revision = self.commit_revision()
+        self.fixture_runner = lambda: self.gate / "qg.py"
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("gate file quality_gate/elisp/qg-elisp-child.el", document["error"])
+        before = document["trust"]["identity_before"]["gate"]["files"]
+        after = document["trust"]["identity_after"]["gate"]["files"]
+        self.assertNotEqual(before["quality_gate/elisp/qg-elisp-child.el"],
+                            after["quality_gate/elisp/qg-elisp-child.el"])
+
     def test_temporary_lock_rewrite_cannot_change_tool_pins(self) -> None:
         self.add_file(
             "tools.lock.toml", (self.gate / "tools.lock.toml").read_bytes()

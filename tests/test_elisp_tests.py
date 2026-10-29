@@ -1,0 +1,500 @@
+"""Real Emacs fixture tests for the ERT and Edebug collector."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+from support import GATE, FixtureCase, baseline_text, output
+from test_reuse import ReuseCase
+
+
+MODULE = """\
+;;; core.el --- fixture -*- lexical-binding: t -*-
+(defun sample-used (number)
+  (funcall (lambda (value) (+ value 1)) number))
+(defun sample-unused (number)
+  (+ number 2))
+(provide 'core)
+"""
+SUITE = """\
+(require 'ert)
+(ert-deftest sample-one () (should (= (sample-used 1) 2)))
+(ert-deftest sample-two () (should (= (sample-used 4) 5)))
+(ert-run-tests-batch-and-exit t)
+"""
+
+
+def config(extra: str = "", *, extra_rules: str = "", instrument_suite: bool = False) -> str:
+    suite_class = "module" if instrument_suite else "suite"
+    return f'''\
+schema = 2
+[code]
+patterns = ["*.el"]
+shebangs = []
+[levels]
+required_tiers = [1]
+[classes.module]
+code = true
+description = "Measured modules"
+checks = ["legacy-tests"]
+[classes.suite]
+code = true
+description = "Suite and supporting files"
+checks = ["smoke"]
+[classes.config]
+code = false
+description = "Configuration"
+[classes.doc]
+code = false
+description = "Documentation"
+[checks.legacy-tests]
+adapter = "elisp_tests"
+tier = 1
+enforcement = "enforced"
+suite = "tests/suite.el"
+{extra}
+[checks.smoke]
+adapter = "command"
+tier = 1
+enforcement = "enforced"
+run = ["python3", "-c", "print(1)"]
+tests_pattern = '(\\d+)'
+[[rule]]
+pattern = "src/*.el"
+class = "module"
+reason = "measured modules"
+[[rule]]
+pattern = "tests/*.el"
+class = "{suite_class}"
+reason = "suite"
+[[rule]]
+pattern = "*.toml"
+class = "config"
+reason = "configuration"
+[[rule]]
+pattern = "*.md"
+class = "doc"
+reason = "documentation"
+[[rule]]
+pattern = ".gitignore"
+class = "config"
+reason = "ignore rules"
+{extra_rules}
+'''
+
+
+class ElispTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.add_file("src/core.el", MODULE)
+        self.add_file("tests/suite.el", SUITE)
+        self.write_config(config())
+
+    def run_check(self):
+        result, document = self.run_json()
+        return result, self.check_by_id(document, "legacy-tests")
+
+    def assert_outcome(self, expected: str, *needles: str):
+        result, check = self.run_check()
+        self.assertEqual(result.returncode, 0 if expected == "pass" else 1, output(result))
+        self.assertEqual(check["outcome"], expected, output(result))
+        for needle in needles:
+            self.assertIn(needle, result.stderr)
+        return result, check
+
+    def test_pass_definitions_and_version(self) -> None:
+        result, check = self.assert_outcome("pass")
+        self.assertEqual(check["test_results"], {
+            "selected": 2, "passed": 2, "failed": 0, "skipped": 0, "failures": [],
+        })
+        definitions = check["definitions"]
+        functions = {item["symbol"]: item for item in definitions}
+        used, unused = functions["sample-used"], functions["sample-unused"]
+        self.assertGreater(used["stop_points"], 0)
+        self.assertEqual(used["reached"], used["stop_points"])
+        self.assertGreater(unused["stop_points"], 0)
+        self.assertEqual(unused["reached"], 0)
+        lambdas = [item for item in definitions if item["symbol"] not in {"sample-used", "sample-unused"}]
+        self.assertEqual(len(lambdas), 1, definitions)
+        self.assertGreater(lambdas[0]["position"], used["position"])
+        self.assertLess(lambdas[0]["position"], unused["position"])
+        self.assertTrue(all(item["file"] == "src/core.el" for item in definitions))
+        version = subprocess.run(["emacs", "-Q", "--batch", "--eval", "(princ emacs-version)"],
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertEqual(check["emacs_version"], version)
+        self.assertIn(f"Emacs {version}", result.stderr)
+
+    def test_redefined_symbols_keep_each_definition_and_position(self) -> None:
+        self.add_file("src/core.el", "(defun redefined () (+ 0 1))\n(defun redefined () (+ 1 1))\n")
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest redefinition () (should (= (redefined) 2)))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("pass")
+        definitions = sorted(check["definitions"], key=lambda item: item["position"])
+        self.assertEqual([item["symbol"] for item in definitions], ["redefined", "redefined"])
+        self.assertLess(definitions[0]["position"], definitions[1]["position"])
+        self.assertEqual(definitions[0]["reached"], 0)
+        self.assertGreater(definitions[1]["reached"], 0)
+
+    def test_failure_names_test_and_ert_condition(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n(ert-deftest broken () (should (= 1 2)))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("fail", "broken", "ert-test-failed", "(= 1 2)")
+        self.assertEqual(check["test_results"]["failed"], 1)
+        failure = check["test_results"]["failures"][0]
+        self.assertIn("broken", failure)
+        self.assertIn(failure.removeprefix("broken: "), check["diagnostics"]["output_tail"])
+
+    def test_no_tests_and_all_skipped_fail(self) -> None:
+        suites = [
+            ("(ert-run-tests-batch-and-exit \"no-such-test\")", "0 selected, 0 skipped"),
+            ("(ert-deftest skip-one () (ert-skip \"fixture\"))\n"
+             "(ert-run-tests-batch-and-exit t)", "1 selected, 1 skipped"),
+        ]
+        for suite, message in suites:
+            with self.subTest(message=message):
+                self.add_file("tests/suite.el", "(require 'ert)\n" + suite + "\n")
+                self.assert_outcome("fail", "no test executed", message)
+
+    def test_expected_failures_and_unexpected_passes_follow_ert(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest expected () :expected-result :failed (should nil))\n"
+                      "(ert-deftest passing () (should t))\n"
+                      "(ert-deftest skipped () (ert-skip \"fixture\"))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("pass")
+        self.assertEqual(check["test_results"], {
+            "selected": 3, "passed": 2, "failed": 0, "skipped": 1, "failures": [],
+        })
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest surprising () :expected-result :failed (should t))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("fail", "surprising", "passed")
+        self.assertEqual(check["test_results"]["failed"], 1)
+
+    def test_suite_contract_is_exactly_one_batch_call(self) -> None:
+        for suite, message in (("(message \"no tests\")", "called 0 times"),
+                               (SUITE + "(ert-run-tests-batch-and-exit t)", "more than once")):
+            with self.subTest(message=message):
+                self.add_file("tests/suite.el", suite)
+                self.assert_outcome("fail", "suite", message)
+
+    def test_module_and_suite_load_errors_name_the_file(self) -> None:
+        self.add_file("src/core.el", '(error "bad module")\n')
+        self.assert_outcome("fail", "src/core.el", "bad module")
+        self.add_file("src/core.el", MODULE)
+        self.add_file("tests/suite.el", '(error "bad suite")\n')
+        self.assert_outcome("fail", "tests/suite.el", "bad suite")
+
+    def test_missing_emacs_is_unsupported(self) -> None:
+        self.write_config(config('emacs = "no-qg-such-emacs-command"'))
+        self.assert_outcome("unsupported", "no-qg-such-emacs-command", "expected")
+
+    def test_kill_emacs_and_malformed_result_are_unsupported(self) -> None:
+        for suite in ("(require 'ert)\n(ert-deftest die () (kill-emacs 0))\n"
+                      "(ert-run-tests-batch-and-exit t)\n",
+                      SUITE + '(defun json-encode (_object) "broken json")\n'):
+            with self.subTest(suite=suite):
+                self.add_file("tests/suite.el", suite)
+                self.assert_outcome("unsupported", "expected", "got")
+
+    def test_invalid_json_measurements_are_unsupported(self) -> None:
+        valid = {"emacs_version": "30.1", "selected": 1, "passed": 1, "failed": 0,
+                 "skipped": 0, "failures": [], "definitions": []}
+        documents = [
+            [],
+            {"missing": "keys"},
+            {"error": ""},
+            {"error": 1},
+            {**valid, "emacs_version": ""},
+            {**valid, "selected": True},
+            {**valid, "passed": 0},
+            {**valid, "failures": [{"name": "extra", "condition": "failure"}]},
+            {**valid, "failures": "bad"},
+            {**valid, "definitions": ["bad"]},
+            {**valid, "definitions": [{"symbol": "", "file": "src/core.el", "position": 1,
+                                        "stop_points": 1, "reached": 0}]},
+            {**valid, "definitions": [{"symbol": "x", "file": "../outside.el", "position": 1,
+                                        "stop_points": 1, "reached": 0}]},
+            {**valid, "definitions": [{"symbol": "x", "file": "src/core.el", "position": 0,
+                                        "stop_points": 1, "reached": 0}]},
+            {**valid, "definitions": [{"symbol": "x", "file": "src/core.el", "position": 1,
+                                        "stop_points": 1, "reached": 2}]},
+            {**valid, "definitions": [{"symbol": "x", "file": "tests/suite.el", "position": 1,
+                                        "stop_points": 1, "reached": 1}]},
+        ]
+        for document in documents:
+            with self.subTest(document=document):
+                encoded = json.dumps(json.dumps(document))
+                self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {encoded})\n")
+                self.assert_outcome("unsupported", "expected", "got")
+
+    def test_budget_kills_emacs_and_its_process_group(self) -> None:
+        marker = self.base / "emacs-pid"
+        child_marker = self.base / "child-pid"
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      f'(with-temp-file {json.dumps(str(marker))} (insert (number-to-string (emacs-pid))))\n'
+                      f'(let ((p (start-process "qg-child" nil "sleep" "20"))) '
+                      f'(with-temp-file {json.dumps(str(child_marker))} '
+                      '(insert (number-to-string (process-id p)))))\n'
+                      "(ert-deftest slow () (sleep-for 20))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        self.write_config(config("budget_seconds = 1"))
+        _result, check = self.assert_outcome("fail", "budget")
+        self.assertEqual(check["execution"], "budget")
+        pid = int(marker.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        child_pid = int(child_marker.read_text(encoding="utf-8"))
+        status = Path(f"/proc/{child_pid}/stat")
+        if status.exists():
+            self.assertEqual(status.read_text(encoding="utf-8").split()[2], "Z")
+
+    def test_instrumented_suite_is_configuration_error(self) -> None:
+        for hard_link in (False, True):
+            with self.subTest(hard_link=hard_link):
+                self.write_config(config(instrument_suite=not hard_link))
+                if hard_link:
+                    suite = self.repo / "tests/suite.el"
+                    suite.unlink()
+                    os.link(self.repo / "src/core.el", suite)
+                result, document = self.run_json()
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn("legacy-tests", result.stderr)
+                self.assertIn("tests/suite.el", result.stderr)
+
+    def test_empty_class_still_runs_the_suite(self) -> None:
+        (self.repo / "src/core.el").unlink()
+        text = config().replace('[[rule]]\npattern = "src/*.el"\nclass = "module"\n'
+                                'reason = "measured modules"\n', "")
+        self.write_config(text)
+        self.add_file("tests/suite.el", "(require 'ert)\n(ert-deftest only () (should t))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("pass")
+        self.assertEqual(check["test_results"]["selected"], 1)
+        self.assertEqual(check["definitions"], [])
+
+    def test_load_path_and_load_file_context(self) -> None:
+        self.add_file("lib/dependency.el", "(defun dependency-function () t)\n(provide 'dependency)\n")
+        self.add_file("src/core.el", '(require \'dependency)\n'
+                      '(unless (equal (file-name-nondirectory load-file-name) "core.el") '
+                      '(error "bad load context"))\n' + MODULE)
+        rules = '[[rule]]\npattern = "lib/*.el"\nclass = "suite"\nreason = "dependency"\n'
+        self.write_config(config(extra_rules=rules))
+        self.assert_outcome("fail", "src/core.el", "dependency")
+        self.write_config(config('load_path = ["lib"]', extra_rules=rules))
+        _result, check = self.assert_outcome("pass")
+        self.assertNotIn("dependency-function", [item["symbol"] for item in check["definitions"]])
+
+    def test_load_path_order_and_quoted_file_names(self) -> None:
+        (self.repo / "src/core.el").unlink()
+        self.add_file('src/module "one".el', "(require 'choice)\n(defun chosen () (choice))\n")
+        self.add_file("lib first/choice.el", "(defun choice () 'first)\n(provide 'choice)\n")
+        self.add_file("lib second/choice.el", "(defun choice () 'second)\n(provide 'choice)\n")
+        self.add_file('tests/suite "one".el', "(require 'ert)\n"
+                      "(ert-deftest choice-test () (should (eq (chosen) 'first)))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        rules = '[[rule]]\npattern = "lib*/*.el"\nclass = "suite"\nreason = "libraries"\n'
+        text = config('load_path = ["lib first", "lib second"]', extra_rules=rules)
+        text = text.replace('suite = "tests/suite.el"', 'suite = ' + json.dumps('tests/suite "one".el'))
+        self.write_config(text)
+        _result, check = self.assert_outcome("pass")
+        self.assertEqual(check["definitions"][0]["file"], 'src/module "one".el')
+
+    def test_verification_consumes_ert_counts(self) -> None:
+        self.add_file("aux/check.py", "VALUE = 1\n")
+        extra_rules = '[[rule]]\npattern = "aux/*.py"\nclass = "python"\nreason = "source"\n'
+        text = config(extra_rules=extra_rules).replace(
+            '[classes.config]', '[classes.python]\ncode = true\ndescription = "Python source"\n'
+            'checks = ["smoke", "verification"]\n[classes.config]',
+        ) + ('\n[checks.verification]\nadapter = "verification"\ntier = 1\n'
+             'enforcement = "enforced"\nrequires = "legacy-tests"\nbaseline = "verification.toml"\n')
+        self.write_config(text)
+        self.add_file("verification.toml", baseline_text(
+            [{"subject": "tests:legacy-tests:executed", "bound": 2, "reason": "floor"}],
+            check="verification", metric_version="verification/1",
+        ))
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(document, "verification")
+        self.assertEqual(check["outcome"], "pass")
+        finding = next(item for item in check["findings"] if item["subject"] == "tests:legacy-tests:executed")
+        self.assertEqual(finding["value"], 2)
+
+    def test_invalid_suite_files_are_configuration_errors(self) -> None:
+        os.mkfifo(self.repo / "tests/fifo.el")
+        (self.repo / "outside.el").symlink_to(self.base / "outside-target.el")
+        (self.base / "outside-target.el").write_text(SUITE, encoding="utf-8")
+        (self.repo / "loop").symlink_to("loop")
+        for path in ("tests/fifo.el", "outside.el", "loop"):
+            with self.subTest(path=path):
+                self.write_config(config().replace('suite = "tests/suite.el"', f'suite = "{path}"'))
+                result, document = self.run_json()
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn("checks.legacy-tests.suite", result.stderr)
+                self.assertIn("expected", result.stderr)
+                self.assertIn("got", result.stderr)
+
+    def test_measuring_an_identical_helper_keeps_the_stage_separate(self) -> None:
+        helper = (GATE / "quality_gate/elisp/qg-elisp-child.el").read_text(encoding="utf-8")
+        self.add_file("src/core.el", helper)
+        # The before hook needs the same dynamically bound vector as an Edebug entry.
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest helper-test () (let ((qg-elisp-child--counts [0])) "
+                      "(should (= (qg-elisp-child--before 0) 0))))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("pass")
+        definitions = {item["symbol"]: item for item in check["definitions"]}
+        self.assertIn("qg-elisp-child--before", definitions)
+        self.assertGreater(definitions["qg-elisp-child--before"]["reached"], 0)
+
+    def test_bad_configuration_names_check_key_and_expected_actual(self) -> None:
+        cases = [
+            (config("bogus = 1"), "bogus"),
+            (config().replace('suite = "tests/suite.el"', ''), "suite"),
+            (config().replace('suite = "tests/suite.el"', 'suite = 42'), "suite"),
+            (config().replace('suite = "tests/suite.el"', 'suite = "missing.el"'), "suite"),
+            (config().replace('suite = "tests/suite.el"', 'suite = "src"'), "suite"),
+            (config().replace('suite = "tests/suite.el"', 'suite = "../outside.el"'), "suite"),
+            (config('load_path = "lib"'), "load_path"),
+            (config('load_path = [42]'), "load_path[0]"),
+            (config('load_path = ["missing"]'), "load_path[0]"),
+            (config('load_path = ["src/core.el"]'), "load_path[0]"),
+            (config('load_path = ["../outside"]'), "load_path[0]"),
+            (config('emacs = 1'), "emacs"),
+            (config('emacs = ""'), "emacs"),
+            (config('budget_seconds = "1"'), "budget_seconds"),
+            (config('budget_seconds = 0'), "budget_seconds"),
+        ]
+        for text, key in cases:
+            with self.subTest(key=key, text=text):
+                self.write_config(text)
+                result, document = self.run_json()
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn("checks.legacy-tests", result.stderr)
+                self.assertIn(key, result.stderr)
+                self.assertIn("expected", result.stderr)
+                self.assertIn("got", result.stderr)
+
+
+class ElispReuseTests(ReuseCase):
+    def assert_no_execution_record_rejected(self, stored, evidence) -> None:
+        bad = dict(stored)
+        bad["elisp_result"] = {**evidence, "selected": 1, "passed": 0, "skipped": 1}
+        malformed = self.base / "bad-elisp-record.jsonl"
+        malformed.write_text(json.dumps(bad) + "\n", encoding="utf-8")
+        rejected = self.merge(malformed)
+        self.assertEqual(rejected.returncode, 2, output(rejected))
+        self.assertIn("no test executed", rejected.stderr)
+
+    def test_elisp_measurement_is_recorded_and_reused(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.add_file("src/core.el", MODULE)
+        self.add_file("tests/suite.el", SUITE)
+        self.write_config(config())
+        env = self.install_strace()
+        first, first_document, records = self.run_reuse("elisp-direct-first", env=env)
+        self.assertEqual(first.returncode, 0, output(first))
+        measurement = self.check_by_id(first_document, "legacy-tests")
+        stored = next(record for record in records if record["check"] == "legacy-tests")
+        self.assertEqual(stored["elisp_result"]["definitions"], measurement["definitions"])
+        self.assert_no_execution_record_rejected(stored, stored["elisp_result"])
+        second, second_document, _records = self.run_reuse("elisp-direct-second", env=env)
+        self.assertEqual(second.returncode, 0, output(second))
+        restored = self.check_by_id(second_document, "legacy-tests")
+        self.assertIn("reused_from", restored)
+        self.assertEqual(restored["definitions"], measurement["definitions"])
+        self.assertEqual(restored["test_results"], measurement["test_results"])
+        (self.base / "store").chmod(0o755)
+        for path in self.store_records():
+            if json.loads(path.read_text(encoding="utf-8"))["check"] == "legacy-tests":
+                path.parent.chmod(0o755)
+                path.unlink()
+                path.parent.rmdir()
+        incomplete = dict(stored)
+        del incomplete["elisp_result"]
+        record_file = self.base / "incomplete.jsonl"
+        record_file.write_text(json.dumps(incomplete) + "\n", encoding="utf-8")
+        merged = self.merge(record_file)
+        self.assertEqual(merged.returncode, 0, output(merged))
+        third, third_document, _records = self.run_reuse("elisp-incomplete", env=env)
+        self.assertEqual(third.returncode, 0, output(third))
+        self.assertNotIn("reused_from", self.check_by_id(third_document, "legacy-tests"))
+
+    def test_reused_evidence_reaches_a_dependent_check(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.add_file("src/core.el", MODULE)
+        self.add_file("tests/suite.el", SUITE)
+        self.write_config(config() + '''
+[checks.consumer]
+adapter = "evidence_consumer"
+tier = 1
+enforcement = "enforced"
+requires = "legacy-tests"
+''')
+        env = self.install_strace()
+        gate = self.fixture_gate()
+        adapters = gate / "quality_gate/adapters.py"
+        with adapters.open("a", encoding="utf-8") as stream:
+            stream.write('''
+def _fixture_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "fixture/1", (), requires=raw["requires"])
+
+def _fixture_run(root, config, check, files, classes, *, prefix, prior):
+    import json, time
+    from .checks import _check_result
+    evidence = prior[check.spec.requires].evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    return _check_result(check, time.monotonic(), "pass", measurement={"evidence": document})
+
+register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_parse, _fixture_run,
+                                   requires_adapter="elisp_tests"))
+''')
+        # Run the copied gate so the dependent fixture adapter consumes its actual evidence path.
+        self.fixture_runner = lambda: gate / "qg.py"
+        first, first_document, records = self.run_reuse("elisp-first", env=env)
+        self.assertEqual(first.returncode, 0, output(first))
+        evidence = self.check_by_id(first_document, "consumer")["measurement"]["evidence"]
+        self.assertEqual(evidence["selected"], 2)
+        self.assertTrue(evidence["definitions"])
+        elisp_records = [record for record in records if record["check"] == "legacy-tests"]
+        self.assertEqual(len(elisp_records), 1, [item["check"] for item in records])
+        self.assertEqual(elisp_records[0]["elisp_result"], evidence)
+        self.assert_no_execution_record_rejected(elisp_records[0], evidence)
+        (self.base / "store").chmod(0o755)
+        for path in self.store_records():
+            if json.loads(path.read_text(encoding="utf-8"))["check"] != "legacy-tests":
+                path.parent.chmod(0o755)
+                path.unlink()
+                path.parent.rmdir()
+        second, second_document, _records = self.run_reuse("elisp-second", env=env)
+        self.assertEqual(second.returncode, 0, output(second))
+        check = self.check_by_id(second_document, "legacy-tests")
+        self.assertIn("reused_from", check)
+        self.assertIn(f"Emacs {evidence['emacs_version']}", second.stderr)
+        self.assertEqual(check["emacs_version"], evidence["emacs_version"])
+        self.assertEqual(check["definitions"], evidence["definitions"])
+        self.assertEqual(check["test_results"]["selected"], 2)
+        self.assertEqual(self.check_by_id(second_document, "consumer")["measurement"]["evidence"], evidence)
+        self.add_file("src/core.el", MODULE + "(defun added () (+ 1 2))\n")
+        third, third_document, _records = self.run_reuse("elisp-third", env=env)
+        self.assertEqual(third.returncode, 0, output(third))
+        self.assertNotIn("reused_from", self.check_by_id(third_document, "legacy-tests"))
+        dependent = self.check_by_id(third_document, "consumer")
+        self.assertNotIn("reused_from", dependent)
+        self.assertNotEqual(dependent["measurement"]["evidence"], evidence)
+        self.write_config(config())
+        suite = self.repo / "tests/suite.el"
+        suite.unlink()
+        os.link(self.repo / "src/core.el", suite)
+        fourth, document, _records = self.run_reuse("elisp-collision", env=env)
+        self.assertEqual(fourth.returncode, 2, output(fourth))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("tests/suite.el", fourth.stderr)

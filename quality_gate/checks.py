@@ -121,6 +121,8 @@ class CheckResult:
     change_scoped_failure: bool = False
     incomplete_locations: bool = False
     reused_from: str | None = None
+    emacs_version: str | None = None
+    definitions: list[dict[str, Any]] | None = None
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:
@@ -153,11 +155,28 @@ class CheckResult:
             "reason": self.reason,
             "location_coverage": self._location_coverage(),
         }
+        document.update(self._json_test_fields())
         if self.reused_from is not None:
             document["reused_from"] = self.reused_from
         if self.measurement is not None:
             document["measurement"] = self.measurement
         return document
+
+    def _json_test_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if self.test_results is not None:
+            fields["test_results"] = {
+                "selected": self.test_results.selected,
+                "passed": self.test_results.passed,
+                "failed": self.test_results.failed,
+                "skipped": self.test_results.skipped,
+                "failures": list(self.test_results.failures),
+            }
+        if self.emacs_version is not None:
+            fields["emacs_version"] = self.emacs_version
+        if self.definitions is not None:
+            fields["definitions"] = self.definitions
+        return fields
 
     def _location_coverage(self) -> str:
         coverage = location_coverage(self.adapter)
@@ -1297,6 +1316,12 @@ def _run_python_tests(context: AdapterContext) -> CheckResult:
     )
 
 
+def _run_elisp_tests(context: AdapterContext) -> CheckResult:
+    from .elisp_tests import run_tests
+
+    return run_tests(context)
+
+
 def _file_present(path: Path | None) -> bool:
     return path is not None and path.is_file()
 
@@ -1747,9 +1772,17 @@ def _reused_result(
         tests_skipped=record.get("tests_skipped"),
     )
     reuse.restore_coverage(record, result)
+    if result.tests_ran is not None and result.tests_skipped is not None:
+        result.test_results = TestResults(result.tests_ran, result.tests_ran - result.tests_skipped, 0)
+    if "elisp_result" in record:
+        from .elisp_tests import apply_document
+
+        apply_document(result, record["elisp_result"])
+        reuse.restore_elisp(record, result)
     result.duration_seconds = 0.0
     result.reused_from = str(reused.tree)
-    print(f"{prefix}: reused record at {reused.tree}", flush=True)
+    version = f" (Emacs {result.emacs_version})" if result.emacs_version is not None else ""
+    print(f"{prefix}: reused record at {reused.tree}{version}", flush=True)
     return result
 
 
@@ -1799,7 +1832,9 @@ def _reuse_context(
     classes: dict[str, str], prior: dict[str, CheckResult],
 ) -> dict[str, Any]:
     selected, names = _reuse_selection(config, check, files, classes)
-    dependencies = prior if check.adapter in ("verification", "python_crap") else {}
+    descriptor = _check_descriptor(check)
+    depends_on_tests = descriptor.requires_tests or getattr(check.spec, "requires", None) is not None
+    dependencies = prior if depends_on_tests else {}
     _lock, tools = current_tools()
     return {
         "root": str(root),
@@ -1821,12 +1856,19 @@ def _reuse_identity(check: CheckDef, context: Any, root: Path, coverage_dir: Pat
         return None
 
 
+def _usable_reuse(check: CheckDef, reused: Any) -> Any:
+    if reused is not None and check.adapter == "elisp_tests":
+        if "elisp_result" not in reused.record:
+            return None
+    return reused
+
+
 def _reuse_lookup(session: Any, check: CheckDef, identity: Any, coverage_dir: Path | None) -> Any:
     if identity is None or check.id == session.prune_id:
         return None
     if coverage_dir is not None and os.path.lexists(coverage_dir):
         return None
-    return session.lookup(identity)
+    return _usable_reuse(check, session.lookup(identity))
 
 
 def _run_recorded_check(
@@ -1846,12 +1888,28 @@ def _recordable(identity: Any, result: CheckResult, recorder: Any) -> bool:
             and result.execution == "completed" and recorder.reliable)
 
 
+def _elisp_reuse_collision(
+    root: Path, config: Config, check: CheckDef, files: list[str],
+    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
+) -> CheckResult | None:
+    from .elisp_tests import _suite_collision
+
+    selected, _names = _select_files(config, check, files, classes)
+    context = AdapterContext(root, config, check, files, classes, prefix, prior)
+    return _suite_collision(context, selected, start)
+
+
 def _reuse_stages(
     session: Any, root: Path, config: Config, check: CheckDef, files: list[str],
     classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
     budget: float,
 ) -> CheckResult:
     deadline = start + budget
+    if check.adapter == "elisp_tests":
+        collision = analysis_step("Elisp suite selection", _elisp_reuse_collision, root, config, check,
+                                  files, classes, prefix, prior, start, deadline=deadline)
+        if collision is not None:
+            return collision
     context = analysis_step("reuse context", _reuse_context, root, config, check, files, classes, prior,
                             deadline=deadline)
     coverage_dir = session.coverage_path(check) if check.adapter == "python_tests" else None

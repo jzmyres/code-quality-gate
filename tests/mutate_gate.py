@@ -33,6 +33,14 @@ class Decision:
 # mutation in the function. Exact AST source matches make drift an error.
 DECISIONS = (
     Decision(
+        "elisp_no_executed_tests",
+        "quality_gate/elisp_tests.py",
+        "_verdict",
+        "comparison",
+        'document["selected"] == document["skipped"]',
+        "An ERT run with no executed test fails.",
+    ),
+    Decision(
         "baseline_max_bound",
         "quality_gate/ratchet.py",
         "_within",

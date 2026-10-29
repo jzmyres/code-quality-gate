@@ -44,6 +44,7 @@ _RECORD_KEYS = {
     "tests_skipped",
     "coverage_data",
     "coverage_config",
+    "elisp_result",
 }
 
 
@@ -380,6 +381,18 @@ def _load_record(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _record_evidence(document: dict[str, Any], result: Any) -> None:
+    evidence = getattr(result, "evidence_path", None)
+    if evidence is None:
+        return
+    configuration = getattr(result, "coverage_config", None)
+    if configuration is not None:
+        document["coverage_data"] = base64.b64encode(evidence.read_bytes()).decode("ascii")
+        document["coverage_config"] = base64.b64encode(configuration.read_bytes()).decode("ascii")
+    elif getattr(result, "adapter", None) == "elisp_tests":
+        document["elisp_result"] = _json_loads(evidence.read_text(encoding="utf-8"))
+
+
 def _record_document(
     identity: dict[str, Any], recorder: tracing.Recorder, result: Any
 ) -> dict[str, Any]:
@@ -387,11 +400,7 @@ def _record_document(
     document["inputs"] = recorder.snapshot()
     document["symlinks"] = dict(sorted(recorder.symlinks.items()))
     document["non_symlinks"] = sorted(recorder.non_symlinks)
-    evidence = getattr(result, "evidence_path", None)
-    configuration = getattr(result, "coverage_config", None)
-    if evidence is not None and configuration is not None:
-        document["coverage_data"] = base64.b64encode(evidence.read_bytes()).decode("ascii")
-        document["coverage_config"] = base64.b64encode(configuration.read_bytes()).decode("ascii")
+    _record_evidence(document, result)
     if getattr(result, "measurement", None) is not None:
         document["measurement"] = result.measurement
     for name in ("tests_ran", "tests_skipped"):
@@ -631,9 +640,34 @@ def restore_coverage(record: dict[str, Any], result: Any) -> None:
         session.temporary_paths.add(str(root))
 
 
+def restore_elisp(record: dict[str, Any], result: Any) -> None:
+    temporary = tempfile.TemporaryDirectory(prefix="qg-elisp-")
+    root = Path(temporary.name)
+    result.evidence_path = root / "result.json"
+    result.evidence_path.write_bytes(_canonical(record["elisp_result"]))
+    result.temporary = temporary
+    session = current()
+    if session is not None:
+        session.temporary_paths.add(str(root))
+
+
+def _elisp_record_fields(value: dict[str, Any], record: dict[str, Any], source: Path, number: int) -> None:
+    if "elisp_result" not in value:
+        return
+    from .elisp_tests import validate_reused_document
+
+    try:
+        record["elisp_result"] = validate_reused_document(value["elisp_result"])
+    except ValueError as error:
+        raise UsageError(
+            f"{source}:{number}: elisp_result: expected valid evidence, got {error}"
+        ) from error
+
+
 def _optional_fields(
     value: dict[str, Any], record: dict[str, Any], source: Path, number: int
 ) -> None:
+    _elisp_record_fields(value, record, source, number)
     if "measurement" in value:
         record["measurement"] = _validate_measurement(
             value["measurement"], source, number

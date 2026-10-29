@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
+    from .elisp_tests import ElispTestsSpec
     from .owners import OwnersSpec
     from .ratchet import BaselineEntry
 
@@ -110,6 +111,7 @@ AdapterSpec = Union[
     CommandSpec,
     CloneSpec,
     PythonTestsSpec,
+    "ElispTestsSpec",
     PythonCrapSpec,
     VerificationSpec,
     "OwnersSpec",
@@ -174,7 +176,7 @@ def _check_keys(
         where = f"{full_key}.{key}" if full_key else key
         names = ", ".join(sorted(allowed))
         raise ConfigError(
-            f"{path}: {where}: unknown key; allowed keys: {names}"
+            f"{path}: {where}: unknown key; expected an allowed key; allowed keys: {names}; got {key!r}"
         )
 
 

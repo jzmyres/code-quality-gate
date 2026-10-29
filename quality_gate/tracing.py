@@ -667,6 +667,16 @@ def _handle_close(
     fds.pop((pid, _first_int(args) or -1), None)
 
 
+def _open_missing(recorder: Recorder, path: str, args: str, error: str) -> None:
+    if error == "ENOTDIR" and "O_DIRECTORY" in args and os.path.lexists(path):
+        if os.path.isdir(path):
+            recorder.reliable = False
+        else:
+            recorder.add_path(path)
+    else:
+        recorder.add_absent(path)
+
+
 def _handle_open(
     recorder: Recorder,
     cwd: Path,
@@ -684,7 +694,7 @@ def _handle_open(
         _unresolved_input(recorder, args, error)
         return
     if error in ("ENOENT", "ENOTDIR"):
-        recorder.add_absent(path)
+        _open_missing(recorder, path, args, error)
         return
     if value is None:
         return
@@ -877,12 +887,23 @@ def _handle_exec(
         _record_interpreters(recorder, path)
 
 
+def _handle_statfs(
+    recorder: Recorder, cwd: Path, fds: Any, pid: int,
+    args: str, value: int | None, error: str | None,
+) -> None:
+    if error in ("ENOENT", "ENOTDIR"):
+        _record_direct(recorder, cwd, args, error)
+    else:
+        recorder.reliable = False
+
+
 _SYSCALL_HANDLERS = {
     "close": _handle_close,
     "open": partial(_handle_open, prefix="AT_FDCWD, "),
     "openat": partial(_handle_open, prefix=""),
     "openat2": partial(_handle_open, prefix=""),
     "stat": _handle_stat,
+    "statfs": _handle_statfs,
     "lstat": _handle_lstat,
     "newfstatat": _handle_fstatat,
     "statx": _handle_fstatat,

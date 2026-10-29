@@ -741,7 +741,7 @@ def _effective_lock(
 
 def _gate_files(root: Path) -> list[Path]:
     package = root / "quality_gate"
-    return [root / "qg.py", *sorted(package.rglob("*.py"))]
+    return [root / "qg.py", *sorted(package.rglob("*.py")), *sorted(package.rglob("*.el"))]
 
 
 def _gate_identity(root: Path) -> dict[str, Any]:

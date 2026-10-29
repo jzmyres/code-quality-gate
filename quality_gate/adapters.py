@@ -136,6 +136,14 @@ def _python_tests_spec(
     return ParsedSpec(spec, "test-count/1", ("tests",))
 
 
+def _elisp_tests_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .elisp_tests import parse_spec
+
+    return ParsedSpec(parse_spec(raw, root, path, full_key), "test-count/1", ("tests",))
+
+
 def _python_crap_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
@@ -264,6 +272,14 @@ register_adapter(AdapterDescriptor(
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     _python_tests_spec,
     _runner("_run_python_tests"),
+    produces_tests=True,
+    budget=_spec_budget,
+))
+register_adapter(AdapterDescriptor(
+    "elisp_tests",
+    ("suite", "load_path", "emacs", "budget_seconds"),
+    _elisp_tests_spec,
+    _runner("_run_elisp_tests"),
     produces_tests=True,
     budget=_spec_budget,
 ))

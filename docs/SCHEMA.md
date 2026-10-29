@@ -60,6 +60,15 @@ tests_pattern = "^Ran (\\d+) tests? in"   # required; one capture group
 skipped_pattern = "skipped=(\\d+)"        # optional; one capture group
 budget_seconds = 900          # optional
 
+[checks.legacy-tests]
+adapter = "elisp_tests"
+tier = 1
+enforcement = "enforced"
+suite = "tests/config-tests.el"     # required repository-relative regular file
+load_path = ["lisp", "emacs/lisp"]  # optional repository-relative directories
+emacs = "emacs"                     # optional command or path
+budget_seconds = 900                # optional
+
 [checks.crap]
 adapter = "python_crap"
 tier = 1
@@ -72,7 +81,7 @@ baseline = "quality-gate-crap.toml"
 adapter = "verification"
 tier = 1
 enforcement = "enforced"
-requires = "tests"            # optional; defaults to every earlier python_tests check
+requires = "tests"            # optional; defaults to every earlier test-producing check
 baseline = "quality-gate-verification.toml"
 
 [protect]                     # optional; used only with --policy-from
@@ -619,6 +628,13 @@ Check keys:
 * `reason` - a structured explanation of a non-passing adapter verdict
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
+* `test_results` - normalized test counts when available: `selected`, `passed`, `failed`,
+  `skipped`, and `failures` (strings naming unexpected results). Passed counts expected results;
+  selected equals passed plus failed plus skipped.
+* `emacs_version` - the Emacs version string for a completed Elisp measurement.
+* `definitions` - the Elisp measurement's array of objects with `symbol`, repository-relative `file`,
+  one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
+  These counts are also retained as evidence for later checks, including through result reuse.
 * `reused_from` - present when a passing check was reused, naming its record tree.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,

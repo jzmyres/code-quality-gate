@@ -425,6 +425,47 @@ class ReuseTests(ReuseCase):
         self.assertEqual(third.returncode, 0, output(third))
         self.assertNotIn("reused record", third.stderr)
 
+    def test_directory_open_of_a_regular_file_remains_reusable(self) -> None:
+        source = (
+            "import os\n"
+            "try: os.open('a.py', os.O_RDONLY | os.O_DIRECTORY)\n"
+            "except NotADirectoryError: pass\n"
+            "open('a.py').read(); print(1)\n"
+        )
+        env = self.install_strace()
+        self.first_pass(env, [sys.executable, "-I", "-c", source])
+        second, document, _records = self.run_reuse("directory-open", env=env)
+        self.assertEqual(second.returncode, 0, output(second))
+        self.assertIn("reused_from", self.check_by_id(document, "smoke"))
+        self.add_file("a.py", "print('changed')\n")
+        third, document, _records = self.run_reuse("directory-open-changed", env=env)
+        self.assertEqual(third.returncode, 0, output(third))
+        self.assertNotIn("reused_from", self.check_by_id(document, "smoke"))
+
+    def test_missing_statfs_path_is_recorded_and_appearance_invalidates_reuse(self) -> None:
+        target = self.repo / "new-mount"
+        source = ("import ctypes; libc = ctypes.CDLL(None); buf = ctypes.create_string_buffer(1024); "
+                  f"libc.statfs({os.fsencode(target)!r}, buf); print(1)")
+        env = self.install_strace()
+        self.first_pass(env, [sys.executable, "-I", "-c", source])
+        second, document, _records = self.run_reuse("statfs-missing", env=env)
+        self.assertEqual(second.returncode, 0, output(second))
+        self.assertIn("reused_from", self.check_by_id(document, "smoke"))
+        target.mkdir()
+        third, document, _records = self.run_reuse("statfs-created", env=env)
+        self.assertEqual(third.returncode, 0, output(third))
+        self.assertNotIn("reused_from", self.check_by_id(document, "smoke"))
+
+    def test_successful_statfs_prevents_reuse(self) -> None:
+        source = ("import ctypes; libc = ctypes.CDLL(None); buf = ctypes.create_string_buffer(1024); "
+                  "assert libc.statfs(b'.', buf) == 0; print(1)")
+        env = self.install_strace()
+        self.write_config(with_run([sys.executable, "-I", "-c", source]))
+        result, document, records = self.run_reuse("statfs-success", env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.check_outcome(document), "pass")
+        self.assertEqual(records, [])
+
     def test_an_absent_file_that_appears_reruns_the_check(self) -> None:
         self.rerun_after(
             [
@@ -903,7 +944,7 @@ class ReuseAdapterTests(ReuseCase):
         env = self.install_strace()
         source = coverage_installation()
         shutil.copytree(source, Path(env["QG_TOOLS_DIR"]) / source.name)
-        first, _document, records = self.run_reuse("python-first", env=env)
+        first, first_document, records = self.run_reuse("python-first", env=env)
         self.assertEqual(first.returncode, 0, output(first))
         test_record = next(record for record in records if record["check"] == "tests")
         prefix = json.loads(test_record["environment"]["QG_PYTHON"])
@@ -912,6 +953,8 @@ class ReuseAdapterTests(ReuseCase):
         second, document, _records = self.run_reuse("python-second", env=env)
         self.assertEqual(second.returncode, 0, output(second))
         self.assertIn("check: tests: reused record", second.stderr)
+        self.assertEqual(self.check_by_id(document, "tests")["test_results"],
+                         self.check_by_id(first_document, "tests")["test_results"])
         self.assertEqual(self.check_by_id(document, "crap")["outcome"], "pass")
         self.write_config(crap_config(threshold=7))
         third, document, _records = self.run_reuse("python-third", env=env)
