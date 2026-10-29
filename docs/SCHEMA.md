@@ -152,8 +152,9 @@ Rules:
   `emacs` is a command or path and `budget_seconds` is a positive integer.
   The defaults are no load paths, `emacs`, and 900 seconds. An empty selection
   fails.
-* `verification.requires`, when present, names an earlier `python_tests`
-  check. Without it the adapter reuses every earlier `python_tests` check.
+* `verification.requires`, when present, names an earlier test-producing
+  check, whatever its language. Without it the adapter reuses every earlier
+  test-producing check.
 * A baseline path must be used by exactly one check. Two checks naming the
   same resolved path is a configuration error.
 * Every class named by a rule and every check named by a class must exist.
@@ -200,7 +201,7 @@ produces them, so a required tier 2, 3 or 4 must be exempted until its adapter
 exists. An unsatisfied obligation rejects the gate.
 
 The `verification` adapter measures verification loss. For each reused
-`python_tests` check it records `tests:CHECK:executed` (direction `min`,
+test-producing check it records `tests:CHECK:executed` (direction `min`,
 value `ran - skipped`) and `tests:CHECK:skipped` (direction `max`). For each
 selected Python file it records `exclusions:FILE:no-cover` (lines matching the
 `pragma: no cover` coverage exclusion), `exclusions:FILE:noqa` (inline `# noqa`
@@ -212,6 +213,10 @@ contributes one to the file-wide count, separate from the inline count. The lint
 directives are recognized in comment tokens using their directive syntax;
 matching text inside a string does not count. The file-wide finding's location
 includes the first directive and its line.
+
+Test counts do not depend on Python files being selected: an empty selection
+scans no suppressions, while no reusable producer result means no measured
+counts and makes the check unsupported.
 
 These verification `max` metrics have threshold 0, so a missing baseline entry
 accepts only 0; a `min` metric without an entry is unmeasured and fails until an

@@ -967,9 +967,12 @@ Notes:
 * An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and a `baseline` path.
   Its `threshold` defaults to 6 and must be finite. Every selected file's class must list both checks.
 * A `verification` check needs a `baseline` path. Its optional `requires` names an earlier
-  test-producing check; without it every earlier test-producing check is used. It measures executed
-  tests (a `min` floor), skipped tests, `pragma: no cover` lines, inline `# noqa` comments and file-wide
-  lint suppressions for the selected Python files, without running the tests again. File-wide directives
+  test-producing check, whatever its language; without it every earlier test-producing check is used. It
+  measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
+  lines, inline `# noqa` comments and file-wide lint suppressions for the selected Python files, without
+  running the tests again. An empty Python selection has nothing to scan, but the test counts still come
+  from every producer; without reusable producer results the counts are not measured and the check is
+  unsupported. File-wide directives
   are counted separately as `exclusions:FILE:file-suppression`: Ruff's `# ruff: noqa`, with or without
   codes, `# ruff: file-ignore[...]`, Flake8's `# flake8: noqa` forms, and isort's `# isort: skip_file`
   (also recognized by Ruff). Directives are recognized in comment tokens, so text inside strings does

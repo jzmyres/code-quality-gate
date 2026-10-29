@@ -1632,7 +1632,7 @@ def _verification_counts(
 ) -> tuple[list[tuple[str, int, int]] | None, str | None]:
     identifiers = _verification_test_checks(check, prior)
     if not identifiers:
-        return None, "no python_tests check to measure"
+        return None, "no test-producing check to measure"
     counts: list[tuple[str, int, int]] = []
     for identifier in identifiers:
         result = prior.get(identifier)
@@ -1655,30 +1655,6 @@ def _verification_domain(findings: list[Any]) -> Domain:
         [finding.subject for finding in findings],
         "the measured Python files and test checks",
     )
-
-
-def _verification_selection(
-    root: Path,
-    config: Config,
-    check: CheckDef,
-    files: list[str],
-    classes: dict[str, str],
-    start: float,
-    prefix: str,
-) -> tuple[list[str] | None, CheckResult | None]:
-    selected, names = analysis_step(
-        "file selection", _select_files, config, check, files, classes
-    )
-    python_files = analysis_step("Python file selection", _verification_files, selected)
-    if python_files:
-        return python_files, None
-    class_text = _class_text(names)
-    reason = (
-        f"no Python files selected (classes: {class_text}); "
-        "zero inputs is not a pass"
-    )
-    print(f"{prefix}: {reason}", file=sys.stderr)
-    return None, _ratchet_result(check, start, "fail", reason=reason)
 
 
 def _verification_findings(
@@ -1725,12 +1701,12 @@ def _verification_measurement(
     start: float,
     prefix: str,
 ) -> list[Any] | CheckResult:
-    python_files, failure = _verification_selection(
-        root, config, check, files, classes, start, prefix
+    selected, _names = analysis_step(
+        "file selection", _select_files, config, check, files, classes
     )
-    if failure is not None:
-        return failure
-    assert python_files is not None
+    python_files = analysis_step(
+        "Python file selection", _verification_files, selected
+    )
     return _verification_findings(
         root, check, python_files, prior, start, prefix
     )

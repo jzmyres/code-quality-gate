@@ -470,6 +470,48 @@ class VerificationTests(FindingMixin, FixtureCase):
         )
         self.assertIn("unmeasured: no baseline entry", result.stderr)
 
+    def test_no_test_producer_leaves_the_counts_unmeasured(self) -> None:
+        text = """\
+schema = 2
+
+[code]
+patterns = ["*.py"]
+shebangs = []
+
+[levels]
+required_tiers = [1]
+
+[classes.python]
+code = true
+description = "Python source"
+checks = ["verification"]
+
+[classes.config]
+code = false
+description = "Configuration"
+
+[classes.doc]
+code = false
+description = "Documentation"
+
+[checks.verification]
+adapter = "verification"
+tier = 1
+enforcement = "enforced"
+baseline = "quality-gate-verification.toml"
+
+[[rule]]
+pattern = "pkg/*.py"
+class = "python"
+reason = "source"
+"""
+        self.write_config(text + "\n".join(PYTHON_COMMON_RULE_LINES))
+        self.empty_verification_baseline()
+        result, _document, check = self.run_verification()
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertIn("no test-producing check to measure", check["reason"])
+        self.assertIn("no test-producing check to measure", result.stderr)
+
 
 class VerificationTrustTests(FindingMixin, TrustCase):
     def test_candidate_cannot_authorize_a_file_suppression(self) -> None:

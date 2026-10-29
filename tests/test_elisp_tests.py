@@ -85,6 +85,14 @@ reason = "ignore rules"
 '''
 
 
+def executed_entry(bound: int) -> dict[str, object]:
+    return {
+        "subject": "tests:legacy-tests:executed",
+        "bound": bound,
+        "reason": "floor",
+    }
+
+
 class ElispTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
@@ -305,25 +313,54 @@ class ElispTests(FixtureCase):
         _result, check = self.assert_outcome("pass")
         self.assertEqual(check["definitions"][0]["file"], 'src/module "one".el')
 
-    def test_verification_consumes_ert_counts(self) -> None:
-        self.add_file("aux/check.py", "VALUE = 1\n")
-        extra_rules = '[[rule]]\npattern = "aux/*.py"\nclass = "python"\nreason = "source"\n'
-        text = config(extra_rules=extra_rules).replace(
-            '[classes.config]', '[classes.python]\ncode = true\ndescription = "Python source"\n'
-            'checks = ["smoke", "verification"]\n[classes.config]',
+    def verify_ert(self, entries: list[dict[str, object]]):
+        text = config().replace(
+            'checks = ["legacy-tests"]',
+            'checks = ["legacy-tests", "verification"]',
         ) + ('\n[checks.verification]\nadapter = "verification"\ntier = 1\n'
              'enforcement = "enforced"\nrequires = "legacy-tests"\nbaseline = "verification.toml"\n')
         self.write_config(text)
         self.add_file("verification.toml", baseline_text(
-            [{"subject": "tests:legacy-tests:executed", "bound": 2, "reason": "floor"}],
-            check="verification", metric_version="verification/1",
+            entries, check="verification", metric_version="verification/1",
         ))
         result, document = self.run_json()
+        return result, self.check_by_id(document, "verification")
+
+    def finding(self, check: dict[str, object], subject: str) -> dict[str, object]:
+        return next(item for item in check["findings"] if item["subject"] == subject)
+
+    def test_verification_consumes_ert_counts(self) -> None:
+        result, check = self.verify_ert([executed_entry(2)])
         self.assertEqual(result.returncode, 0, output(result))
-        check = self.check_by_id(document, "verification")
         self.assertEqual(check["outcome"], "pass")
-        finding = next(item for item in check["findings"] if item["subject"] == "tests:legacy-tests:executed")
-        self.assertEqual(finding["value"], 2)
+        self.assertEqual(self.finding(check, "tests:legacy-tests:executed")["value"], 2)
+        self.assertEqual(
+            sorted(item["subject"] for item in check["findings"]),
+            ["tests:legacy-tests:executed", "tests:legacy-tests:skipped"],
+        )
+
+    def test_verification_floor_fails_with_a_reduced_ert_count(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest only () (should t))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        result, check = self.verify_ert([executed_entry(2)])
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "fail")
+        self.assertEqual(self.finding(check, "tests:legacy-tests:executed")["value"], 1)
+        self.assertIn("falls below baseline bound 2", result.stderr)
+
+    def test_verification_counts_skipped_ert_tests(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest passing () (should t))\n"
+                      "(ert-deftest skipped () (ert-skip \"fixture\"))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        result, check = self.verify_ert([executed_entry(1)])
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "fail")
+        self.assertEqual(self.finding(check, "tests:legacy-tests:executed")["value"], 1)
+        self.assertEqual(self.finding(check, "tests:legacy-tests:skipped")["value"], 1)
+        self.assertIn("tests:legacy-tests:skipped", result.stderr)
+        self.assertIn("exceeds threshold 0", result.stderr)
 
     def test_invalid_suite_files_are_configuration_errors(self) -> None:
         os.mkfifo(self.repo / "tests/fifo.el")
