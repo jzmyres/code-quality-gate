@@ -665,6 +665,30 @@ errors carry `error`. Python CRAP findings carry `cc`, `statements`, `executed` 
 `measurement`; Emacs Lisp CRAP findings carry `cc`, `points` and `hits`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
 bound fails.
 
+### worklist
+
+    python3 -I qg.py worklist
+    python3 -I qg.py worklist --json
+    python3 -I qg.py worklist crap
+    python3 -I qg.py --repo /path/to/repo worklist crap elisp-crap
+
+`worklist` ranks the debt a reasoned baseline still carries. With no `CHECK` it covers every
+configured check that has a baseline and a `max` metric; with ids it covers exactly those checks. For
+each selected check it runs the check and every check it requires, in policy order, exactly as `check`
+runs them. It lists every baseline entry whose bound is above the check's threshold, ranked by churn
+times the current measured value, highest first. Churn is the number of commits `git log --follow`
+reports for the file in the finding's location. A row gives churn, bound, current value, churn x value,
+subject and location. Unrounded values are compared; the human report displays them to one decimal.
+
+An entry whose subject is no longer measured is a note instead of a row, reading `no longer exists`. A
+finding whose file Git cannot follow is a note reading `churn not measured`. `--json` writes one
+machine-readable document of rows and notes; its schema is in `docs/SCHEMA.md`.
+
+The command exits 0 after writing the report. It exits 1, ranking nothing, when a selected check or one
+it requires does not pass, naming the check and expected versus actual, or when Git fails, naming the
+`git log --follow` command and expected versus actual. It exits 2 for an unknown check id, a check with
+no baseline, or a check with no `max` metric. `worklist` never writes a baseline or any other file.
+
 ### Result reuse by recorded reads
 
     python3 -I qg.py check --reuse-store DIR --record-fd N

@@ -708,6 +708,45 @@ outcome fail, and policy satisfaction then decides acceptance. A prune that is
 refused or fails makes the command exit 1 while `decision` still reports the
 gate evaluation.
 
+## Result: `worklist --json`
+
+`worklist --json` writes exactly one JSON document to stdout. Its schema is 1:
+
+```json
+{
+  "schema": 1,
+  "rows": [
+    {
+      "check": "crap",
+      "subject": "pkg/alpha.py:alpha",
+      "churn": 2,
+      "bound": 25,
+      "value": 20.0,
+      "churn_x_value": 40.0,
+      "location": "pkg/alpha.py:1-6"
+    }
+  ],
+  "notes": [
+    {"check": "crap", "subject": "pkg/alpha.py:removed", "reason": "no longer exists"},
+    {
+      "check": "crap",
+      "subject": "pkg/ghost.py:ghost",
+      "reason": "churn not measured",
+      "file": "pkg/ghost.py"
+    }
+  ]
+}
+```
+
+Rows hold every baseline entry whose bound is above the check's threshold, ranked by
+`churn_x_value` descending. `churn` is the number of commits `git log --follow` reports for the file in
+the finding's location; `bound`, `value` and `churn_x_value` are the unrounded numbers that were
+compared. The human report displays those three to one decimal.
+
+Notes hold entries that are not ranked. `reason` is `no longer exists` when the baseline subject has no
+current finding, or `churn not measured` when Git reports no commits for the finding's file; the latter
+also names that `file`. A Git command that fails makes the command exit 1 and write no document.
+
 ## Reuse record
 
 With `--reuse-store`, a passing check writes one JSON record through the
@@ -746,6 +785,7 @@ trace unanalysable, so no record is written.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Reuse record: `schema = 1`.
+* Worklist result: `schema = 1`.
 * Metric versions: `command-exit/1`, `test-count/1`,
   `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `elisp-lint/1`, `verification/1`,
   `owners/1`, `inventory/1`, `hygiene/1`.

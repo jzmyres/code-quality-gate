@@ -20,6 +20,7 @@ from .tools import (
     load_tools,
 )
 from .trust import prepare_trust
+from .worklist import command_worklist
 
 
 class _Parser(argparse.ArgumentParser):
@@ -99,6 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="write new reuse records to this descriptor",
     )
+    worklist = commands.add_parser(
+        "worklist", help="rank baseline debt by churn x current value"
+    )
+    worklist.add_argument(
+        "--json",
+        action="store_true",
+        help="write one JSON worklist document to stdout",
+    )
+    worklist.add_argument(
+        "check_ids",
+        metavar="CHECK",
+        nargs="*",
+        help="check id (default: every check with a baseline and a max metric)",
+    )
     reuse = commands.add_parser("reuse", help="manage recorded check results")
     reuse_commands = reuse.add_subparsers(
         dest="reuse_command", required=True, parser_class=_Parser
@@ -152,6 +167,8 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         return command_hygiene(root, config)
     if args.command == "clones":
         return command_clones(root, config, args.prune)
+    if args.command == "worklist":
+        return command_worklist(root, config, args.check_ids, args.json)
     return command_check(
         root,
         config,
