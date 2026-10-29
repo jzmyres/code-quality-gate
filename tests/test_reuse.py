@@ -600,6 +600,50 @@ class ReuseTests(ReuseCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assertNotIn("reused record", result.stderr)
 
+    def test_a_symlink_before_a_parent_component_resolves_as_the_kernel(self) -> None:
+        self.add_file("input.py", "0\n")
+        target = self.base / "external" / "input.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("0\n", encoding="utf-8")
+        (self.base / "external" / "deep").mkdir()
+        (self.base / "external" / "deep2").mkdir()
+        link = self.repo / "jump.py"
+        link.symlink_to("../external/deep")
+        source = (
+            "import os, sys\n"
+            "size = os.stat('jump.py/../input.py').st_size\n"
+            "print(1)\n"
+            "sys.exit(0 if size == 2 else 1)\n"
+        )
+        env = self.install_strace()
+        _first, records = self.first_pass(env, [sys.executable, "-I", "-c", source])
+        self.assertIn(str(target), records[0]["inputs"])
+        self.assertIn(str(link), records[0]["symlinks"])
+        target.write_text("changed\n", encoding="utf-8")
+        self.assert_failing_rerun("symlink-target", env)
+        target.write_text("0\n", encoding="utf-8")
+        link.unlink()
+        link.symlink_to("../external/deep2")
+        result, _document, _records = self.run_reuse("symlink-link", env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertNotIn("reused record", result.stderr)
+
+    def test_a_changed_permission_bit_reruns_the_check(self) -> None:
+        target = self.add_file("tool.py", "VALUE = 1\n")
+        target.chmod(0o755)
+        source = (
+            "import os, sys\n"
+            "print(1)\n"
+            "sys.exit(0 if os.access('tool.py', os.X_OK) else 1)\n"
+        )
+        env = self.install_strace()
+        _first, records = self.first_pass(env, [sys.executable, "-I", "-c", source])
+        metadata = records[0]["metadata"][str(target)]
+        self.assertEqual(metadata["type"], "file")
+        self.assertEqual(metadata["mode"], 0o755)
+        target.chmod(0o644)
+        self.assert_failing_rerun("permission", env)
+
     def test_a_write_through_a_hardlink_invalidates_the_record(self) -> None:
         flag = self.add_file("flag.py", "0")
         os.link(flag, self.repo / "alias.py")

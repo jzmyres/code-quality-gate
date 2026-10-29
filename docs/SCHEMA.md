@@ -708,12 +708,44 @@ outcome fail, and policy satisfaction then decides acceptance. A prune that is
 refused or fails makes the command exit 1 while `decision` still reports the
 gate evaluation.
 
+## Reuse record
+
+With `--reuse-store`, a passing check writes one JSON record through the
+`--record-fd` descriptor; `qg.py reuse merge` validates it before writing it
+into the store. The record schema is 1 and holds:
+
+* `schema`, `program`, `check`, `command`, `environment`, `context` - the
+  check's identity.
+* `inputs` - absolute normalized path to a SHA-256 content digest, the string
+  `directory` (the path is a directory), or `null` (the path is absent). A
+  path is resolved as the kernel resolved it: symlinks are followed and `..`
+  applies after the links before it.
+* `symlinks` - absolute normalized path to the SHA-256 of the link target
+  bytes, for every symlink the resolution passed through.
+* `non_symlinks` - absolute normalized paths observed to be non-symlinks.
+* `metadata` - absolute normalized path to an object with `type`, `mode`,
+  `size`, `uid` and `gid`, for each file (not directory) the check stat'ed,
+  lstat'ed or tested with `access`. `type` is the file type (`file`,
+  `symlink`, `fifo`, `socket`, `character`, `block` or `other`), `mode`
+  holds the permission bits, `size` is the size in bytes, and `uid`/`gid`
+  name the owner. A directory keeps its `inputs` presence rule because its
+  size changes with unrelated entries.
+* `measurement`, `tests_ran`, `tests_skipped`, `coverage_data`,
+  `coverage_config`, `elisp_result` and `emacs_version` - optional evidence
+  retained for later checks.
+
+A record is reused only when its identity, every input, every symlink, every
+non-symlink and every metadata entry still match. A path that cannot be resolved
+(for example through an unreadable directory or too many symlinks) makes the
+trace unanalysable, so no record is written.
+
 ## Versions and superseded proposals
 
 * Policy: `schema = 2`.
 * Result: `schema = 2`; `schema = 3` when `--policy-from` adds `trust`.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
+* Reuse record: `schema = 1`.
 * Metric versions: `command-exit/1`, `test-count/1`,
   `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `elisp-lint/1`, `verification/1`,
   `owners/1`, `inventory/1`, `hygiene/1`.

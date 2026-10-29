@@ -93,6 +93,33 @@ def _inode(path: str) -> tuple[int, int] | None:
     return info.st_dev, info.st_ino
 
 
+_FILE_TYPES = (
+    (stat.S_IFREG, "file"),
+    (stat.S_IFDIR, "directory"),
+    (stat.S_IFLNK, "symlink"),
+    (stat.S_IFIFO, "fifo"),
+    (stat.S_IFSOCK, "socket"),
+    (stat.S_IFCHR, "character"),
+    (stat.S_IFBLK, "block"),
+)
+
+
+def _file_type(mode: int) -> str:
+    kind = stat.S_IFMT(mode)
+    return next((name for value, name in _FILE_TYPES if value == kind), "other")
+
+
+def _observed_metadata(info: os.stat_result) -> dict[str, Any]:
+    """The metadata a stat, lstat or access call could observe."""
+    return {
+        "type": _file_type(info.st_mode),
+        "mode": stat.S_IMODE(info.st_mode),
+        "size": info.st_size,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+    }
+
+
 _MISSING = object()
 State = tuple[Any, ...]
 
@@ -131,6 +158,7 @@ class Recorder:
     temporary_paths: set[str] = field(default_factory=set)
     symlinks: dict[str, str] = field(default_factory=dict)
     non_symlinks: set[str] = field(default_factory=set)
+    metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
     reliable: bool = True
     environment: dict[str, str] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -184,18 +212,40 @@ class Recorder:
         else:
             self._remember_non_symlink(path)
 
+    def _remember_metadata(self, path: str, info: os.stat_result) -> None:
+        if stat.S_ISDIR(info.st_mode):
+            return
+        value = _observed_metadata(info)
+        old = self.metadata.get(path)
+        if old is not None and old != value:
+            self.reliable = False
+        self.metadata[path] = value
+
     def _record_lstat_checked(self, path: str, is_link: bool) -> None:
         try:
-            if stat.S_ISLNK(_original_lstat(path).st_mode) != is_link:
-                self.reliable = False
-                return
-            self._record_lstat_type(path, is_link)
+            info = _original_lstat(path)
         except OSError:
             self.reliable = False
+            return
+        if stat.S_ISLNK(info.st_mode) != is_link:
+            self.reliable = False
+            return
+        self._record_lstat_type(path, is_link)
+        self._remember_metadata(path, info)
 
     def record_lstat(self, path: str, is_link: bool) -> None:
         if self._keep(path) and path not in self.created:
             self._record_lstat_checked(path, is_link)
+
+    def record_stat(self, path: str) -> None:
+        if not self._keep(path) or path in self.created:
+            return
+        try:
+            info = _original_lstat(path)
+        except OSError:
+            self.reliable = False
+            return
+        self._remember_metadata(path, info)
 
     def mark_created(self, path: str) -> None:
         if self._keep(path):
@@ -251,7 +301,8 @@ class Recorder:
             return (dict(sorted(self.inputs.items())), tuple(sorted(self.created)),
                     self.reliable, tuple(sorted(self.temporary_paths)), dict(self.symlinks),
                     tuple(sorted(self.written)), tuple(sorted(self.read_inodes)),
-                    tuple(sorted(self.written_inodes)), tuple(sorted(self.non_symlinks)))
+                    tuple(sorted(self.written_inodes)), tuple(sorted(self.non_symlinks)),
+                    dict(sorted(self.metadata.items())))
 
 
 _active: contextvars.ContextVar[Recorder | None] = contextvars.ContextVar(
@@ -311,9 +362,19 @@ def _merge_links(recorder: Recorder, symlinks: dict[str, str], non_symlinks: Any
         recorder._remember_non_symlink(path)
 
 
+def _merge_metadata(recorder: Recorder, metadata: Any) -> None:
+    for path, value in metadata.items():
+        old = recorder.metadata.get(path)
+        if old is not None and old != value:
+            recorder.reliable = False
+        recorder.metadata[path] = value
+
+
 def _merge_state(recorder: Recorder, state: State) -> None:
-    inputs, created, reliable, temporary_paths, symlinks, written, reads, writes, non_symlinks = state
+    (inputs, created, reliable, temporary_paths, symlinks, written, reads, writes,
+     non_symlinks, metadata) = state
     _merge_links(recorder, symlinks, non_symlinks)
+    _merge_metadata(recorder, metadata)
     _merge_inodes(recorder, reads, writes)
     recorder.written.update(written)
     recorder.temporary_paths.update(temporary_paths)
@@ -339,16 +400,38 @@ def _audit_path(value: Any) -> str | None:
         return None
 
 
-def _audit_read(recorder: Recorder, path: str) -> None:
+def _audit_absent(recorder: Recorder, path: str) -> None:
+    resolved = _resolve(recorder, recorder.cwd, None, path)
+    if resolved is not None:
+        recorder.add_absent(resolved)
+
+
+def _audit_present(recorder: Recorder, path: str) -> None:
+    resolved = _resolve(recorder, recorder.cwd, None, path)
+    if resolved is not None:
+        recorder.add_path(resolved)
+
+
+def _audited_stat(path: str) -> str:
     try:
         _original_stat(path)
     except FileNotFoundError:
-        recorder.add_absent(path)
-        return
+        return "missing"
     except OSError:
-        recorder.reliable = False
+        return "error"
+    return "present"
+
+
+def _audit_read(recorder: Recorder, path: str) -> None:
+    if not recorder._keep(path):
         return
-    recorder.add_path(path)
+    status = _audited_stat(path)
+    if status == "missing":
+        _audit_absent(recorder, path)
+    elif status == "error":
+        recorder.reliable = False
+    else:
+        _audit_present(recorder, path)
 
 
 def _audit_flags(recorder: Recorder, path: str, flags: int) -> None:
@@ -390,10 +473,12 @@ def _audit_temporary(args: tuple[Any, ...]) -> None:
 
 
 def _audit_directory(args: tuple[Any, ...]) -> None:
-    if args:
-        path = _audit_path(args[0])
-        if path is not None:
-            current().add_directory(path)  # type: ignore[union-attr]
+    recorder = current()
+    path = _audit_path(args[0]) if args else None
+    if recorder is not None and path is not None and recorder._keep(path):
+        resolved = _resolve(recorder, recorder.cwd, None, path)
+        if resolved is not None:
+            recorder.add_directory(resolved)
 
 
 def _audit_open_event(args: tuple[Any, ...]) -> None:
@@ -444,18 +529,27 @@ def _fd_location(descriptor: int) -> str | None:
         return None
 
 
-def _relative_stat_path(path: Any, descriptor: int) -> str | None:
-    base = _fd_location(descriptor)
-    return os.path.normpath(os.path.join(base, os.fsdecode(path))) if base else None
+def _stat_follow(function: Any, kwargs: dict[str, Any]) -> bool:
+    return function is not _original_lstat and kwargs.get("follow_symlinks") is not False
 
 
-def _stat_path(path: Any, kwargs: dict[str, Any]) -> str | None:
+def _stat_base(raw: str, kwargs: dict[str, Any]) -> str | None:
+    descriptor = kwargs.get("dir_fd")
+    if descriptor is None or os.path.isabs(raw):
+        return ""
+    return _fd_location(descriptor)
+
+
+def _stat_location(
+    recorder: Recorder, path: Any, kwargs: dict[str, Any], follow: bool,
+) -> str | None:
     if isinstance(path, int):
         return _fd_location(path)
-    descriptor = kwargs.get("dir_fd")
-    if descriptor is not None and not os.path.isabs(os.fsdecode(path)):
-        return _relative_stat_path(path, descriptor)
-    return _audit_path(path)
+    raw = os.fsdecode(os.fspath(path))
+    base = _stat_base(raw, kwargs)
+    if base is None:
+        return None
+    return _resolve(recorder, recorder.cwd, base or None, raw, follow=follow)
 
 
 def _record_missing_error(recorder: Recorder, name: str, error: OSError) -> None:
@@ -468,15 +562,18 @@ def _record_stat_error(recorder: Recorder, name: str | None, error: OSError) -> 
         _record_missing_error(recorder, name, error)
 
 
-def _record_stat_type(recorder: Recorder, name: str, function: Any, kwargs: Any, result: Any) -> None:
-    if function is _original_lstat or kwargs.get("follow_symlinks") is False:
+def _record_stat_type(recorder: Recorder, name: str, follow: bool, result: Any) -> None:
+    if follow:
+        recorder.record_stat(name)
+    else:
         recorder.record_lstat(name, stat.S_ISLNK(result.st_mode))
 
 
 def _stat_and_record(
     recorder: Recorder, function: Any, path: Any, args: Any, kwargs: Any,
 ) -> Any:
-    name = _stat_path(path, kwargs)
+    follow = _stat_follow(function, kwargs)
+    name = _stat_location(recorder, path, kwargs, follow)
     try:
         result = function(path, *args, **kwargs)
     except OSError as error:
@@ -484,7 +581,7 @@ def _stat_and_record(
         raise
     if name:
         recorder.add_path(name)
-        _record_stat_type(recorder, name, function, kwargs, result)
+        _record_stat_type(recorder, name, follow, result)
     return result
 
 
@@ -543,12 +640,99 @@ def _parse_string(text: str) -> str | None:
         return None
 
 
-def _resolve(cwd: Path, base: str | None, raw: str) -> str:
+_MAX_LINKS = 40
+
+
+@dataclass
+class _Walk:
+    parts: list[str]
+    resolved: list[str]
+    follow: bool
+    links: int = 0
+
+
+def _absolute(cwd: Path, base: str | None, raw: str) -> str:
     if raw.startswith("/"):
-        return os.path.normpath(raw)
-    if base is not None:
-        return os.path.normpath(os.path.join(base, raw))
-    return os.path.normpath(os.path.join(str(cwd), raw))
+        return raw
+    return os.path.join(base if base is not None else str(cwd), raw)
+
+
+def _component(recorder: Recorder, candidate: str) -> tuple[str, Any]:
+    try:
+        return "ok", _original_lstat(candidate)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return "missing", None
+        recorder.reliable = False
+        return "error", None
+
+
+def _symlink_target(recorder: Recorder, path: str) -> str | None:
+    try:
+        target = os.readlink(path)
+    except OSError:
+        recorder.reliable = False
+        return None
+    if recorder._keep(path):
+        recorder._remember_symlink(
+            path, hashlib.sha256(os.fsencode(target)).hexdigest()
+        )
+        recorder.add_path(path)
+    return target
+
+
+def _is_followed(walk: _Walk, info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) and (walk.follow or bool(walk.parts))
+
+
+def _expand_link(walk: _Walk, recorder: Recorder, candidate: str) -> tuple[bool, str | None]:
+    walk.links += 1
+    if walk.links > _MAX_LINKS:
+        recorder.reliable = False
+        return True, None
+    target = _symlink_target(recorder, candidate)
+    if target is None:
+        return True, None
+    if target.startswith("/"):
+        walk.resolved.clear()
+    walk.parts[0:0] = target.split("/")
+    return False, None
+
+
+def _skip_component(walk: _Walk, part: str) -> bool:
+    if part == "..":
+        if walk.resolved:
+            walk.resolved.pop()
+        return True
+    return part in ("", ".")
+
+
+def _walk_component(walk: _Walk, recorder: Recorder) -> tuple[bool, str | None]:
+    if not walk.parts:
+        return True, "/" + "/".join(walk.resolved)
+    part = walk.parts.pop(0)
+    if _skip_component(walk, part):
+        return False, None
+    candidate = "/" + "/".join([*walk.resolved, part])
+    status, info = _component(recorder, candidate)
+    if status != "ok":
+        if status == "missing":
+            return True, candidate
+        return True, None
+    if _is_followed(walk, info):
+        return _expand_link(walk, recorder, candidate)
+    walk.resolved.append(part)
+    return False, None
+
+
+def _resolve(
+    recorder: Recorder, cwd: Path, base: str | None, raw: str, *, follow: bool = True,
+) -> str | None:
+    walk = _Walk(_absolute(cwd, base, raw).split("/"), [], follow)
+    while True:
+        done, value = _walk_component(walk, recorder)
+        if done:
+            return value
 
 
 def _first_int(text: str) -> int | None:
@@ -576,7 +760,8 @@ def _descriptor_base(
 
 
 def _located_path(
-    cwd: Path, fds: dict[tuple[int, int], str], pid: int, args: str,
+    recorder: Recorder, cwd: Path, fds: dict[tuple[int, int], str], pid: int,
+    args: str, *, follow: bool = True,
 ) -> str | None:
     parts = args.split(",", 1)
     if len(parts) != 2:
@@ -588,7 +773,7 @@ def _located_path(
     base = _descriptor_base(cwd, fds, pid, first)
     if base is None and not raw.startswith("/"):
         return None
-    return _resolve(cwd, base, raw)
+    return _resolve(recorder, cwd, base, raw, follow=follow)
 
 
 def _record_presence(
@@ -636,12 +821,17 @@ def _record_stat(
     args: str,
     error: str | None,
 ) -> None:
-    path = _located_path(cwd, fds, pid, args)
+    follow = "AT_SYMLINK_NOFOLLOW" not in args
+    path = _located_path(recorder, cwd, fds, pid, args, follow=follow)
     if path is None:
         _unresolved_input(recorder, args, error)
         return
     _record_presence(recorder, path, error)
-    if error is None and "AT_SYMLINK_NOFOLLOW" in args:
+    if error is not None:
+        return
+    if follow:
+        recorder.record_stat(path)
+    else:
         recorder.record_lstat(path, "S_IFLNK" in args)
 
 
@@ -652,7 +842,12 @@ def _record_direct(
     if raw is None:
         _unresolved_input(recorder, args, error)
         return
-    _record_presence(recorder, _resolve(cwd, None, raw), error)
+    path = _resolve(recorder, cwd, None, raw)
+    if path is None:
+        return
+    _record_presence(recorder, path, error)
+    if error is None:
+        recorder.record_stat(path)
 
 
 def _handle_close(
@@ -689,7 +884,7 @@ def _handle_open(
     prefix: str,
 ) -> None:
     args = prefix + args
-    path = _located_path(cwd, fds, pid, args)
+    path = _located_path(recorder, cwd, fds, pid, args, follow="O_NOFOLLOW" not in args)
     if path is None:
         _unresolved_input(recorder, args, error)
         return
@@ -714,9 +909,11 @@ def _handle_stat(
     _record_direct(recorder, cwd, args, error)
 
 
-def _direct_lstat_path(cwd: Path, args: str) -> str | None:
+def _direct_lstat_path(recorder: Recorder, cwd: Path, args: str) -> str | None:
     raw = _parse_string(args)
-    return _resolve(cwd, None, raw) if raw is not None else None
+    if raw is None:
+        return None
+    return _resolve(recorder, cwd, None, raw, follow=False)
 
 
 def _record_lstat_result(recorder: Recorder, path: str, args: str, error: str | None) -> None:
@@ -729,7 +926,7 @@ def _handle_lstat(
     recorder: Recorder, cwd: Path, fds: dict[tuple[int, int], str], pid: int,
     args: str, value: int | None, error: str | None,
 ) -> None:
-    path = _direct_lstat_path(cwd, args)
+    path = _direct_lstat_path(recorder, cwd, args)
     if path is None:
         recorder.reliable = False
         return
@@ -786,9 +983,13 @@ def _handle_fstat(
         recorder.reliable = False
 
 
-def _link_path(cwd: Path, fds: Any, pid: int, args: str, direct: bool) -> str | None:
+def _link_path(
+    recorder: Recorder, cwd: Path, fds: Any, pid: int, args: str, direct: bool,
+) -> str | None:
     raw = _parse_string(args) if direct else None
-    return _resolve(cwd, None, raw) if raw is not None else _located_path(cwd, fds, pid, args)
+    if raw is None:
+        return _located_path(recorder, cwd, fds, pid, args, follow=False)
+    return _resolve(recorder, cwd, None, raw, follow=False)
 
 
 def _reported_link(args: str) -> str | None:
@@ -832,7 +1033,7 @@ def _handle_readlink(
     recorder: Recorder, cwd: Path, fds: dict[tuple[int, int], str], pid: int,
     args: str, value: int | None, error: str | None, *, direct: bool,
 ) -> None:
-    path = _link_path(cwd, fds, pid, args, direct)
+    path = _link_path(recorder, cwd, fds, pid, args, direct)
     if path is None:
         _unresolved_input(recorder, args, error)
         return
@@ -878,7 +1079,10 @@ def _handle_exec(
     args: str, value: int | None, error: str | None, *, direct: bool,
 ) -> None:
     raw = _parse_string(args) if direct else None
-    path = _resolve(cwd, None, raw) if raw is not None else _located_path(cwd, fds, pid, args)
+    if raw is None:
+        path = _located_path(recorder, cwd, fds, pid, args)
+    else:
+        path = _resolve(recorder, cwd, None, raw)
     if path is None:
         recorder.reliable = False
         return
@@ -927,7 +1131,8 @@ def _unknown_syscall(recorder: Recorder, cwd: Path, name: str, args: str) -> Non
     if name in _NON_INPUT_CALLS:
         return
     raw = _parse_string(args)
-    if raw is None or recorder._keep(_resolve(cwd, None, raw)):
+    path = _resolve(recorder, cwd, None, raw) if raw is not None else None
+    if path is None or recorder._keep(path):
         recorder.reliable = False
 
 
@@ -981,9 +1186,12 @@ def _inherit_fds(fds: Any, parent: int, child: int) -> None:
     fds.update({(child, fd): path for (owner, fd), path in fds.items() if owner == parent})
 
 
-def _chdir_path(current: Path, args: str) -> Path | None:
+def _chdir_path(recorder: Recorder, current: Path, args: str) -> Path | None:
     raw = _parse_string(args)
-    return Path(_resolve(current, None, raw)) if raw is not None else None
+    if raw is None:
+        return None
+    path = _resolve(recorder, current, None, raw)
+    return Path(path) if path is not None else None
 
 
 def _fchdir_path(recorder: Recorder, args: str) -> Path | None:
@@ -996,7 +1204,7 @@ def _fchdir_path(recorder: Recorder, args: str) -> Path | None:
 
 def _changed_directory(recorder: Recorder, current: Path, args: str, name: str) -> Path | None:
     if name == "chdir":
-        return _chdir_path(current, args)
+        return _chdir_path(recorder, current, args)
     return _fchdir_path(recorder, args)
 
 

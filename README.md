@@ -677,16 +677,22 @@ check is never selected by guessing that a file is related: the trace decides.
 Every check's process tree runs under the pinned `strace`, and the gate's own reads are observed in the
 same run. The inputs are every file the check opened for reading or executed (including its interpreter
 and shared libraries), every path it looked up and did not find (recorded as absent), every path it
-statted, and every directory it listed (recorded as a hash of the sorted names). Paths under `/proc`,
-`/dev` and `/sys`, the run's own temporary directories and files the run created before reading them
-are not inputs.
+statted, lstat'ed or tested with `access`, and every directory it listed (recorded as a hash of the
+sorted names). A traced path is resolved the way the kernel resolved it: `..` applies after the
+symlinks before it, and every symlink the resolution passed through is recorded. A path that cannot be
+resolved makes the run unanalysable. Paths under `/proc`, `/dev` and `/sys`, the run's own temporary
+directories and files the run created before reading them are not inputs.
 
 A check that passes writes one record to the `--record-fd N` descriptor: the gate program hash, the
-check's name and command, the values of the environment it received and each input's content hash or
-absence. A failed, timed-out or unanalysable check writes no record. Before running a check, the gate
-reads `DIR` for a record with the same program, check, command and environment whose inputs still hash
-the same or are still absent; it then reports the check as reused, naming the record's tree, and does not
-run it. Otherwise the check runs traced. Baseline expiry is also rechecked, so a record cannot preserve a
+check's name and command, the values of the environment it received, each resolved input's content hash
+or absence, the digest of every symlink it passed through, and, for each file the check stat'ed,
+lstat'ed or tested with `access`, the file type, permission bits, size and owner it observed. A file
+that was only read keeps its content-hash rule; a change to observed metadata invalidates reuse even
+when the content is unchanged. A failed, timed-out or unanalysable check writes no record. Before
+running a check, the gate reads `DIR` for a record with the same program, check, command and environment
+whose inputs still hash the same or are still absent, whose symlinks still point where they did, and
+whose recorded metadata still matches; it then reports the check as reused, naming the record's tree,
+and does not run it. Otherwise the check runs traced. Baseline expiry is also rechecked, so a record cannot preserve a
 pass after a baseline entry expires.
 
 The gate only reads `DIR`. Records leave through the caller's `--record-fd` descriptor, which the gate

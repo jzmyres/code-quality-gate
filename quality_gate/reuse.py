@@ -29,6 +29,10 @@ from .tools import UnsupportedError, current_tools, tool_binary
 SCHEMA = 1
 LOCK_ENTRY = "strace"
 _HEX = "0123456789abcdefABCDEF"
+_METADATA_FIELDS = ("type", "mode", "size", "uid", "gid")
+_METADATA_TYPES = {
+    "file", "directory", "symlink", "fifo", "socket", "character", "block", "other",
+}
 _RECORD_KEYS = {
     "schema",
     "program",
@@ -39,6 +43,7 @@ _RECORD_KEYS = {
     "inputs",
     "symlinks",
     "non_symlinks",
+    "metadata",
     "measurement",
     "tests_ran",
     "tests_skipped",
@@ -147,6 +152,17 @@ def _symlinks_match(symlinks: dict[str, str]) -> bool:
 
 def _non_symlinks_match(paths: list[str]) -> bool:
     return all(os.path.lexists(path) and not os.path.islink(path) for path in paths)
+
+
+def _metadata_matches(metadata: dict[str, Any]) -> bool:
+    for path, expected in metadata.items():
+        try:
+            actual = tracing._observed_metadata(tracing._original_lstat(path))
+        except OSError:
+            return False
+        if actual != expected:
+            return False
+    return True
 
 
 def _identity(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -371,7 +387,8 @@ def _record_matches(record: dict[str, Any] | None, identity: dict[str, Any]) -> 
     if record is None or _identity(record) != identity:
         return False
     return (_inputs_match(record["inputs"]) and _symlinks_match(record["symlinks"])
-            and _non_symlinks_match(record["non_symlinks"]))
+            and _non_symlinks_match(record["non_symlinks"])
+            and _metadata_matches(record["metadata"]))
 
 
 def _load_record(path: Path) -> dict[str, Any] | None:
@@ -401,6 +418,7 @@ def _record_document(
     document["inputs"] = recorder.snapshot()
     document["symlinks"] = dict(sorted(recorder.symlinks.items()))
     document["non_symlinks"] = sorted(recorder.non_symlinks)
+    document["metadata"] = dict(sorted(recorder.metadata.items()))
     _record_evidence(document, result)
     if getattr(result, "measurement", None) is not None:
         document["measurement"] = result.measurement
@@ -552,6 +570,53 @@ def _validate_non_symlinks(value: Any, source: str, number: int) -> list[str]:
     return paths
 
 
+def _metadata_integer(name: str, value: Any, source: str, number: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise UsageError(
+            f"{source}:{number}: metadata {name}: expected a non-negative integer, "
+            f"got {_describe(value)}"
+        )
+    return value
+
+
+def _metadata_shape(value: Any, source: str, number: int) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(_METADATA_FIELDS):
+        raise UsageError(
+            f"{source}:{number}: metadata: expected type, mode, size, uid and gid"
+        )
+    return value
+
+
+def _metadata_mode(value: Any, source: str, number: int) -> int:
+    mode = _metadata_integer("mode", value, source, number)
+    if mode > 0o7777:
+        raise UsageError(f"{source}:{number}: metadata mode: expected permission bits")
+    return mode
+
+
+def _validate_metadata_entry(value: Any, source: str, number: int) -> dict[str, Any]:
+    value = _metadata_shape(value, source, number)
+    if value["type"] not in _METADATA_TYPES:
+        raise UsageError(
+            f"{source}:{number}: metadata type: unexpected {_describe(value['type'])}"
+        )
+    entry = {"type": value["type"], "mode": _metadata_mode(value["mode"], source, number)}
+    for name in ("size", "uid", "gid"):
+        entry[name] = _metadata_integer(name, value[name], source, number)
+    return entry
+
+
+def _validate_metadata(value: Any, source: str, number: int) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        raise UsageError(
+            f"{source}:{number}: metadata: expected a table, got {_describe(value)}"
+        )
+    return {
+        _input_path(path, source, number): _validate_metadata_entry(item, source, number)
+        for path, item in value.items()
+    }
+
+
 def _record_keys(value: dict[str, Any], source: Path, number: int) -> None:
     unknown = sorted(set(value) - _RECORD_KEYS)
     if unknown:
@@ -562,7 +627,7 @@ def _record_keys(value: dict[str, Any], source: Path, number: int) -> None:
 
 def _required_keys(value: dict[str, Any], source: Path, number: int) -> None:
     keys = ("schema", "program", "check", "command", "environment", "context",
-            "inputs", "symlinks", "non_symlinks")
+            "inputs", "symlinks", "non_symlinks", "metadata")
     for key in keys:
         if key not in value:
             raise UsageError(f"{source}:{number}: {key}: missing")
@@ -723,6 +788,7 @@ def _validate_record(value: Any, source: Path, number: int) -> dict[str, Any]:
         "inputs": _validate_inputs(value["inputs"], str(source), number),
         "symlinks": _validate_inputs(value["symlinks"], str(source), number),
         "non_symlinks": _validate_non_symlinks(value["non_symlinks"], str(source), number),
+        "metadata": _validate_metadata(value["metadata"], str(source), number),
     }
     _validate_link_types(record, source, number)
     _optional_fields(value, record, source, number)
