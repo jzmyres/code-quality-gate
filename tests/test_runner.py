@@ -4,12 +4,15 @@ from __future__ import annotations
 import contextlib
 import importlib
 import io
+import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -111,6 +114,33 @@ class ReapTests(unittest.TestCase):
 
 
 class AnalysisWorkerTests(unittest.TestCase):
+    def test_process_registration_and_cancellation_are_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "registry.json"
+            path.write_text(json.dumps({"cancelled": [], "entries": {}}), encoding="utf-8")
+            registry = runner._WorkerRegistry(str(path), (123,))
+            context = runner._worker_registry.set(registry)
+            try:
+                with mock.patch.object(runner.os, "setsid") as setsid:
+                    runner._register_session(("example", "argument"), "process", "token")
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    entry = data["entries"][str(os.getpid())]
+                    self.assertEqual(entry["command"], ["example", "argument"])
+                    self.assertEqual(entry["ancestors"], [123])
+                    setsid.assert_called_once()
+                    data["cancelled"].append(123)
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    with self.assertRaisesRegex(runner.WorkerError, "cancelled"):
+                        runner._register_session(("example",), "process", "next")
+                    setsid.assert_called_once()
+            finally:
+                runner._worker_registry.reset(context)
+
+    def test_unreadable_process_status_is_not_treated_as_stopped(self) -> None:
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            self.assertTrue(runner._proc_group_member("/proc/123/stat", 123))
+        self.assertFalse(runner._proc_group_member("/proc/no-such-pid/stat", 123))
+
     def test_large_result_and_output_are_returned(self) -> None:
         def work() -> bytes:
             print("worker output")

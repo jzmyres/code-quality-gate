@@ -634,9 +634,11 @@ do not block the whole-tree judgement. With `--changed-from`, a located threshol
 lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. Each check has one
 absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
 baseline loading and ratchet evaluation. Command, Python test and Emacs Lisp checks use their configured budgets;
-clone, CRAP, verification and owners checks each have 600 seconds. Synchronous analysis runs in supervised workers
-that are stopped at the deadline. An overrun reports `outcome = "fail"` and `execution = "budget"`, names
-the step, deadline and elapsed time, and retains the subprocess diagnostics collected so far.
+clone, CRAP, verification and owners checks each have 600 seconds. Synchronous analysis runs in supervised workers.
+Cancelling a worker stops it, every subprocess it started through the runner, and those subprocesses' process
+groups before cancellation returns. If a process cannot be stopped, the check reports an error naming its pid and
+command. An overrun reports `outcome = "fail"` and `execution = "budget"`, names the step, deadline and elapsed
+time, and retains the subprocess diagnostics collected so far.
 
 `diagnostics` carries `argv`, `exit_code` or `signal`, `output_bytes`, `output_tail` (at most 4 KiB),
 `output_truncated` and, when execution failed, `error`. Every subprocess the gate starts (git
