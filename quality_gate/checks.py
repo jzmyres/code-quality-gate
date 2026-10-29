@@ -1322,6 +1322,12 @@ def _run_elisp_tests(context: AdapterContext) -> CheckResult:
     return run_tests(context)
 
 
+def _run_elisp_crap(context: AdapterContext) -> CheckResult:
+    from .elisp_crap import run_crap
+
+    return run_crap(context)
+
+
 def _file_present(path: Path | None) -> bool:
     return path is not None and path.is_file()
 
@@ -1827,6 +1833,22 @@ def _reuse_expired_entries(check: CheckDef) -> list[str] | None:
     return [entry.subject for entry in entries if _entry_expired(entry, today)]
 
 
+def _elisp_reuse_files(
+    root: Path, config: Config, check: CheckDef, selected: list[str],
+    files: list[str], classes: dict[str, str],
+) -> dict[str, Any] | None:
+    if check.adapter == "elisp_tests":
+        inputs = selected
+    elif check.adapter == "elisp_crap":
+        required = config.checks[check.spec.requires]
+        inputs, _names = _select_files(config, required, files, classes)
+    else:
+        return None
+    from .elisp_crap import _file_key
+
+    return {name: _file_key(root, name) for name in inputs}
+
+
 def _reuse_context(
     root: Path, config: Config, check: CheckDef, files: list[str],
     classes: dict[str, str], prior: dict[str, CheckResult],
@@ -1843,6 +1865,7 @@ def _reuse_context(
         "expired_entries": _reuse_expired_entries(check),
         "selection": selected,
         "classes": names,
+        "elisp_files": _elisp_reuse_files(root, config, check, selected, files, classes),
         "prior": {name: [result.outcome, result.tests_ran, result.tests_skipped,
                           result.measurement, reuse.evidence_hash(result.evidence_path)]
                   for name, result in dependencies.items()},
@@ -1899,17 +1922,29 @@ def _elisp_reuse_collision(
     return _suite_collision(context, selected, start)
 
 
+def _elisp_reuse_selection(
+    root: Path, config: Config, check: CheckDef, files: list[str],
+    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
+) -> CheckResult | None:
+    if check.adapter == "elisp_tests":
+        return _elisp_reuse_collision(root, config, check, files, classes, prefix, prior, start)
+    from .elisp_crap import selection_failure
+
+    context = AdapterContext(root, config, check, files, classes, prefix, prior)
+    return selection_failure(context, start)
+
+
 def _reuse_stages(
     session: Any, root: Path, config: Config, check: CheckDef, files: list[str],
     classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
     budget: float,
 ) -> CheckResult:
     deadline = start + budget
-    if check.adapter == "elisp_tests":
-        collision = analysis_step("Elisp suite selection", _elisp_reuse_collision, root, config, check,
+    if check.adapter in ("elisp_tests", "elisp_crap"):
+        selection = analysis_step("Elisp selection", _elisp_reuse_selection, root, config, check,
                                   files, classes, prefix, prior, start, deadline=deadline)
-        if collision is not None:
-            return collision
+        if selection is not None:
+            return selection
     context = analysis_step("reuse context", _reuse_context, root, config, check, files, classes, prior,
                             deadline=deadline)
     coverage_dir = session.coverage_path(check) if check.adapter == "python_tests" else None

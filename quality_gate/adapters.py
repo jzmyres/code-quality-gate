@@ -17,6 +17,7 @@ from .policy import (
     DEFAULT_CRAP_THRESHOLD,
     DEFAULT_MIN_TOKENS,
     CloneSpec,
+    ElispCrapSpec,
     PythonCrapSpec,
     VerificationSpec,
     _integer,
@@ -77,6 +78,7 @@ class AdapterDescriptor:
     fixed_header: tuple[int, str, str] | None = None
     budget: Callable[[Any], int] = _default_budget
     entry_direction: Callable[[str, str], str] | None = None
+    parse_candidate_inputs: bool = False
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
@@ -144,8 +146,9 @@ def _elisp_tests_spec(
     return ParsedSpec(parse_spec(raw, root, path, full_key), "test-count/1", ("tests",))
 
 
-def _python_crap_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
+def _crap_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str,
+    spec_type: Any, version: str,
 ) -> ParsedSpec:
     requires = _string(raw, "requires", path, f"{full_key}.requires")
     baseline = _baseline(raw, root, path, full_key)
@@ -158,13 +161,25 @@ def _python_crap_spec(
         minimum=0,
     )
     return ParsedSpec(
-        PythonCrapSpec(requires),
-        "python-lines/1",
+        spec_type(requires),
+        version,
         ("crap",),
         threshold=threshold,
         baseline=baseline,
         requires=requires,
     )
+
+
+def _python_crap_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    return _crap_spec(raw, root, path, full_key, PythonCrapSpec, "python-lines/1")
+
+
+def _elisp_crap_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    return _crap_spec(raw, root, path, full_key, ElispCrapSpec, "elisp-edebug/1")
 
 
 def _verification_spec(
@@ -282,6 +297,7 @@ register_adapter(AdapterDescriptor(
     _runner("_run_elisp_tests"),
     produces_tests=True,
     budget=_spec_budget,
+    parse_candidate_inputs=True,
 ))
 register_adapter(AdapterDescriptor(
     "python_crap",
@@ -291,6 +307,15 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",
+))
+register_adapter(AdapterDescriptor(
+    "elisp_crap",
+    ("requires", "threshold", "baseline"),
+    _elisp_crap_spec,
+    _runner("_run_elisp_crap"),
+    location_coverage="complete",
+    display=lambda value: f"{value:.1f}",
+    requires_adapter="elisp_tests",
 ))
 register_adapter(AdapterDescriptor(
     "verification",

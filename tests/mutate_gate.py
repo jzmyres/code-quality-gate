@@ -33,6 +33,22 @@ class Decision:
 # mutation in the function. Exact AST source matches make drift an error.
 DECISIONS = (
     Decision(
+        "elisp_unmeasured",
+        "quality_gate/elisp_crap.py",
+        "_finding",
+        "comparison",
+        "points == 0",
+        "A definition without Edebug stop points is unmeasured.",
+    ),
+    Decision(
+        "elisp_attribution_end",
+        "quality_gate/elisp_crap.py",
+        "_within_span",
+        "comparison",
+        'position < definition["end"]',
+        "A definition's end position is excluded from attribution.",
+    ),
+    Decision(
         "elisp_no_executed_tests",
         "quality_gate/elisp_tests.py",
         "_verdict",

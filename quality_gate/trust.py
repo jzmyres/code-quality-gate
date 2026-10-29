@@ -981,7 +981,7 @@ def prepare_trust(
     _materialize(
         policy_root, root, revision, _rev_policy_bytes(root, revision)
     )
-    rev_config = load_config(policy_root)
+    rev_config = load_config(policy_root, candidate_root=root)
     inputs = _protected_inputs(root, revision, rev_config)
     allowed_paths = {_normalise(path) for path in allowed}
     config, policy_status = _policy_config(

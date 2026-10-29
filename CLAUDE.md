@@ -4,14 +4,15 @@ A reusable, offline code-quality gate any repository can run, built to keep AI-w
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
 implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `runner`, `ratchet`, `clones`,
-`python_tests`, `python_crap`, `elisp_tests`, `elisp/qg-elisp-child.el`, `verification`, `covrun`,
+`python_tests`, `python_crap`, `elisp_tests`, `elisp_crap`, `elisp/qg-elisp-child.el`,
+`elisp/qg-elisp-complexity.el`, `verification`, `covrun`,
 `coverage_tool`, `checks`, `gate_result`,
 `trust`, `reuse`, `tracing`, `trace_guard`, `exec_inputs`, `cli`);
 `qg.py` is only the entry point. `check --policy-from REV` takes its policy, baselines, tool lock and
 protected paths from `REV`; `docs/TRUST.md` is the contract.
 
 Policy declares `schema = 2`, code classes with their `checks`, and one `[checks.ID]` table per check
-(`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `verification` or `owners`). Adapters declare evidence
+(`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `elisp_crap`, `verification` or `owners`). Adapters declare evidence
 (`tests`, `crap`, `duplication`, `static`) and the result reports one obligation per code class and
 required tier.
 Adapters measure subjects; the core in `ratchet.py` decides raw outcome, policy satisfaction, expiry,

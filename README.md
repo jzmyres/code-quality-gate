@@ -23,8 +23,8 @@ The gate is deliberately narrow. It owns the orchestration no maintained tool ow
   the adapter's raw outcome and policy satisfaction, and carries diagnostics, obligations and prune
   reporting; `--policy-from` adds a `trust` object and result schema 3.
 
-Tier 1 includes Python tests, per-function Python CRAP scores, and Emacs Lisp tests with Edebug
-coverage. The next metric layer is an Emacs Lisp CRAP adapter.
+Tier 1 includes Python and Emacs Lisp tests and per-function CRAP scores. Emacs Lisp CRAP uses
+the Edebug coverage collected by the test adapter.
 
 ## Requirements
 
@@ -45,7 +45,9 @@ supported-adapter registry, `files.py` resolves the repository and runs inventor
 `tools.py` owns the pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning,
 `clones.py` measures jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage,
 `python_crap.py` joins coverage with `ast` complexity, `elisp_tests.py` and
-`elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `verification.py` measures test counts and source
+`elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `elisp_crap.py` and
+`elisp/qg-elisp-complexity.el` join that coverage with the editor's complexity rules,
+`verification.py` measures test counts and source
 exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
@@ -333,6 +335,56 @@ Each finding carries `measurement`: `cc`, `statements`, `executed` and `excluded
 excluded by `# pragma: no cover` inside the measured span). An added pragma is therefore visible in
 `check --json`. The metric version is `python-lines/1`.
 
+### Emacs Lisp CRAP
+
+    [checks.legacy-crap]
+    adapter = "elisp_crap"
+    tier = 1
+    enforcement = "enforced"
+    requires = "legacy-tests"                  # an earlier elisp_tests check id
+    threshold = 6                              # optional; finite; this is the default
+    baseline = "quality-gate-crap-legacy.toml" # the file may not exist yet
+
+`requires` must name an `elisp_tests` check declared earlier. Every file selected by this CRAP
+check must belong to a class that also lists the required test check, so that it was instrumented.
+An unknown, later or different-adapter reference, or a selected file without that instrumentation,
+is a configuration error. If the required check did not pass, CRAP is `unsupported` with
+`coverage unreliable: CHECK did not pass` and nothing is scored. The suite runs once; CRAP consumes
+its recorded Edebug evidence, including evidence restored with `--reuse-store`. Reuse also checks the
+physical identities of the instrumented files, since changing a link can change Edebug attribution.
+
+Subjects are top-level `defun`, `defsubst`, `defmacro` and `cl-defun` forms in the selected files.
+The subject is `PATH:NAME`, using Emacs `symbol-name`, and the location is the form's first line.
+Other top-level forms are not subjects. Two definitions with the same identity in one file fail,
+with both lines reported. A batch Emacs using the required check's `emacs` reads the source without
+evaluating or instrumenting it; an unreadable form fails the check and names the file and error.
+
+Complexity is 1 plus decisions in the body after the argument list. The table below is the editor's
+source-level counting rule; nested functions and lambdas contribute to their enclosing subject.
+Quoted data is skipped.
+
+| Form | Decisions added |
+|---|---|
+| `if`, `when`, `unless`, `while`, `dolist`, `dotimes`, `cl-dolist`, `cl-dotimes`, `cl-do`, `cl-do*`, `dolist-with-progress-reporter`, `ignore-errors`, `bound-and-true-p` | One per form. |
+| `and`, `or` | One per operand after the first. |
+| `cond` | One per clause, except a final `t`, `_` or `otherwise` clause. |
+| `if-let`, `if-let*`, `when-let`, `when-let*`, `and-let*` | One per binding. |
+| `condition-case`, `condition-case-unless-debug` | One per handler. |
+| `pcase`, `pcase-exhaustive`, `cl-case`, `cl-ecase`, `cl-typecase` | One per clause, except a final `t`, `_` or `otherwise` clause; patterns are data and are not counted. |
+| `cl-loop` | One for the loop and one for each top-level conditional clause keyword: `when`, `if`, `unless`, `while`, `until`, `always`, `never`, `thereis`. |
+
+Edebug entries are attributed to the first subject in the same physical file whose character span
+contains the entry's position, including the start and excluding the end; symlinks and hard links
+to the same file match, and entries outside every subject are ignored.
+This includes lambda points in the enclosing subject. `points` is the sum of its entries' stop points,
+and `hits` the sum reached. With `cov = hits / points`, CRAP is `CC^2 * (1 - cov)^3 + CC`. A subject
+with no stop points is `unmeasured` and fails with `no Edebug stop point in this definition`.
+
+Findings use `PATH:NAME` as `subject` and unrounded CRAP as `value` in the generic ratchet; the human
+report rounds to one decimal. Each finding's `measurement` contains `cc`, `points` and `hits`, and the
+metric version is `elisp-edebug/1`. The measured domain is the selected files, so resolved baseline
+entries and `--prune` follow the same ratchet rules as Python CRAP.
+
 ### Single-owner rules
 
 The `owners` adapter checks a declared concern across the **entire inventory**, including tracked and
@@ -552,8 +604,8 @@ never has to parse stderr to learn why a check failed.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`, `locations` and `expired`; baseline
-errors carry `error`, and CRAP findings carry a `measurement` with `cc`, `statements`, `executed` and
-`excluded_lines`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
+errors carry `error`. Python CRAP findings carry `cc`, `statements`, `executed` and `excluded_lines` in
+`measurement`; Emacs Lisp CRAP findings carry `cc`, `points` and `hits`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
 bound fails.
 
 ### Result reuse by recorded reads
@@ -615,8 +667,8 @@ inventory cannot be compared and its finding is reported as not change-scoped.
 Git's line matching decides which lines count as additions, and a deletion alone adds no lines. Ignored
 untracked files and deleted files are outside inventory. A bad revision or failed diff exits 2.
 
-The `python_crap`, `owners` and `clones` adapters provide complete locations: respectively the entire
-function range (including decorators), every occurrence line, and both ranges of every clone in a
+The `python_crap`, `elisp_crap`, `owners` and `clones` adapters provide complete locations: respectively the entire
+function range (including Python decorators), every occurrence line, and both ranges of every clone in a
 fingerprint group. CRAP's module subject uses the span from its first to last outside-function node;
 that conservative span can include intervening functions. Verification supplies every inline and
 file-wide suppression line, one location per directive, but its test-count metrics have no source
@@ -726,7 +778,7 @@ and the allowed keys. The complete shape is:
     description = "Configuration and pinned data"
 
     [checks.ruff]
-    adapter = "command"                   # also clones, python_tests, python_crap, verification, owners
+    adapter = "command"                   # also clones, python_tests, elisp_tests, python_crap, elisp_crap, verification, owners
     tier = 1                              # 1-4
     enforcement = "enforced"              # enforced or advisory
     run = ["{tool:ruff}", "check", "--no-cache", "--config", "ruff.toml", "{files}"]
@@ -819,6 +871,8 @@ Notes:
   the classes that list it.
 * An `elisp_tests` check needs a repository-relative `suite` file; `load_path`, `emacs` and
   `budget_seconds` are optional. Its measured files come from the classes that list it.
+* An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and a `baseline` path.
+  Its `threshold` defaults to 6 and must be finite. Every selected file's class must list both checks.
 * A `verification` check needs a `baseline` path. Its optional `requires` names an earlier
   test-producing check; without it every earlier test-producing check is used. It measures executed
   tests (a `min` floor), skipped tests, `pragma: no cover` lines, inline `# noqa` comments and file-wide
@@ -991,12 +1045,9 @@ Reproduce it locally with the same tools cache:
 ## Planned later layers
 
 The core gate is deliberately language-agnostic; adapters measure and the core decides. Tier 1 now
-includes the Python tests and CRAP adapters described above. The policy and baseline contract is fixed
+includes the Python and Emacs Lisp tests and CRAP adapters described above. The policy and baseline contract is fixed
 at schema 2 (a trust result adds schema 3) so M4 (tier 2 properties/fuzzing) and M5 (tiers 3/4
-bounded/proof) add adapters without reworking the core. The next metric layer is:
-
-* **Emacs Lisp CRAP adapter** - reuse the same baseline and reporting model, but compute complexity and
-  coverage through an Emacs batch helper, since Emacs Lisp has no maintained standalone CRAP tool.
+bounded/proof) add adapters without reworking the core.
 
 Every layer uses the same rule: a new exception is a hand-written baseline entry with a reason, and
 pruning only removes resolved entries or tightens bounds.

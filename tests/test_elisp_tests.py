@@ -215,7 +215,7 @@ class ElispTests(FixtureCase):
             {**valid, "failures": [{"name": "extra", "condition": "failure"}]},
             {**valid, "failures": "bad"},
             {**valid, "definitions": ["bad"]},
-            {**valid, "definitions": [{"symbol": "", "file": "src/core.el", "position": 1,
+            {**valid, "definitions": [{"symbol": None, "file": "src/core.el", "position": 1,
                                         "stop_points": 1, "reached": 0}]},
             {**valid, "definitions": [{"symbol": "x", "file": "../outside.el", "position": 1,
                                         "stop_points": 1, "reached": 0}]},

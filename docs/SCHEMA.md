@@ -77,6 +77,14 @@ requires = "tests"            # an earlier python_tests check
 threshold = 6                 # optional; finite
 baseline = "quality-gate-crap.toml"
 
+[checks.legacy-crap]
+adapter = "elisp_crap"
+tier = 1
+enforcement = "enforced"
+requires = "legacy-tests"     # an earlier elisp_tests check
+threshold = 6                 # optional; finite
+baseline = "quality-gate-crap-legacy.toml"
+
 [checks.verification]
 adapter = "verification"
 tier = 1
@@ -121,6 +129,8 @@ Rules:
   `executed = ran - skipped`, and zero executed tests fail.
 * `python_crap.requires` names an earlier `python_tests` check. Anything else
   is a configuration error.
+* `elisp_crap.requires` names an earlier `elisp_tests` check. Every file selected
+  for CRAP must belong to a class that also lists that test check.
 * `verification.requires`, when present, names an earlier `python_tests`
   check. Without it the adapter reuses every earlier `python_tests` check.
 * A baseline path must be used by exactly one check. Two checks naming the
@@ -144,8 +154,10 @@ Each adapter declares the evidence it produces:
 | `command` without `tests_pattern` | `static` |
 | `command` with `tests_pattern` | `tests` |
 | `python_tests` | `tests` |
+| `elisp_tests` | `tests` |
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
+| `elisp_crap` | `crap` |
 | `verification` | none |
 | `owners` | `static` |
 
@@ -643,8 +655,10 @@ A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `start_line` and `end_line`, or null when the source locations are incomplete.
 With `--changed-from`, `on_changed_lines` is a boolean for a finding with
 complete, comparable locations and null otherwise. A baseline-covered finding may have
-`blocking = true` when it violates its threshold on changed lines. Baseline errors carry `error`; CRAP findings carry
-`measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
+`blocking = true` when it violates its threshold on changed lines. Baseline errors carry `error`.
+Python CRAP findings carry `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
+Emacs Lisp CRAP findings carry `measurement` with `cc` (cyclomatic complexity), `points` (Edebug
+stop points) and `hits` (reached stop points); their metric version is `elisp-edebug/1`.
 
 Obligation status is `satisfied`, `exempted` (with `reason`) or
 `unsatisfied`. `required` names the evidence the tier needs; `checks` names
@@ -673,7 +687,7 @@ gate evaluation.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Metric versions: `command-exit/1`, `test-count/1`,
-  `jscpd-clone-occurrences/1`, `python-lines/1`, `verification/1`,
+  `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `verification/1`,
   `owners/1`, `inventory/1`, `hygiene/1`.
 
 The following proposals in the historical plans are superseded and are not part

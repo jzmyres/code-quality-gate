@@ -96,7 +96,7 @@ def _definition_shape(item: Any) -> bool:
 
 
 def _definition_names(item: dict[str, Any]) -> bool:
-    return all(isinstance(item[key], str) and item[key] for key in ("symbol", "file"))
+    return isinstance(item["symbol"], str) and isinstance(item["file"], str) and bool(item["file"])
 
 
 def _definition_file(item: dict[str, Any], selected: list[str] | None) -> bool:
