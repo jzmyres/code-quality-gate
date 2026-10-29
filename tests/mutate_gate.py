@@ -33,6 +33,22 @@ class Decision:
 # mutation in the function. Exact AST source matches make drift an error.
 DECISIONS = (
     Decision(
+        "elisp_compile_warning",
+        "quality_gate/elisp_lint.py",
+        "_compile_failed",
+        "comparison",
+        'len(document["failed"]) > 0',
+        "A compiler warning or error fails the compile check.",
+    ),
+    Decision(
+        "elisp_checkdoc_issue",
+        "quality_gate/elisp_lint.py",
+        "_checkdoc_failed",
+        "comparison",
+        'len(document["issues"]) > 0',
+        "A checkdoc issue fails the documentation check.",
+    ),
+    Decision(
         "elisp_unmeasured",
         "quality_gate/elisp_crap.py",
         "_finding",

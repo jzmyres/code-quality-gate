@@ -1322,6 +1322,12 @@ def _run_elisp_tests(context: AdapterContext) -> CheckResult:
     return run_tests(context)
 
 
+def _run_elisp_lint(context: AdapterContext) -> CheckResult:
+    from .elisp_lint import run_lint
+
+    return run_lint(context)
+
+
 def _run_elisp_crap(context: AdapterContext) -> CheckResult:
     from .elisp_crap import run_crap
 
@@ -1776,6 +1782,7 @@ def _reused_result(
         measurement=record.get("measurement"),
         tests_ran=record.get("tests_ran"),
         tests_skipped=record.get("tests_skipped"),
+        emacs_version=record.get("emacs_version"),
     )
     reuse.restore_coverage(record, result)
     if result.tests_ran is not None and result.tests_skipped is not None:
@@ -1879,10 +1886,17 @@ def _reuse_identity(check: CheckDef, context: Any, root: Path, coverage_dir: Pat
         return None
 
 
+def _lint_reuse_missing(check: CheckDef, record: dict[str, Any]) -> bool:
+    return check.adapter in ("elisp_compile", "elisp_checkdoc") and "emacs_version" not in record
+
+
 def _usable_reuse(check: CheckDef, reused: Any) -> Any:
-    if reused is not None and check.adapter == "elisp_tests":
-        if "elisp_result" not in reused.record:
-            return None
+    if reused is None:
+        return None
+    if check.adapter == "elisp_tests" and "elisp_result" not in reused.record:
+        return None
+    if _lint_reuse_missing(check, reused.record):
+        return None
     return reused
 
 

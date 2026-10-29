@@ -47,6 +47,7 @@ supported-adapter registry, `files.py` resolves the repository and runs inventor
 `python_crap.py` joins coverage with `ast` complexity, `elisp_tests.py` and
 `elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `elisp_crap.py` and
 `elisp/qg-elisp-complexity.el` join that coverage with the editor's complexity rules,
+`elisp_lint.py` and `elisp/qg-elisp-lint.el` run byte compilation and checkdoc,
 `verification.py` measures test counts and source
 exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
@@ -275,6 +276,39 @@ report includes the Emacs version. Each definition entry, including generated la
 repository-relative file, character position, total stop points and reached stop points. This evidence
 is retained for a later check that requires it, including when a passing result is restored from a
 reuse store. A changed Emacs executable or other recorded input invalidates reuse.
+
+### Emacs Lisp compile and checkdoc
+
+    [checks.compile]
+    adapter = "elisp_compile"
+    tier = 1
+    enforcement = "enforced"
+    load_path = ["lisp", "emacs/lisp"]    # optional repository-relative directories, in order
+    emacs = "emacs"                       # optional command on PATH or path; the default
+    budget_seconds = 900                  # optional; the default
+
+    [checks.checkdoc]
+    adapter = "elisp_checkdoc"
+    tier = 1
+    enforcement = "enforced"
+    load_path = ["lisp", "emacs/lisp"]
+    emacs = "emacs"
+    budget_seconds = 900
+
+Each check selects the files of the classes that list it; no selected files fails. `load_path`
+entries must be directories within the repository. Each check independently chooses its Emacs binary,
+so a repository can use a no-X build for both. Unknown keys and invalid configuration are errors.
+Both checks produce static evidence; a class still needs test evidence to satisfy its tier 1 obligation.
+
+Compilation runs each selected file, in path order, in its own fresh `emacs -Q --batch` process with
+warnings treated as errors. The generated `.elc` files go to a temporary directory that is removed
+after the check, so they cannot shadow source files in the repository. A warning or error fails and
+reports the file and compiler messages. Checkdoc runs once for all selected files; each issue fails
+and is reported with its file, line and message.
+
+An expired budget fails with `execution = "budget"`. A missing Emacs command or a process that does
+not produce a valid report is `unsupported`. Completed measurements report `emacs_version` in JSON
+and in the human output, including when a passing result is reused.
 
 ### Python CRAP
 
@@ -588,7 +622,7 @@ finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = t
 do not block the whole-tree judgement. With `--changed-from`, a located threshold violation on changed
 lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. Each check has one
 absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
-baseline loading and ratchet evaluation. Command, Python test and Emacs Lisp test checks use their configured budgets;
+baseline loading and ratchet evaluation. Command, Python test and Emacs Lisp checks use their configured budgets;
 clone, CRAP, verification and owners checks each have 600 seconds. Synchronous analysis runs in supervised workers
 that are stopped at the deadline. An overrun reports `outcome = "fail"` and `execution = "budget"`, names
 the step, deadline and elapsed time, and retains the subprocess diagnostics collected so far.
@@ -778,7 +812,7 @@ and the allowed keys. The complete shape is:
     description = "Configuration and pinned data"
 
     [checks.ruff]
-    adapter = "command"                   # also clones, python_tests, elisp_tests, python_crap, elisp_crap, verification, owners
+    adapter = "command"                   # see adapter sections above for other choices
     tier = 1                              # 1-4
     enforcement = "enforced"              # enforced or advisory
     run = ["{tool:ruff}", "check", "--no-cache", "--config", "ruff.toml", "{files}"]
@@ -871,6 +905,8 @@ Notes:
   the classes that list it.
 * An `elisp_tests` check needs a repository-relative `suite` file; `load_path`, `emacs` and
   `budget_seconds` are optional. Its measured files come from the classes that list it.
+* `elisp_compile` and `elisp_checkdoc` select files from the classes that list them. Their `load_path`,
+  `emacs` and `budget_seconds` settings are optional and independent for each check.
 * An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and a `baseline` path.
   Its `threshold` defaults to 6 and must be finite. Every selected file's class must list both checks.
 * A `verification` check needs a `baseline` path. Its optional `requires` names an earlier

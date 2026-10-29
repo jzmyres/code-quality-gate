@@ -146,6 +146,14 @@ def _elisp_tests_spec(
     return ParsedSpec(parse_spec(raw, root, path, full_key), "test-count/1", ("tests",))
 
 
+def _elisp_lint_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .elisp_lint import parse_spec
+
+    return ParsedSpec(parse_spec(raw, root, path, full_key), "elisp-lint/1", ("static",))
+
+
 def _crap_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str,
     spec_type: Any, version: str,
@@ -296,6 +304,22 @@ register_adapter(AdapterDescriptor(
     _elisp_tests_spec,
     _runner("_run_elisp_tests"),
     produces_tests=True,
+    budget=_spec_budget,
+    parse_candidate_inputs=True,
+))
+register_adapter(AdapterDescriptor(
+    "elisp_compile",
+    ("load_path", "emacs", "budget_seconds"),
+    _elisp_lint_spec,
+    _runner("_run_elisp_lint"),
+    budget=_spec_budget,
+    parse_candidate_inputs=True,
+))
+register_adapter(AdapterDescriptor(
+    "elisp_checkdoc",
+    ("load_path", "emacs", "budget_seconds"),
+    _elisp_lint_spec,
+    _runner("_run_elisp_lint"),
     budget=_spec_budget,
     parse_candidate_inputs=True,
 ))

@@ -69,6 +69,22 @@ load_path = ["lisp", "emacs/lisp"]  # optional repository-relative directories
 emacs = "emacs"                     # optional command or path
 budget_seconds = 900                # optional
 
+[checks.compile]
+adapter = "elisp_compile"
+tier = 1
+enforcement = "enforced"
+load_path = ["lisp", "emacs/lisp"]  # optional repository-relative directories
+emacs = "emacs"                     # optional command or path
+budget_seconds = 900                # optional
+
+[checks.checkdoc]
+adapter = "elisp_checkdoc"
+tier = 1
+enforcement = "enforced"
+load_path = ["lisp", "emacs/lisp"]
+emacs = "emacs"
+budget_seconds = 900
+
 [checks.crap]
 adapter = "python_crap"
 tier = 1
@@ -131,6 +147,11 @@ Rules:
   is a configuration error.
 * `elisp_crap.requires` names an earlier `elisp_tests` check. Every file selected
   for CRAP must belong to a class that also lists that test check.
+* `elisp_compile` and `elisp_checkdoc` select files from the classes listing
+  them. Their optional `load_path` entries are repository-relative directories;
+  `emacs` is a command or path and `budget_seconds` is a positive integer.
+  The defaults are no load paths, `emacs`, and 900 seconds. An empty selection
+  fails.
 * `verification.requires`, when present, names an earlier `python_tests`
   check. Without it the adapter reuses every earlier `python_tests` check.
 * A baseline path must be used by exactly one check. Two checks naming the
@@ -155,6 +176,8 @@ Each adapter declares the evidence it produces:
 | `command` with `tests_pattern` | `tests` |
 | `python_tests` | `tests` |
 | `elisp_tests` | `tests` |
+| `elisp_compile` | `static` |
+| `elisp_checkdoc` | `static` |
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
 | `elisp_crap` | `crap` |
@@ -643,7 +666,9 @@ Check keys:
 * `test_results` - normalized test counts when available: `selected`, `passed`, `failed`,
   `skipped`, and `failures` (strings naming unexpected results). Passed counts expected results;
   selected equals passed plus failed plus skipped.
-* `emacs_version` - the Emacs version string for a completed Elisp measurement.
+* `emacs_version` - the Emacs version string for a completed Elisp measurement,
+  including compile and checkdoc checks and reused passing results. It is absent
+  when no process has reported a version, such as when Emacs is missing.
 * `definitions` - the Elisp measurement's array of objects with `symbol`, repository-relative `file`,
   one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
   These counts are also retained as evidence for later checks, including through result reuse.
@@ -687,7 +712,7 @@ gate evaluation.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Metric versions: `command-exit/1`, `test-count/1`,
-  `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `verification/1`,
+  `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `elisp-lint/1`, `verification/1`,
   `owners/1`, `inventory/1`, `hygiene/1`.
 
 The following proposals in the historical plans are superseded and are not part

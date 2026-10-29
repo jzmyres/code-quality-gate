@@ -45,6 +45,7 @@ _RECORD_KEYS = {
     "coverage_data",
     "coverage_config",
     "elisp_result",
+    "emacs_version",
 }
 
 
@@ -403,6 +404,8 @@ def _record_document(
     _record_evidence(document, result)
     if getattr(result, "measurement", None) is not None:
         document["measurement"] = result.measurement
+    if getattr(result, "emacs_version", None) is not None:
+        document["emacs_version"] = result.emacs_version
     for name in ("tests_ran", "tests_skipped"):
         value = getattr(result, name, None)
         if value is not None:
@@ -668,6 +671,8 @@ def _optional_fields(
     value: dict[str, Any], record: dict[str, Any], source: Path, number: int
 ) -> None:
     _elisp_record_fields(value, record, source, number)
+    if "emacs_version" in value:
+        record["emacs_version"] = _validate_emacs_version(value["emacs_version"], source, number)
     if "measurement" in value:
         record["measurement"] = _validate_measurement(
             value["measurement"], source, number
@@ -675,6 +680,14 @@ def _optional_fields(
     for name in ("tests_ran", "tests_skipped"):
         if name in value:
             record[name] = _validate_count(name, value[name], source, number)
+
+
+def _validate_emacs_version(value: Any, source: Path, number: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise UsageError(
+            f"{source}:{number}: emacs_version: expected a non-empty string, got {_describe(value)}"
+        )
+    return value
 
 
 def _invalid_symlink_digest(digest: Any) -> bool:

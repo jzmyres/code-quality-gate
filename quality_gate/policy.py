@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
+    from .elisp_lint import ElispLintSpec
     from .elisp_tests import ElispTestsSpec
     from .owners import OwnersSpec
     from .ratchet import BaselineEntry
@@ -117,6 +118,7 @@ AdapterSpec = Union[
     CloneSpec,
     PythonTestsSpec,
     "ElispTestsSpec",
+    "ElispLintSpec",
     PythonCrapSpec,
     ElispCrapSpec,
     VerificationSpec,

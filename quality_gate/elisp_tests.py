@@ -53,9 +53,7 @@ def _relative_path(root: Path, value: str, path: Path, key: str, kind: str) -> N
         raise _config_error(path, key, f"a {kind}", f"{value!r} is missing or not a {kind}")
 
 
-def parse_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ElispTestsSpec:
-    suite = _string(raw, "suite", path, f"{key}.suite")
-    _relative_path(root, suite, path, f"{key}.suite", "regular file")
+def _common_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> tuple[tuple[str, ...], str, int]:
     load_path = _optional_string_list(raw, "load_path", path, f"{key}.load_path")
     for index, directory in enumerate(load_path):
         _relative_path(root, directory, path, f"{key}.load_path[{index}]", "directory")
@@ -64,7 +62,13 @@ def parse_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ElispTe
         raise _config_error(path, f"{key}.emacs", "a command without NUL", repr(emacs))
     budget = _integer(raw, "budget_seconds", path, f"{key}.budget_seconds",
                       default=DEFAULT_TESTS_BUDGET_SECONDS, minimum=1)
-    return ElispTestsSpec(suite, load_path, emacs, budget)
+    return load_path, emacs, budget
+
+
+def parse_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ElispTestsSpec:
+    suite = _string(raw, "suite", path, f"{key}.suite")
+    _relative_path(root, suite, path, f"{key}.suite", "regular file")
+    return ElispTestsSpec(suite, *_common_spec(raw, root, path, key))
 
 
 def _lisp_string(value: str) -> str:
