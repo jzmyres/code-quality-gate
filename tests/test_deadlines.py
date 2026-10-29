@@ -150,9 +150,12 @@ class AnalysisDeadlineTests(unittest.TestCase):
         )
         start = time.monotonic()
         with mock.patch.object(checks, "coverage_prefix", return_value=[]):
-            with mock.patch.object(checks, "combine_coverage", side_effect=self.stall):
-                with contextlib.redirect_stderr(io.StringIO()):
-                    result = checks.run_check(self.root, self.config, check, [], {}, prefix="check")
+            with mock.patch.object(
+                checks, "_coverage_config_problem", return_value=None
+            ):
+                with mock.patch.object(checks, "combine_coverage", side_effect=self.stall):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        result = checks.run_check(self.root, self.config, check, [], {}, prefix="check")
         self.assert_timeout(result, "coverage combination", time.monotonic() - start)
         self.assertEqual(result.diagnostics.exit_code, 0)
         self.assertIn("Ran 1 test", result.diagnostics.output_tail)

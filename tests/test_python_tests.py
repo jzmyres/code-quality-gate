@@ -562,7 +562,7 @@ class CovrunTests(unittest.TestCase):
         coverage_tool.combine_coverage(
             self.data_dir,
             self.base / "combined" / ".coverage",
-            self.config_file,
+            self.source_root,
         )
 
     def test_program_imports_its_own_quality_gate_package(self) -> None:
@@ -822,7 +822,7 @@ class CoverageRegistryTests(unittest.TestCase):
         coverage_tool.combine_coverage(
             self.data_dir,
             self.data_dir / "combined" / ".coverage",
-            coverage_tool.coverage_config_path(self.data_dir),
+            self.data_dir,
         )
 
     def test_no_registration_is_unsupported(self) -> None:
@@ -910,9 +910,9 @@ class CoverageDeadlineTests(unittest.TestCase):
             spec,
             0.0,
             "check: tests",
+            Path("/nonexistent-root"),
             Path("/nonexistent-data"),
             Path("combined"),
-            Path("config"),
             runner.Diagnostics(),
             0.0,
         )
@@ -1114,6 +1114,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         data_dir = Path(temporary.name) / "data"
         data_dir.mkdir()
+        coverage_tool.write_coverage_config(data_dir, data_dir)
         with contextlib.redirect_stderr(io.StringIO()):
             result = checks._tests_evidence(
                 self.check,
@@ -1121,6 +1122,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 0.0,
                 "check: tests",
                 temporary,
+                data_dir,
                 data_dir,
                 1,
                 0,
@@ -1137,6 +1139,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         data_dir = Path(temporary.name) / "data"
         data_dir.mkdir()
+        coverage_tool.write_coverage_config(data_dir, data_dir)
         with mock.patch.object(
             checks, "_combine_tests_evidence", return_value=None
         ), contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -1146,6 +1149,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 0.0,
                 "check: tests",
                 temporary,
+                data_dir,
                 data_dir,
                 3,
                 1,

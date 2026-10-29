@@ -5,6 +5,7 @@ adapters, and they put the tools cache's coverage install on sys.path first.
 """
 from __future__ import annotations
 
+import configparser
 import json
 import sys
 from pathlib import Path
@@ -29,6 +30,28 @@ def coverage_config_text(root: Path) -> str:
         "[report]\n"
         f"exclude_lines =\n    {PRAGMA_NO_COVER}\n"
     )
+
+
+def coverage_config_data(root: Path, data_file: Path) -> str:
+    """The canonical configuration as coverage's in-memory `:data:` value."""
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(coverage_config_text(root))
+    install = import_coverage()
+    config = install.config.CoverageConfig()
+    config.set_option("run:branch", parser.getboolean("run", "branch"))
+    config.set_option("run:sigterm", parser.getboolean("run", "sigterm"))
+    config.set_option("run:source", parser.get("run", "source").split())
+    config.set_option("run:data_file", str(data_file))
+    config.set_option(
+        "report:exclude_lines",
+        [
+            line.strip()
+            for line in parser.get("report", "exclude_lines").splitlines()
+            if line.strip()
+        ],
+    )
+    config.post_process()
+    return ":data:" + config.serialize()
 
 
 def coverage_config_path(data_dir: Path) -> Path:
@@ -144,19 +167,14 @@ def _check_datasets(datasets: list[tuple[str, str, Path]]) -> None:
 def combine_coverage(
     data_dir: Path,
     combined_file: Path,
-    config_file: Path | None = None,
+    root: Path,
 ) -> None:
     """Combine every registered dataset under DATA_DIR into COMBINED_FILE."""
     coverage = import_coverage()
     _check_datasets(registered_datasets(data_dir))
     combined_file.parent.mkdir(parents=True, exist_ok=True)
-    config = (
-        config_file
-        if config_file is not None
-        else coverage_config_path(data_dir)
-    )
     cover = coverage.Coverage(
-        data_file=str(combined_file), config_file=str(config)
+        config_file=coverage_config_data(root, combined_file)
     )
     try:
         cover.combine(data_paths=[str(data_dir)], strict=True)

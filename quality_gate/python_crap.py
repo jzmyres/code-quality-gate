@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .coverage_tool import import_coverage
+from .coverage_tool import coverage_config_data, import_coverage
 from .policy import GateError
 from .ratchet import Finding, Location
 
@@ -583,15 +583,14 @@ def _analyse_file(
 
 
 def _analyse_coverage(
-    root: Path, selected: list[str], evidence: Path, config_file: Path | None,
+    root: Path, selected: list[str], evidence: Path,
     parsed: dict[str, tuple[str, list[MeasuredFunction]]], failures: list[str],
 ) -> list[Finding]:
     if not evidence.is_file():
         raise GateError(f"combined coverage data is missing at {evidence}")
     coverage = import_coverage()
     cover = coverage.Coverage(
-        data_file=str(evidence),
-        config_file=str(config_file) if config_file is not None else False,
+        config_file=coverage_config_data(root, evidence)
     )
     findings: list[Finding] = []
     try:
@@ -610,13 +609,12 @@ def measure_crap(
     root: Path,
     selected: list[str],
     evidence: Path,
-    config_file: Path | None = None,
 ) -> CrapMeasurement:
     """Measure every function and outside-function subject in SELECTED."""
     parsed, failures = _parse_selected(root, selected)
     if failures:
         return CrapMeasurement([], failures)
-    findings = _analyse_coverage(root, selected, evidence, config_file, parsed, failures)
+    findings = _analyse_coverage(root, selected, evidence, parsed, failures)
     if failures:
         return CrapMeasurement([], failures)
     findings.sort(key=lambda item: item.subject)

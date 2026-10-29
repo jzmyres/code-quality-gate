@@ -21,6 +21,7 @@ from .clones import measure_clones
 from .coverage_tool import (
     combine_coverage,
     coverage_config_path,
+    coverage_config_text,
 )
 from .files import git_argv, hygiene_result, validate_inventory
 from .owners import measure_owners
@@ -1104,9 +1105,9 @@ def _combine_tests_evidence(
     spec: Any,
     start: float,
     prefix: str,
+    root: Path,
     data_dir: Path,
     combined_file: Path,
-    config_file: Path,
     diagnostics: Diagnostics,
     deadline: float,
 ) -> CheckResult | None:
@@ -1114,7 +1115,7 @@ def _combine_tests_evidence(
     try:
         analysis_step(
             "coverage combination", combine_coverage,
-            data_dir, combined_file, config_file, deadline=deadline,
+            data_dir, combined_file, root, deadline=deadline,
         )
     except StepTimeout:
         return _tests_result(
@@ -1264,12 +1265,27 @@ def _tests_counts(
     return (ran, skipped, executed), None
 
 
+def _coverage_config_problem(root: Path, data_dir: Path) -> str | None:
+    path = coverage_config_path(data_dir)
+    try:
+        actual = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return f"coverage configuration {path} cannot be read: {error}"
+    if actual != coverage_config_text(root):
+        return (
+            f"coverage configuration {path} differs from the "
+            "gate-owned configuration after the test run"
+        )
+    return None
+
+
 def _tests_evidence(
     check: CheckDef,
     spec: Any,
     start: float,
     prefix: str,
     temporary: tempfile.TemporaryDirectory,
+    root: Path,
     data_dir: Path,
     ran: int,
     skipped: int,
@@ -1277,6 +1293,19 @@ def _tests_evidence(
     diagnostics: Diagnostics,
     deadline: float,
 ) -> CheckResult:
+    problem = _coverage_config_problem(root, data_dir)
+    if problem is not None:
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            problem,
+            outcome="error",
+            execution="error",
+            diagnostics=Diagnostics(error=problem),
+            configuration_error=True,
+        )
     combined_file = Path(temporary.name) / "combined" / ".coverage"
     config_file = coverage_config_path(data_dir)
     failure = _combine_tests_evidence(
@@ -1284,9 +1313,9 @@ def _tests_evidence(
         spec,
         start,
         prefix,
+        root,
         data_dir,
         combined_file,
-        config_file,
         diagnostics,
         deadline,
     )
@@ -1366,6 +1395,7 @@ def _run_python_tests(context: AdapterContext) -> CheckResult:
         start,
         prefix,
         temporary,
+        root,
         data_dir,
         ran,
         skipped,
@@ -1409,26 +1439,25 @@ def _crap_required(
     prior: dict[str, CheckResult],
     spec: Any,
     prefix: str,
-) -> tuple[Path | None, Path | None, Diagnostics | None, str | None]:
+) -> tuple[Path | None, Diagnostics | None, str | None]:
     required = prior.get(spec.requires)
     if required is None or required.outcome != "pass":
         message = f"coverage unreliable: {spec.requires} did not pass"
     else:
         missing = _crap_missing_evidence(required)
         if missing is None:
-            return required.evidence_path, required.coverage_config, None, None
+            return required.evidence_path, None, None
         message = (
             f"coverage unreliable: {spec.requires} produced no {missing}"
         )
     print(f"{prefix}: {message}", file=sys.stderr)
-    return None, None, Diagnostics(error=message), message
+    return None, Diagnostics(error=message), message
 
 
 def _crap_measure(
     root: Path,
     selected: list[str],
     evidence_path: Path | None,
-    config_path: Path | None,
     check: CheckDef,
     start: float,
     prefix: str,
@@ -1439,7 +1468,6 @@ def _crap_measure(
             root,
             selected,
             evidence_path,
-            config_path,
             deadline=start + CLONE_BUDGET_SECONDS,
         )
     except StepTimeout:
@@ -1477,7 +1505,7 @@ def _run_python_crap(context: AdapterContext) -> CheckResult:
         print(f"{prefix}: {reason}", file=sys.stderr)
         return _ratchet_result(check, start, "fail", reason=reason)
 
-    evidence_path, config_path, failure_diagnostics, message = analysis_step(
+    evidence_path, failure_diagnostics, message = analysis_step(
         "coverage evidence validation", _crap_required, prior, spec, prefix
     )
     if message is not None:
@@ -1493,7 +1521,6 @@ def _run_python_crap(context: AdapterContext) -> CheckResult:
         root,
         selected,
         evidence_path,
-        config_path,
         check,
         start,
         prefix,

@@ -867,5 +867,91 @@ class PythonCrapTests(FixtureCase):
         self.assertNotIn("pkg/constructs.py:with_nested.inner", findings)
 
 
+RISKY_SOURCE = (
+    "def risky(value):\n"
+    "    if value:\n"
+    "        return 1\n"
+    "    a = 1  # dead\n"
+    "    b = a  # dead\n"
+    "    c = b  # dead\n"
+    "    d = c  # dead\n"
+    "    if value:  # dead\n"
+    "        return d  # dead\n"
+    "    return 0  # dead\n"
+)
+
+
+class CoverageConfigurationAttackTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.add_file("pkg/__init__.py", "")
+        self.add_file("pkg/risky.py", RISKY_SOURCE)
+        self.write_config(crap_config(threshold=8))
+        self.fixture_gate()
+
+    def add_covering_test(self, tamper: bool) -> None:
+        lines = [
+            "",
+            "class Sample(unittest.TestCase):",
+            "    def test_risky(self):",
+            "        import json",
+            "        import os",
+            "        import pkg.risky",
+            "        self.assertEqual(pkg.risky.risky(True), 1)",
+        ]
+        if tamper:
+            lines.extend(
+                [
+                    "        configuration = pathlib.Path(",
+                    "            json.loads(os.environ['QG_PYTHON'])[8]",
+                    "        )",
+                    "        configuration.write_text(",
+                    "            configuration.read_text() + '    dead\\n'",
+                    "        )",
+                ]
+            )
+        self.add_file(
+            "tests/test_risky.py",
+            PYTHON_TEST_HEADER + "\n".join(lines) + "\n",
+        )
+
+    def run_attack(
+        self, *, tamper: bool
+    ) -> tuple[object, dict[str, object]]:
+        self.add_covering_test(tamper)
+        self.commit_all()
+        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        return self.run_json(
+            "--policy-from", revision, env=self.default_tool_env()
+        )
+
+    def test_untouched_run_scores_exactly_as_before(self) -> None:
+        result, document = self.run_attack(tamper=False)
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(document, "crap")
+        finding = next(
+            item
+            for item in check["findings"]
+            if item["subject"] == "pkg/risky.py:risky"
+        )
+        self.assertAlmostEqual(finding["value"], 343 / 81 + 3, places=12)
+        self.assertEqual(finding["measurement"]["excluded_lines"], [])
+
+    def test_a_test_cannot_rewrite_the_coverage_configuration(self) -> None:
+        result, document = self.run_attack(tamper=True)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("coverage.ini", result.stderr)
+        self.assertIn(
+            "differs from the gate-owned configuration", result.stderr
+        )
+        tests = self.check_by_id(document, "tests")
+        self.assertEqual(tests["outcome"], "error")
+        self.assertIn("coverage.ini", tests["reason"])
+        crap = self.check_by_id(document, "crap")
+        self.assertEqual(crap["outcome"], "unsupported")
+        self.assertEqual(crap["findings"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
