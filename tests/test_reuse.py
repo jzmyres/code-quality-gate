@@ -21,15 +21,8 @@ from support import BASE_CONFIG, PYTHON_TEST_HEADER, FixtureCase, output
 from quality_gate import reuse, tracing
 from quality_gate.policy import UsageError
 
-STRACE_DEB = Path(
-    os.environ.get(
-        "QG_STRACE_DEB",
-        "/tmp/claude-1000/-home-work-spacemacs-config/cc02e3ce-dc97-491e-8364-7ba7beb6fcbd/"
-        "scratchpad/tool-strace-pin/strace_6.13+ds-1_amd64.deb",
-    )
-)
-STRACE_SHA256 = (
-    "cae290b67cf835350a2cde58ca332256fba475784b3e02a9a8677d73eaf47511"
+STRACE_DEB = (
+    Path(os.environ["QG_STRACE_DEB"]) if "QG_STRACE_DEB" in os.environ else None
 )
 STRACE_PAYLOAD = (
     "69f88291a4e47f258b8e32b089c919a247509f063ef3d6afe5389939051102b3"
@@ -45,7 +38,7 @@ def with_run(run: list[str]) -> str:
 
 class ReuseCase(FixtureCase):
     def require_deb(self) -> Path:
-        if STRACE_DEB.is_file():
+        if STRACE_DEB is not None and STRACE_DEB.is_file():
             return STRACE_DEB
         from quality_gate.tools import tool_binary
 
@@ -76,8 +69,6 @@ class ReuseCase(FixtureCase):
         lock = self.base / "strace-lock.toml"
         deb = self.require_deb()
         digest = sha256 or hashlib.sha256(deb.read_bytes()).hexdigest()
-        if deb == STRACE_DEB and sha256 is None:
-            self.assertEqual(digest, STRACE_SHA256)
         lock.write_text(
             "[strace]\n"
             'version = "6.13+ds-1"\n'

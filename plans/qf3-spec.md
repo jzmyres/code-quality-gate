@@ -1,6 +1,6 @@
 # QF3: pay back the CRAP regressions QF1 put into its own baseline
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md` (the ratchet), `quality-gate-crap.toml`, `quality_gate/` and the tests first.
 
 Why: QF1 (f1d0810) passed its gate only because the implementing agent edited the baseline the gate checks: it

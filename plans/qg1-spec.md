@@ -1,16 +1,16 @@
 # QG1: the reusable gate's core (inventory, hygiene, duplicate-code ratchet, pinned tools)
 
-Repository: `~/quality-gate`. Work only in the clone `/home/work/quality-gate/.worktrees/qg1`. Read its
+Repository: `~/quality-gate`. Work only in the clone `~/quality-gate/.worktrees/qg1`. Read its
 `CLAUDE.md` first. You run as an unprivileged user in a sandbox with no network and no sudo.
 
 Reference implementations, to read and generalize, not copy blindly:
-- `/home/work/agent-harness/tests/inventory.py`, `/home/work/agent-harness/Makefile` (lint, hygiene and
-  inventory targets) and `/home/work/agent-harness/tests/test_inventory.py`.
+- `~/agent-harness/tests/inventory.py`, `~/agent-harness/Makefile` (lint, hygiene and
+  inventory targets) and `~/agent-harness/tests/test_inventory.py`.
 
 jscpd 5.4.1 is installed at `~/.local/share/quality-gate/tools/jscpd-5.4.1/jscpd`. Its documentation is in
-`/tmp/claude-1000/-home-work-spacemacs-config/cc02e3ce-dc97-491e-8364-7ba7beb6fcbd/scratchpad/jscpd-docs/rust.md`
+`~/scratchpad/jscpd-docs/rust.md`
 (the docs describe HEAD, so check behaviour against the binary). Ruff 0.16.0 is at
-`/home/work/.local/share/spacemacs-tools/venv/bin/ruff`.
+`~/.local/share/spacemacs-tools/venv/bin/ruff`.
 
 ## 1. `qg.py`: one standard-library Python 3.12 command
 

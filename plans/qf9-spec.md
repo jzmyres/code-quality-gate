@@ -1,6 +1,6 @@
 # QF9: the trust root cannot be redirected by the candidate
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `docs/TRUST.md`, `README.md` (the trust root, `--policy-from`, `[protect]`, `--prune`),
 `quality_gate/trust.py`, `quality_gate/ratchet.py` (`subject_direction`, `tighter_bound`), `quality-gate.toml` and
 `quality-gate-verification.toml`, `tests/test_trust.py`, and the review record

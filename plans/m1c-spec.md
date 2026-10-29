@@ -1,6 +1,6 @@
 # M1c: Python tests under coverage and Python CRAP, applied to the gate itself
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, the package `quality_gate/` (M1a, M1b), `quality-gate.toml`, `tools.lock.toml`,
 `tests/support.py`, and `plans/review-fable-tiered-design-2026-10-24.md` first.
 

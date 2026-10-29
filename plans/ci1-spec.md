@@ -2,7 +2,7 @@
 
 TIER: trivial
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `Makefile`, `quality-gate.toml` and `tools.lock.toml` first. This item runs after M1b,
 so the Makefile already takes ruff from the pinned tools cache.
 

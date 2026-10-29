@@ -320,7 +320,7 @@ class ToolsTests(FixtureCase):
     def test_fetch_allows_directory_members_and_nested_binary(self) -> None:
         archive = self.make_tarball(
             files={"pkg/jscpd": b"#!/bin/sh\necho nested\n"},
-            directories=["pkg"],
+            directories=[".", "pkg"],
         )
         lock = self.write_lock(
             archive.as_uri(),

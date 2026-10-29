@@ -1,6 +1,6 @@
 # M2a: installed tools are authenticated by their whole payload, at every use
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md` (tools, `qg tools fetch`), `docs/SCHEMA.md`, `quality_gate/tools.py`,
 `quality_gate/covrun.py`, `quality_gate/coverage_tool.py`, `tools.lock.toml` and the tool tests first, then
 `plans/review-sol-gate-2026-10-25.md` (finding 26) and `plans/review-astra-gate-2026-10-25.md` (finding 2).

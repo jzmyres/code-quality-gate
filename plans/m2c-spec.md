@@ -1,6 +1,6 @@
 # M2c: verification loss is measured — a ratchet on executed tests, skips and exclusions
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `docs/SCHEMA.md`, `docs/TRUST.md`, the generic baseline/ratchet code, the `python_tests`
 adapter, `quality_gate/trust.py` (baseline merge) and the tests first, then `plans/review-fable-tiered-design-2026-10-24.md`
 (M2 row: "a verification-loss detector (deleted tests, added skips, lowered budgets, grown pragma counts)") and

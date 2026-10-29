@@ -1,6 +1,6 @@
 # QF6: a coverage dataset counts when coverage saved it, however the program ended
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md` (the `python_tests` section on children and the registry), `docs/SCHEMA.md`,
 `quality_gate/covrun.py`, `quality_gate/coverage_tool.py`, the adapter that calls them, and
 `tests/test_python_tests.py` first.

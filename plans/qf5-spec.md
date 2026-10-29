@@ -1,6 +1,6 @@
 # QF5: a tracked file deleted from the working tree is a deletion, not a file
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `quality_gate/files.py` (enumeration, inventory, hygiene), its tests, and README's enumeration paragraph first.
 
 Why: agents now work with a read-only `.git` (safe-agent-harness SH7), so they cannot stage deletions; the runner

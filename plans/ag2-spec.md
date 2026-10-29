@@ -2,7 +2,7 @@
 
 TIER: trivial
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`.
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`.
 
 The agent runner's reflection step will write this repository's learned memory to `.agents/AGENTS.md` (and
 `.agents/skills/`). Seed the file and classify the directory:

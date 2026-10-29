@@ -1,6 +1,6 @@
 # QF4: Sol's final-review findings 27-40 and 42
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `docs/SCHEMA.md`, `quality_gate/`, the tests, and
 `plans/review-sol-gate-2026-10-25.md` (Sol's findings 27-40 and 42 are this item; each gives file:line, the
 reproduction and the fix) first.

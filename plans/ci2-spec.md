@@ -2,7 +2,7 @@
 
 TIER: trivial
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`.
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`.
 
 The workflow's own rule (the comment above `timeout-minutes` in `.github/workflows/check.yml`) is the smallest
 multiple of 5 minutes at least three times the measured time. The latest CI run (40188680325, after QF4) measured

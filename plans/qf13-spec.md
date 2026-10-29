@@ -2,7 +2,7 @@
 
 TIER: trivial
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `docs/SCHEMA.md` (around the ratchet rules), README (the ratchet section), `quality_gate/ratchet.py`,
 `quality_gate/python_tests.py`, its tests, and findings 9 and 10 of `plans/review-astra-gate-2026-10-26.md` first.
 

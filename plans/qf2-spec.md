@@ -1,6 +1,6 @@
 # QF2: the result and ratchet contract (Astra's gate review, second fix set)
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `quality_gate/`, the tests, and `plans/review-astra-gate-2026-10-25.md` (the "QF2" line of
 Claude's triage: findings 1, 3, 4, 5, 15, 20, 21, 22, 24) first. QF1 has landed before this item.
 

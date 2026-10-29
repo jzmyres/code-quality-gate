@@ -1,6 +1,6 @@
 # M1a: split qg.py into a package (behaviour-preserving)
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `qg.py`, `quality-gate.toml`, `Makefile` and `tests/support.py` first, then
 `plans/review-fable-tiered-design-2026-10-24.md` sections 3 and 5 (the approved architecture; M1 is split into
 M1a, M1b and M1c, and this is M1a).

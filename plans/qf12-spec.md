@@ -1,6 +1,6 @@
 # QF12: _run_python_tests meets the CRAP threshold
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md` (cohesive abstractions, never fragmenting), `quality_gate/checks.py` (`_run_python_tests` and its
 callers), `quality-gate-crap.toml`, and finding 4 of `plans/review-astra-gate-2026-10-26.md` first.
 

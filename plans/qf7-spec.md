@@ -1,6 +1,6 @@
 # QF7: the coverage runner never shadows the measured program's imports
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md` (python_tests), `quality_gate/covrun.py`, `quality_gate/coverage_tool.py`, the
 `python_tests` adapter that builds the `{python}` prefix, and `tests/test_python_tests.py` first.
 

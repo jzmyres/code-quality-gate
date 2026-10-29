@@ -1,6 +1,6 @@
 # QF11: the coverage runner verifies the effective coverage install without importing the gate
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md` (every subprocess goes through `runner.py`), `quality_gate/covrun.py`, `quality_gate/tools.py`
 (`verify_tool_directory`, the payload digest), `quality_gate/coverage_tool.py`, the trust root's lock override, the
 tests for covrun and tools, and finding 3 of `plans/review-astra-gate-2026-10-26.md` first.

@@ -1,6 +1,6 @@
 # QF10: the trust root closes its remaining gaps (prune exemption, lint configuration, git invocation)
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `docs/TRUST.md`, README (the trust root, `--prune`), `quality_gate/trust.py`, `quality_gate/files.py`,
 `quality_gate/gate_result.py`, `quality-gate.toml`, `tests/test_trust.py`, and findings 2, 7 and 8 of
 `plans/review-astra-gate-2026-10-26.md` first.

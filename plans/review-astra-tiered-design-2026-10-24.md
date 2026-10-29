@@ -6,11 +6,11 @@
 
    It should not implement solvers, coverage instrumentation, fuzzing engines, proof generation, or an agent supervisor. The blueprint’s agentic prove-or-falsify loop belongs outside the gate: agents propose changes; the gate evaluates them.
 
-   Preserve the existing QG1 foundation. However, **QG1 is an implementation milestone, not completed Tier 1**: [`command_check`](/home/work/code-quality-gate/.worktrees/qg1/qg.py:1195) currently runs inventory, hygiene, and optional clones. Consumer tests, coverage, lint, and integrity checks still need integration.
+   Preserve the existing QG1 foundation. However, **QG1 is an implementation milestone, not completed Tier 1**: [`command_check`](../qg.py:1195) currently runs inventory, hygiene, and optional clones. Consumer tests, coverage, lint, and integrity checks still need integration.
 
 2. **Correct the assurance claims and make T3/T4 explicitly opt-in.**
 
-   The [blueprint’s tier table and mandatory T3 stage](/home/work/code-quality-gate/.worktrees/qg1/plans/blueprint-tiered-verification-2026-10-24.md:21) need revision:
+   The [blueprint’s tier table and mandatory T3 stage](../plans/blueprint-tiered-verification-2026-10-24.md:21) need revision:
 
    | Tier | Defensible claim |
    |---|---|
@@ -97,7 +97,7 @@
 
    Hashes establish identity only when their expected values are trusted. CODEOWNERS needs an enforced review mechanism; a path name or repository instruction does not make a file immutable.
 
-   QG1 verifies download archives, but [`_jscpd_binary`](/home/work/code-quality-gate/.worktrees/qg1/qg.py:784) currently checks only that the cached binary exists. Stronger integrity requires validating the installed payload or using an installation the agent cannot modify. `python -I` is useful isolation, not a security boundary.
+   QG1 verifies download archives, but [`_jscpd_binary`](../qg.py:784) currently checks only that the cached binary exists. Stronger integrity requires validating the installed payload or using an installation the agent cannot modify. `python -I` is useful isolation, not a security boundary.
 
    Test counts alone are insufficient: deleted meaningful tests can be replaced with trivial ones. Permit reviewed replacements, and retain independent golden behavior checks to catch “reject every input” patches. Add targeted mutation testing later.
 
@@ -122,7 +122,7 @@
 
    Keep JSON stdout clean and send progress to stderr. Provide reproducible argument arrays rather than shell strings assembled from finding text.
 
-   Later, MCP should wrap the same implementation. Reject the research’s proposed unrestricted [`gate_waive`](/home/work/code-quality-gate/.worktrees/qg1/plans/research-tiered-gates-2026-10-24.md:311): an agent may propose an exception, but it should not approve its own acceptance.
+   Later, MCP should wrap the same implementation. Reject the research’s proposed unrestricted [`gate_waive`](../plans/research-tiered-gates-2026-10-24.md:311): an agent may propose an exception, but it should not approve its own acceptance.
 
 9. **Give ML research code separate deterministic and expensive execution profiles.**
 
@@ -169,7 +169,7 @@
 
 12. **Ship a smaller Python T1+T2 milestone with explicit acceptance criteria.**
 
-   The [research’s first milestone](/home/work/code-quality-gate/.worktrees/qg1/plans/research-tiered-gates-2026-10-24.md:337) includes too many integrations. Ship:
+   The [research’s first milestone](../plans/research-tiered-gates-2026-10-24.md:337) includes too many integrations. Ship:
 
    - Versioned policy, explicit applicability, approved waivers, and canonical JSON.
    - Existing inventory/hygiene/clones plus Ruff, tests, fresh coverage, and a per-function CRAP ratchet.

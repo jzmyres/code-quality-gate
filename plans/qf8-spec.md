@@ -2,7 +2,7 @@
 
 TIER: trivial
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `quality_gate/tools.py` (`_verify_tool_payload`, `verify_tool_directory`, the payload walk) and
 `tests/test_tools.py` (`test_unreadable_tool_entry_is_unsupported_before_it_runs`) first.
 

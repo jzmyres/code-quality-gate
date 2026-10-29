@@ -1,6 +1,6 @@
 # QF14: payload errors are handled at installation, and the docs say when a minimum entry resolves
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `quality_gate/payload.py`, `quality_gate/tools.py` (`_build_install`, `command_tools_fetch`),
 `quality_gate/ratchet.py` (`_record_unmeasured`), `docs/SCHEMA.md` (near line 250), README (near line 607), their
 tests, and `plans/review-astra-gate-2026-10-26b.md` first.

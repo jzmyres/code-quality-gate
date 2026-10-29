@@ -1,6 +1,6 @@
 # M1b: policy checks, the command adapter, one generic ratchet, and a JSON result
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, the package `quality_gate/` (M1a), `quality-gate.toml`, `tools.lock.toml`, the tests,
 and `plans/review-fable-tiered-design-2026-10-24.md` sections 3-5 first. Fable's schema is the approved design;
 where this spec is more specific, follow this spec.

@@ -1,6 +1,6 @@
 # M2b: the trust root — `qg check --policy-from REV`
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `docs/SCHEMA.md`, `qg.py`, `quality_gate/` (policy loading, checks, baselines, the result
 document, prune) and the tests first, then `plans/review-astra-gate-2026-10-25.md` (finding 2),
 `plans/review-sol-gate-2026-10-25.md` (finding 26) and `plans/review-fable-tiered-design-2026-10-24.md` (M2 row).

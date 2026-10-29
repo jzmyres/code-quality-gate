@@ -1,6 +1,6 @@
 # QF1: metric and evidence correctness (Astra's gate review, first fix set)
 
-Repository: `~/code-quality-gate`. Work only in the clone `/home/work/code-quality-gate/.worktrees/qg1`. Read
+Repository: `~/code-quality-gate`. Work only in the clone `~/code-quality-gate/.worktrees/qg1`. Read
 `CLAUDE.md`, `README.md`, `quality_gate/` and the tests first, then `plans/review-astra-gate-2026-10-25.md` (this
 item is the "QF1" line of Claude's triage; the numbers below are Astra's).
 
