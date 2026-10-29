@@ -619,6 +619,7 @@ Check keys:
 * `reason` - a structured explanation of a non-passing adapter verdict
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
+* `reused_from` - present when a passing check was reused, naming its record tree.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`,

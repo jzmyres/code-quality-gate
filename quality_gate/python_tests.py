@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .coverage_tool import (
+    coverage_config_path,
     registry_dir,
     write_coverage_config,
 )
@@ -13,11 +14,9 @@ from .policy import PythonTestsSpec
 from .tools import installed_tool
 
 
-def coverage_prefix(root: Path, data_dir: Path) -> list[str]:
-    """The in-place expansion of {python} and the value exported as QG_PYTHON."""
+def coverage_prefix_values(root: Path, data_dir: Path) -> list[str]:
+    """The coverage command and QG_PYTHON value before creating its files."""
     tool, installation = installed_tool("coverage")
-    config_file = write_coverage_config(data_dir, root)
-    registry = registry_dir(data_dir)
     runner = Path(__file__).with_name("covrun.py")
     return [
         sys.executable,
@@ -28,9 +27,15 @@ def coverage_prefix(root: Path, data_dir: Path) -> list[str]:
         str(installation),
         tool.version,
         tool.payload_sha256,
-        str(config_file),
-        str(registry),
+        str(coverage_config_path(data_dir)),
+        str(registry_dir(data_dir)),
     ]
+
+
+def coverage_prefix(root: Path, data_dir: Path) -> list[str]:
+    """The in-place expansion of {python} and the value exported as QG_PYTHON."""
+    write_coverage_config(data_dir, root)
+    return coverage_prefix_values(root, data_dir)
 
 
 def expand_run(run: tuple[str, ...], prefix: list[str]) -> list[str]:

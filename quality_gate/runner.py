@@ -23,6 +23,8 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from . import tracing
+
 
 CAPTURE_LIMIT = 1024 * 1024
 TAIL_LIMIT = 4096
@@ -156,17 +158,23 @@ def _worker_payload(function: Callable[..., Any], args: tuple[Any, ...]) -> byte
         except BaseException as error:
             success, result = False, error
         snapshot = _finish_worker_coverage(coverage)
-    response = (success, result, stdout.getvalue(), stderr.getvalue(), snapshot)
+    trace = tracing.snapshot()
+    response = (
+        success, result, stdout.getvalue(), stderr.getvalue(), snapshot, trace
+    )
     try:
         return pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as error:
         failure = WorkerError(f"cannot return worker result: {error}")
-        return pickle.dumps((False, failure, stdout.getvalue(), stderr.getvalue(), snapshot))
+        return pickle.dumps(
+            (False, failure, stdout.getvalue(), stderr.getvalue(), snapshot, trace)
+        )
 
 
 def _worker(write_fd: int, function: Callable[..., Any], args: tuple[Any, ...]) -> None:
     try:
         os.setsid()
+        tracing.close_in_child()
         payload = memoryview(_worker_payload(function, args))
         while payload:
             payload = payload[os.write(write_fd, payload):]
@@ -203,10 +211,11 @@ def _read_worker(read_fd: int, deadline: float, step: str) -> bytes:
 
 def _decode_worker(data: bytes, step: str) -> Any:
     try:
-        success, result, stdout, stderr, snapshot = pickle.loads(data)
+        success, result, stdout, stderr, snapshot, trace = pickle.loads(data)
     except Exception as error:
         raise WorkerError(f"{step} worker returned invalid data: {error}") from error
     _merge_worker_coverage(snapshot)
+    tracing.merge_snapshot(trace)
     sys.stdout.write(stdout)
     sys.stderr.write(stderr)
     if not success:
@@ -541,6 +550,84 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
     )
 
 
+def _traced_command(
+    argv: tuple[str, ...], prepared: tracing.Prepared | None
+) -> tuple[str, ...]:
+    return tuple(prepared.argv) if prepared is not None else argv
+
+
+def _run_budget(
+    budget_seconds: float, grace_seconds: float
+) -> tuple[float, float]:
+    if _check_deadline.get() is not None:
+        check_time()
+        return remaining_budget(budget_seconds), 0.0
+    return budget_seconds, grace_seconds
+
+
+def _spawn(
+    command: tuple[str, ...],
+    cwd: os.PathLike[str] | str | None,
+    env: dict[str, str] | None,
+    prepared: tracing.Prepared | None,
+    argv: tuple[str, ...],
+    started: float,
+) -> tuple[subprocess.Popen[bytes] | None, RunResult | None]:
+    try:
+        return (
+            subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            ),
+            None,
+        )
+    except OSError as error:
+        if prepared is not None:
+            prepared.abandon()
+        return None, _empty(
+            argv,
+            execution="error",
+            error=f"cannot run command: {error}",
+            started=started,
+        )
+
+
+def _record_environment(env: dict[str, str] | None) -> None:
+    recorder = tracing.current()
+    if recorder is not None and recorder.environment is None:
+        recorder.environment = dict(os.environ if env is None else env)
+
+
+def _capture_process(
+    process: subprocess.Popen[bytes], deadline: float,
+    grace_seconds: float, capture_limit: int | None,
+) -> tuple[str, _Capture]:
+    assert process.stdout is not None and process.stderr is not None
+    limit = 2**63 if capture_limit is None else max(0, capture_limit)
+    capture = _Capture(limit=limit)
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    selector = selectors.DefaultSelector()
+    for name, stream in streams.items():
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream.fileno(), selectors.EVENT_READ, name)
+    try:
+        execution = _drain(process, selector, streams, capture, deadline, grace_seconds)
+    finally:
+        _close(selector, streams)
+    return execution, capture
+
+
+def _finish_trace(process: subprocess.Popen[bytes], prepared: tracing.Prepared | None) -> None:
+    _reap(process)
+    if prepared is not None:
+        prepared.finish()
+
+
 def run(
     argv: list[str] | tuple[str, ...],
     *,
@@ -551,47 +638,26 @@ def run(
     grace_seconds: float = GRACE_SECONDS,
 ) -> RunResult:
     """Run ARGV in its own process group within BUDGET_SECONDS."""
-    if _check_deadline.get() is not None:
-        check_time()
-        budget_seconds = remaining_budget(budget_seconds)
-        grace_seconds = 0.0
+    budget_seconds, grace_seconds = _run_budget(
+        budget_seconds, grace_seconds
+    )
     argv_tuple = tuple(argv)
+    _record_environment(env)
     started = time.monotonic()
     deadline = started + max(0.0, budget_seconds)
-    try:
-        process = subprocess.Popen(
-            argv_tuple,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    except OSError as error:
-        return _empty(
-            argv_tuple,
-            execution="error",
-            error=f"cannot run command: {error}",
-            started=started,
-        )
+    prepared = tracing.prepare(argv_tuple, cwd)
+    command = _traced_command(argv_tuple, prepared)
+    process, failure = _spawn(
+        command, cwd, env, prepared, argv_tuple, started
+    )
+    if failure is not None:
+        return failure
+    assert process is not None
+    if prepared is not None:
+        prepared.start(process.pid)
 
-    assert process.stdout is not None
-    assert process.stderr is not None
-    limit = 2**63 if capture_limit is None else max(0, capture_limit)
-    capture = _Capture(limit=limit)
-    streams = {"stdout": process.stdout, "stderr": process.stderr}
-    selector = selectors.DefaultSelector()
-    for name, stream in streams.items():
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream.fileno(), selectors.EVENT_READ, name)
-    try:
-        execution = _drain(
-            process, selector, streams, capture, deadline, grace_seconds
-        )
-    finally:
-        _close(selector, streams)
-    _reap(process)
+    execution, capture = _capture_process(process, deadline, grace_seconds, capture_limit)
+    _finish_trace(process, prepared)
     returncode = process.poll()
     if _was_signalled(execution, returncode):
         execution = "signal"

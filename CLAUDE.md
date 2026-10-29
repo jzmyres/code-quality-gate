@@ -5,7 +5,7 @@ quality and maintainable. Consuming repositories pin it as a git submodule and d
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
 implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `runner`, `ratchet`, `clones`,
 `python_tests`, `python_crap`, `verification`, `covrun`, `coverage_tool`, `checks`, `gate_result`,
-`trust`, `cli`);
+`trust`, `reuse`, `tracing`, `trace_guard`, `exec_inputs`, `cli`);
 `qg.py` is only the entry point. `check --policy-from REV` takes its policy, baselines, tool lock and
 protected paths from `REV`; `docs/TRUST.md` is the contract.
 

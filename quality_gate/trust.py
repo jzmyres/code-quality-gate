@@ -22,7 +22,7 @@ from typing import Any
 
 from . import tools as tools_module
 from .files import _type_name, git_argv
-from .payload import PayloadError, payload_digest
+from .payload import PayloadError
 from .policy import Config, ConfigError, GateError, UsageError, load_config
 from .ratchet import (
     BaselineEntry,
@@ -31,7 +31,7 @@ from .ratchet import (
     tighter_bound,
 )
 from .runner import RunResult, run
-from .tools import Tool, _default_lock_path, _tools_dir, load_tools
+from .tools import Tool, _default_lock_path, _tool_payload_digest, _tools_dir, load_tools
 
 POLICY_NAME = "quality-gate.toml"
 LOCK_NAME = "tools.lock.toml"
@@ -769,7 +769,7 @@ def _tool_digest(tool: Any) -> str | None:
     if not directory.is_dir():
         return None
     try:
-        return payload_digest(directory)
+        return _tool_payload_digest(tool, directory)
     except PayloadError:
         return "invalid"
 

@@ -9,11 +9,12 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from functools import partial
 from pathlib import Path
 from typing import Any
 
-from . import gate_result
+from . import gate_result, reuse
 from .adapters import AdapterContext, adapter_for
 from .changes import apply_changes, changed_lines, location_coverage, resolve_revision
 from .clones import measure_clones
@@ -59,6 +60,7 @@ from .runner import (
     run,
 )
 from .tools import current_tools, tool_binary
+from .tracing import TraceUnavailable
 from .trust import checked_prune_path
 from .verification import measure_verification
 
@@ -118,6 +120,7 @@ class CheckResult:
     configuration_error: bool = False
     change_scoped_failure: bool = False
     incomplete_locations: bool = False
+    reused_from: str | None = None
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:
@@ -150,6 +153,8 @@ class CheckResult:
             "reason": self.reason,
             "location_coverage": self._location_coverage(),
         }
+        if self.reused_from is not None:
+            document["reused_from"] = self.reused_from
         if self.measurement is not None:
             document["measurement"] = self.measurement
         return document
@@ -1058,7 +1063,9 @@ def _tests_setup(
     start: float,
     prefix: str,
 ) -> tuple[tempfile.TemporaryDirectory, Path, list[str]] | CheckResult:
-    temporary = tempfile.TemporaryDirectory(prefix="qg-coverage-")
+    session = reuse.current()
+    temporary = (session.coverage_directory(check) if session is not None
+                 else tempfile.TemporaryDirectory(prefix="qg-coverage-"))
     data_dir = Path(temporary.name) / "data"
     try:
         data_dir.mkdir()
@@ -1726,6 +1733,155 @@ def _adapter_runner(
     )
 
 
+def _reused_result(
+    check: CheckDef, start: float, prefix: str, reused: reuse.Reused
+) -> CheckResult:
+    record = reused.record
+    result = _check_result(
+        check,
+        start,
+        "pass",
+        budget_seconds=_check_budget(check),
+        measurement=record.get("measurement"),
+        tests_ran=record.get("tests_ran"),
+        tests_skipped=record.get("tests_skipped"),
+    )
+    reuse.restore_coverage(record, result)
+    result.duration_seconds = 0.0
+    result.reused_from = str(reused.tree)
+    print(f"{prefix}: reused record at {reused.tree}", flush=True)
+    return result
+
+
+def _reuse_unavailable(
+    check: CheckDef, start: float, prefix: str, error: TraceUnavailable
+) -> CheckResult:
+    message = str(error)
+    print(f"{prefix}: {message}", file=sys.stderr)
+    return _check_result(
+        check,
+        start,
+        "unsupported",
+        execution="error",
+        budget_seconds=_check_budget(check),
+        diagnostics=Diagnostics(error=message),
+        reason=message,
+    )
+
+
+def _reuse_selection(
+    config: Config, check: CheckDef, files: list[str], classes: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    if check.adapter == "python_tests":
+        return [], []
+    if check.adapter == "command" and "{files}" not in check.spec.run:
+        return [], []
+    return _select_files(config, check, files, classes)
+
+
+def _entry_expired(entry: BaselineEntry, today: date) -> bool:
+    return entry.expires is not None and entry.expires < today
+
+
+def _reuse_expired_entries(check: CheckDef) -> list[str] | None:
+    if check.baseline is None:
+        return []
+    try:
+        entries = _baseline_entries(check)
+    except GateError:
+        return None
+    today = date.today()
+    return [entry.subject for entry in entries if _entry_expired(entry, today)]
+
+
+def _reuse_context(
+    root: Path, config: Config, check: CheckDef, files: list[str],
+    classes: dict[str, str], prior: dict[str, CheckResult],
+) -> dict[str, Any]:
+    selected, names = _reuse_selection(config, check, files, classes)
+    dependencies = prior if check.adapter in ("verification", "python_crap") else {}
+    _lock, tools = current_tools()
+    return {
+        "root": str(root),
+        "tools": {name: reuse._spec_text(tool) for name, tool in sorted(tools.items())},
+        "check": reuse._spec_text(check),
+        "expired_entries": _reuse_expired_entries(check),
+        "selection": selected,
+        "classes": names,
+        "prior": {name: [result.outcome, result.tests_ran, result.tests_skipped,
+                          result.measurement, reuse.evidence_hash(result.evidence_path)]
+                  for name, result in dependencies.items()},
+    }
+
+
+def _reuse_identity(check: CheckDef, context: Any, root: Path, coverage_dir: Path | None) -> Any:
+    try:
+        return reuse.check_identity(check, context, root, coverage_dir)
+    except UnsupportedError:
+        return None
+
+
+def _reuse_lookup(session: Any, check: CheckDef, identity: Any, coverage_dir: Path | None) -> Any:
+    if identity is None or check.id == session.prune_id:
+        return None
+    if coverage_dir is not None and os.path.lexists(coverage_dir):
+        return None
+    return session.lookup(identity)
+
+
+def _run_recorded_check(
+    session: Any, identity: Any, root: Path, config: Config, check: CheckDef,
+    files: list[str], classes: dict[str, str], prefix: str,
+    prior: dict[str, CheckResult], start: float, tracer: tuple[str, ...],
+) -> CheckResult:
+    with session.collect(check, tracer) as recorder:
+        result = _run_check_with_deadline(root, config, check, files, classes, prefix, prior, start)
+    if _recordable(identity, result, recorder):
+        session.record(identity, recorder, result)
+    return result
+
+
+def _recordable(identity: Any, result: CheckResult, recorder: Any) -> bool:
+    return (identity is not None and result.outcome == "pass"
+            and result.execution == "completed" and recorder.reliable)
+
+
+def _reuse_stages(
+    session: Any, root: Path, config: Config, check: CheckDef, files: list[str],
+    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
+    budget: float,
+) -> CheckResult:
+    deadline = start + budget
+    context = analysis_step("reuse context", _reuse_context, root, config, check, files, classes, prior,
+                            deadline=deadline)
+    coverage_dir = session.coverage_path(check) if check.adapter == "python_tests" else None
+    identity = analysis_step("reuse identity", _reuse_identity, check, context, root, coverage_dir,
+                             deadline=deadline)
+    tracer = analysis_step("reuse tracer verification", session._require_tracer, deadline=deadline)
+    reused = analysis_step("reuse lookup", _reuse_lookup, session, check, identity, coverage_dir,
+                           deadline=deadline)
+    if reused is not None:
+        return _reused_result(check, start, prefix, reused)
+    return _run_recorded_check(session, identity, root, config, check, files, classes, prefix,
+                               prior, start, tracer)
+
+
+def _reuse_check(
+    root: Path, config: Config, check: CheckDef, files: list[str],
+    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult],
+) -> CheckResult:
+    session = reuse.current()
+    assert session is not None
+    start = time.monotonic()
+    budget = _check_budget(check)
+    try:
+        return _reuse_stages(session, root, config, check, files, classes, prefix, prior, start, budget)
+    except TraceUnavailable as error:
+        return _reuse_unavailable(check, start, prefix, error)
+    except (StepTimeout, WorkerError) as error:
+        return _deadline_failure(check, prefix, start, budget, None, error)
+
+
 def run_check(
     root: Path,
     config: Config,
@@ -1737,7 +1893,13 @@ def run_check(
     prior: dict[str, CheckResult] | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
-    return _run_check_with_deadline(root, config, check, files, classes, prefix, prior or {})
+    if reuse.current() is None:
+        return _run_check_with_deadline(
+            root, config, check, files, classes, prefix, prior or {}
+        )
+    return _reuse_check(
+        root, config, check, files, classes, prefix, prior or {}
+    )
 
 
 def _check_budget(check: CheckDef) -> float:
@@ -1752,14 +1914,16 @@ def _run_check_with_deadline(
     classes: dict[str, str],
     prefix: str,
     prior: dict[str, CheckResult],
+    started: float | None = None,
 ) -> CheckResult:
     budget = _check_budget(check)
-    start = time.monotonic()
+    start = time.monotonic() if started is None else started
     with check_deadline(start, budget) as scope:
         try:
             result = _adapter_runner(
                 root, config, check, files, classes, prefix, prior
             )
+            check_time()
         except (StepTimeout, WorkerError) as error:
             failure = error
         else:
@@ -2256,20 +2420,24 @@ def command_check(
     prune_id: str | None = None,
     trust: Any = None,
     changed_from: str | None = None,
+    reuse_store: str | None = None,
+    record_fd: int | None = None,
 ) -> int:
-    if trust is None:
-        code, document = _run_check_document(
-            root, config, prune_id, json_output, changed_from=changed_from
-        )
-    else:
-        try:
-            with trust.activate():
-                code, document = _run_check_document(
-                    root, config, prune_id, json_output, trust, changed_from
-                )
-            code, document = trust.finish(code, document)
-        finally:
-            trust.close()
+    store = Path(reuse_store).expanduser() if reuse_store else None
+    with reuse.active(store, root, record_fd, prune_id):
+        if trust is None:
+            code, document = _run_check_document(
+                root, config, prune_id, json_output, changed_from=changed_from
+            )
+        else:
+            try:
+                with trust.activate():
+                    code, document = _run_check_document(
+                        root, config, prune_id, json_output, trust, changed_from
+                    )
+                code, document = trust.finish(code, document)
+            finally:
+                trust.close()
     if json_output:
         print(
             json.dumps(document, indent=2, allow_nan=False),

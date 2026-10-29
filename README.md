@@ -432,7 +432,7 @@ downloads with `urllib`, verifies the archive SHA-256, extracts into a temporary
 tools directory, and computes the install tree's payload digest before moving it into place. It refuses
 an archive hash or payload digest mismatch, or an unsafe archive member (absolute path, `..`, link, or
 non-regular file), without installing anything. Tool names and versions must match
-`[A-Za-z0-9][A-Za-z0-9._-]*`, the install destination must resolve inside the tools directory, and a
+`[A-Za-z0-9][A-Za-z0-9._+-]*`, the install destination must resolve inside the tools directory, and a
 lock table accepts only `version`, `url`, `sha256`, `payload_sha256`, `binary` and `format`;
 other keys are configuration errors and a missing `payload_sha256` is a lock error. An existing install
 is kept only when its payload digest matches the lock; otherwise `tools fetch` replaces it.
@@ -453,6 +453,9 @@ An archive without `format` is a tar archive. `format = "wheel"` marks a Python 
 it is extracted with `zipfile` under the same safety rules. The wheel's install directory is what the
 Python adapters put on `sys.path`; for coverage that is `coverage-7.16.2/`, and its `binary` entry
 `coverage/__init__.py` is looked up inside the verified tree.
+`format = "deb"` marks a Debian package: the standard library reads the `ar` container, extracts its
+single `data.tar.*` member and unpacks that with the same tar safety rules. A debian package's payload
+digest is the declared binary's content hash; the other formats digest the whole install tree.
 
 `tools path NAME` prints the expected binary path, whether or not the tool is installed, so scripts can
 locate the cache. An unknown tool name exits 2.
@@ -514,6 +517,43 @@ A finding has `subject`, its raw `value`, `bound` (or null when no baseline entr
 errors carry `error`, and CRAP findings carry a `measurement` with `cc`, `statements`, `executed` and
 `excluded_lines`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
 bound fails.
+
+### Result reuse by recorded reads
+
+    python3 -I qg.py check --reuse-store DIR --record-fd N
+    python3 -I qg.py reuse merge --store DIR FILE
+
+A gate run should cost in proportion to the change. With `--reuse-store DIR`, the gate records what each
+passing check actually read and reuses a passing result while every one of those files is unchanged. A
+check is never selected by guessing that a file is related: the trace decides.
+
+Every check's process tree runs under the pinned `strace`, and the gate's own reads are observed in the
+same run. The inputs are every file the check opened for reading or executed (including its interpreter
+and shared libraries), every path it looked up and did not find (recorded as absent), every path it
+statted, and every directory it listed (recorded as a hash of the sorted names). Paths under `/proc`,
+`/dev` and `/sys`, the run's own temporary directories and files the run created before reading them
+are not inputs.
+
+A check that passes writes one record to the `--record-fd N` descriptor: the gate program hash, the
+check's name and command, the values of the environment it received and each input's content hash or
+absence. A failed, timed-out or unanalysable check writes no record. Before running a check, the gate
+reads `DIR` for a record with the same program, check, command and environment whose inputs still hash
+the same or are still absent; it then reports the check as reused, naming the record's tree, and does not
+run it. Otherwise the check runs traced. Baseline expiry is also rechecked, so a record cannot preserve a
+pass after a baseline entry expires.
+
+The gate only reads `DIR`. Records leave through the caller's `--record-fd` descriptor, which the gate
+closes in every child it starts. The trace is unlinked after the tracer opens it, and the gate makes both itself and the tracer
+non-dumpable before starting the check. The traced processes inherit neither the trace channel nor the
+record descriptor, and cannot reach their descriptors through `/proc`. The caller must mount the store
+read-only inside the sandbox: ordinary file permission bits alone do not prevent their owner from changing
+the permissions. The trusted caller then runs
+`qg.py reuse merge --store DIR FILE`, outside the sandbox, which validates every record's schema and
+program hash before writing any of them into the store.
+
+Without `--reuse-store` nothing is reused and every check runs as before. That full run is what a merge
+or landing uses, so a deployment never depends on a store a candidate can influence. A requested prune
+runs its target check to obtain the ratchet evidence needed for the write.
 
 ### New and changed lines
 
@@ -824,8 +864,8 @@ human accepts it.
 ## Pinned tools and this repository
 
 `tools.lock.toml` in the gate repository is the only place tool versions live. It pins jscpd 5.4.1,
-ruff 0.17.0 and coverage 7.16.2, including the archive URL, SHA-256, payload SHA-256, archive format and
-binary path.
+ruff 0.17.0, strace 6.13+ds-1 and coverage 7.16.2, including the archive URL, SHA-256, payload SHA-256,
+archive format and binary path.
 `tools fetch` accepts `--lock FILE` for testing or for a private mirror; `file://` URLs exercise
 installation without a network.
 

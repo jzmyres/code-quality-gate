@@ -19,11 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .payload import PayloadError, payload_digest
+from .payload import PayloadError, _content_sha256, payload_digest
 from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
-TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 LOCK_KEYS = (
     "version",
     "url",
@@ -92,7 +92,7 @@ def _lock_version(lock: Path, name: str, raw: dict[str, Any]) -> str:
         raise _tool_error(
             lock,
             f"{name}.version",
-            "a version matching [A-Za-z0-9][A-Za-z0-9._-]*",
+            "a version matching [A-Za-z0-9][A-Za-z0-9._+-]*",
             _describe(version),
         )
     return version
@@ -136,11 +136,11 @@ def _lock_binary(lock: Path, name: str, raw: dict[str, Any]) -> str:
 
 def _lock_format(lock: Path, name: str, raw: dict[str, Any]) -> str:
     archive_format = raw.get("format", "tar")
-    if archive_format not in ("tar", "wheel"):
+    if archive_format not in ("tar", "wheel", "deb"):
         raise _tool_error(
             lock,
             f"{name}.format",
-            "one of tar, wheel",
+            "one of tar, wheel, deb",
             _describe(archive_format),
         )
     return archive_format
@@ -188,7 +188,7 @@ def load_tools(lock: Path) -> dict[str, Tool]:
             raise _tool_error(
                 lock,
                 name,
-                "a tool name matching [A-Za-z0-9][A-Za-z0-9._-]*",
+                "a tool name matching [A-Za-z0-9][A-Za-z0-9._+-]*",
                 _describe(name),
             )
         tools[name] = _parse_tool(lock, name, raw)
@@ -217,6 +217,17 @@ def _payload_mismatch(
     )
 
 
+def _tool_payload_digest(tool: Tool, directory: Path) -> str:
+    """The digest the lock pins for this archive format.
+
+    A debian package's payload is the declared binary itself, so its digest
+    is the binary's content hash; other formats digest the whole install tree.
+    """
+    if tool.format == "deb":
+        return _content_sha256(directory / tool.binary)
+    return payload_digest(directory)
+
+
 def _verify_tool_payload(tool: Tool, directory: Path) -> Path:
     binary = directory / tool.binary
     try:
@@ -225,7 +236,7 @@ def _verify_tool_payload(tool: Tool, directory: Path) -> Path:
                 f"{tool.name} {tool.version} is not installed at {binary}; "
                 f"run '{TOOLS_FETCH}'"
             )
-        actual = payload_digest(directory)
+        actual = _tool_payload_digest(tool, directory)
     except (OSError, PayloadError) as error:
         raise UnsupportedError(
             f"{tool.name} {tool.version}: payload tree at {directory} is "
@@ -295,6 +306,8 @@ def _unsafe_member(tool: Tool, name: str) -> GateError:
 
 def _member_path(member: tarfile.TarInfo, tool: Tool) -> PurePosixPath:
     path = PurePosixPath(member.name)
+    if member.isdir() and path in (PurePosixPath("."), PurePosixPath("./")):
+        return PurePosixPath()
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise _unsafe_member(tool, member.name)
     return path
@@ -385,9 +398,100 @@ def _extract_wheel(archive_path: Path, destination: Path, tool: Tool) -> None:
         ) from error
 
 
+def _ar_header(
+    data: bytes, offset: int, tool: Tool
+) -> tuple[str, int]:
+    header = data[offset : offset + 60]
+    if len(header) < 60:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: truncated ar header; "
+            "nothing installed"
+        )
+    if header[58:60] != b"`\n":
+        raise GateError(f"tools: {tool.name} {tool.version}: invalid ar header; nothing installed")
+    try:
+        name = header[:16].decode("ascii").strip().rstrip("/")
+        size = int(header[48:58].decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError) as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: invalid ar header: "
+            f"{error}; nothing installed"
+        ) from error
+    return name, size
+
+
+def _ar_members(
+    data: bytes, tool: Tool
+) -> list[tuple[str, bytes]]:
+    if not data.startswith(b"!<arch>\n"):
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: not an ar archive; "
+            "nothing installed"
+        )
+    members: list[tuple[str, bytes]] = []
+    offset = 8
+    while offset < len(data):
+        name, size = _ar_header(data, offset, tool)
+        offset += 60
+        if size < 0 or offset + size > len(data):
+            raise GateError(
+                f"tools: {tool.name} {tool.version}: truncated ar member "
+                f"{name!r}; nothing installed"
+            )
+        members.append((name, data[offset : offset + size]))
+        offset += size + (size & 1)
+    return members
+
+
+def _debian_version(members: list[tuple[str, bytes]], tool: Tool) -> None:
+    version = [raw for name, raw in members if name == "debian-binary"]
+    if version != [b"2.0\n"]:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: expected debian-binary 2.0; "
+            "nothing installed"
+        )
+
+
+def _debian_data(members: list[tuple[str, bytes]], tool: Tool) -> bytes:
+    _debian_version(members, tool)
+    data = [raw for name, raw in members if name.startswith("data.tar.")]
+    if len(data) != 1:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: expected one data.tar member, "
+            f"got {len(data)}; nothing installed"
+        )
+    return data[0]
+
+
+def _extract_deb(archive_path: Path, destination: Path, tool: Tool) -> None:
+    try:
+        members = _ar_members(archive_path.read_bytes(), tool)
+        data = _debian_data(members, tool)
+    except OSError as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: cannot read archive: {error}"
+        ) from error
+    temporary = tempfile.NamedTemporaryFile(
+        prefix=".qg-data-", dir=destination.parent, delete=False
+    )
+    path = Path(temporary.name)
+    try:
+        with temporary:
+            temporary.write(data)
+        _extract_tar(path, destination, tool)
+    except OSError as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"
+        ) from error
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
     if tool.format == "wheel":
         _extract_wheel(archive_path, destination, tool)
+    elif tool.format == "deb":
+        _extract_deb(archive_path, destination, tool)
     else:
         _extract_tar(archive_path, destination, tool)
 
@@ -423,7 +527,7 @@ def _existing_payload_matches(tool: Tool, destination: Path) -> bool:
     if not destination.is_dir():
         return False
     try:
-        return payload_digest(destination) == tool.payload_sha256
+        return _tool_payload_digest(tool, destination) == tool.payload_sha256
     except PayloadError:
         return False
 
@@ -445,7 +549,7 @@ def _build_install(tool: Tool, temporary_path: Path) -> Path:
     if not mode & 0o111:
         os.chmod(installed_binary, mode | 0o111)
     try:
-        actual = payload_digest(build)
+        actual = _tool_payload_digest(tool, build)
     except PayloadError as error:
         raise UsageError(
             f"tools: {tool.name} {tool.version}: cannot read payload at "
