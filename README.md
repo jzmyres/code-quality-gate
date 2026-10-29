@@ -461,6 +461,8 @@ operands, such as `--rcfile FILE` and `--check-hash-based-pycs never`.
 When a command or script pattern applies, an unknown interpreter option, an option whose meaning
 depends on the interpreter version or implementation, or a shell expansion that prevents the scanner
 from determining the command head, an option, or the script produces an `unanalysable` finding.
+An extended-glob word, `?(...)`, `*(...)`, `+(...)`, `@(...)` or `!(...)` with balanced
+parentheses, is nonliteral and produces one too, whether or not the script enables `extglob`.
 A nonliteral Python argv element in the option or script position is also
 reported. The finding names the file, line, word and reason, and fails the check even in an owner file
 or with a baseline entry. Rewrite the invocation so its command and script can be determined. An

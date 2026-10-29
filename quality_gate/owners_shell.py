@@ -83,6 +83,30 @@ def _substitution_end(source: str, start: int, relative: str) -> int:
     raise GateError(f"cannot tokenize shell {relative}: unterminated command substitution")
 
 
+_EXTGLOB = "?*+@!"
+
+
+def _starts_extglob(source: str, start: int) -> bool:
+    return source[start] in _EXTGLOB and source.startswith("(", start + 1)
+
+
+def _extglob_end(source: str, start: int) -> int | None:
+    if not _starts_extglob(source, start):
+        return None
+    depth = 1
+    index = start + 2
+    while index < len(source):
+        following = _skip_special(source, index)
+        if following is not None:
+            index = following
+            continue
+        depth = _substitution_depth(source[index], depth)
+        if depth == 0:
+            return index + 1
+        index += 1
+    return None
+
+
 class _Scanner:
     def __init__(self, relative: str, source: str) -> None:
         self.relative = relative
@@ -236,11 +260,21 @@ class _Scanner:
             return end, False
         return index + 1, _literal_char(self.source, index)
 
+    def _pattern_body(self, index: int, end: int) -> None:
+        while index < end - 1:
+            index, _ = self._word_part(index)
+
     def _word_end(self, index: int) -> tuple[int, bool]:
         literal = True
         while index < len(self.source):
             if self._word_boundary(index):
                 break
+            end = _extglob_end(self.source, index)
+            if end is not None:
+                self._pattern_body(index + 2, end)
+                index = end
+                literal = False
+                continue
             index, part_literal = self._word_part(index)
             literal = literal and part_literal
         return index, literal

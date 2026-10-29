@@ -102,6 +102,30 @@ class InterpreterOptionsTests(unittest.TestCase):
                           ("python-script", "private.py")])
 
 
+class ShellStructureTests(unittest.TestCase):
+    def test_non_extended_glob_forms_parse_as_before(self) -> None:
+        cases = [
+            ("<(printf python3) -I private.py\n",
+             [("unanalysable", "<(printf python3)"), ("shell-command", "printf")]),
+            (">(printf python3) -I private.py\n",
+             [("unanalysable", ">(printf python3)"), ("shell-command", "printf")]),
+            ("( python3 -I private.py )\n",
+             [("shell-command", "python3"), ("shell-script", "private.py")]),
+            ("f() { python3 -I private.py; }\n",
+             [("shell-command", "f"), ("shell-command", "python3"),
+              ("shell-script", "private.py")]),
+            ('"@(x)" -I private.py\n', [("shell-command", "@(x)")]),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                events, _ = shell_events("test.sh", source)
+                self.assertEqual(
+                    [(event.kind, event.value) for event in events
+                     if event.kind in ("shell-command", "shell-script", "unanalysable")],
+                    expected,
+                )
+
+
 class FailClosedCliTests(OwnerCase):
     def setUp(self) -> None:
         super().setUp()
@@ -180,6 +204,26 @@ class FailClosedCliTests(OwnerCase):
         self.add_file("other.sh", "<(printf python3) -I private.py\n")
         check = self.assert_rejected("other.sh:1: unanalysable '<(printf python3)'")
         self.assertEqual(len(check["findings"]), 1)
+
+    def test_review_case_extended_glob_script_fails_closed(self) -> None:
+        self.add_file("other.sh", "python3 ./@(private).py\n")
+        word = "./@(private).py"
+        check = self.assert_rejected(f"other.sh:1: unanalysable {word!r}")
+        self.assertEqual(len(check["findings"]), 1)
+        finding = check["findings"][0]
+        self.assertEqual(finding["measurement"]["word"], word)
+        self.assertEqual(finding["locations"],
+                         [{"path": "other.sh", "start_line": 1, "end_line": 1}])
+
+    def test_each_extended_glob_operator_in_command_position_fails_closed(self) -> None:
+        for operator in "?*+@!":
+            word = f"{operator}(private).py"
+            with self.subTest(operator=operator):
+                self.add_file("other.sh", word + "\n")
+                check = self.assert_rejected(f"other.sh:1: unanalysable {word!r}")
+                self.assertEqual(len(check["findings"]), 1)
+                self.assertEqual(check["findings"][0]["measurement"]["word"], word)
+                (self.repo / "other.sh").unlink()
 
     def test_backtick_substitution_commands_are_still_scanned(self) -> None:
         self.add_file("other.sh", 'VALUE="`python3 -I private.py`" echo done\n')
