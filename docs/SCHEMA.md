@@ -663,9 +663,12 @@ Check keys:
 * `reason` - a structured explanation of a non-passing adapter verdict
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
-* `test_results` - normalized test counts when available: `selected`, `passed`, `failed`,
-  `skipped`, and `failures` (strings naming unexpected results). Passed counts expected results;
-  selected equals passed plus failed plus skipped.
+* `test_results` - normalized test outcomes when available: `selected`, `passed`, `failed`,
+  `skipped`, and `failures` (strings naming unexpected results). The Python tests adapter reads
+  `failed` and `failures` from one `FAILED (failures=N, errors=M)` summary and its matching
+  `FAIL:` and `ERROR:` test headings, naming each test by its id; a failing run without that
+  consistent result data has no `test_results`. The Emacs Lisp adapter reads them from its child
+  result document. Passed counts expected results; selected equals passed plus failed plus skipped.
 * `emacs_version` - the Emacs version string for a completed Elisp measurement,
   including compile and checkdoc checks and reused passing results. It is absent
   when no process has reported a version, such as when Emacs is missing.

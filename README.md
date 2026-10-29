@@ -241,6 +241,14 @@ installed. On `pass` the adapter combines the registered coverage datasets and k
 as the evidence for checks that require it. Pattern matching runs in an interruptible child bounded by
 the check's remaining budget, together with coverage combination.
 
+A completed run that executed tests also reports normalized `test_results`. `selected` is the parsed
+run count and `skipped` the parsed skipped count, as above. For a failing run, `failed` and
+`failures` come from the run's own unittest result data: one `FAILED (failures=N, errors=M)` summary
+and its matching `FAIL:` and `ERROR:` test headings. Each failure is named by its unittest test id,
+and `passed` is `selected - skipped - failed`. A run that crashes, or whose failing summary is
+missing, repeated or inconsistent with its headings, reports no `test_results`; the reason remains
+`command exited N`.
+
 ### Emacs Lisp tests
 
     [checks.legacy-tests]

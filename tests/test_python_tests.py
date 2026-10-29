@@ -146,7 +146,60 @@ class PythonTestsTests(FixtureCase):
         self.assertEqual(check["execution"], "completed")
         self.assertEqual(check["measurement"], {"tests": 2})
         self.assertEqual(check["metric_version"], "test-count/1")
+        self.assertEqual(check["test_results"], {
+            "selected": 2, "passed": 2, "failed": 0, "skipped": 0,
+            "failures": [],
+        })
         self.assertIn("passed (2 tests", result.stderr)
+
+    def test_a_mixed_suite_reports_real_outcomes_and_failure_names(self) -> None:
+        self.add_test(
+            "test_mixed",
+            "    def test_passes(self):\n        self.assertTrue(True)\n\n"
+            "    def test_fails(self):\n        self.fail('deliberate failure')\n\n"
+            "    def test_errors(self):\n        raise RuntimeError('deliberate error')\n",
+        )
+        result, check = self.failed_tests(
+            "command exited 1", "deliberate failure", "deliberate error"
+        )
+        self.assertEqual(check["measurement"], {"tests": 3})
+        results = check["test_results"]
+        self.assertEqual(results["selected"], 3)
+        self.assertEqual(results["passed"], 1)
+        self.assertEqual(results["failed"], 2)
+        self.assertEqual(results["skipped"], 0)
+        self.assertCountEqual(results["failures"], [
+            "test_mixed.Sample.test_errors",
+            "test_mixed.Sample.test_fails",
+        ])
+        for failure in results["failures"]:
+            self.assertIn(failure, result.stderr)
+
+    def test_a_crashing_suite_has_no_test_results(self) -> None:
+        self.add_test(
+            "test_crash",
+            "    def test_crash(self):\n        import os\n        os._exit(3)\n",
+        )
+        _result, check = self.failed_tests("command exited 3")
+        self.assertNotIn("test_results", check)
+        self.assertEqual(check["reason"], "command exited 3")
+
+    def test_ambiguous_failure_summary_has_no_test_results(self) -> None:
+        self.add_file(
+            "tests/failing_summary.py",
+            "import sys\n"
+            "print('Ran 1 test in 0.1s')\n"
+            "print('FAILED (failures=1)')\n"
+            "print('FAIL: only (failing_summary.Sample.only)')\n"
+            "print('FAILED (failures=1)')\n"
+            "sys.exit(1)\n",
+        )
+        self.write_config(
+            tests_config(run='["{python}", "tests/failing_summary.py"]')
+        )
+        _result, check = self.failed_tests("command exited 1")
+        self.assertNotIn("test_results", check)
+        self.assertEqual(check["reason"], "command exited 1")
 
     def test_zero_tests_fails(self) -> None:
         self.add_file("tests/helper.py", "VALUE = 1\n")
@@ -211,6 +264,7 @@ class PythonTestsTests(FixtureCase):
         )
         _result, check = self.failed_tests("command exited 1", "no summary")
         self.assertNotIn("measurement", check)
+        self.assertNotIn("test_results", check)
 
     def test_failed_command_with_zero_executed_tests_reports_counts(self) -> None:
         self.add_file(

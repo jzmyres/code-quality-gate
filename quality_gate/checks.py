@@ -881,12 +881,69 @@ def _executed_tests(
     return ran - skipped
 
 
-def _failed_test_results(
-    ran: int | None, executed: int | None
-) -> TestResults | None:
-    if ran is None or executed is None:
+_UNITTEST_FAILED_SUMMARY = re.compile(r"^FAILED \((.*)\)$", re.MULTILINE)
+_UNITTEST_OK_SUMMARY = re.compile(r"^OK(?: \(.*\))?$", re.MULTILINE)
+_UNITTEST_FAILURE_HEADING = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
+_UNITTEST_FAILURE_COUNT = re.compile(r"^(failures|errors)=([0-9]+)$")
+
+
+def _unittest_summary(combined: str) -> str | None:
+    summaries = _UNITTEST_FAILED_SUMMARY.findall(combined)
+    if len(summaries) != 1 or _UNITTEST_OK_SUMMARY.search(combined):
         return None
-    return TestResults(ran, 0, executed)
+    return summaries[0]
+
+
+def _unittest_failure_count(summary: str) -> int | None:
+    failed = 0
+    for part in summary.split(","):
+        match = _UNITTEST_FAILURE_COUNT.match(part.strip())
+        if match is not None:
+            failed += int(match.group(2))
+    return failed or None
+
+
+def _unittest_failure_name(heading: str) -> str:
+    match = re.search(r"\(([^()]+)\)", heading)
+    return match.group(1) if match is not None else heading
+
+
+def _unittest_outcomes(
+    combined: str,
+) -> tuple[int, tuple[str, ...]] | None:
+    summary = _unittest_summary(combined)
+    if summary is None:
+        return None
+    failed = _unittest_failure_count(summary)
+    headings = _UNITTEST_FAILURE_HEADING.findall(combined)
+    if failed is None or len(headings) != failed:
+        return None
+    return failed, tuple(_unittest_failure_name(item) for item in headings)
+
+
+def _counted_test_results(
+    ran: int, skipped: int, failed: int, failures: tuple[str, ...]
+) -> TestResults | None:
+    passed = ran - skipped - failed
+    if passed < 0:
+        return None
+    return TestResults(ran, passed, failed, failures)
+
+
+def _failed_test_results(
+    ran: int | None,
+    skipped: int | None,
+    executed: int | None,
+    combined: str,
+) -> TestResults | None:
+    if ran is None or skipped is None or executed is None:
+        return None
+    if executed == 0:
+        return TestResults(ran, 0, 0)
+    outcomes = _unittest_outcomes(combined)
+    if outcomes is None:
+        return None
+    return _counted_test_results(ran, skipped, *outcomes)
 
 
 def _tests_result(
@@ -1016,7 +1073,7 @@ def _tests_failed(
             combined=combined,
         )
     executed = _executed_tests(ran, skipped)
-    test_results = _failed_test_results(ran, executed)
+    test_results = _failed_test_results(ran, skipped, executed, combined)
     return _tests_result(
         check,
         spec,
