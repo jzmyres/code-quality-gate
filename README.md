@@ -2,8 +2,8 @@
 
 A reusable, offline code-quality gate for repositories that want every file classified, every
 reason recorded, every check declared by policy, and every metric exception explicit and ratcheted.
-Its core is one standard-library Python 3.12 command plus pinned external tools; the Python adapters
-also load the pinned coverage wheel from the tools cache. A consuming repository pins it as a git
+Its core is one standard-library Python 3.12 command plus pinned external tools; the Python test
+and CRAP adapters also load the pinned coverage wheel from the tools cache. A consuming repository pins it as a git
 submodule and keeps its own `quality-gate.toml` and baselines. The authoritative policy, baseline and
 result contract is [`docs/SCHEMA.md`](docs/SCHEMA.md); the trust-root contract for
 `check --policy-from` is [`docs/TRUST.md`](docs/TRUST.md); this README explains how to use it.
@@ -39,18 +39,29 @@ Python; only the Python adapters put the pinned coverage wheel on `sys.path`. Th
 to run as `python3 -I qg.py`, so the consuming repository's modules cannot leak into it.
 
 The implementation lives in the `quality_gate/` package next to `qg.py`: `policy.py` loads and validates
-the configuration, `files.py` resolves the repository and runs inventory and hygiene, `tools.py` owns the
-pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning, `clones.py` measures
-jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage, `python_crap.py` joins
-coverage with `ast` complexity, `verification.py` measures test counts and source exclusions,
-`coverage_tool.py` loads and combines the pinned wheel's data,
+the configuration, `adapters.py` declares every adapter once in its descriptor and holds the only
+supported-adapter registry, `files.py` resolves the repository and runs inventory and hygiene,
+`tools.py` owns the pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning,
+`clones.py` measures jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage,
+`python_crap.py` joins coverage with `ast` complexity, `verification.py` measures test counts and source
+exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
 `--policy-from` protected inputs, effective inputs and run identity, and `cli.py` holds the
 argument parser and dispatch. `owners.py` and its matchers enforce declared single-owner rules.
-`qg.py` is only the entry point. The implementer agents' learned memory
-lives in `.agents/AGENTS.md`, written by the runner's reflection step after each batch and reviewed
-before landing.
+`qg.py` is only the entry point.
+
+An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
+parser, run function, location coverage, number display, metric direction per subject kind, whether it
+produces test results, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The
+registry is the only list of supported adapters. A test adapter returns normalized test results:
+selected, passed and failed, with any named failures. A metric adapter returns findings. Verification's
+prerequisite is every earlier result from an adapter that produces tests, whatever its language, and
+the ratchet takes each finding's direction from its descriptor and subject kind rather than its subject
+text.
+
+The implementer agents' learned memory lives in `.agents/AGENTS.md`, written by the runner's
+reflection step after each batch and reviewed before landing.
 
 ## Quick start in a consuming repository
 

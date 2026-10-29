@@ -847,10 +847,7 @@ class CoverageDeadlineTests(unittest.TestCase):
             enforcement="enforced",
             metric_version="test-count/1",
             evidence=("tests",),
-            command=None,
-            clones=None,
-            python_tests=spec,
-            python_crap=None,
+            spec=spec,
             threshold=None,
             baseline=None,
         )
@@ -890,10 +887,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             enforcement="enforced",
             metric_version="test-count/1",
             evidence=("tests",),
-            command=None,
-            clones=None,
-            python_tests=self.spec,
-            python_crap=None,
+            spec=self.spec,
             threshold=None,
             baseline=None,
         )

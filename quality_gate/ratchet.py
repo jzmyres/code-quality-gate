@@ -37,6 +37,7 @@ class Finding:
     location: str
     measurement: dict[str, Any] | None = None
     locations: tuple[Location, ...] | None = None
+    kind: str = "metric"
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ class FindingResult:
     locations: tuple[Location, ...] | None = None
     on_changed_lines: bool | None = None
     change_scope_evaluated: bool = False
+    direction: str = "max"
 
     def to_json(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -439,24 +441,42 @@ def write_baseline(
     return text.encode("utf-8")
 
 
-def _subject_label(subject: str, adapter: str, has_entry: bool) -> str:
-    if adapter == "clones":
+def _descriptor(adapter: Any) -> Any:
+    from .adapters import adapter_for
+
+    return adapter_for(adapter)
+
+
+def _adapter_name(adapter: Any) -> str:
+    descriptor = _descriptor(adapter)
+    return descriptor.name if descriptor is not None else str(adapter)
+
+
+def _subject_label(subject: str, adapter: Any, has_entry: bool) -> str:
+    if _adapter_name(adapter) == "clones":
         return f"clone {subject}" if has_entry else f"new clone {subject}"
     return subject
 
 
-def _display_number(value: float, adapter: str) -> str:
-    if adapter == "python_crap":
-        return f"{value:.1f}"
+def _display_number(value: float, adapter: Any) -> str:
+    descriptor = _descriptor(adapter)
+    if descriptor is not None:
+        return descriptor.display(value)
     return _number(value)
 
 
-def subject_direction(adapter: str, direction: str, subject: str) -> str:
-    if adapter != "verification":
+def subject_direction(adapter: Any, direction: str, subject: str) -> str:
+    descriptor = _descriptor(adapter)
+    if descriptor is None:
         return direction
-    if subject.startswith("tests:") and subject.endswith(":executed"):
-        return "min"
-    return "max"
+    return descriptor.direction_for_subject(subject, direction)
+
+
+def metric_direction(adapter: Any, direction: str, kind: str) -> str:
+    descriptor = _descriptor(adapter)
+    if descriptor is None:
+        return direction
+    return descriptor.direction(kind, direction)
 
 
 def _within(value: float, bound: float, direction: str) -> bool:
@@ -548,7 +568,7 @@ def _format_failure(
     direction: str = "max",
 ) -> str:
     label = _subject_label(finding.subject, adapter, entry is not None)
-    if adapter == "clones":
+    if _adapter_name(adapter) == "clones":
         detail = _clone_detail(finding, entry, expired, threshold)
     else:
         detail = _metric_detail(
@@ -631,6 +651,8 @@ def _record_unmeasured(
     results: list[FindingResult],
     resolved: list[str],
     unmeasured: list[str],
+    adapter: Any = "metric",
+    direction: str = "max",
 ) -> None:
     for entry in entries:
         if entry.subject in measured:
@@ -648,6 +670,9 @@ def _record_unmeasured(
                     covered_by_baseline=False,
                     expired=entry.subject in expired,
                     error="empty baseline reason",
+                    direction=subject_direction(
+                        adapter, direction, entry.subject
+                    ),
                 )
             )
         if domain.contains(entry.subject):
@@ -680,6 +705,7 @@ def _missing_min(
         error=reason,
         measurement=finding.measurement,
         locations=finding.locations,
+        direction="min",
     )
     return _Verdict(
         result=result,
@@ -712,6 +738,7 @@ def _finding_result(
     empty_reason_subjects: set[str],
     threshold: float,
     enforcement: str,
+    direction: str,
 ) -> FindingResult:
     result = FindingResult(
         subject=finding.subject,
@@ -725,6 +752,7 @@ def _finding_result(
         expired=expired,
         measurement=finding.measurement,
         locations=finding.locations,
+        direction=direction,
     )
     if finding.subject in empty_reason_subjects:
         result.blocking = enforcement == "enforced"
@@ -778,6 +806,7 @@ def _max_verdict(
         empty_reason_subjects,
         threshold,
         enforcement,
+        "max",
     )
     failure = _verdict_failure(
         finding,
@@ -821,6 +850,7 @@ def _min_verdict(
         empty_reason_subjects,
         threshold,
         enforcement,
+        "min",
     )
     failure = _verdict_failure(
         finding,
@@ -852,7 +882,7 @@ def _evaluate_finding(
     adapter: str,
     direction: str,
 ) -> _Verdict:
-    direction = subject_direction(adapter, direction, finding.subject)
+    direction = metric_direction(adapter, direction, finding.kind)
     entry = by_subject.get(finding.subject)
     if direction == "min":
         if entry is None:
@@ -978,7 +1008,7 @@ def evaluate(
     threshold: float,
     enforcement: str,
     prefix: str,
-    adapter: str,
+    adapter: Any,
     domain: Domain,
     today: datetime.date | None = None,
     direction: str = "max",
@@ -1018,6 +1048,8 @@ def evaluate(
         evaluation.results,
         evaluation.resolved,
         evaluation.unmeasured,
+        adapter,
+        direction,
     )
     _report(
         prefix,

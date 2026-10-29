@@ -108,12 +108,14 @@ def measure_exclusions(relative: str, source: str) -> list[Finding]:
             len(no_cover),
             _location(relative, no_cover),
             locations=tuple(Location(relative, line, line) for line in no_cover),
+            kind="exclusion",
         ),
         Finding(
             f"exclusions:{relative}:noqa",
             len(noqa),
             _location(relative, noqa),
             locations=tuple(Location(relative, line, line) for line in noqa),
+            kind="exclusion",
         ),
         Finding(
             f"exclusions:{relative}:file-suppression",
@@ -122,6 +124,7 @@ def measure_exclusions(relative: str, source: str) -> list[Finding]:
             locations=tuple(
                 Location(relative, line, line) for line, _ in file_suppressions
             ),
+            kind="exclusion",
         ),
     ]
 
@@ -135,11 +138,13 @@ def test_findings(
             f"tests:{check_id}:executed",
             ran - skipped,
             location,
+            kind="executed",
         ),
         Finding(
             f"tests:{check_id}:skipped",
             skipped,
             location,
+            kind="skipped",
         ),
     ]
 

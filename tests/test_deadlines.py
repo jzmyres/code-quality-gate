@@ -58,25 +58,24 @@ class AnalysisDeadlineTests(unittest.TestCase):
             "single-owner", "one implementation", ("source.py",),
             (owners.Pattern("python-call", "peak"),), (),
         )
-        return owners.OwnersSpec(self.root / "baseline", (rule,))
+        return owners.OwnersSpec((rule,))
+
+    def adapter_spec(self, adapter: str) -> object:
+        if adapter == "clones":
+            return policy.CloneSpec(50)
+        if adapter == "crap":
+            return policy.PythonCrapSpec("tests")
+        if adapter == "verification":
+            return policy.VerificationSpec("tests")
+        return self.owners_spec()
 
     def check_def(self, adapter: str) -> object:
         return policy.CheckDef(
             id=adapter, adapter="python_crap" if adapter == "crap" else adapter,
             tier=1, enforcement="enforced",
-            metric_version="metric/1", evidence=(), command=None,
-            clones=policy.CloneSpec(50, self.root / "baseline") if adapter == "clones" else None,
-            python_tests=None,
-            python_crap=(
-                policy.PythonCrapSpec("tests", self.root / "baseline")
-                if adapter == "crap" else None
-            ),
-            verification=(
-                policy.VerificationSpec("tests", self.root / "baseline")
-                if adapter == "verification" else None
-            ),
+            metric_version="metric/1", evidence=(),
+            spec=self.adapter_spec(adapter),
             threshold=6, baseline=self.root / "baseline",
-            owners=self.owners_spec() if adapter == "owners" else None,
         )
 
     def prior_tests(self) -> object:
@@ -122,7 +121,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
         )
         check = replace(
             self.check_def("verification"), id="tests", adapter="python_tests",
-            verification=None, python_tests=spec, evidence=("tests",), threshold=None,
+            spec=spec, evidence=("tests",), threshold=None,
         )
         start = time.monotonic()
         with mock.patch.object(checks, "coverage_prefix", return_value=[]):

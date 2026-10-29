@@ -478,7 +478,10 @@ def _entries_from_bytes(
     name = hashlib.sha256(f"{tag}\0{check.id}".encode()).hexdigest()[:16]
     path = temporary / f"{name}.toml"
     path.write_bytes(raw)
-    extras = ("files",) if check.adapter == "clones" else ()
+    from .adapters import adapter_for
+
+    descriptor = adapter_for(check.adapter)
+    extras = descriptor.extras if descriptor is not None else ()
     return load_baseline(
         path,
         check_id=check.id,

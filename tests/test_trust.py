@@ -812,7 +812,7 @@ class GitInvocationTests(TrustCase):
 class RepositoryPolicyTests(TrustCase):
     def repository_config(self) -> str:
         real = load_config(GATE)
-        run = list(real.checks["ruff"].command.run)
+        run = list(real.checks["ruff"].spec.run)
         self.assertIn("--config", run)
         self.assertEqual(run[run.index("--config") + 1], "ruff.toml")
         lines = [

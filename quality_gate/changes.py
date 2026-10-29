@@ -11,7 +11,7 @@ from typing import Any
 
 from .files import _git, git_argv
 from .policy import GateError, UsageError
-from .ratchet import Location, subject_direction
+from .ratchet import Location
 from .runner import run
 
 
@@ -202,11 +202,10 @@ def changed_lines(
 
 
 def location_coverage(adapter: str) -> str:
-    if adapter in ("python_crap", "owners", "clones"):
-        return "complete"
-    if adapter == "verification":
-        return "partial"
-    return "none"
+    from .adapters import adapter_for
+
+    descriptor = adapter_for(adapter)
+    return descriptor.location_coverage if descriptor is not None else "none"
 
 
 def _overlaps(location: Location, changes: Changes) -> bool:
@@ -217,8 +216,7 @@ def _overlaps(location: Location, changes: Changes) -> bool:
 
 
 def _threshold_violation(finding: Any, result: Any) -> bool:
-    direction = subject_direction(result.adapter, result.ratchet.direction, finding.subject)
-    if direction == "min":
+    if finding.direction == "min":
         return finding.value < finding.threshold
     return finding.value > finding.threshold
 

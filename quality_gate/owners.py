@@ -61,7 +61,6 @@ class OwnerRule:
 
 @dataclass(frozen=True)
 class OwnersSpec:
-    baseline: Path
     rules: tuple[OwnerRule, ...]
 
 
@@ -180,11 +179,8 @@ def _rules(raw: dict[str, Any], path: Path, where: str) -> tuple[OwnerRule, ...]
     return rules
 
 
-def parse_owners(raw: dict[str, Any], root: Path, path: Path, where: str) -> OwnersSpec:
-    baseline = Path(_string(raw, "baseline", path, f"{where}.baseline"))
-    if not baseline.is_absolute():
-        baseline = root / baseline
-    return OwnersSpec(baseline, _rules(raw, path, where))
+def parse_owners(raw: dict[str, Any], path: Path, where: str) -> OwnersSpec:
+    return OwnersSpec(_rules(raw, path, where))
 
 
 def _parent_fd(root: Path, relative: str) -> int:

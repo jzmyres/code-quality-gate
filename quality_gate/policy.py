@@ -6,7 +6,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
     from .owners import OwnersSpec
@@ -19,14 +19,6 @@ DEFAULT_BUDGET_SECONDS = 600
 DEFAULT_TESTS_BUDGET_SECONDS = 900
 DEFAULT_CRAP_THRESHOLD = 6.0
 SUPPORTED_SCHEMA = 2
-SUPPORTED_ADAPTERS = (
-    "command",
-    "clones",
-    "python_tests",
-    "python_crap",
-    "verification",
-    "owners",
-)
 COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement", "direction")
 TOP_LEVEL_KEYS = (
     "schema",
@@ -92,7 +84,6 @@ class CommandSpec:
 @dataclass(frozen=True)
 class CloneSpec:
     min_tokens: int
-    baseline: Path
 
 
 @dataclass(frozen=True)
@@ -108,13 +99,21 @@ class PythonTestsSpec:
 @dataclass(frozen=True)
 class PythonCrapSpec:
     requires: str
-    baseline: Path
 
 
 @dataclass(frozen=True)
 class VerificationSpec:
     requires: str | None
-    baseline: Path
+
+
+AdapterSpec = Union[
+    CommandSpec,
+    CloneSpec,
+    PythonTestsSpec,
+    PythonCrapSpec,
+    VerificationSpec,
+    "OwnersSpec",
+]
 
 
 @dataclass(frozen=True)
@@ -125,15 +124,10 @@ class CheckDef:
     enforcement: str
     metric_version: str
     evidence: tuple[str, ...]
-    command: CommandSpec | None
-    clones: CloneSpec | None
-    python_tests: PythonTestsSpec | None
-    python_crap: PythonCrapSpec | None
+    spec: AdapterSpec
     threshold: float | None
     baseline: Path | None
-    verification: VerificationSpec | None = None
     direction: str = "max"
-    owners: OwnersSpec | None = None
     effective_baseline: tuple[BaselineEntry, ...] | None = None
 
 
@@ -481,24 +475,6 @@ def _parse_command(
     )
 
 
-def _parse_clones(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> CloneSpec:
-    min_tokens = _integer(
-        raw,
-        "min_tokens",
-        path,
-        f"{full_key}.min_tokens",
-        default=DEFAULT_MIN_TOKENS,
-        minimum=1,
-    )
-    baseline_name = _string(raw, "baseline", path, f"{full_key}.baseline")
-    baseline = Path(baseline_name)
-    if not baseline.is_absolute():
-        baseline = root / baseline
-    return CloneSpec(min_tokens, baseline)
-
-
 def _parse_python_tests(
     raw: dict[str, Any], path: Path, full_key: str
 ) -> PythonTestsSpec:
@@ -535,171 +511,6 @@ def _parse_python_tests(
     )
 
 
-def _parse_python_crap(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> PythonCrapSpec:
-    requires = _string(raw, "requires", path, f"{full_key}.requires")
-    baseline_name = _string(raw, "baseline", path, f"{full_key}.baseline")
-    baseline = Path(baseline_name)
-    if not baseline.is_absolute():
-        baseline = root / baseline
-    return PythonCrapSpec(requires, baseline)
-
-
-def _parse_verification(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> VerificationSpec:
-    requires: str | None = None
-    if "requires" in raw:
-        requires = _string(raw, "requires", path, f"{full_key}.requires")
-    baseline_name = _string(raw, "baseline", path, f"{full_key}.baseline")
-    baseline = Path(baseline_name)
-    if not baseline.is_absolute():
-        baseline = root / baseline
-    return VerificationSpec(requires, baseline)
-
-
-@dataclass(frozen=True)
-class _ParsedSpec:
-    command: CommandSpec | None = None
-    clones: CloneSpec | None = None
-    python_tests: PythonTestsSpec | None = None
-    python_crap: PythonCrapSpec | None = None
-    verification: VerificationSpec | None = None
-    baseline: Path | None = None
-    threshold: float | None = None
-    metric_version: str = ""
-    evidence: tuple[str, ...] = ()
-    owners: OwnersSpec | None = None
-
-
-def _command_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    command = _parse_command(raw, path, full_key)
-    evidence = ("tests",) if command.tests_pattern is not None else ("static",)
-    return _ParsedSpec(
-        command=command,
-        metric_version="command-exit/1",
-        evidence=evidence,
-    )
-
-
-def _clones_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    clones = _parse_clones(raw, root, path, full_key)
-    return _ParsedSpec(
-        clones=clones,
-        baseline=clones.baseline,
-        threshold=0,
-        metric_version="jscpd-clone-occurrences/1",
-        evidence=("duplication",),
-    )
-
-
-def _python_tests_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    python_tests = _parse_python_tests(raw, path, full_key)
-    return _ParsedSpec(
-        python_tests=python_tests,
-        metric_version="test-count/1",
-        evidence=("tests",),
-    )
-
-
-def _python_crap_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    python_crap = _parse_python_crap(raw, root, path, full_key)
-    return _ParsedSpec(
-        python_crap=python_crap,
-        baseline=python_crap.baseline,
-        threshold=_number(
-            raw,
-            "threshold",
-            path,
-            f"{full_key}.threshold",
-            default=DEFAULT_CRAP_THRESHOLD,
-            minimum=0,
-        ),
-        metric_version="python-lines/1",
-        evidence=("crap",),
-    )
-
-
-def _verification_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    verification = _parse_verification(raw, root, path, full_key)
-    return _ParsedSpec(
-        verification=verification,
-        baseline=verification.baseline,
-        threshold=0,
-        metric_version="verification/1",
-        evidence=(),
-    )
-
-
-def _owners_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    from .owners import parse_owners
-
-    spec = parse_owners(raw, root, path, full_key)
-    return _ParsedSpec(
-        owners=spec,
-        baseline=spec.baseline,
-        threshold=0,
-        metric_version="owners/1",
-        evidence=("static",),
-    )
-
-
-def _adapter_spec(
-    adapter: str, raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> _ParsedSpec:
-    if adapter == "command":
-        return _command_spec(raw, root, path, full_key)
-    if adapter == "clones":
-        return _clones_spec(raw, root, path, full_key)
-    if adapter == "python_tests":
-        return _python_tests_spec(raw, root, path, full_key)
-    if adapter == "python_crap":
-        return _python_crap_spec(raw, root, path, full_key)
-    if adapter == "owners":
-        return _owners_spec(raw, root, path, full_key)
-    return _verification_spec(raw, root, path, full_key)
-
-
-def _allowed_keys(adapter: str) -> tuple[str, ...]:
-    if adapter == "command":
-        return (
-            *COMMON_CHECK_KEYS,
-            "run",
-            "budget_seconds",
-            "must_match",
-            "tests_pattern",
-            "skipped_pattern",
-        )
-    if adapter == "clones":
-        return (*COMMON_CHECK_KEYS, "min_tokens", "baseline")
-    if adapter == "python_tests":
-        return (
-            *COMMON_CHECK_KEYS,
-            "run",
-            "tests_pattern",
-            "skipped_pattern",
-            "budget_seconds",
-        )
-    if adapter == "python_crap":
-        return (*COMMON_CHECK_KEYS, "requires", "threshold", "baseline")
-    if adapter == "owners":
-        return (*COMMON_CHECK_KEYS, "baseline", "rule")
-    return (*COMMON_CHECK_KEYS, "requires", "baseline")
-
-
 def _parse_direction(
     raw: dict[str, Any], path: Path, full_key: str
 ) -> str:
@@ -716,21 +527,38 @@ def _parse_direction(
     return direction
 
 
+def _requires_match(
+    descriptor: Any, required: CheckDef | None
+) -> bool:
+    if required is None:
+        return False
+    if descriptor.requires_adapter is not None:
+        return required.adapter == descriptor.requires_adapter
+    if descriptor.requires_tests:
+        from .adapters import adapter_for
+
+        target = adapter_for(required.adapter)
+        return target is not None and target.produces_tests
+    return True
+
+
 def _validate_requires(
     checks: dict[str, CheckDef],
     name: str,
     requires: str | None,
     path: Path,
+    descriptor: Any,
 ) -> None:
     if requires is None:
         return
     required = checks.get(requires)
-    if required is None:
-        actual = f"unknown check {requires!r}"
-    elif required.adapter != "python_tests":
-        actual = f"{requires!r} is a {required.adapter} check"
-    else:
+    if _requires_match(descriptor, required):
         return
+    actual = (
+        f"unknown check {requires!r}"
+        if required is None
+        else f"{requires!r} is a {required.adapter} check"
+    )
     raise _config_error(
         path,
         f"checks.{name}.requires",
@@ -739,27 +567,22 @@ def _validate_requires(
     )
 
 
-def _required_check(parts: _ParsedSpec) -> str | None:
-    if parts.python_crap is not None:
-        return parts.python_crap.requires
-    if parts.verification is not None:
-        return parts.verification.requires
-    return None
-
-
 def _check_header(
     raw: dict[str, Any], path: Path, full_key: str
-) -> tuple[str, int, str]:
+) -> tuple[Any, int, str]:
+    from .adapters import adapter_for, adapter_names
+
     adapter = _string(raw, "adapter", path, f"{full_key}.adapter")
-    if adapter not in SUPPORTED_ADAPTERS:
-        names = ", ".join(SUPPORTED_ADAPTERS)
+    descriptor = adapter_for(adapter)
+    if descriptor is None:
+        names = ", ".join(adapter_names())
         raise _config_error(
             path,
             f"{full_key}.adapter",
             f"one of {names}",
             _describe(adapter),
         )
-    _check_keys(raw, _allowed_keys(adapter), path, full_key)
+    _check_keys(raw, descriptor.allowed_keys(), path, full_key)
     tier = _integer(
         raw, "tier", path, f"{full_key}.tier", minimum=1, maximum=4
     )
@@ -771,20 +594,27 @@ def _check_header(
             "one of enforced, advisory",
             _describe(enforcement),
         )
-    return adapter, tier, enforcement
+    return descriptor, tier, enforcement
 
 
-def _validate_owners_header(
-    adapter: str, tier: int, enforcement: str, direction: str, path: Path, full_key: str
+def _validate_fixed_header(
+    descriptor: Any, tier: int, enforcement: str, direction: str,
+    path: Path, full_key: str,
 ) -> None:
-    if adapter != "owners":
+    fixed = descriptor.fixed_header
+    if fixed is None:
         return
-    if tier != 1 or enforcement != "enforced":
+    fixed_tier, fixed_enforcement, fixed_direction = fixed
+    if tier != fixed_tier or enforcement != fixed_enforcement:
         raise _config_error(
-            path, full_key, "an enforced tier 1 owners check", f"tier {tier}, {enforcement}"
+            path, full_key,
+            f"an {fixed_enforcement} tier {fixed_tier} {descriptor.name} check",
+            f"tier {tier}, {enforcement}",
         )
-    if direction != "max":
-        raise _config_error(path, f"{full_key}.direction", "max", direction)
+    if direction != fixed_direction:
+        raise _config_error(
+            path, f"{full_key}.direction", fixed_direction, direction
+        )
 
 
 def _parse_check(
@@ -799,28 +629,25 @@ def _parse_check(
         raise _config_error(path, full_key, "a non-empty check id", "an empty key")
     if not isinstance(raw, dict):
         raise _config_error(path, full_key, "a table", _describe(raw))
-    adapter, tier, enforcement = _check_header(raw, path, full_key)
-    parts = _adapter_spec(adapter, raw, root, path, full_key)
+    descriptor, tier, enforcement = _check_header(raw, path, full_key)
+    parts = descriptor.parse(raw, root, path, full_key)
     direction = _parse_direction(raw, path, full_key)
-    _validate_owners_header(adapter, tier, enforcement, direction, path, full_key)
+    _validate_fixed_header(
+        descriptor, tier, enforcement, direction, path, full_key
+    )
     check = CheckDef(
         id=name,
-        adapter=adapter,
+        adapter=descriptor.name,
         tier=tier,
         enforcement=enforcement,
         metric_version=parts.metric_version,
         evidence=parts.evidence,
-        command=parts.command,
-        clones=parts.clones,
-        python_tests=parts.python_tests,
-        python_crap=parts.python_crap,
+        spec=parts.spec,
         threshold=parts.threshold,
         baseline=parts.baseline,
-        verification=parts.verification,
         direction=direction,
-        owners=parts.owners,
     )
-    _validate_requires(checks, name, _required_check(parts), path)
+    _validate_requires(checks, name, parts.requires, path, descriptor)
     return check
 
 

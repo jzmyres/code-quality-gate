@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import gate_result
+from .adapters import AdapterContext, adapter_for
 from .changes import apply_changes, changed_lines, location_coverage, resolve_revision
 from .clones import measure_clones
 from .coverage_tool import (
@@ -71,6 +72,20 @@ def _budget_detail(reason: str, start: float, budget: float) -> str:
     return f"{reason} (timeout; deadline: {budget:g} seconds; elapsed: {elapsed:.3f} seconds)"
 
 
+@dataclass(frozen=True)
+class TestResults:
+    """One test adapter's normalized result, whatever the language."""
+
+    selected: int
+    passed: int
+    failed: int
+    failures: tuple[str, ...] = ()
+
+    @property
+    def skipped(self) -> int:
+        return max(0, self.selected - self.passed - self.failed)
+
+
 @dataclass
 class CheckResult:
     id: str
@@ -91,6 +106,7 @@ class CheckResult:
     baseline_path: Path | None = None
     ratchet: RatchetResult | None = None
     measurement: dict[str, Any] | None = None
+    test_results: TestResults | None = None
     tests_ran: int | None = None
     tests_skipped: int | None = None
     satisfied: bool | None = None
@@ -177,11 +193,13 @@ def _baseline_entries(check: CheckDef) -> list[BaselineEntry]:
     if check.effective_baseline is not None:
         return list(check.effective_baseline)
     assert check.baseline is not None
+    descriptor = adapter_for(check.adapter)
+    extras = descriptor.extras if descriptor is not None else ()
     return load_baseline(
         check.baseline,
         check_id=check.id,
         metric_version=check.metric_version,
-        allowed_extras=("files",) if check.adapter == "clones" else (),
+        allowed_extras=extras,
     )
 
 
@@ -192,10 +210,10 @@ def _file_argument(name: str) -> str:
 def _expand_run(
     check: CheckDef, files: list[str]
 ) -> tuple[list[str], str | None]:
-    assert check.command is not None
+    spec = check.spec
     expanded: list[str] = []
     tools = None
-    for argument in check.command.run:
+    for argument in spec.run:
         if argument == "{files}":
             expanded.extend(map(_file_argument, files))
             continue
@@ -547,20 +565,22 @@ def _command_evidence(
     return outcome
 
 
-def _run_command(
-    root: Path,
-    config: Config,
-    check: CheckDef,
-    files: list[str],
-    classes: dict[str, str],
-    prefix: str,
-) -> CheckResult:
-    assert check.command is not None
-    spec = check.command
+def _adapter_selection(
+    context: AdapterContext,
+) -> tuple[Any, float, list[str], list[str]]:
+    check = context.check
+    spec = check.spec
     start = time.monotonic()
     selected, names = analysis_step(
-        "file selection", _select_files, config, check, files, classes
+        "file selection", _select_files, context.config, check,
+        context.files, context.classes,
     )
+    return spec, start, selected, names
+
+
+def _run_command(context: AdapterContext) -> CheckResult:
+    root, check, prefix = context.root, context.check, context.prefix
+    spec, start, selected, names = _adapter_selection(context)
     if "{files}" in spec.run and not selected:
         return _command_failure(
             check,
@@ -675,7 +695,6 @@ def _clone_result(
     diagnostics: Diagnostics | None = None,
     reason: str | None = None,
 ) -> CheckResult:
-    assert check.clones is not None
     return _ratchet_result(
         check,
         start,
@@ -722,19 +741,10 @@ def _clone_domain(
     return Domain.of_subjects(subjects, "the selected files")
 
 
-def _run_clones(
-    root: Path,
-    config: Config,
-    check: CheckDef,
-    files: list[str],
-    classes: dict[str, str],
-    prefix: str,
-) -> CheckResult:
-    assert check.clones is not None
-    start = time.monotonic()
-    selected, names = analysis_step(
-        "file selection", _select_files, config, check, files, classes
-    )
+def _run_clones(context: AdapterContext) -> CheckResult:
+    root, config = context.root, context.config
+    check, files, prefix = context.check, context.files, context.prefix
+    spec, start, selected, names = _adapter_selection(context)
     if not selected:
         class_text = _class_text(names)
         print(
@@ -752,7 +762,7 @@ def _run_clones(
     measurement = measure_clones(
         root,
         selected,
-        check.clones.min_tokens,
+        spec.min_tokens,
         config.max_bytes,
     )
     return _finish_clones(check, start, prefix, measurement, selected, files)
@@ -845,6 +855,14 @@ def _executed_tests(
     if ran is None or skipped is None:
         return None
     return ran - skipped
+
+
+def _failed_test_results(
+    ran: int | None, executed: int | None
+) -> TestResults | None:
+    if ran is None or executed is None:
+        return None
+    return TestResults(ran, 0, executed)
 
 
 def _tests_result(
@@ -974,6 +992,7 @@ def _tests_failed(
             combined=combined,
         )
     executed = _executed_tests(ran, skipped)
+    test_results = _failed_test_results(ran, executed)
     return _tests_result(
         check,
         spec,
@@ -982,6 +1001,7 @@ def _tests_failed(
         _tests_failure_reason(run_result, ran, skipped, executed),
         diagnostics=diagnostics,
         measurement={"tests": executed} if executed is not None else None,
+        test_results=test_results,
         combined=combined,
     )
 
@@ -1153,6 +1173,7 @@ def _tests_counts(
             "zero tests is not a pass",
             diagnostics=diagnostics,
             measurement={"tests": 0},
+            test_results=TestResults(ran, 0, 0),
             combined=combined,
         )
     return (ran, skipped, executed), None
@@ -1193,6 +1214,7 @@ def _tests_evidence(
         budget_seconds=spec.budget_seconds,
         diagnostics=diagnostics,
         measurement={"tests": executed},
+        test_results=TestResults(ran, executed, 0),
         tests_ran=ran,
         tests_skipped=skipped,
         evidence_path=combined_file,
@@ -1207,14 +1229,9 @@ def _tests_evidence(
     return outcome
 
 
-def _run_python_tests(
-    root: Path,
-    check: CheckDef,
-    *,
-    prefix: str,
-) -> CheckResult:
-    assert check.python_tests is not None
-    spec = check.python_tests
+def _run_python_tests(context: AdapterContext) -> CheckResult:
+    root, check, prefix = context.root, context.check, context.prefix
+    spec = check.spec
     start = time.monotonic()
     deadline = start + spec.budget_seconds
     setup = _tests_setup(root, check, spec, start, prefix)
@@ -1344,22 +1361,10 @@ def _crap_measure(
     return measurement, None
 
 
-def _run_python_crap(
-    root: Path,
-    config: Config,
-    check: CheckDef,
-    files: list[str],
-    classes: dict[str, str],
-    *,
-    prefix: str,
-    prior: dict[str, CheckResult],
-) -> CheckResult:
-    assert check.python_crap is not None
-    spec = check.python_crap
-    start = time.monotonic()
-    selected, names = analysis_step(
-        "file selection", _select_files, config, check, files, classes
-    )
+def _run_python_crap(context: AdapterContext) -> CheckResult:
+    root, check = context.root, context.check
+    prefix, prior = context.prefix, context.prior
+    spec, start, selected, names = _adapter_selection(context)
     if not selected:
         class_text = _class_text(names)
         reason = (
@@ -1443,28 +1448,38 @@ def _run_python_crap(
         )
     return outcome
 
+def _produces_tests(adapter: str) -> bool:
+    descriptor = adapter_for(adapter)
+    return descriptor is not None and descriptor.produces_tests
+
+
 def _verification_test_checks(
     check: CheckDef, prior: dict[str, CheckResult]
 ) -> list[str]:
-    assert check.verification is not None
-    if check.verification.requires is not None:
-        return [check.verification.requires]
+    spec = check.spec
+    if spec.requires is not None:
+        return [spec.requires]
     return [
         identifier
         for identifier, result in prior.items()
-        if result.adapter == "python_tests"
+        if _produces_tests(result.adapter)
     ]
+
+
+def _recorded_test_counts(
+    result: CheckResult,
+) -> tuple[int, int] | None:
+    if result.test_results is not None:
+        return result.test_results.selected, result.test_results.skipped
+    if result.tests_ran is not None and result.tests_skipped is not None:
+        return result.tests_ran, result.tests_skipped
+    return None
 
 
 def _missing_test_count(
     identifier: str, result: CheckResult
 ) -> str | None:
-    if result.tests_ran is None:
-        return (
-            f"test counts unreliable: {identifier} recorded no "
-            "ran/skipped counts"
-        )
-    if result.tests_skipped is None:
+    if _recorded_test_counts(result) is None:
         return (
             f"test counts unreliable: {identifier} recorded no "
             "ran/skipped counts"
@@ -1495,11 +1510,9 @@ def _verification_counts(
         if problem is not None:
             return None, problem
         assert result is not None
-        assert result.tests_ran is not None
-        assert result.tests_skipped is not None
-        counts.append(
-            (identifier, result.tests_ran, result.tests_skipped)
-        )
+        recorded = _recorded_test_counts(result)
+        assert recorded is not None
+        counts.append((identifier, *recorded))
     return counts, None
 
 
@@ -1634,17 +1647,10 @@ def _verification_ratchet(
     return result
 
 
-def _run_verification(
-    root: Path,
-    config: Config,
-    check: CheckDef,
-    selected_files: list[str],
-    file_classes: dict[str, str],
-    *,
-    prefix: str,
-    prior: dict[str, CheckResult],
-) -> CheckResult:
-    assert check.verification is not None
+def _run_verification(context: AdapterContext) -> CheckResult:
+    root, config, check = context.root, context.config, context.check
+    selected_files, file_classes = context.files, context.classes
+    prefix, prior = context.prefix, context.prior
     start = time.monotonic()
     measured = _verification_measurement(
         root,
@@ -1681,11 +1687,12 @@ def _owners_error(check: CheckDef, start: float, prefix: str, error: GateError) 
     return result
 
 
-def _run_owners(root: Path, check: CheckDef, files: list[str], prefix: str) -> CheckResult:
-    assert check.owners is not None
+def _run_owners(context: AdapterContext) -> CheckResult:
+    root, check = context.root, context.check
+    files, prefix = context.files, context.prefix
     start = time.monotonic()
     try:
-        findings = analysis_step("owners analysis", measure_owners, root, files, check.owners)
+        findings = analysis_step("owners analysis", measure_owners, root, files, check.spec)
         entries = analysis_step("baseline loading", _baseline_entries, check)
     except GateError as error:
         return _owners_error(check, start, prefix, error)
@@ -1698,6 +1705,13 @@ def _run_owners(root: Path, check: CheckDef, files: list[str], prefix: str) -> C
     return _ratchet_result(check, start, ratchet.outcome, ratchet=ratchet)
 
 
+def _check_descriptor(check: CheckDef) -> Any:
+    descriptor = adapter_for(check.adapter)
+    if descriptor is None:
+        raise GateError(f"unsupported adapter {check.adapter!r}")
+    return descriptor
+
+
 def _adapter_runner(
     root: Path,
     config: Config,
@@ -1707,32 +1721,8 @@ def _adapter_runner(
     prefix: str,
     prior: dict[str, CheckResult],
 ) -> CheckResult:
-    if check.adapter == "command":
-        return _run_command(root, config, check, files, classes, prefix)
-    if check.adapter == "clones":
-        return _run_clones(root, config, check, files, classes, prefix)
-    if check.adapter == "python_tests":
-        return _run_python_tests(root, check, prefix=prefix)
-    if check.adapter == "python_crap":
-        return _run_python_crap(
-            root,
-            config,
-            check,
-            files,
-            classes,
-            prefix=prefix,
-            prior=prior,
-        )
-    if check.adapter == "owners":
-        return _run_owners(root, check, files, prefix)
-    return _run_verification(
-        root,
-        config,
-        check,
-        files,
-        classes,
-        prefix=prefix,
-        prior=prior,
+    return _check_descriptor(check).run(
+        root, config, check, files, classes, prefix=prefix, prior=prior
     )
 
 
@@ -1746,24 +1736,12 @@ def run_check(
     prefix: str,
     prior: dict[str, CheckResult] | None = None,
 ) -> CheckResult:
-    if check.adapter not in (
-        "command",
-        "clones",
-        "python_tests",
-        "python_crap",
-        "verification",
-        "owners",
-    ):
-        raise GateError(f"unsupported adapter {check.adapter!r}")
+    _check_descriptor(check)
     return _run_check_with_deadline(root, config, check, files, classes, prefix, prior or {})
 
 
 def _check_budget(check: CheckDef) -> float:
-    if check.command is not None:
-        return check.command.budget_seconds
-    if check.python_tests is not None:
-        return check.python_tests.budget_seconds
-    return CLONE_BUDGET_SECONDS
+    return _check_descriptor(check).budget(check.spec)
 
 
 def _run_check_with_deadline(
@@ -1817,12 +1795,7 @@ def _deadline_failure(
 
 
 def _skipped(check: CheckDef) -> CheckResult:
-    if check.command is not None:
-        budget = check.command.budget_seconds
-    elif check.python_tests is not None:
-        budget = check.python_tests.budget_seconds
-    else:
-        budget = CLONE_BUDGET_SECONDS
+    budget = _check_budget(check)
     return CheckResult(
         id=check.id,
         kind="check",
