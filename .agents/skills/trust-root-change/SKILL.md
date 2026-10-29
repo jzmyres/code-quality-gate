@@ -1,9 +1,9 @@
 ---
 name: trust-root-change
 description: Checklist for changing the gate's trust root, protected inputs, baseline merge, prune or run identity.
-verified: 2026-10-28
-commit: 76be052
-paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, tests/test_trust.py, tests/test_verification.py
+verified: 2026-10-29
+commit: 697d33f
+paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py
 ---
 
 # Changing the trust root
@@ -19,18 +19,21 @@ closure: the suite covers the probes below, but a new trust path needs its own a
    touching a protected input.
 2. **One Git invocation policy.** `files.git_argv` builds every command the gate runs on a candidate repository:
    `git --no-replace-objects -c safe.directory=ROOT -c core.fsmonitor=false -C ROOT`; `trust._git`,
-   `files._git` and `gate_result._git` call it. Blobs are read with `git cat-file blob`, and `_refuse_graft` runs
+   `files._git` and `gate_result._git` call it, and `checks` and `changes` use it directly for inventory/
+   hygiene argv and worktree diffs. Blobs are read with `git cat-file blob`, and `_refuse_graft` runs
    before the revision is read. A new bare `git` call or a hand-built argument list loses replacement-ref and
    fsmonitor isolation.
-3. **Candidate reads are regular files.** `_read_regular` opens with `O_NOFOLLOW|O_NONBLOCK` and requires `fstat`
-   to report a regular file; `_candidate_parent` rejects a symlinked parent. `Path.read_text()` follows symlinks
-   and can block on a FIFO; do not use it for a protected input.
-4. **Respect metric direction in the merge.** `_merge_revision_entry` keeps a trusted `min` floor when the
+3. **Candidate reads are regular files.** `_open_candidate` opens with `O_NOFOLLOW|O_NONBLOCK`, and
+   `_read_regular` requires `fstat` to report a regular file; `_candidate_parent` rejects a symlinked parent.
+   `Path.read_text()` follows symlinks and can block on a FIFO; do not use it for a protected input.
+4. **Respect metric direction in the merge.** `load_baseline` sets each `BaselineEntry.direction` with
+   `subject_direction`; `_merge_revision_entry` reads that direction, keeps a trusted `min` floor when the
    candidate omits it, applies a candidate removal only for `max`, and preserves every trusted entry when the
-   candidate baseline cannot be parsed. A merge that parses a bad candidate as empty or drops floors loosens the
-   ratchet. The merged tuple goes on `CheckDef.effective_baseline`; `checks._baseline_entries` returns it
-   first, and no check passes a baseline path to a child process. An authorized policy's new baseline is read
-   from the candidate, but still validated before the checks.
+   candidate baseline cannot be parsed. `evaluate` re-derives the direction with `entry_direction`, which takes a
+   measured finding's `kind` first. A merge that parses a bad candidate as empty, recomputes direction locally, or
+   drops floors loosens the ratchet (QF44). The merged tuple goes on `CheckDef.effective_baseline`;
+   `checks._baseline_entries` returns it first, and no check passes a baseline path to a child process. An
+   authorized policy's new baseline is read from the candidate, but still validated before the checks.
 5. **Identity and prune.** `_capture_identity` runs before the checks and records `protected`,
    `effective_inputs` (policy, lock, tool pins and each effective baseline digest), `tools` and `gate`; when
    a prune is requested, `Trust.before_prune` captures it again after the checks and must find no difference
@@ -38,10 +41,11 @@ closure: the suite covers the probes below, but a new trust path needs its own a
    `write_baseline` returned with `Trust.record_prune_write`, and `Trust.finish` allows that write to change
    only the path's `candidate_sha256` to the digest of those bytes; every other difference fails the run
    naming the path. Do not reintroduce a path-wide or per-check exemption.
-6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version and
-   payload digest as arguments and loads the standard-library `payload.py` by file path, so the measured
-   interpreter never imports `quality_gate` (QF7). Do not move that verifier into the package import graph or
-   start a nested verifier interpreter. `payload.PayloadError` is a plain exception, not a `GateError`;
+6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version,
+   payload digest, gate-owned coverage config and registry directory as arguments and loads the
+   standard-library `payload.py` by file path, so the measured interpreter never imports `quality_gate` (QF7).
+   Do not move that verifier into the package import graph or start a nested verifier interpreter.
+   `payload.PayloadError` is a plain exception, not a `GateError`;
    each caller that reads a payload catches it at its own boundary and converts it to that boundary's error;
    `tools._build_install` raises `UsageError` (exit 2) for an unreadable build tree, and `command_tools_fetch`
    returns `error.exit_code`.
