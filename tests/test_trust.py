@@ -376,6 +376,7 @@ class StubFloorTrustTests(TrustCase):
         )
 
     def test_candidate_omitting_a_floor_keeps_the_trusted_bound(self) -> None:
+        self.assertIs(adapters.adapter_for(FLOOR_STUB.name), FLOOR_STUB)
         prepared = prepare_trust(self.repo, self.revision, [])
         self.addCleanup(prepared.close)
         entries = prepared.config.checks["floor"].effective_baseline

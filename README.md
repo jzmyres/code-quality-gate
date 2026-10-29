@@ -65,6 +65,13 @@ prerequisite is every earlier result from an adapter that produces tests, whatev
 the ratchet takes each finding's direction from its descriptor and subject kind rather than its subject
 text.
 
+When writing an adapter with minimum kinds, declare its subjects' directions with
+`entry_direction(subject, configured)`, matching the directions used to evaluate their findings.
+`register_adapter` refuses kinds with mixed directions or a direction different from the descriptor's
+default (`max` when unset) unless this per-subject rule is provided. For example,
+`directions={"floor": "min"}` with a `max` default needs a rule identifying its floor subjects, so the
+trusted baseline merge can preserve them before any findings exist.
+
 The implementer agents' learned memory lives in `.agents/AGENTS.md`, written by the runner's
 reflection step after each batch and reviewed before landing.
 

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import GATE, baseline_text
 
@@ -65,6 +66,10 @@ def run_stub(
     )
 
 
+def floor_entry_direction(subject: str, configured: str) -> str:
+    return "min" if subject == "floor-subject" else configured
+
+
 STUB = adapters.AdapterDescriptor(
     "stub",
     ("count",),
@@ -74,11 +79,8 @@ STUB = adapters.AdapterDescriptor(
     directions={"floor": "min"},
     produces_tests=True,
     budget=lambda spec: 3,
+    entry_direction=floor_entry_direction,
 )
-
-
-def floor_entry_direction(subject: str, configured: str) -> str:
-    return "min" if subject == "floor-subject" else configured
 
 
 FLOOR_STUB = adapters.AdapterDescriptor(
@@ -87,6 +89,7 @@ FLOOR_STUB = adapters.AdapterDescriptor(
     parse_stub,
     run_stub,
     directions={"floor": "min"},
+    default_direction="max",
     produces_tests=True,
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
@@ -155,6 +158,53 @@ tier = 1
 enforcement = "enforced"
 baseline = "verification.toml"
 """
+
+
+class AdapterRegistrationTests(unittest.TestCase):
+    def test_minimum_kind_requires_subject_directions(self) -> None:
+        descriptor = dataclasses.replace(FLOOR_STUB, entry_direction=None)
+        with mock.patch.dict(adapters.ADAPTERS):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"adapter 'floor-stub': kinds \(floor=min\).*default 'max'.*entry_direction",
+            ):
+                adapters.register_adapter(descriptor)
+            self.assertNotIn(descriptor.name, adapters.ADAPTERS)
+
+    def test_mixed_kinds_require_subject_directions(self) -> None:
+        descriptor = dataclasses.replace(
+            FLOOR_STUB, directions={"floor": "min", "ceiling": "max"},
+            default_direction="min", entry_direction=None,
+        )
+        with mock.patch.dict(adapters.ADAPTERS):
+            with self.assertRaisesRegex(
+                ValueError, r"floor-stub.*floor=min, ceiling=max.*entry_direction"
+            ):
+                adapters.register_adapter(descriptor)
+            self.assertNotIn(descriptor.name, adapters.ADAPTERS)
+
+    def test_kinds_matching_the_default_register_without_subject_rule(self) -> None:
+        for default in (None, "max", "min"):
+            with self.subTest(default=default), mock.patch.dict(adapters.ADAPTERS):
+                descriptor = dataclasses.replace(
+                    FLOOR_STUB, directions={"metric": default or "max"},
+                    default_direction=default, entry_direction=None,
+                )
+                self.assertIs(adapters.register_adapter(descriptor), descriptor)
+                self.assertIs(adapters.adapter_for(descriptor.name), descriptor)
+
+    def test_shipped_adapters_register_unchanged(self) -> None:
+        names = (
+            "command", "clones", "python_tests", "elisp_tests", "elisp_compile",
+            "elisp_checkdoc", "python_crap", "elisp_crap", "verification", "owners",
+        )
+        descriptors = [adapters.adapter_for(name) for name in names]
+        with mock.patch.dict(adapters.ADAPTERS, clear=True):
+            for descriptor in descriptors:
+                with self.subTest(adapter=descriptor.name):
+                    self.assertIs(adapters.register_adapter(descriptor), descriptor)
+                    self.assertIs(adapters.adapter_for(descriptor.name), descriptor)
+            self.assertEqual(adapters.adapter_names(), names)
 
 
 class StubAdapterTests(unittest.TestCase):
@@ -252,9 +302,9 @@ class StubAdapterTests(unittest.TestCase):
         self.assertFalse(result.findings[0].blocking)
 
     def test_descriptor_directions_apply_to_registered_kinds(self) -> None:
-        entry = ratchet.BaselineEntry("subject", 4, "floor")
+        entry = ratchet.BaselineEntry("floor-subject", 4, "floor")
         result = ratchet.evaluate(
-            [ratchet.Finding("subject", 5, "file:1", kind="floor")],
+            [ratchet.Finding("floor-subject", 5, "file:1", kind="floor")],
             [entry],
             threshold=0,
             enforcement="enforced",
@@ -267,8 +317,8 @@ class StubAdapterTests(unittest.TestCase):
 
     def test_prune_keeps_a_minimum_metric_at_its_measured_value(self) -> None:
         result = ratchet.evaluate(
-            [ratchet.Finding("raised-subject", 5, "file:1", kind="floor")],
-            [ratchet.BaselineEntry("raised-subject", 4, "floor")],
+            [ratchet.Finding("floor-subject", 5, "file:1", kind="floor")],
+            [ratchet.BaselineEntry("floor-subject", 4, "floor")],
             threshold=0,
             enforcement="enforced",
             prefix="check: stub",

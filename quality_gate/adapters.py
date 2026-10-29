@@ -257,6 +257,15 @@ ADAPTERS: dict[str, AdapterDescriptor] = {}
 
 
 def register_adapter(descriptor: AdapterDescriptor) -> AdapterDescriptor:
+    default = descriptor.default_direction or "max"
+    if descriptor.entry_direction is None and set(descriptor.directions.values()) - {default}:
+        kinds = ", ".join(
+            f"{kind}={direction}" for kind, direction in descriptor.directions.items()
+        )
+        raise ValueError(
+            f"adapter {descriptor.name!r}: kinds ({kinds}) differ from default "
+            f"{default!r}; expected entry_direction to decide each subject's direction"
+        )
     ADAPTERS[descriptor.name] = descriptor
     return descriptor
 
