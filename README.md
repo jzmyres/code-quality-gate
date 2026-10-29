@@ -1046,8 +1046,14 @@ This repository gates itself with `quality-gate.toml`:
 * `verification` reuses the `tests` counts and measures inline `# noqa`, file-wide lint suppressions and
   `pragma: no cover` lines in the Python source; `quality-gate-verification.toml` floors the executed
   tests and ceilings the skips and exclusions measured at adoption;
-* `levels.required_tiers = [1]` makes tier 1 mandatory for both code classes; the `tests` check
-  provides the required `tests` evidence and each class's obligation is reported as satisfied.
+* the `elisp` class lists `elisp-tests`, `elisp-crap`, `elisp-compile` and `elisp-checkdoc`, so this
+  repository gates its Emacs Lisp helpers with the gate's own Elisp checks; the ERT suite
+  `tests/elisp/qg-elisp-tests.el` exercises the complexity, child and lint helpers, `elisp-crap` scores
+  every helper function from that run at or below CRAP 6 with no baseline entries, and the suite's
+  `elisp-suite` class lists only `elisp-compile` and `elisp-checkdoc`, so the suite is never instrumented;
+* `levels.required_tiers = [1]` makes tier 1 mandatory for every code class; the `tests` check
+  provides the Python classes' required `tests` evidence, `elisp-tests` provides it for `elisp`, and the
+  `elisp-suite` obligation is exempted because the suite is measured only by its own run.
 
 `make check` is the single entry point and runs only `python3 -I qg.py check`; Ruff, the tests and
 CRAP are policy checks, so the Makefile does not duplicate them.

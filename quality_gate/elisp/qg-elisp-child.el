@@ -42,7 +42,7 @@
           (let ((load-file-name absolute)
                 (load-true-file-name (file-truename absolute)))
             (eval-buffer nil nil absolute))))
-    (error (error "instrumenting %s: %s" file (error-message-string failure)))))
+    (error (error "Instrumenting %s: %s" file (error-message-string failure)))))
 
 (defun qg-elisp-child--instrument (root files)
   "Instrument FILES under ROOT and return all definition names, including lambdas."
@@ -68,9 +68,9 @@
                  (setq stats (ert-run-tests-batch selector)))))
       (condition-case failure
           (load (expand-file-name suite root) nil t)
-        (error (error "loading suite %s: %s" suite (error-message-string failure)))))
+        (error (error "Loading suite %s: %s" suite (error-message-string failure)))))
     (unless (= calls 1)
-      (error "suite %s: expected ert-run-tests-batch-and-exit exactly once, called %d times"
+      (error "Suite %s: expected ert-run-tests-batch-and-exit exactly once, called %d times"
              suite calls))
     stats))
 

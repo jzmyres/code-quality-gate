@@ -25,8 +25,13 @@ checks = ["ruff", "clones", "tests", "verification"]
 
 [classes.elisp]
 code = true
-description = "Emacs Lisp measurement helpers exercised by fixture tests"
-checks = ["tests"]
+description = "Emacs Lisp measurement helpers, measured by the gate's own Elisp checks"
+checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc"]
+
+[classes.elisp-suite]
+code = true
+description = "The ERT suite that exercises the Emacs Lisp helpers"
+checks = ["elisp-compile", "elisp-checkdoc"]
 
 [classes.config]
 code = false
@@ -59,6 +64,11 @@ reason = "the gate's Emacs Lisp measurement helpers"
 pattern = "tests/*.py"
 class = "test"
 reason = "tests execute the gate against disposable fixture repositories"
+
+[[rule]]
+pattern = "tests/elisp/*.el"
+class = "elisp-suite"
+reason = "the ERT suite for the Emacs Lisp helpers, never instrumented"
 
 [[rule]]
 pattern = "Makefile"
@@ -130,3 +140,35 @@ tier = 1
 enforcement = "enforced"
 requires = "tests"
 baseline = "quality-gate-verification.toml"
+
+[checks.elisp-tests]
+adapter = "elisp_tests"
+tier = 1
+enforcement = "enforced"
+suite = "tests/elisp/qg-elisp-tests.el"
+load_path = ["quality_gate/elisp"]
+
+[checks.elisp-crap]
+adapter = "elisp_crap"
+tier = 1
+enforcement = "enforced"
+requires = "elisp-tests"
+threshold = 6
+baseline = "quality-gate-elisp-crap.toml"
+
+[checks.elisp-compile]
+adapter = "elisp_compile"
+tier = 1
+enforcement = "enforced"
+load_path = ["quality_gate/elisp"]
+
+[checks.elisp-checkdoc]
+adapter = "elisp_checkdoc"
+tier = 1
+enforcement = "enforced"
+load_path = ["quality_gate/elisp"]
+
+[[not_applicable]]
+class = "elisp-suite"
+tier = 1
+reason = "the suite is run by the elisp-tests check and is never instrumented"

@@ -339,7 +339,7 @@ checks = ["crap"]
                 self.assertEqual(result.returncode, 1, output(result))
                 self.assertEqual(self.check_by_id(document, "legacy-tests")["outcome"], "pass")
                 self.assertEqual(check["outcome"], "fail")
-                self.assertIn("cannot read src/core.el", result.stderr)
+                self.assertIn("Cannot read src/core.el", result.stderr)
                 self.assertIn(error, result.stderr)
 
     def test_complexity_child_failure_and_invalid_result(self) -> None:

@@ -114,7 +114,7 @@
                 (push (qg-elisp-complexity--definition file form end) definitions)))
             (forward-comment (point-max)))
           (nreverse definitions)))
-    (error (error "cannot read %s: %s" file (error-message-string failure)))))
+    (error (error "Cannot read %s: %s" file (error-message-string failure)))))
 
 (defun qg-elisp-complexity-run (root files result-file)
   "Read FILES under ROOT and write complexity JSON to RESULT-FILE."
