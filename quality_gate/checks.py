@@ -1711,18 +1711,25 @@ def _run_verification(context: AdapterContext) -> CheckResult:
     return _verification_ratchet(check, measured, prefix, start)
 
 
+def _owners_message(path: str, line: int, details: dict[str, Any]) -> str:
+    if details.get("kind") == "unanalysable":
+        return f"owners: {path}:{line}: unanalysable {details['word']!r}: {details['reason']}"
+    owners = ", ".join(details["owners"])
+    return f"owners: {details['rule']}: {path}:{line}: {details['pattern']} outside its owners ({owners})"
+
+
 def _owners_report(findings: list[Any]) -> None:
     for finding in findings:
         details = finding.measurement
         assert details is not None
         path = finding.location.rsplit(":", 1)[0]
-        owners = ", ".join(details["owners"])
         for line in details["lines"]:
-            print(
-                f"owners: {details['rule']}: {path}:{line}: "
-                f"{details['pattern']} outside its owners ({owners})",
-                file=sys.stderr,
-            )
+            print(_owners_message(path, line, details), file=sys.stderr)
+
+
+def _owners_baseline(findings: list[Any], entries: list[Any]) -> list[Any]:
+    uncertain = {finding.subject for finding in findings if finding.kind == "unanalysable"}
+    return [entry for entry in entries if entry.subject not in uncertain]
 
 
 def _owners_error(check: CheckDef, start: float, prefix: str, error: GateError) -> CheckResult:
@@ -1741,7 +1748,9 @@ def _run_owners(context: AdapterContext) -> CheckResult:
     except GateError as error:
         return _owners_error(check, start, prefix, error)
     _owners_report(findings)
-    ratchet, failure = _evaluate_ratchet(findings, entries, check, prefix, Domain.all("the full inventory"))
+    ratchet, failure = _evaluate_ratchet(
+        findings, _owners_baseline(findings, entries), check, prefix, Domain.all("the full inventory")
+    )
     if ratchet is None:
         return _ratchet_result(check, start, failure or "error", reason=failure)
     if ratchet.satisfied:

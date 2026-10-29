@@ -354,6 +354,8 @@ def _python_file(relative: str, source: str, kinds: set[str]) -> tuple[list[Occu
     events = []
     if kinds & {"python-call", "python-import", "python-argv", "python-script"}:
         events = python_events(relative, source)
+    if not kinds & {"python-argv", "python-script"}:
+        events = [event for event in events if event.kind != "unanalysable"]
     code = python_code(relative, source) if "text-regex" in kinds else source
     return events, code
 
@@ -372,7 +374,10 @@ def _source_events(
 
 def _shell_file(relative: str, source: str, kinds: set[str]) -> tuple[list[Occurrence], str]:
     if kinds & {"shell-command", "shell-script", "text-regex"}:
-        return shell_events(relative, source)
+        events, code = shell_events(relative, source)
+        if not kinds & {"shell-command", "shell-script"}:
+            events = [event for event in events if event.kind != "unanalysable"]
+        return events, code
     return [], source
 
 
@@ -454,13 +459,16 @@ def _check_patterns(rule: OwnerRule, counts: dict[Pattern, int]) -> None:
                 )
 
 
-def _check_stale(rule: OwnerRule, regular: set[str], counts: dict[Pattern, int]) -> None:
+def _check_stale(
+    rule: OwnerRule, regular: set[str], counts: dict[Pattern, int], *, complete: bool
+) -> None:
     for owner in rule.owners:
         if owner not in regular:
             raise ConfigError(
                 f"owners: rule {rule.name}: owner file {owner} is missing or not an enumerated regular file"
             )
-    _check_patterns(rule, counts)
+    if complete:
+        _check_patterns(rule, counts)
 
 
 def _uncovered(hits: list[Occurrence], allowed: list[Occurrence]) -> list[Occurrence]:
@@ -495,8 +503,29 @@ def _rule_findings(
         for pattern, hits in matches.items():
             counts[pattern] += len(hits)
         findings.extend(_file_findings(rule, relative, matches))
-    _check_stale(rule, regular, counts)
+    _check_stale(rule, regular, counts, complete=_analysis_complete(events))
     return findings
+
+
+def _analysis_complete(events: dict[str, list[Occurrence]]) -> bool:
+    return not any(item.kind == "unanalysable" for items in events.values() for item in items)
+
+
+def _analysis_finding(path: str, word: str, reason: str, items: list[Occurrence]) -> Finding:
+    lines = sorted(item.line for item in items)
+    subject = json.dumps(["unanalysable", path, word, reason], ensure_ascii=True, separators=(",", ":"))
+    return Finding(subject, len(lines), f"{path}:{lines[0]}",
+                   {"kind": "unanalysable", "word": word, "reason": reason, "lines": lines},
+                   tuple(Location(path, line, line) for line in lines), kind="unanalysable")
+
+
+def _analysis_findings(events: dict[str, list[Occurrence]]) -> list[Finding]:
+    groups: dict[tuple[str, str, str], list[Occurrence]] = {}
+    for path, items in events.items():
+        for item in items:
+            if item.kind == "unanalysable":
+                groups.setdefault((path, item.value, item.reason or "unknown"), []).append(item)
+    return [_analysis_finding(*key, items) for key, items in groups.items()]
 
 
 def measure_owners(
@@ -504,4 +533,5 @@ def measure_owners(
 ) -> list[Finding]:
     events, regular = _file_events(root, files, spec, time.monotonic() + budget_seconds)
     findings = [finding for rule in spec.rules for finding in _rule_findings(rule, events, regular)]
+    findings.extend(_analysis_findings(events))
     return sorted(findings, key=lambda finding: finding.subject)

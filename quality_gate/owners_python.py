@@ -70,16 +70,22 @@ def _argv_scope(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.AST | Non
     return None
 
 
-def _script_event(node: ast.List | ast.Tuple, scope: ast.AST) -> list[Occurrence]:
+def _script_event(node: ast.List | ast.Tuple, scope: ast.AST, source: str) -> list[Occurrence]:
     words = [_literal(item) for item in node.elts]
-    index = script_index(words)
-    if index is None:
-        return []
-    assert words[index] is not None
-    return [_event("python-script", words[index], node.elts[index], scope)]
+    result = script_index(words)
+    if result.error_index is not None:
+        item = node.elts[result.error_index]
+        word = words[result.error_index] or ast.get_source_segment(source, item) or "<expression>"
+        key = ("python", id(scope))
+        return [Occurrence("unanalysable", word, item.lineno, 0, 0, key, frozenset(), result.reason)]
+    if result.index is not None:
+        value = words[result.index]
+        assert value is not None
+        return [_event("python-script", value, node.elts[result.index], scope)]
+    return []
 
 
-def _argv_event(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[Occurrence]:
+def _argv_event(node: ast.AST, parents: dict[ast.AST, ast.AST], source: str) -> list[Occurrence]:
     if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
         return []
     first = _literal(node.elts[0])
@@ -88,7 +94,7 @@ def _argv_event(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[Occurren
     scope = _argv_scope(node, parents)
     if scope is None:
         return []
-    return [_event("python-argv", first, node, scope), *_script_event(node, scope)]
+    return [_event("python-argv", first, node, scope), *_script_event(node, scope, source)]
 
 
 def _import_events(node: ast.AST) -> list[Occurrence]:
@@ -110,7 +116,7 @@ def python_events(relative: str, source: str) -> list[Occurrence]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             events.extend(_call_event(node, parents))
-        events.extend(_argv_event(node, parents))
+        events.extend(_argv_event(node, parents, source))
         events.extend(_import_events(node))
     return events
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -42,7 +43,7 @@ def _skip_quote(source: str, index: int) -> int:
             return index + 1
         else:
             index += 1
-    return index
+    return len(source) + 1
 
 
 def _skip_special(source: str, index: int) -> int | None:
@@ -110,9 +111,7 @@ class _Scanner:
         line = bisect.bisect_left(self.lines, start)
         self.tokens.append(Token(value, start, end, line, operator, assignment))
 
-    def substitution(self, start: int) -> int:
-        end = _substitution_end(self.source, start, self.relative)
-        inner = start + 2
+    def _embedded(self, inner: int, end: int) -> None:
         tokens, code, nested = _Scanner(self.relative, self.source[inner:end]).scan()
         line_offset = bisect.bisect_left(self.lines, inner) - 1
         self.substitutions.append([_shifted(token, inner, line_offset) for token in tokens])
@@ -120,7 +119,19 @@ class _Scanner:
             [_shifted(token, inner, line_offset) for token in group] for group in nested
         )
         self.mask[inner:end] = code
+
+    def substitution(self, start: int) -> int:
+        end = _substitution_end(self.source, start, self.relative)
+        self._embedded(start + 2, end)
         return end + 1
+
+    def backtick(self, start: int) -> int:
+        end = _skip_quote(self.source, start)
+        if end > len(self.source):
+            raise GateError(f"cannot tokenize shell {self.relative}: unterminated backtick")
+        self.blank(start, end)
+        self._embedded(start + 1, end - 1)
+        return end
 
     def _quoted_substitution(self, quote: str, index: int) -> bool:
         return (
@@ -131,6 +142,9 @@ class _Scanner:
 
     def _quote_escape(self, quote: str, index: int) -> bool:
         return self.source[index] == "\\" and quote != "'"
+
+    def _quoted_backtick(self, quote: str, index: int) -> bool:
+        return quote == '"' and self.source[index] == "`"
 
     def quote(self, index: int) -> int:
         quote = self.source[index]
@@ -146,6 +160,11 @@ class _Scanner:
                 index = self.substitution(index)
                 start = index - 1
                 continue
+            if self._quoted_backtick(quote, index):
+                self.blank(start, index + 1)
+                index = self.backtick(index)
+                start = index - 1
+                continue
             if char == quote:
                 self.blank(start, index + 1)
                 return index + 1
@@ -154,18 +173,68 @@ class _Scanner:
 
     def _word_boundary(self, index: int) -> bool:
         char = self.source[index]
-        return char.isspace() or char in "|&;()<>" or self.source.startswith("$((", index)
+        if self.source.startswith(("<(", ">("), index):
+            return False
+        return char.isspace() or char in "|&;()<>"
+
+    def arithmetic(self, start: int) -> int:
+        end = _substitution_end(self.source, start, self.relative)
+        index = start + 3
+        while index < end:
+            if self.source.startswith("$(", index) and not self.source.startswith("$((", index):
+                index = self.substitution(index)
+            elif self.source[index] == "`":
+                index = self.backtick(index)
+            else:
+                index += 1
+        return end + 1
+
+    def _parameter_part(self, index: int) -> int | None:
+        if self.source[index] == "`":
+            return self.backtick(index)
+        if self.source[index] in "'\"":
+            return self.quote(index)
+        if self.source[index] == "\\":
+            return index + 2
+        return self._expansion(index)
+
+    def parameter(self, start: int) -> int:
+        index = start + 2
+        depth = 1
+        while index < len(self.source):
+            following = self._parameter_part(index)
+            if following is not None:
+                index = following
+                continue
+            depth += (self.source[index] == "{") - (self.source[index] == "}")
+            index += 1
+            if not depth:
+                return index
+        raise GateError(f"cannot tokenize shell {self.relative}: unterminated parameter expansion")
+
+    def _expansion(self, index: int) -> int | None:
+        if self.source.startswith("$((", index):
+            return self.arithmetic(index)
+        if self.source.startswith(("$(", "<(", ">("), index):
+            return self.substitution(index)
+        if self.source.startswith("${", index):
+            return self.parameter(index)
+        return None
 
     def _word_part(self, index: int) -> tuple[int, bool]:
         char = self.source[index]
-        if char in "'\"`":
-            return self.quote(index), False
+        if char == "`":
+            return self.backtick(index), False
+        if char in "'\"":
+            end = self.quote(index)
+            return end, _literal_quote(self.source[index:end])
         if char == "\\":
             self.blank(index, min(index + 2, len(self.source)))
-            return index + 2, False
-        if self.source.startswith("$(", index):
-            return self.substitution(index), False
-        return index + 1, char != "$"
+            return index + 2, True
+        end = self._expansion(index)
+        if end is not None:
+            return end, False
+        return index + 1, _literal_char(self.source, index)
 
     def _word_end(self, index: int) -> tuple[int, bool]:
         literal = True
@@ -187,7 +256,8 @@ class _Scanner:
         index, literal = self._word_end(index)
         raw = self.source[start:index]
         self._record_heredoc(raw)
-        self.add(raw if literal else None, start, index, assignment=bool(_ASSIGNMENT.match(raw)))
+        value = _literal_word(raw) if literal else None
+        self.add(value, start, index, assignment=bool(_ASSIGNMENT.match(raw)))
         return index
 
     def _heredoc(self, index: int, delimiter: str, strip_tabs: bool) -> int:
@@ -226,10 +296,8 @@ class _Scanner:
         return end
 
     def _code_token(self, index: int) -> int:
-        if self.source.startswith("$((", index):
-            end = _substitution_end(self.source, index, self.relative) + 1
-            self.add(None, index, end)
-            return end
+        if self.source.startswith(("<(", ">("), index):
+            return self.word(index)
         if self.source[index] in "|&;()<>":
             return self.operator(index)
         return self.word(index)
@@ -261,10 +329,32 @@ class _Scanner:
         return self.tokens, "".join(self.mask), self.substitutions
 
 
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:\[[^]\n]*\])?\+?=")
 _RESERVED = {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!", "{", "}"}
 _SEPARATORS = {"\n", "|", "||", "&&", "&", ";", ";;", "(", ")"}
 _REDIRECTS = {"<", ">", "<<", "<<-", ">>", ">&", "<&", "&>", "&>>"}
+
+
+def _literal_quote(raw: str) -> bool:
+    if raw.startswith("'"):
+        return True
+    if raw.startswith("`"):
+        return False
+    return not re.search(r"(?<!\\)(?:\\\\)*[$`]", raw)
+
+
+def _literal_word(raw: str) -> str | None:
+    if raw.startswith("~"):
+        return None
+    return shlex.split(raw)[0] if raw else ""
+
+
+def _literal_char(source: str, index: int) -> bool:
+    if source[index] in "$*?":
+        return False
+    if source[index] == "[" and re.match(r"\[[^]\s]+\]", source[index:]):
+        return False
+    return not (source[index] == "{" and re.match(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}", source[index:]))
 
 
 class _Commands:
@@ -327,21 +417,34 @@ def _shell_event(kind: str, value: str, token: Token, scope: tuple[str, int]) ->
     return Occurrence(kind, value, token.line, token.start, token.end, scope, frozenset({scope}))
 
 
-def _command_events(command: list[Token]) -> list[Occurrence]:
+def _unanalysable(token: Token, source: str, reason: str) -> Occurrence:
+    scope = ("shell", token.start)
+    return Occurrence("unanalysable", source[token.start:token.end], token.line, token.start,
+                      token.end, scope, frozenset(), reason)
+
+
+def _script_events(command: list[Token], source: str, scope: tuple[str, int]) -> list[Occurrence]:
+    result = script_index([token.value for token in command])
+    if result.error_index is not None:
+        return [_unanalysable(command[result.error_index], source, result.reason or "unknown")]
+    if result.index is not None:
+        script = command[result.index]
+        assert script.value is not None
+        return [_shell_event("shell-script", script.value, script, scope)]
+    return []
+
+
+def _command_events(command: list[Token], source: str) -> list[Occurrence]:
     events: list[Occurrence] = []
     head = command[0]
     if head.value is None:
-        return []
+        return [_unanalysable(head, source, "cannot determine command head")]
     scope = ("shell", head.start)
     events.append(_shell_event("shell-command", head.value, head, scope))
     basename = PurePosixPath(head.value).name
     if basename != head.value:
         events.append(_shell_event("shell-command", basename, head, scope))
-    index = script_index([token.value for token in command])
-    if index is not None:
-        script = command[index]
-        assert script.value is not None
-        events.append(_shell_event("shell-script", script.value, script, scope))
+    events.extend(_script_events(command, source, scope))
     return events
 
 
@@ -350,5 +453,5 @@ def shell_events(relative: str, source: str) -> tuple[list[Occurrence], str]:
     commands = _commands(tokens)
     for group in substitutions:
         commands.extend(_commands(group))
-    events = [event for command in commands for event in _command_events(command)]
+    events = [event for command in commands for event in _command_events(command, source)]
     return events, code

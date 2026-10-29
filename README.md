@@ -450,12 +450,23 @@ Gitlinks and symlinks are not read, and symlinked parents are refused.
 Python matching parses the AST and never matches text inside a comment or ordinary string. An argv
 pattern deliberately inspects literal **elements** of a list or tuple passed directly to a call or
 returned by a builder, not a data list assigned to a variable or text that merely looks like a list.
-Shell matching skips comments, quoted words and here-document bodies; commands in
+Shell matching skips comments and here-document bodies; literal quoted words are recognised, and commands in
 `$(...)` are scanned separately, including inside double quotes, while the substitution stays an
-argument of the enclosing command. Interpreter patterns require literal words. A shell's short `-c`
+argument of the enclosing command. Arithmetic expansions stay in their enclosing word, including in
+assignment prefixes. Interpreter patterns require literal words. A shell's short `-c`
 (alone or in a cluster such as `-ec`) and Python's `-c` and `-m` name a command string or module, not
-a script; shell long options such as `--norc` do not, and an option that takes an operand consumes it,
-such as `--rcfile FILE`. Text patterns mask Python and shell comments and strings with their
+a script; interpreter-specific option tables also recognise shell `+` forms and options that consume
+operands, such as `--rcfile FILE` and `--check-hash-based-pycs never`.
+
+When a command or script pattern applies, an unknown interpreter option, an option whose meaning
+depends on the interpreter version or implementation, or a shell expansion that prevents the scanner
+from determining the command head, an option, or the script produces an `unanalysable` finding.
+A nonliteral Python argv element in the option or script position is also
+reported. The finding names the file, line, word and reason, and fails the check even in an owner file
+or with a baseline entry. Rewrite the invocation so its command and script can be determined. An
+unanalysable invocation also prevents a missing pattern match from being reported as a stale rule.
+
+Text patterns mask Python and shell comments and strings with their
 language tokenizers. For other text they mask quoted strings, `#` and `//` line comments, `/* ... */`
 block comments, and, in `.el` files, `;` comments. Use a more specific pattern when those conventions do
 not describe the file. Regular expressions run in a bounded child process; only non-empty matches
