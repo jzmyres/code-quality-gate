@@ -1058,10 +1058,11 @@ and removal of a raise. This is a selected set of faults, not an exhaustive meas
 possible change.
 
 Each copied module records its own run in a marker file: a line when the import starts, one when
-the import completes, and one when an exception escapes, with its traceback, including in child
-processes that import the module. A mutant is killed only when the same complete test suite runs,
-loads and imports that mutant, and fails an assertion while the marker file records no import or
-execution failure; assertion text is never inspected. Survivors, timeouts, a missing or incomplete
+the import completes, and a traceback for any uncaught exception or `unittest` error, including errors
+in subtests and in child processes that import the module. A mutant is killed only when the same
+complete test suite runs, loads and imports that mutant, and fails an assertion while the marker file
+records no import or execution failure; assertion text is never inspected. Any recorded error makes
+the mutant an error even if the parent suite passes. Survivors, timeouts, a missing or incomplete
 marker, a recorded import or execution failure, skipped tests, suite errors, invalid decisions and a
 failing unmodified suite all fail the command. Each suite has a 900-second limit; independent mutant
 copies run concurrently and their results are printed in declaration order. The slow mutation run is

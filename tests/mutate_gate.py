@@ -426,10 +426,12 @@ def _instrument(source: str, marker: Path, token: str) -> str:
         else:
             break
     lines = source.splitlines(keepends=True)
+    # Existing and future TestResult subclasses may override callbacks without
+    # delegating to the base class, so instrument each implementation.
     preamble = (
         "\n"
         "import json as _qg_mutation_json, sys as _qg_mutation_sys, "
-        "traceback as _qg_mutation_traceback\n"
+        "traceback as _qg_mutation_traceback, unittest as _qg_mutation_unittest\n"
         f"_qg_mutation_marker = {str(marker)!r}\n"
         f"_qg_mutation_token = {token!r}\n"
         "def _qg_mutation_record(event, detail=''):\n"
@@ -442,6 +444,38 @@ def _instrument(source: str, marker: Path, token: str) -> str:
         "    _qg_mutation_record('failure', detail)\n"
         "    _qg_mutation_sys.__excepthook__(exc_type, exc, tb)\n"
         "_qg_mutation_sys.excepthook = _qg_mutation_hook\n"
+        "def _qg_mutation_test_error(error):\n"
+        "    detail = ''.join(_qg_mutation_traceback.format_exception(*error))\n"
+        "    _qg_mutation_record('error', detail)\n"
+        "def _qg_mutation_wrap_error(original):\n"
+        "    def add_error(self, test, error):\n"
+        "        _qg_mutation_test_error(error)\n"
+        "        return original(self, test, error)\n"
+        "    return add_error\n"
+        "def _qg_mutation_wrap_subtest(original):\n"
+        "    def add_subtest(self, test, subtest, error):\n"
+        "        if error is not None and not issubclass(error[0], test.failureException):\n"
+        "            _qg_mutation_test_error(error)\n"
+        "        return original(self, test, subtest, error)\n"
+        "    return add_subtest\n"
+        "def _qg_mutation_wrap_result(result):\n"
+        "    if 'addError' in result.__dict__:\n"
+        "        result.addError = _qg_mutation_wrap_error(result.addError)\n"
+        "    if 'addSubTest' in result.__dict__:\n"
+        "        result.addSubTest = _qg_mutation_wrap_subtest(result.addSubTest)\n"
+        "    for child in result.__subclasses__():\n"
+        "        _qg_mutation_wrap_result(child)\n"
+        "def _qg_mutation_subclass_hook(previous):\n"
+        "    def init_subclass(cls, **kwargs):\n"
+        "        if previous is None:\n"
+        "            super(_qg_mutation_unittest.TestResult, cls).__init_subclass__(**kwargs)\n"
+        "        else:\n"
+        "            previous.__get__(None, cls)(**kwargs)\n"
+        "        _qg_mutation_wrap_result(cls)\n"
+        "    return classmethod(init_subclass)\n"
+        "_qg_mutation_wrap_result(_qg_mutation_unittest.TestResult)\n"
+        "_qg_mutation_unittest.TestResult.__init_subclass__ = _qg_mutation_subclass_hook(\n"
+        "    _qg_mutation_unittest.TestResult.__dict__.get('__init_subclass__'))\n"
     )
     trailer = "\n_qg_mutation_record('imported')\n"
     return "".join(lines[:prefix]) + preamble + "".join(lines[prefix:]) + trailer
@@ -601,7 +635,7 @@ def _marker_events(marker: Path, token: str) -> list[dict]:
         if (
             isinstance(event, dict)
             and event.get("token") == token
-            and event.get("event") in ("loaded", "imported", "failure")
+            and event.get("event") in ("loaded", "imported", "failure", "error")
             and isinstance(event.get("detail"), str)
         ):
             events.append(event)
@@ -609,7 +643,7 @@ def _marker_events(marker: Path, token: str) -> list[dict]:
 
 
 def _marker_failure(events: list[dict]) -> str | None:
-    failures = [event["detail"] for event in events if event["event"] == "failure"]
+    failures = [event["detail"] for event in events if event["event"] in ("failure", "error")]
     return failures[-1][-5000:] if failures else None
 
 

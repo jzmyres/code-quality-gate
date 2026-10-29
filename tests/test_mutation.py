@@ -32,6 +32,35 @@ class MutationRunnerTests(unittest.TestCase):
     def write_tests(self, code: str) -> None:
         (self.root / "tests" / "test_sample.py").write_text(code, encoding="utf-8")
 
+    def write_child_unittest(
+        self, body: str, assertion: str, *, result_class: str = "", result_before_import: bool = False,
+        import_before_tests: bool = True,
+    ) -> None:
+        result_before = result_class if result_before_import else ""
+        result_after = "" if result_before_import else result_class
+        runner = "testRunner=unittest.TextTestRunner(resultclass=ChildResult), " if result_class else ""
+        decision_import = "from sample.decision import decision\n" if import_before_tests else ""
+        child = (
+            "import sys, traceback, unittest\nsys.path.insert(0, sys.argv[1])\n"
+            + result_before
+            + decision_import
+            + result_after
+            + "class ChildTests(unittest.TestCase):\n"
+            + "    def test_value(self):\n"
+            + "".join(f"        {line}\n" for line in body.splitlines())
+            + f"unittest.main({runner}argv=[sys.argv[0]])\n"
+        )
+        self.write_tests(
+            "import pathlib, subprocess, sys, unittest\n"
+            "class ParentTests(unittest.TestCase):\n"
+            "    def test_child(self):\n"
+            "        root = str(pathlib.Path(__file__).resolve().parent.parent)\n"
+            f"        code = {child!r}\n"
+            "        result = subprocess.run([sys.executable, '-I', '-c', code, root], "
+            "capture_output=True, text=True)\n"
+            f"        {assertion}\n"
+        )
+
     def decision(
         self,
         name: str,
@@ -52,6 +81,12 @@ class MutationRunnerTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertEqual(report.outcomes[0].status, "error")
         self.assertIn("not shown to be loaded", report.outcomes[0].detail)
+
+    def assert_child_assertion_kills(self, name: str, body: str, result_class: str = "") -> None:
+        self.write_child_unittest(body, "self.assertEqual(result.returncode, 0)", result_class=result_class)
+        report = self.run_fixture(self.decision(name, "decision", "return True", operator="opposite_return"))
+        self.assertTrue(report.passed, str(report))
+        self.assertEqual(report.outcomes[0].status, "killed")
 
     def test_tested_decision_is_killed_and_untested_decision_survives(self) -> None:
         source = "def tested(x):\n    return x >= 1\n\ndef untested(x):\n    return x >= 1\n"
@@ -202,6 +237,98 @@ class MutationRunnerTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertEqual(report.outcomes[0].status, "error")
         self.assertIn("RuntimeError", report.outcomes[0].detail)
+
+    def test_child_unittest_errors_are_not_kills(self) -> None:
+        self.source(
+            "def decision():\n    if False:\n        raise RuntimeError('broken child unittest')\n"
+            "    return True\n"
+        )
+        cases = (
+            ("test", "self.assertTrue(decision())", "self.assertEqual(result.returncode, 0)"),
+            (
+                "subtest", "with self.subTest():\n    self.assertTrue(decision())",
+                "self.assertEqual(result.returncode, 0)",
+            ),
+            ("passing_parent", "self.assertTrue(decision())", "self.assertIn(result.returncode, (0, 1))"),
+            (
+                "reloaded", "import importlib, sample.decision\nimportlib.reload(sample.decision)\n"
+                "self.assertTrue(decision())", "self.assertEqual(result.returncode, 0)",
+            ),
+        )
+        for name, body, assertion in cases:
+            with self.subTest(name=name):
+                self.write_child_unittest(body, assertion)
+                report = self.run_fixture(self.decision(name, "decision", "False", operator="negate"))
+                self.assertFalse(report.passed)
+                self.assertEqual(report.outcomes[0].status, "error")
+                self.assertIn("Traceback (most recent call last)", report.outcomes[0].detail)
+                self.assertIn("RuntimeError: broken child unittest", report.outcomes[0].detail)
+
+    def test_child_unittest_assertions_are_kills(self) -> None:
+        self.source("def decision():\n    return True\n")
+        for name, body in (
+            ("test", "self.assertTrue(decision())"),
+            ("subtest", "with self.subTest():\n    self.assertTrue(decision())"),
+        ):
+            with self.subTest(name=name):
+                self.assert_child_assertion_kills(name, body)
+
+    def test_child_unittest_custom_results_distinguish_errors_and_assertions(self) -> None:
+        self.source(
+            "def decision():\n    if False:\n        raise RuntimeError('custom result error')\n"
+            "    return True\n"
+        )
+        result_class = (
+            "class ChildResult(unittest.TextTestResult):\n"
+            "    def addError(self, test, error):\n"
+            "        self.errors.append((test, ''.join(traceback.format_exception(*error))))\n"
+            "    def addSubTest(self, test, subtest, error):\n"
+            "        if error is not None:\n"
+            "            records = (self.failures if issubclass(error[0], test.failureException) "
+            "else self.errors)\n"
+            "            records.append((subtest, ''.join(traceback.format_exception(*error))))\n"
+        )
+        for before_import in (True, False):
+            for name, body in (
+                ("test", "self.assertTrue(decision())"),
+                ("subtest", "with self.subTest():\n    self.assertTrue(decision())"),
+            ):
+                with self.subTest(before_import=before_import, name=name):
+                    self.write_child_unittest(
+                        body, "self.assertEqual(result.returncode, 0)",
+                        result_class=result_class, result_before_import=before_import,
+                    )
+                    report = self.run_fixture(self.decision(name, "decision", "False", operator="negate"))
+                    self.assertFalse(report.passed)
+                    self.assertEqual(report.outcomes[0].status, "error")
+                    self.assertIn("RuntimeError: custom result error", report.outcomes[0].detail)
+        self.source("def decision():\n    return True\n")
+        for name, body in (
+            ("test", "self.assertTrue(decision())"),
+            ("subtest", "with self.subTest():\n    self.assertTrue(decision())"),
+        ):
+            with self.subTest(name=name):
+                self.assert_child_assertion_kills(name, body, result_class)
+
+    def test_child_unittest_records_errors_when_imported_during_a_subtest(self) -> None:
+        self.source(
+            "def decision():\n    if False:\n        raise RuntimeError('late import error')\n"
+            "    return True\n"
+        )
+        result_class = (
+            "class ChildResult(unittest.TextTestResult):\n"
+            "    def addSubTest(self, test, subtest, error):\n"
+            "        if error is not None:\n"
+            "            self.errors.append((subtest, ''.join(traceback.format_exception(*error))))\n"
+        )
+        self.write_child_unittest(
+            "with self.subTest():\n    from sample.decision import decision\n    self.assertTrue(decision())",
+            "self.assertEqual(result.returncode, 0)", result_class=result_class, import_before_tests=False,
+        )
+        report = self.run_fixture(self.decision("late_import", "decision", "False", operator="negate"))
+        self.assertFalse(report.passed)
+        self.assertEqual(report.outcomes[0].status, "error")
+        self.assertIn("RuntimeError: late import error", report.outcomes[0].detail)
 
     def test_subprocess_import_error_is_not_counted_as_a_kill(self) -> None:
         self.source(
