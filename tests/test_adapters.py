@@ -26,8 +26,13 @@ def parse_stub(
     raw: dict[str, object], root: Path, path: Path, full_key: str
 ) -> adapters.ParsedSpec:
     count = policy._integer(raw, "count", path, f"{full_key}.count")
+    baseline = (
+        adapters._baseline(raw, root, path, full_key)
+        if "baseline" in raw
+        else None
+    )
     return adapters.ParsedSpec(
-        StubSpec(count), "stub/1", ("tests",), threshold=0
+        StubSpec(count), "stub/1", ("tests",), threshold=0, baseline=baseline
     )
 
 
@@ -71,6 +76,22 @@ STUB = adapters.AdapterDescriptor(
     budget=lambda spec: 3,
 )
 
+
+def floor_entry_direction(subject: str, configured: str) -> str:
+    return "min" if subject == "floor-subject" else configured
+
+
+FLOOR_STUB = adapters.AdapterDescriptor(
+    "floor-stub",
+    ("count", "baseline"),
+    parse_stub,
+    run_stub,
+    directions={"floor": "min"},
+    produces_tests=True,
+    budget=lambda spec: 3,
+    entry_direction=floor_entry_direction,
+)
+
 STUB_CONFIG = """\
 schema = 2
 
@@ -88,6 +109,26 @@ adapter = "stub"
 tier = 1
 enforcement = "enforced"
 count = 4
+"""
+
+FLOOR_CONFIG = """\
+schema = 2
+
+[code]
+patterns = ["*.py"]
+shebangs = []
+
+[classes.python]
+code = true
+description = "Python source"
+checks = ["floor"]
+
+[checks.floor]
+adapter = "floor-stub"
+tier = 1
+enforcement = "enforced"
+count = 4
+baseline = "floor.toml"
 """
 
 VERIFICATION_CONFIG = """\
@@ -223,6 +264,22 @@ class StubAdapterTests(unittest.TestCase):
         )
         self.assertEqual(result.findings[0].direction, "min")
         self.assertFalse(result.findings[0].blocking)
+
+    def test_prune_keeps_a_minimum_metric_at_its_measured_value(self) -> None:
+        result = ratchet.evaluate(
+            [ratchet.Finding("raised-subject", 5, "file:1", kind="floor")],
+            [ratchet.BaselineEntry("raised-subject", 4, "floor")],
+            threshold=0,
+            enforcement="enforced",
+            prefix="check: stub",
+            adapter=STUB,
+            domain=ratchet.Domain.all(),
+        )
+        self.assertEqual(result.findings[0].direction, "min")
+        self.assertTrue(result.findings[0].covered_by_baseline)
+        self.assertEqual(
+            [entry.bound for entry in ratchet.pruned_entries(result)], [5]
+        )
 
 
 if __name__ == "__main__":

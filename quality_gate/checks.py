@@ -224,6 +224,8 @@ def _baseline_entries(check: CheckDef) -> list[BaselineEntry]:
         check_id=check.id,
         metric_version=check.metric_version,
         allowed_extras=extras,
+        adapter=check.adapter,
+        direction=check.direction,
     )
 
 

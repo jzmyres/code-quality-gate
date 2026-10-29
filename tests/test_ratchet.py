@@ -28,6 +28,7 @@ class RatchetTests(unittest.TestCase):
         domain=None,
         today: datetime.date | None = None,
         direction: str = "max",
+        adapter: str = "metric",
     ):
         output = io.StringIO()
         errors = io.StringIO()
@@ -46,7 +47,7 @@ class RatchetTests(unittest.TestCase):
                 threshold=threshold,
                 enforcement="enforced",
                 prefix="check: metric",
-                adapter="metric",
+                adapter=adapter,
                 domain=domain or ratchet.Domain.all(),
                 today=today,
                 direction=direction,
@@ -254,6 +255,62 @@ class RatchetTests(unittest.TestCase):
         self.assertTrue(result.satisfied, "a satisfied ratchet is required before pruning")
         pruned = ratchet.pruned_entries(result)
         self.assertEqual([entry.bound for entry in pruned], [7, 3])
+
+    def test_python_crap_prune_lowers_a_max_bound(self) -> None:
+        result, _out, _errors = self.decide(
+            [("subject", 1)],
+            [("subject", 5, "accepted", None)],
+            adapter="python_crap",
+        )
+        self.assertTrue(result.satisfied)
+        self.assertEqual(
+            [entry.bound for entry in ratchet.pruned_entries(result)], [1]
+        )
+
+    def test_verification_entries_take_their_subject_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "verification.toml"
+            path.write_text(
+                'check = "verification"\n'
+                'metric_version = "verification/1"\n'
+                '[[entry]]\nsubject = "tests:tests:executed"\n'
+                'bound = 4\nreason = "floor"\n'
+                '[[entry]]\nsubject = "exclusions:a.py:noqa"\n'
+                'bound = 2\nreason = "ceiling"\n',
+                encoding="utf-8",
+            )
+            entries = ratchet.load_baseline(
+                path,
+                check_id="verification",
+                metric_version="verification/1",
+                adapter="verification",
+                direction="max",
+            )
+        self.assertEqual(
+            {entry.subject: entry.direction for entry in entries},
+            {"tests:tests:executed": "min", "exclusions:a.py:noqa": "max"},
+        )
+        result = ratchet.evaluate(
+            [
+                ratchet.Finding(
+                    "tests:tests:executed", 7, "test summary", kind="executed"
+                ),
+                ratchet.Finding(
+                    "exclusions:a.py:noqa", 1, "a.py:1", kind="exclusion"
+                ),
+            ],
+            entries,
+            threshold=0,
+            enforcement="enforced",
+            prefix="check: verification",
+            adapter="verification",
+            domain=ratchet.Domain.of_files(("a.py",)),
+        )
+        self.assertTrue(result.satisfied)
+        self.assertEqual(
+            {entry.subject: entry.bound for entry in ratchet.pruned_entries(result)},
+            {"tests:tests:executed": 7, "exclusions:a.py:noqa": 1},
+        )
 
     def test_non_finite_measured_value_is_unsupported(self) -> None:
         for value in (float("inf"), float("-inf"), float("nan")):

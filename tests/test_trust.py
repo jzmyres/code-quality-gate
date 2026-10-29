@@ -21,9 +21,10 @@ from support import (
     sarif_report,
     with_clones,
 )
+from test_adapters import FLOOR_CONFIG, FLOOR_STUB
 from test_python_crap import crap_config
 
-from quality_gate import trust
+from quality_gate import adapters, ratchet, trust
 from quality_gate.policy import load_config
 from quality_gate.trust import prepare_trust
 
@@ -350,6 +351,45 @@ class BaselineTrustTests(TrustCase):
         self.assertNotIn("bound = 9", text)
 
 
+class StubFloorTrustTests(TrustCase):
+    def setUp(self) -> None:
+        super().setUp()
+        adapters.register_adapter(FLOOR_STUB)
+        self.addCleanup(adapters.remove_adapter, FLOOR_STUB.name)
+        self.write_config(FLOOR_CONFIG)
+        self.add_file(
+            "floor.toml",
+            baseline_text(
+                [{
+                    "subject": "floor-subject",
+                    "bound": 4,
+                    "reason": "reviewed floor",
+                }],
+                check="floor",
+                metric_version="stub/1",
+            ),
+        )
+        self.revision = self.commit_revision()
+        self.add_file(
+            "floor.toml",
+            baseline_text([], check="floor", metric_version="stub/1"),
+        )
+
+    def test_candidate_omitting_a_floor_keeps_the_trusted_bound(self) -> None:
+        prepared = prepare_trust(self.repo, self.revision, [])
+        self.addCleanup(prepared.close)
+        entries = prepared.config.checks["floor"].effective_baseline
+        self.assertEqual(
+            [(entry.subject, entry.bound, entry.direction) for entry in entries],
+            [("floor-subject", 4, "min")],
+        )
+        item = next(
+            item for item in prepared.protected if item.path == "floor.toml"
+        )
+        self.assertEqual(item.status, "ignored")
+        self.assertEqual(item.ignored_entries, ("floor-subject",))
+
+
 class PolicyTrustTests(TrustCase):
     def test_raised_policy_threshold_is_ignored(self) -> None:
         (self.repo / "a.py").unlink()
@@ -576,6 +616,15 @@ class IdentityDecisionTests(unittest.TestCase):
             trust._identity_problems(before, after),
             ["tool payload ruff changed during the run", "gate file qg.py changed during the run"],
         )
+
+    def test_removed_minimum_entry_keeps_the_revision_floor(self) -> None:
+        floor = ratchet.BaselineEntry(
+            "stub-subject", 4, "reviewed floor", direction="min"
+        )
+        merged, ignored, tightened = trust._merge_entries([floor], [])
+        self.assertEqual(merged, [floor])
+        self.assertEqual(ignored, ("stub-subject",))
+        self.assertFalse(tightened)
 
     def test_trust_prune_identity_allows_only_the_exact_generated_bytes(self) -> None:
         before = {"rev_sha256": "revision", "candidate_sha256": "old"}

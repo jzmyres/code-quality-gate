@@ -24,12 +24,7 @@ from . import tools as tools_module
 from .files import _type_name, git_argv
 from .payload import PayloadError
 from .policy import Config, ConfigError, GateError, UsageError, load_config
-from .ratchet import (
-    BaselineEntry,
-    load_baseline,
-    subject_direction,
-    tighter_bound,
-)
+from .ratchet import BaselineEntry, load_baseline, tighter_bound
 from .runner import RunResult, run
 from .tools import Tool, _default_lock_path, _tool_payload_digest, _tools_dir, load_tools
 
@@ -487,6 +482,8 @@ def _entries_from_bytes(
         check_id=check.id,
         metric_version=check.metric_version,
         allowed_extras=extras,
+        adapter=check.adapter,
+        direction=check.direction,
     )
 
 
@@ -545,12 +542,6 @@ def _ignored_parts(entry: BaselineEntry, chosen: BaselineEntry) -> bool:
     )
 
 
-def _merge_direction(check: Any, subject: str) -> str:
-    if check is None:
-        return "max"
-    return subject_direction(check.adapter, check.direction, subject)
-
-
 def _merge_entry(
     entry: BaselineEntry,
     chosen: BaselineEntry,
@@ -573,7 +564,7 @@ def _merge_revision_entry(
     check: Any,
 ) -> tuple[list[BaselineEntry], list[str], bool]:
     chosen = remaining.pop(entry.subject, None)
-    direction = _merge_direction(check, entry.subject)
+    direction = entry.direction
     if chosen is None:
         if direction == "min":
             return [entry], [entry.subject], False

@@ -88,6 +88,7 @@ class BaselineEntry:
     reason: str
     expires: datetime.date | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    direction: str = "max"
 
 
 @dataclass
@@ -325,6 +326,8 @@ def load_baseline(
     check_id: str,
     metric_version: str,
     allowed_extras: tuple[str, ...] = (),
+    adapter: Any = None,
+    direction: str = "max",
 ) -> list[BaselineEntry]:
     data = _read_baseline(path)
     if data is None:
@@ -346,6 +349,10 @@ def load_baseline(
     for index, raw in enumerate(raw_entries):
         entry = _parse_baseline_entry(
             path, f"entry[{index}]", raw, allowed_extras
+        )
+        entry = replace(
+            entry,
+            direction=subject_direction(adapter, direction, entry.subject),
         )
         if entry.subject in seen:
             raise _baseline_error(
@@ -477,6 +484,14 @@ def metric_direction(adapter: Any, direction: str, kind: str) -> str:
     if descriptor is None:
         return direction
     return descriptor.direction(kind, direction)
+
+
+def entry_direction(
+    adapter: Any, direction: str, subject: str, kind: str | None = None
+) -> str:
+    if kind is not None:
+        return metric_direction(adapter, direction, kind)
+    return subject_direction(adapter, direction, subject)
 
 
 def _within(value: float, bound: float, direction: str) -> bool:
@@ -651,8 +666,6 @@ def _record_unmeasured(
     results: list[FindingResult],
     resolved: list[str],
     unmeasured: list[str],
-    adapter: Any = "metric",
-    direction: str = "max",
 ) -> None:
     for entry in entries:
         if entry.subject in measured:
@@ -670,9 +683,7 @@ def _record_unmeasured(
                     covered_by_baseline=False,
                     expired=entry.subject in expired,
                     error="empty baseline reason",
-                    direction=subject_direction(
-                        adapter, direction, entry.subject
-                    ),
+                    direction=entry.direction,
                 )
             )
         if domain.contains(entry.subject):
@@ -1015,6 +1026,16 @@ def evaluate(
 ) -> RatchetResult:
     today = today or datetime.date.today()
     _finite_inputs(findings, entries, threshold, prefix)
+    kinds = {finding.subject: finding.kind for finding in findings}
+    entries = [
+        replace(
+            entry,
+            direction=entry_direction(
+                adapter, direction, entry.subject, kinds.get(entry.subject)
+            ),
+        )
+        for entry in entries
+    ]
     by_subject = {entry.subject: entry for entry in entries}
     (
         expired_subjects,
@@ -1048,8 +1069,6 @@ def evaluate(
         evaluation.results,
         evaluation.resolved,
         evaluation.unmeasured,
-        adapter,
-        direction,
     )
     _report(
         prefix,
@@ -1076,9 +1095,7 @@ def evaluate(
 def _prune_entry(
     entry: BaselineEntry, value: float, result: RatchetResult
 ) -> BaselineEntry:
-    direction = subject_direction(
-        result.adapter, result.direction, entry.subject
-    )
+    direction = entry.direction
     if direction == "min":
         return replace(entry, bound=max(entry.bound, value))
     return replace(entry, bound=min(entry.bound, value))

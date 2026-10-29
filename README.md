@@ -978,6 +978,9 @@ identity and then holds `[[entry]]` tables:
 * `bound` is the largest value a `max` entry accepts and the smallest value a `min` entry
   accepts. It must be finite (`inf` and `nan` are errors), and is compared unrounded; exactly at the
   bound passes.
+* An entry's direction is the one the check evaluated for its subject: a measured finding's kind
+  decides it, and a subject with no finding uses the adapter's per-subject rule and otherwise the
+  check's `direction`. Evaluation, pruning and the trusted merge all use that same direction.
 * `reason` must be non-empty. An empty or missing reason fails the check even if the value is covered.
 * `expires` is optional. A TOML date before today no longer covers its subject and is reported as
   expired. An entry expiring today still covers today.
