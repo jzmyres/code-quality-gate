@@ -8,7 +8,6 @@ import tomllib
 
 from support import FixtureCase, baseline_text, output
 from test_elisp_tests import MODULE, SUITE, config
-from test_reuse import ReuseCase
 from test_trust import TrustCase
 
 
@@ -406,68 +405,6 @@ checks = ["crap"]
         self.assertEqual(finding["locations"], [{"path": "src/core.el", "start_line": 1, "end_line": 4}])
         self.assertTrue(finding["on_changed_lines"])
         self.assertTrue(finding["blocking"])
-
-
-class ElispCrapReuseTests(ReuseCase):
-    def test_changing_hard_link_identity_invalidates_reused_evidence(self) -> None:
-        (self.repo / "a.py").unlink()
-        self.add_file("src/core.el", MODULE)
-        alias = self.repo / "src/alias.el"
-        os.link(self.repo / "src/core.el", alias)
-        self.add_file("tests/suite.el", SUITE)
-        text = crap_config().replace('pattern = "src/*.el"', 'pattern = "src/core.el"')
-        self.write_config(text + '''\n[classes.alias]
-code = true
-description = "A second test input"
-checks = ["legacy-tests"]
-[[rule]]
-pattern = "src/alias.el"
-class = "alias"
-reason = "another path to the instrumented file"
-''')
-        env = self.install_strace()
-        first, document, _records = self.run_reuse("alias-first", env=env)
-        self.assertEqual(first.returncode, 0, output(first))
-        first_measurement = by_subject(self.check_by_id(document, "crap"))["src/core.el:sample-used"]
-        alias.unlink()
-        alias.write_text(MODULE, encoding="utf-8")
-        second, document, _records = self.run_reuse("alias-second", env=env)
-        self.assertEqual(second.returncode, 0, output(second))
-        self.assertNotIn("reused_from", self.check_by_id(document, "legacy-tests"))
-        check = self.check_by_id(document, "crap")
-        self.assertNotIn("reused_from", check)
-        self.assertNotEqual(by_subject(check)["src/core.el:sample-used"]["measurement"],
-                            first_measurement["measurement"])
-        third, document, _records = self.run_reuse("alias-third", env=env)
-        self.assertEqual(third.returncode, 0, output(third))
-        self.assertIn("reused_from", self.check_by_id(document, "legacy-tests"))
-        self.assertIn("reused_from", self.check_by_id(document, "crap"))
-
-    def test_reused_edebug_evidence_is_scored_and_pruned(self) -> None:
-        (self.repo / "a.py").unlink()
-        self.add_file("src/core.el", MODULE)
-        self.add_file("tests/suite.el", SUITE)
-        self.write_config(crap_config())
-        env = self.install_strace()
-        first, document, _records = self.run_reuse("crap-first", env=env)
-        self.assertEqual(first.returncode, 0, output(first))
-        findings = self.check_by_id(document, "crap")["findings"]
-        second, document, _records = self.run_reuse("crap-second", env=env)
-        self.assertEqual(second.returncode, 0, output(second))
-        self.assertIn("reused_from", self.check_by_id(document, "legacy-tests"))
-        self.assertIn("reused_from", self.check_by_id(document, "crap"))
-        third, document, _records = self.run_reuse("crap-prune", env=env, extra=("--prune", "crap"))
-        self.assertEqual(third.returncode, 0, output(third))
-        self.assertIn("reused_from", self.check_by_id(document, "legacy-tests"))
-        self.assertEqual(self.check_by_id(document, "crap")["findings"], findings)
-        self.assertTrue(document["prune"]["performed"])
-        self.add_file("other/uncovered.el", "(defun other () 1)\n")
-        self.write_config(uncovered_config())
-        fourth, document = self.run_json("--reuse-store", str(self.base / "store"), env=env)
-        self.assertEqual(fourth.returncode, 2, output(fourth))
-        self.assertEqual(document["decision"], "error")
-        self.assertIn("other/uncovered.el", fourth.stderr)
-        self.assertIn("legacy-tests", fourth.stderr)
 
 
 class ElispCrapTrustTests(TrustCase):

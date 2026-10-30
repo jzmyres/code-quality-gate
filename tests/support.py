@@ -454,7 +454,6 @@ class FixtureCase(unittest.TestCase):
         repo: Path | None = None,
         include_repo: bool = True,
         timeout: int = 120,
-        pass_fds: tuple[int, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         program = (
             str(self.gate / "qg.py")
@@ -474,7 +473,6 @@ class FixtureCase(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            pass_fds=pass_fds,
         )
 
     def install_fake_jscpd(

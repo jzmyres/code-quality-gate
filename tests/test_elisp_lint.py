@@ -8,7 +8,6 @@ import subprocess
 
 import test_command_checks
 from support import GATE, FixtureCase, output
-from test_reuse import ReuseCase
 
 
 MODULE = """\
@@ -338,48 +337,3 @@ reason = "dependency"
                     self.assertEqual(document["decision"], "error")
                     for expected in (f"checks.{adapter}", key, "expected", "got"):
                         self.assertIn(expected, result.stderr)
-
-
-class ElispLintReuseTests(ReuseCase):
-    def test_versions_survive_reuse_and_source_changes_force_execution(self) -> None:
-        self.assertIsNotNone(shutil.which("emacs"), "these tests require a real Emacs")
-        (self.repo / "a.py").unlink()
-        self.add_file("src/core.el", MODULE)
-        self.write_config(config())
-        env = self.install_strace()
-        first, original, records = self.run_reuse("elisp-lint-first", env=env)
-        self.assertEqual(first.returncode, 0, output(first))
-        compile_record = next(record for record in records if record["check"] == "elisp_compile")
-        invalid = self.base / "invalid-version.jsonl"
-        invalid.write_text(json.dumps({**compile_record, "emacs_version": ""}) + "\n")
-        rejected = self.merge(invalid)
-        self.assertEqual(rejected.returncode, 2, output(rejected))
-        self.assertIn("emacs_version", rejected.stderr)
-        second, reused, _records = self.run_reuse("elisp-lint-second", env=env)
-        self.assertEqual(second.returncode, 0, output(second))
-        for adapter in ("elisp_compile", "elisp_checkdoc"):
-            initial = self.check_by_id(original, adapter)
-            restored = self.check_by_id(reused, adapter)
-            self.assertIn("reused_from", restored)
-            self.assertEqual(restored["emacs_version"], initial["emacs_version"])
-            self.assertIn(f'Emacs {initial["emacs_version"]}', second.stderr)
-        (self.base / "store").chmod(0o755)
-        for path in self.store_records():
-            if json.loads(path.read_text())["check"] == "elisp_compile":
-                path.parent.chmod(0o755)
-                path.unlink()
-                path.parent.rmdir()
-        incomplete = dict(compile_record)
-        del incomplete["emacs_version"]
-        missing = self.base / "missing-version.jsonl"
-        missing.write_text(json.dumps(incomplete) + "\n")
-        merged = self.merge(missing)
-        self.assertEqual(merged.returncode, 0, output(merged))
-        rerun, document, _records = self.run_reuse("elisp-lint-no-version", env=env)
-        self.assertEqual(rerun.returncode, 0, output(rerun))
-        self.assertNotIn("reused_from", self.check_by_id(document, "elisp_compile"))
-        self.add_file("src/core.el", MODULE.replace("  42)", "  core-missing-variable)"))
-        third, changed, _records = self.run_reuse("elisp-lint-third", env=env)
-        self.assertEqual(third.returncode, 1, output(third))
-        self.assertNotIn("reused_from", self.check_by_id(changed, "elisp_compile"))
-        self.assertEqual(self.check_by_id(changed, "elisp_compile")["outcome"], "fail")

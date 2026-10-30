@@ -12,14 +12,6 @@ sha256 = "c94fc1dc71f054d06d9f1149442dcb471516aa2b7d4b7e8124e05d082d4c91d3"
 payload_sha256 = "720b5c33ea890631d66ca66568d65e180ef0d14bdf0e7026d13115570636cacb"
 binary = "ruff-x86_64-unknown-linux-gnu/ruff"
 
-[strace]
-version = "6.13+ds-1"
-url = "https://deb.debian.org/debian/pool/main/s/strace/strace_6.13%2bds-1_amd64.deb"
-sha256 = "cae290b67cf835350a2cde58ca332256fba475784b3e02a9a8677d73eaf47511"
-payload_sha256 = "69f88291a4e47f258b8e32b089c919a247509f063ef3d6afe5389939051102b3"
-format = "deb"
-binary = "usr/bin/strace"
-
 [coverage]
 version = "7.16.2"
 url = "https://files.pythonhosted.org/packages/3f/0c/7a64e1ac90541a8edf50daef0914848011fb057a5bf55284a4811e21939a/coverage-7.16.2-py3-none-any.whl"

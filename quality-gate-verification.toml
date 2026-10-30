@@ -8,8 +8,8 @@ metric_version = "verification/1"
 
 [[entry]]
 subject = "tests:tests:executed"
-bound = 747
-reason = "measured at adoption (M2c, 2026-10-25)"
+bound = 705
+reason = "measured after result reuse was retired (QF58b, 2026-10-30)"
 
 [[entry]]
 subject = "exclusions:quality_gate/coverage_tool.py:no-cover"

@@ -7,7 +7,7 @@ implementation is the `quality_gate/` package (`policy`, `files`, `tools`, `runn
 `python_tests`, `python_crap`, `elisp_tests`, `elisp_crap`, `elisp_lint`, `elisp/qg-elisp-child.el`,
 `elisp/qg-elisp-complexity.el`, `elisp/qg-elisp-lint.el`, `verification`, `covrun`,
 `coverage_tool`, `checks`, `gate_result`,
-`trust`, `reuse`, `tracing`, `trace_guard`, `exec_inputs`, `cli`);
+`trust`, `cli`);
 `qg.py` is only the entry point. `check --policy-from REV` takes its policy, baselines, tool lock and
 protected paths from `REV`; `docs/TRUST.md` is the contract.
 

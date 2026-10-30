@@ -407,6 +407,20 @@ class StubFloorTrustTests(TrustCase):
 
 
 class PolicyTrustTests(TrustCase):
+    def test_historical_package_lock_remains_usable(self) -> None:
+        lock = (
+            '[legacy]\nversion = "1"\nurl = "file:///unused"\n'
+            f'sha256 = "{"0" * 64}"\npayload_sha256 = "{"0" * 64}"\n'
+            'format = "deb"\nbinary = "usr/bin/legacy"\n'
+        )
+        self.add_file("tools.lock.toml", lock)
+        revision = self.commit_revision()
+        self.add_file("tools.lock.toml", "")
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.protected(document, "tools.lock.toml")["status"], "ignored")
+        self.assertEqual(document["trust"]["identity_before"]["tools"]["legacy"]["version"], "1")
+
     def test_raised_policy_threshold_is_ignored(self) -> None:
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")

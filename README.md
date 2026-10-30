@@ -26,6 +26,9 @@ The gate is deliberately narrow. It owns the orchestration no maintained tool ow
 Tier 1 includes Python and Emacs Lisp tests and per-function CRAP scores. Emacs Lisp CRAP uses
 the Edebug coverage collected by the test adapter.
 
+The archived implementation can be inspected with
+`git show archive/result-reuse-2026-10-30:PATH`, or by checking out that tag.
+
 ## Requirements
 
 * Python 3.12 or later (the command uses `tomllib` and coverage uses `sys.monitoring`).
@@ -313,8 +316,7 @@ input, and invalid-result messages state what was expected and found.
 The check reports `emacs_version`, normalized `test_results`, and `definitions` in JSON; the human
 report includes the Emacs version. Each definition entry, including generated lambda symbols, gives its
 repository-relative file, character position, total stop points and reached stop points. This evidence
-is retained for a later check that requires it, including when a passing result is restored from a
-reuse store. A changed Emacs executable or other recorded input invalidates reuse.
+is retained for a later check that requires it.
 
 ### Emacs Lisp compile and checkdoc
 
@@ -347,7 +349,7 @@ and is reported with its file, line and message.
 
 An expired budget fails with `execution = "budget"`. A missing Emacs command or a process that does
 not produce a valid report is `unsupported`. Completed measurements report `emacs_version` in JSON
-and in the human output, including when a passing result is reused.
+and in the human output.
 
 ### Python CRAP
 
@@ -423,8 +425,7 @@ check must belong to a class that also lists the required test check, so that it
 An unknown, later or different-adapter reference, or a selected file without that instrumentation,
 is a configuration error. If the required check did not pass, CRAP is `unsupported` with
 `coverage unreliable: CHECK did not pass` and nothing is scored. The suite runs once; CRAP consumes
-its recorded Edebug evidence, including evidence restored with `--reuse-store`. Reuse also checks the
-physical identities of the instrumented files, since changing a link can change Edebug attribution.
+its recorded Edebug evidence.
 
 Subjects are top-level `defun`, `defsubst`, `defmacro` and `cl-defun` forms in the selected files.
 The subject is `PATH:NAME`, using Emacs `symbol-name`, and the location is the form's first line.
@@ -631,7 +632,8 @@ Python adapters put on `sys.path`; for coverage that is `coverage-7.16.2/`, and 
 `coverage/__init__.py` is looked up inside the verified tree.
 `format = "deb"` marks a Debian package: the standard library reads the `ar` container, extracts its
 single `data.tar.*` member and unpacks that with the same tar safety rules. A debian package's payload
-digest is the declared binary's content hash; the other formats digest the whole install tree.
+digest is the declared binary's content hash; the other formats digest the whole install tree. This
+format also supports locks in trusted historical revisions.
 
 `tools path NAME` prints the expected binary path, whether or not the tool is installed, so scripts can
 locate the cache. An unknown tool name exits 2.
@@ -731,49 +733,6 @@ The command exits 0 after writing the report. It exits 1, ranking nothing, when 
 it requires does not pass, when the tree cannot be copied, or when Git fails or its output is truncated;
 the error names the problem. It exits 2 for an unknown or repeated check id, or a check with no baseline
 or threshold. `worklist` does not write to the original tree.
-
-### Result reuse by recorded reads
-
-    python3 -I qg.py check --reuse-store DIR --record-fd N
-    python3 -I qg.py reuse merge --store DIR FILE
-
-A gate run should cost in proportion to the change. With `--reuse-store DIR`, the gate records what each
-passing check actually read and reuses a passing result while every one of those files is unchanged. A
-check is never selected by guessing that a file is related: the trace decides.
-
-Every check's process tree runs under the pinned `strace`, and the gate's own reads are observed in the
-same run. The inputs are every file the check opened for reading or executed (including its interpreter
-and shared libraries), every path it looked up and did not find (recorded as absent), every path it
-statted, lstat'ed or tested with `access`, and every directory it listed (recorded as a hash of the
-sorted names). A traced path is resolved the way the kernel resolved it: `..` applies after the
-symlinks before it, and every symlink the resolution passed through is recorded. A path that cannot be
-resolved makes the run unanalysable. Paths under `/proc`, `/dev` and `/sys`, the run's own temporary
-directories and files the run created before reading them are not inputs.
-
-A check that passes writes one record to the `--record-fd N` descriptor: the gate program hash, the
-check's name and command, the values of the environment it received, each resolved input's content hash
-or absence, the digest of every symlink it passed through, and, for each file the check stat'ed,
-lstat'ed or tested with `access`, the file type, permission bits, size and owner it observed. A file
-that was only read keeps its content-hash rule; a change to observed metadata invalidates reuse even
-when the content is unchanged. A failed, timed-out or unanalysable check writes no record. Before
-running a check, the gate reads `DIR` for a record with the same program, check, command and environment
-whose inputs still hash the same or are still absent, whose symlinks still point where they did, and
-whose recorded metadata still matches; it then reports the check as reused, naming the record's tree,
-and does not run it. Otherwise the check runs traced. Baseline expiry is also rechecked, so a record cannot preserve a
-pass after a baseline entry expires.
-
-The gate only reads `DIR`. Records leave through the caller's `--record-fd` descriptor, which the gate
-closes in every child it starts. The trace is unlinked after the tracer opens it, and the gate makes both itself and the tracer
-non-dumpable before starting the check. The traced processes inherit neither the trace channel nor the
-record descriptor, and cannot reach their descriptors through `/proc`. The caller must mount the store
-read-only inside the sandbox: ordinary file permission bits alone do not prevent their owner from changing
-the permissions. The trusted caller then runs
-`qg.py reuse merge --store DIR FILE`, outside the sandbox, which validates every record's schema and
-program hash before writing any of them into the store.
-
-Without `--reuse-store` nothing is reused and every check runs as before. That full run is what a merge
-or landing uses, so a deployment never depends on a store a candidate can influence. A requested prune
-runs its target check to obtain the ratchet evidence needed for the write.
 
 ### New and changed lines
 
@@ -1021,7 +980,7 @@ Notes:
   measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
   lines, inline `# noqa` comments and file-wide lint suppressions for the selected Python files, without
   running the tests again. An empty Python selection has nothing to scan, but the test counts still come
-  from every producer; without reusable producer results the counts are not measured and the check is
+  from every producer; without valid producer results the counts are not measured and the check is
   unsupported. File-wide directives
   are counted separately as `exclusions:FILE:file-suppression`: Ruff's `# ruff: noqa`, with or without
   codes, `# ruff: file-ignore[...]`, Flake8's `# flake8: noqa` forms, and isort's `# isort: skip_file`
@@ -1108,7 +1067,7 @@ human accepts it.
 ## Pinned tools and this repository
 
 `tools.lock.toml` in the gate repository is the only place tool versions live. It pins jscpd 5.4.1,
-ruff 0.17.0, strace 6.13+ds-1 and coverage 7.16.2, including the archive URL, SHA-256, payload SHA-256,
+ruff 0.17.0 and coverage 7.16.2, including the archive URL, SHA-256, payload SHA-256,
 archive format and binary path.
 `tools fetch` accepts `--lock FILE` for testing or for a private mirror; `file://` URLs exercise
 installation without a network.
@@ -1125,7 +1084,7 @@ This repository gates itself with `quality-gate.toml`:
 * `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
   requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
   and a worklist reason;
-* `verification` reuses the `tests` counts and measures inline `# noqa`, file-wide lint suppressions and
+* `verification` uses the `tests` counts and measures inline `# noqa`, file-wide lint suppressions and
   `pragma: no cover` lines in the Python source; `quality-gate-verification.toml` floors the executed
   tests and ceilings the skips and exclusions measured at adoption;
 * the `elisp` class lists `elisp-tests`, `elisp-crap`, `elisp-compile` and `elisp-checkdoc`, so this

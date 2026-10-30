@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import reuse
 from .policy import (
     DEFAULT_TESTS_BUDGET_SECONDS,
     _config_error,
@@ -19,7 +18,6 @@ from .policy import (
     _string,
 )
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
-from .tracing import current as current_recorder
 
 
 @dataclass(frozen=True)
@@ -103,11 +101,11 @@ def _definition_names(item: dict[str, Any]) -> bool:
     return isinstance(item["symbol"], str) and isinstance(item["file"], str) and bool(item["file"])
 
 
-def _definition_file(item: dict[str, Any], selected: list[str] | None) -> bool:
+def _definition_file(item: dict[str, Any], selected: list[str]) -> bool:
     filename = Path(item["file"])
     if filename.is_absolute() or ".." in filename.parts:
         return False
-    return selected is None or item["file"] in selected
+    return item["file"] in selected
 
 
 def _definition_counts(item: dict[str, Any]) -> bool:
@@ -115,7 +113,7 @@ def _definition_counts(item: dict[str, Any]) -> bool:
             and item["position"] > 0 and item["reached"] <= item["stop_points"])
 
 
-def _definition(item: Any, selected: list[str] | None) -> bool:
+def _definition(item: Any, selected: list[str]) -> bool:
     return (_definition_shape(item) and _definition_names(item)
             and _definition_file(item, selected) and _definition_counts(item))
 
@@ -150,13 +148,13 @@ def _validate_failures(document: dict[str, Any]) -> None:
         raise ValueError("one condition per unexpected result")
 
 
-def _validate_definitions(document: dict[str, Any], selected: list[str] | None) -> None:
+def _validate_definitions(document: dict[str, Any], selected: list[str]) -> None:
     definitions = document["definitions"]
     if not isinstance(definitions, list) or not all(_definition(item, selected) for item in definitions):
         raise ValueError("a list of valid instrumented definitions")
 
 
-def validate_document(document: Any, selected: list[str] | None = None) -> dict[str, Any]:
+def validate_document(document: Any, selected: list[str]) -> dict[str, Any]:
     """Validate a child measurement, raising ValueError on malformed evidence."""
     _validate_shape(document)
     _validate_counts(document)
@@ -181,7 +179,9 @@ def _read_document(path: Path, selected: list[str]) -> dict[str, Any]:
         return document
     try:
         validated = validate_document(document, selected)
-        path.write_bytes(reuse._canonical(validated))
+        path.write_bytes(json.dumps(
+            validated, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        ).encode("utf-8"))
         return validated
     except (OSError, ValueError) as error:
         raise ValueError(f"a valid result ({error}), got {document!r}") from error
@@ -210,24 +210,8 @@ def _verdict(document: dict[str, Any]) -> str | None:
     return None
 
 
-def validate_reused_document(document: Any) -> dict[str, Any]:
-    """Stored evidence must describe a passing, executed ERT run."""
-    result = validate_document(document)
-    problem = _verdict(result)
-    if problem is not None:
-        raise ValueError(problem)
-    return result
-
-
 def _temporary() -> tempfile.TemporaryDirectory[str]:
-    temporary = tempfile.TemporaryDirectory(prefix="qg-elisp-")
-    recorder = current_recorder()
-    if recorder is not None:
-        recorder.temporary_paths.add(temporary.name)
-    session = reuse.current()
-    if session is not None:
-        session.temporary_paths.add(temporary.name)
-    return temporary
+    return tempfile.TemporaryDirectory(prefix="qg-elisp-")
 
 
 def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any],
@@ -290,7 +274,7 @@ def _suite_collision(context: Any, selected: list[str], start: float) -> Any:
 
 
 def run_tests(context: Any) -> Any:
-    """Run the configured suite and return its check result and reusable evidence."""
+    """Run the configured suite and return its check result and evidence."""
     from .checks import _select_files, _tests_result
 
     start = time.monotonic()

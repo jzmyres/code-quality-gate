@@ -7,7 +7,6 @@ import subprocess
 from pathlib import Path
 
 from support import GATE, FixtureCase, baseline_text, output
-from test_reuse import ReuseCase
 
 
 MODULE = """\
@@ -134,6 +133,41 @@ class ElispTests(FixtureCase):
                                  check=True, capture_output=True, text=True).stdout
         self.assertEqual(check["emacs_version"], version)
         self.assertIn(f"Emacs {version}", result.stderr)
+
+    def test_evidence_document_reaches_a_dependent_check(self) -> None:
+        self.write_config(config() + '''
+[checks.consumer]
+adapter = "evidence_consumer"
+tier = 1
+enforcement = "enforced"
+requires = "legacy-tests"
+''')
+        gate = self.fixture_gate()
+        with (gate / "quality_gate/adapters.py").open("a", encoding="utf-8") as stream:
+            stream.write('''
+def _fixture_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "fixture/1", (), requires=raw["requires"])
+
+def _fixture_run(root, config, check, files, classes, *, prefix, prior):
+    import json, time
+    from .checks import _check_result
+    evidence = prior[check.spec.requires].evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    return _check_result(check, time.monotonic(), "pass", measurement={"evidence": document})
+
+register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_parse, _fixture_run,
+                                   requires_adapter="elisp_tests"))
+''')
+        self.fixture_runner = lambda: gate / "qg.py"
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 0, output(result))
+        measured = self.check_by_id(document, "legacy-tests")
+        evidence = self.check_by_id(document, "consumer")["measurement"]["evidence"]
+        self.assertEqual(evidence["selected"], 2)
+        self.assertTrue(evidence["definitions"])
+        self.assertEqual(evidence["definitions"], measured["definitions"])
+        self.assertEqual(evidence["emacs_version"], measured["emacs_version"])
 
     def test_redefined_symbols_keep_each_definition_and_position(self) -> None:
         self.add_file("src/core.el", "(defun redefined () (+ 0 1))\n(defun redefined () (+ 1 1))\n")
@@ -418,120 +452,3 @@ class ElispTests(FixtureCase):
                 self.assertIn(key, result.stderr)
                 self.assertIn("expected", result.stderr)
                 self.assertIn("got", result.stderr)
-
-
-class ElispReuseTests(ReuseCase):
-    def assert_no_execution_record_rejected(self, stored, evidence) -> None:
-        bad = dict(stored)
-        bad["elisp_result"] = {**evidence, "selected": 1, "passed": 0, "skipped": 1}
-        malformed = self.base / "bad-elisp-record.jsonl"
-        malformed.write_text(json.dumps(bad) + "\n", encoding="utf-8")
-        rejected = self.merge(malformed)
-        self.assertEqual(rejected.returncode, 2, output(rejected))
-        self.assertIn("no test executed", rejected.stderr)
-
-    def test_elisp_measurement_is_recorded_and_reused(self) -> None:
-        (self.repo / "a.py").unlink()
-        self.add_file("src/core.el", MODULE)
-        self.add_file("tests/suite.el", SUITE)
-        self.write_config(config())
-        env = self.install_strace()
-        first, first_document, records = self.run_reuse("elisp-direct-first", env=env)
-        self.assertEqual(first.returncode, 0, output(first))
-        measurement = self.check_by_id(first_document, "legacy-tests")
-        stored = next(record for record in records if record["check"] == "legacy-tests")
-        self.assertEqual(stored["elisp_result"]["definitions"], measurement["definitions"])
-        self.assert_no_execution_record_rejected(stored, stored["elisp_result"])
-        second, second_document, _records = self.run_reuse("elisp-direct-second", env=env)
-        self.assertEqual(second.returncode, 0, output(second))
-        restored = self.check_by_id(second_document, "legacy-tests")
-        self.assertIn("reused_from", restored)
-        self.assertEqual(restored["definitions"], measurement["definitions"])
-        self.assertEqual(restored["test_results"], measurement["test_results"])
-        (self.base / "store").chmod(0o755)
-        for path in self.store_records():
-            if json.loads(path.read_text(encoding="utf-8"))["check"] == "legacy-tests":
-                path.parent.chmod(0o755)
-                path.unlink()
-                path.parent.rmdir()
-        incomplete = dict(stored)
-        del incomplete["elisp_result"]
-        record_file = self.base / "incomplete.jsonl"
-        record_file.write_text(json.dumps(incomplete) + "\n", encoding="utf-8")
-        merged = self.merge(record_file)
-        self.assertEqual(merged.returncode, 0, output(merged))
-        third, third_document, _records = self.run_reuse("elisp-incomplete", env=env)
-        self.assertEqual(third.returncode, 0, output(third))
-        self.assertNotIn("reused_from", self.check_by_id(third_document, "legacy-tests"))
-
-    def test_reused_evidence_reaches_a_dependent_check(self) -> None:
-        (self.repo / "a.py").unlink()
-        self.add_file("src/core.el", MODULE)
-        self.add_file("tests/suite.el", SUITE)
-        self.write_config(config() + '''
-[checks.consumer]
-adapter = "evidence_consumer"
-tier = 1
-enforcement = "enforced"
-requires = "legacy-tests"
-''')
-        env = self.install_strace()
-        gate = self.fixture_gate()
-        adapters = gate / "quality_gate/adapters.py"
-        with adapters.open("a", encoding="utf-8") as stream:
-            stream.write('''
-def _fixture_parse(raw, root, path, full_key):
-    from types import SimpleNamespace
-    return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "fixture/1", (), requires=raw["requires"])
-
-def _fixture_run(root, config, check, files, classes, *, prefix, prior):
-    import json, time
-    from .checks import _check_result
-    evidence = prior[check.spec.requires].evidence_path
-    document = json.loads(evidence.read_text(encoding="utf-8"))
-    return _check_result(check, time.monotonic(), "pass", measurement={"evidence": document})
-
-register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_parse, _fixture_run,
-                                   requires_adapter="elisp_tests"))
-''')
-        # Run the copied gate so the dependent fixture adapter consumes its actual evidence path.
-        self.fixture_runner = lambda: gate / "qg.py"
-        first, first_document, records = self.run_reuse("elisp-first", env=env)
-        self.assertEqual(first.returncode, 0, output(first))
-        evidence = self.check_by_id(first_document, "consumer")["measurement"]["evidence"]
-        self.assertEqual(evidence["selected"], 2)
-        self.assertTrue(evidence["definitions"])
-        elisp_records = [record for record in records if record["check"] == "legacy-tests"]
-        self.assertEqual(len(elisp_records), 1, [item["check"] for item in records])
-        self.assertEqual(elisp_records[0]["elisp_result"], evidence)
-        self.assert_no_execution_record_rejected(elisp_records[0], evidence)
-        (self.base / "store").chmod(0o755)
-        for path in self.store_records():
-            if json.loads(path.read_text(encoding="utf-8"))["check"] != "legacy-tests":
-                path.parent.chmod(0o755)
-                path.unlink()
-                path.parent.rmdir()
-        second, second_document, _records = self.run_reuse("elisp-second", env=env)
-        self.assertEqual(second.returncode, 0, output(second))
-        check = self.check_by_id(second_document, "legacy-tests")
-        self.assertIn("reused_from", check)
-        self.assertIn(f"Emacs {evidence['emacs_version']}", second.stderr)
-        self.assertEqual(check["emacs_version"], evidence["emacs_version"])
-        self.assertEqual(check["definitions"], evidence["definitions"])
-        self.assertEqual(check["test_results"]["selected"], 2)
-        self.assertEqual(self.check_by_id(second_document, "consumer")["measurement"]["evidence"], evidence)
-        self.add_file("src/core.el", MODULE + "(defun added () (+ 1 2))\n")
-        third, third_document, _records = self.run_reuse("elisp-third", env=env)
-        self.assertEqual(third.returncode, 0, output(third))
-        self.assertNotIn("reused_from", self.check_by_id(third_document, "legacy-tests"))
-        dependent = self.check_by_id(third_document, "consumer")
-        self.assertNotIn("reused_from", dependent)
-        self.assertNotEqual(dependent["measurement"]["evidence"], evidence)
-        self.write_config(config())
-        suite = self.repo / "tests/suite.el"
-        suite.unlink()
-        os.link(self.repo / "src/core.el", suite)
-        fourth, document, _records = self.run_reuse("elisp-collision", env=env)
-        self.assertEqual(fourth.returncode, 2, output(fourth))
-        self.assertEqual(document["decision"], "error")
-        self.assertIn("tests/suite.el", fourth.stderr)

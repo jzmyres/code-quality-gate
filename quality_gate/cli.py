@@ -14,7 +14,6 @@ from .clones import command_clones
 from .files import command_hygiene, command_inventory, resolve_repo
 from .gate_result import error_document
 from .policy import UsageError, load_config
-from .reuse import merge_records
 from .tools import (
     _default_lock_path,
     command_tools_fetch,
@@ -103,17 +102,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="also reject threshold violations on lines changed since REV",
     )
     _add_allow_protected_argument(check)
-    check.add_argument(
-        "--reuse-store",
-        metavar="DIR",
-        help="reuse a passing check when every recorded input is unchanged",
-    )
-    check.add_argument(
-        "--record-fd",
-        metavar="N",
-        type=int,
-        help="write new reuse records to this descriptor",
-    )
     worklist = commands.add_parser(
         "worklist", help="rank baseline debt by churn x current value"
     )
@@ -128,15 +116,6 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="check id (default: every check with a baseline)",
     )
-    reuse = commands.add_parser("reuse", help="manage recorded check results")
-    reuse_commands = reuse.add_subparsers(
-        dest="reuse_command", required=True, parser_class=_Parser
-    )
-    merge = reuse_commands.add_parser(
-        "merge", help="validate and merge records into a store"
-    )
-    merge.add_argument("--store", metavar="DIR", required=True)
-    merge.add_argument("file", metavar="FILE")
     return parser
 
 
@@ -189,13 +168,7 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         json_output=args.json,
         prune_ids=args.prune,
         changed_from=args.changed_from,
-        reuse_store=args.reuse_store,
-        record_fd=args.record_fd,
     )
-
-
-def _run_reuse(args: Any) -> int:
-    return merge_records(Path(args.store), Path(args.file))
 
 
 def _run_tools(args: Any) -> int:
@@ -209,16 +182,7 @@ def _run_tools(args: Any) -> int:
     return command_tools_path(lock, args.name)
 
 
-def _check_reuse_arguments(args: Any) -> None:
-    if (
-        getattr(args, "record_fd", None) is not None
-        and getattr(args, "reuse_store", None) is None
-    ):
-        raise UsageError("qg.py: --record-fd: expected --reuse-store")
-
-
 def _run_trusted_check(root: Path, args: Any) -> int:
-    _check_reuse_arguments(args)
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
     return command_check(
         root,
@@ -227,8 +191,6 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         prune_ids=args.prune,
         trust=trust,
         changed_from=args.changed_from,
-        reuse_store=args.reuse_store,
-        record_fd=args.record_fd,
     )
 
 
@@ -257,7 +219,6 @@ def _run_gate(root: Path, args: Any) -> int:
         raise UsageError(
             "qg.py: --allow-protected: expected --policy-from"
         )
-    _check_reuse_arguments(args)
     config = load_config(root)
     load_tools(_default_lock_path())
     return _dispatch(root, config, args)
@@ -271,8 +232,6 @@ def _main(raw: list[str]) -> int:
         args = build_parser().parse_args(raw)
         if args.command == "tools":
             return _run_tools(args)
-        if args.command == "reuse":
-            return _run_reuse(args)
         root = resolve_repo(args.repo)
         return _run_gate(root, args)
     except UsageError as error:

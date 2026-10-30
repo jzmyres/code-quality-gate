@@ -28,9 +28,6 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import tracing
-
-
 CAPTURE_LIMIT = 1024 * 1024
 TAIL_LIMIT = 4096
 GRACE_SECONDS = 5.0
@@ -232,16 +229,15 @@ def _worker_payload(function: Callable[..., Any], args: tuple[Any, ...]) -> byte
         except BaseException as error:
             success, result = False, error
         snapshot = _finish_worker_coverage(coverage)
-    trace = tracing.snapshot()
     response = (
-        success, result, stdout.getvalue(), stderr.getvalue(), snapshot, trace
+        success, result, stdout.getvalue(), stderr.getvalue(), snapshot
     )
     try:
         return pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as error:
         failure = WorkerError(f"cannot return worker result: {error}")
         return pickle.dumps(
-            (False, failure, stdout.getvalue(), stderr.getvalue(), snapshot, trace)
+            (False, failure, stdout.getvalue(), stderr.getvalue(), snapshot)
         )
 
 
@@ -250,7 +246,6 @@ def _worker(
 ) -> None:
     try:
         _register_session(("analysis worker", step), "worker", "")
-        tracing.close_in_child()
         payload = memoryview(_worker_payload(function, args))
         while payload:
             payload = payload[os.write(write_fd, payload):]
@@ -490,11 +485,10 @@ def _read_worker(read_fd: int, deadline: float, step: str) -> bytes:
 
 def _decode_worker(data: bytes, step: str) -> Any:
     try:
-        success, result, stdout, stderr, snapshot, trace = pickle.loads(data)
+        success, result, stdout, stderr, snapshot = pickle.loads(data)
     except Exception as error:
         raise WorkerError(f"{step} worker returned invalid data: {error}") from error
     _merge_worker_coverage(snapshot)
-    tracing.merge_snapshot(trace)
     sys.stdout.write(stdout)
     sys.stderr.write(stderr)
     if not success:
@@ -796,7 +790,7 @@ def _process_finished(process: subprocess.Popen[bytes]) -> bool:
 def _tracked_finished(process: subprocess.Popen[bytes]) -> bool:
     if sys.platform.startswith("linux"):
         # Keep the leader unreaped until the group has stopped, so its pid
-        # cannot be reused while the registry still refers to that group.
+        # cannot identify another process while the registry still refers to that group.
         return not _group_running(process.pid) and process.poll() is not None
     return _process_finished(process)
 
@@ -865,12 +859,6 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
     )
 
 
-def _traced_command(
-    argv: tuple[str, ...], prepared: tracing.Prepared | None
-) -> tuple[str, ...]:
-    return tuple(prepared.argv) if prepared is not None else argv
-
-
 def _run_budget(
     budget_seconds: float, grace_seconds: float
 ) -> tuple[float, float]:
@@ -901,33 +889,23 @@ def _popen(
 
 
 def _spawn(
-    command: tuple[str, ...],
+    argv: tuple[str, ...],
     cwd: os.PathLike[str] | str | None,
     env: dict[str, str] | None,
-    prepared: tracing.Prepared | None,
-    argv: tuple[str, ...],
     started: float,
 ) -> tuple[subprocess.Popen[bytes] | None, RunResult | None]:
     token = uuid.uuid4().hex if _current_registry() is not None else None
     try:
-        return _popen(command, cwd, env, token), None
+        return _popen(argv, cwd, env, token), None
     except (OSError, subprocess.SubprocessError) as error:
         if token is not None:
             _forget_token(token)
-        if prepared is not None:
-            prepared.abandon()
         return None, _empty(
             argv,
             execution="error",
             error=f"cannot run command: {error}",
             started=started,
         )
-
-
-def _record_environment(env: dict[str, str] | None) -> None:
-    recorder = tracing.current()
-    if recorder is not None and recorder.environment is None:
-        recorder.environment = dict(os.environ if env is None else env)
 
 
 def _capture_process(
@@ -947,12 +925,6 @@ def _capture_process(
     finally:
         _close(selector, streams)
     return execution, capture
-
-
-def _finish_trace(process: subprocess.Popen[bytes], prepared: tracing.Prepared | None) -> None:
-    _reap(process)
-    if prepared is not None:
-        prepared.finish()
 
 
 def _ensure_process_stopped(process: subprocess.Popen[bytes], command: tuple[str, ...]) -> None:
@@ -975,23 +947,15 @@ def run(
         budget_seconds, grace_seconds
     )
     argv_tuple = tuple(argv)
-    _record_environment(env)
     started = time.monotonic()
     deadline = started + max(0.0, budget_seconds)
-    prepared = tracing.prepare(argv_tuple, cwd)
-    command = _traced_command(argv_tuple, prepared)
-    process, failure = _spawn(
-        command, cwd, env, prepared, argv_tuple, started
-    )
+    process, failure = _spawn(argv_tuple, cwd, env, started)
     if failure is not None:
         return failure
     assert process is not None
-    if prepared is not None:
-        prepared.start(process.pid)
-
     execution, capture = _capture_process(process, deadline, grace_seconds, capture_limit)
-    _finish_trace(process, prepared)
-    _ensure_process_stopped(process, command)
+    _reap(process)
+    _ensure_process_stopped(process, argv_tuple)
     returncode = process.poll()
     if _was_signalled(execution, returncode):
         execution = "signal"

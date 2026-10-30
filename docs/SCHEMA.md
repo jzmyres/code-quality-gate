@@ -153,7 +153,7 @@ Rules:
   The defaults are no load paths, `emacs`, and 900 seconds. An empty selection
   fails.
 * `verification.requires`, when present, names an earlier test-producing
-  check, whatever its language. Without it the adapter reuses every earlier
+  check, whatever its language. Without it the adapter uses every earlier
   test-producing check.
 * A baseline path must be used by exactly one check. Two checks naming the
   same resolved path is a configuration error.
@@ -200,7 +200,7 @@ evidence do not satisfy it, and a policy with only a lint check rejects. Tiers
 produces them, so a required tier 2, 3 or 4 must be exempted until its adapter
 exists. An unsatisfied obligation rejects the gate.
 
-The `verification` adapter measures verification loss. For each reused
+The `verification` adapter measures verification loss. For each earlier
 test-producing check it records `tests:CHECK:executed` (direction `min`,
 value `ran - skipped`) and `tests:CHECK:skipped` (direction `max`). For each
 selected Python file it records `exclusions:FILE:no-cover` (lines matching the
@@ -215,7 +215,7 @@ matching text inside a string does not count. The file-wide finding's location
 includes the first directive and its line.
 
 Test counts do not depend on Python files being selected: an empty selection
-scans no suppressions, while no reusable producer result means no measured
+scans no suppressions, while no valid producer result means no measured
 counts and makes the check unsupported.
 
 These verification `max` metrics have threshold 0, so a missing baseline entry
@@ -682,12 +682,11 @@ Check keys:
   consistent result data has no `test_results`. The Emacs Lisp adapter reads them from its child
   result document. Passed counts expected results; selected equals passed plus failed plus skipped.
 * `emacs_version` - the Emacs version string for a completed Elisp measurement,
-  including compile and checkdoc checks and reused passing results. It is absent
+  including compile and checkdoc checks. It is absent
   when no process has reported a version, such as when Emacs is missing.
 * `definitions` - the Elisp measurement's array of objects with `symbol`, repository-relative `file`,
   one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
-  These counts are also retained as evidence for later checks, including through result reuse.
-* `reused_from` - present when a passing check was reused, naming its record tree.
+  These counts are also retained as evidence for later checks.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`,
@@ -759,44 +758,12 @@ Notes hold entries that are not ranked. `reason` is `no longer exists` when the 
 current finding, or `churn not measured` when Git reports no commits for the finding's file; the latter
 also names that `file`. A Git command that fails makes the command exit 1 and write no document.
 
-## Reuse record
-
-With `--reuse-store`, a passing check writes one JSON record through the
-`--record-fd` descriptor; `qg.py reuse merge` validates it before writing it
-into the store. The record schema is 1 and holds:
-
-* `schema`, `program`, `check`, `command`, `environment`, `context` - the
-  check's identity.
-* `inputs` - absolute normalized path to a SHA-256 content digest, the string
-  `directory` (the path is a directory), or `null` (the path is absent). A
-  path is resolved as the kernel resolved it: symlinks are followed and `..`
-  applies after the links before it.
-* `symlinks` - absolute normalized path to the SHA-256 of the link target
-  bytes, for every symlink the resolution passed through.
-* `non_symlinks` - absolute normalized paths observed to be non-symlinks.
-* `metadata` - absolute normalized path to an object with `type`, `mode`,
-  `size`, `uid` and `gid`, for each file (not directory) the check stat'ed,
-  lstat'ed or tested with `access`. `type` is the file type (`file`,
-  `symlink`, `fifo`, `socket`, `character`, `block` or `other`), `mode`
-  holds the permission bits, `size` is the size in bytes, and `uid`/`gid`
-  name the owner. A directory keeps its `inputs` presence rule because its
-  size changes with unrelated entries.
-* `measurement`, `tests_ran`, `tests_skipped`, `coverage_data`,
-  `coverage_config`, `elisp_result` and `emacs_version` - optional evidence
-  retained for later checks.
-
-A record is reused only when its identity, every input, every symlink, every
-non-symlink and every metadata entry still match. A path that cannot be resolved
-(for example through an unreadable directory or too many symlinks) makes the
-trace unanalysable, so no record is written.
-
 ## Versions and superseded proposals
 
 * Policy: `schema = 2`.
 * Result: `schema = 2`; `schema = 3` when `--policy-from` adds `trust`.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
-* Reuse record: `schema = 1`.
 * Worklist result: `schema = 1`.
 * Metric versions: `command-exit/1`, `test-count/1`,
   `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `elisp-lint/1`, `verification/1`,

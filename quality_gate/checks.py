@@ -12,12 +12,11 @@ import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date
 from functools import partial
 from pathlib import Path
 from typing import Any
 
-from . import gate_result, reuse
+from . import gate_result
 from .adapters import AdapterContext, adapter_for
 from .changes import apply_changes, changed_lines, location_coverage, resolve_revision
 from .clones import measure_clones
@@ -64,7 +63,6 @@ from .runner import (
     run,
 )
 from .tools import current_tools, tool_binary
-from .tracing import TraceUnavailable
 from .trust import checked_prune_path
 from .verification import measure_verification
 
@@ -125,7 +123,6 @@ class CheckResult:
     configuration_error: bool = False
     change_scoped_failure: bool = False
     incomplete_locations: bool = False
-    reused_from: str | None = None
     emacs_version: str | None = None
     definitions: list[dict[str, Any]] | None = None
 
@@ -161,8 +158,6 @@ class CheckResult:
             "location_coverage": self._location_coverage(),
         }
         document.update(self._json_test_fields())
-        if self.reused_from is not None:
-            document["reused_from"] = self.reused_from
         if self.measurement is not None:
             document["measurement"] = self.measurement
         return document
@@ -1146,9 +1141,7 @@ def _tests_setup(
     start: float,
     prefix: str,
 ) -> tuple[tempfile.TemporaryDirectory, Path, list[str]] | CheckResult:
-    session = reuse.current()
-    temporary = (session.coverage_directory(check) if session is not None
-                 else tempfile.TemporaryDirectory(prefix="qg-coverage-"))
+    temporary = tempfile.TemporaryDirectory(prefix="qg-coverage-")
     data_dir = Path(temporary.name) / "data"
     try:
         data_dir.mkdir()
@@ -1889,227 +1882,6 @@ def _adapter_runner(
     )
 
 
-def _reused_result(
-    root: Path, check: CheckDef, start: float, prefix: str, reused: reuse.Reused
-) -> CheckResult:
-    record = reused.record
-    result = _check_result(
-        check,
-        start,
-        "pass",
-        budget_seconds=_check_budget(check),
-        measurement=record.get("measurement"),
-        tests_ran=record.get("tests_ran"),
-        tests_skipped=record.get("tests_skipped"),
-        emacs_version=record.get("emacs_version"),
-    )
-    reuse.restore_coverage(record, result)
-    if result.coverage_config is not None:
-        result.coverage_settings = coverage_config_text(root)
-    if result.tests_ran is not None and result.tests_skipped is not None:
-        result.test_results = TestResults(result.tests_ran, result.tests_ran - result.tests_skipped, 0)
-    if "elisp_result" in record:
-        from .elisp_tests import apply_document
-
-        apply_document(result, record["elisp_result"])
-        reuse.restore_elisp(record, result)
-    result.duration_seconds = 0.0
-    result.reused_from = str(reused.tree)
-    version = f" (Emacs {result.emacs_version})" if result.emacs_version is not None else ""
-    print(f"{prefix}: reused record at {reused.tree}{version}", flush=True)
-    return result
-
-
-def _reuse_unavailable(
-    check: CheckDef, start: float, prefix: str, error: TraceUnavailable
-) -> CheckResult:
-    message = str(error)
-    print(f"{prefix}: {message}", file=sys.stderr)
-    return _check_result(
-        check,
-        start,
-        "unsupported",
-        execution="error",
-        budget_seconds=_check_budget(check),
-        diagnostics=Diagnostics(error=message),
-        reason=message,
-    )
-
-
-def _reuse_selection(
-    config: Config, check: CheckDef, files: list[str], classes: dict[str, str]
-) -> tuple[list[str], list[str]]:
-    if check.adapter == "python_tests":
-        return [], []
-    if check.adapter == "command" and "{files}" not in check.spec.run:
-        return [], []
-    return _select_files(config, check, files, classes)
-
-
-def _entry_expired(entry: BaselineEntry, today: date) -> bool:
-    return entry.expires is not None and entry.expires < today
-
-
-def _reuse_expired_entries(check: CheckDef) -> list[str] | None:
-    if check.baseline is None:
-        return []
-    try:
-        entries = _baseline_entries(check)
-    except GateError:
-        return None
-    today = date.today()
-    return [entry.subject for entry in entries if _entry_expired(entry, today)]
-
-
-def _elisp_reuse_files(
-    root: Path, config: Config, check: CheckDef, selected: list[str],
-    files: list[str], classes: dict[str, str],
-) -> dict[str, Any] | None:
-    if check.adapter == "elisp_tests":
-        inputs = selected
-    elif check.adapter == "elisp_crap":
-        required = config.checks[check.spec.requires]
-        inputs, _names = _select_files(config, required, files, classes)
-    else:
-        return None
-    from .elisp_crap import _file_key
-
-    return {name: _file_key(root, name) for name in inputs}
-
-
-def _reuse_context(
-    root: Path, config: Config, check: CheckDef, files: list[str],
-    classes: dict[str, str], prior: dict[str, CheckResult],
-) -> dict[str, Any]:
-    selected, names = _reuse_selection(config, check, files, classes)
-    descriptor = _check_descriptor(check)
-    depends_on_tests = descriptor.requires_tests or getattr(check.spec, "requires", None) is not None
-    dependencies = prior if depends_on_tests else {}
-    _lock, tools = current_tools()
-    return {
-        "root": str(root),
-        "tools": {name: reuse._spec_text(tool) for name, tool in sorted(tools.items())},
-        "check": reuse._spec_text(check),
-        "expired_entries": _reuse_expired_entries(check),
-        "selection": selected,
-        "classes": names,
-        "elisp_files": _elisp_reuse_files(root, config, check, selected, files, classes),
-        "prior": {name: [result.outcome, result.tests_ran, result.tests_skipped,
-                          result.measurement, reuse.evidence_hash(result.evidence_path)]
-                  for name, result in dependencies.items()},
-    }
-
-
-def _reuse_identity(check: CheckDef, context: Any, root: Path, coverage_dir: Path | None) -> Any:
-    try:
-        return reuse.check_identity(check, context, root, coverage_dir)
-    except UnsupportedError:
-        return None
-
-
-def _lint_reuse_missing(check: CheckDef, record: dict[str, Any]) -> bool:
-    return check.adapter in ("elisp_compile", "elisp_checkdoc") and "emacs_version" not in record
-
-
-def _usable_reuse(check: CheckDef, reused: Any) -> Any:
-    if reused is None:
-        return None
-    if check.adapter == "elisp_tests" and "elisp_result" not in reused.record:
-        return None
-    if _lint_reuse_missing(check, reused.record):
-        return None
-    return reused
-
-
-def _reuse_lookup(session: Any, check: CheckDef, identity: Any, coverage_dir: Path | None) -> Any:
-    if identity is None or check.id in session.prune_ids:
-        return None
-    if coverage_dir is not None and os.path.lexists(coverage_dir):
-        return None
-    return _usable_reuse(check, session.lookup(identity))
-
-
-def _run_recorded_check(
-    session: Any, identity: Any, root: Path, config: Config, check: CheckDef,
-    files: list[str], classes: dict[str, str], prefix: str,
-    prior: dict[str, CheckResult], start: float, tracer: tuple[str, ...],
-) -> CheckResult:
-    with session.collect(check, tracer) as recorder:
-        result = _run_check_with_deadline(root, config, check, files, classes, prefix, prior, start)
-    if _recordable(identity, result, recorder):
-        session.record(identity, recorder, result)
-    return result
-
-
-def _recordable(identity: Any, result: CheckResult, recorder: Any) -> bool:
-    return (identity is not None and result.outcome == "pass"
-            and result.execution == "completed" and recorder.reliable)
-
-
-def _elisp_reuse_collision(
-    root: Path, config: Config, check: CheckDef, files: list[str],
-    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
-) -> CheckResult | None:
-    from .elisp_tests import _suite_collision
-
-    selected, _names = _select_files(config, check, files, classes)
-    context = AdapterContext(root, config, check, files, classes, prefix, prior)
-    return _suite_collision(context, selected, start)
-
-
-def _elisp_reuse_selection(
-    root: Path, config: Config, check: CheckDef, files: list[str],
-    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
-) -> CheckResult | None:
-    if check.adapter == "elisp_tests":
-        return _elisp_reuse_collision(root, config, check, files, classes, prefix, prior, start)
-    from .elisp_crap import selection_failure
-
-    context = AdapterContext(root, config, check, files, classes, prefix, prior)
-    return selection_failure(context, start)
-
-
-def _reuse_stages(
-    session: Any, root: Path, config: Config, check: CheckDef, files: list[str],
-    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult], start: float,
-    budget: float,
-) -> CheckResult:
-    deadline = start + budget
-    if check.adapter in ("elisp_tests", "elisp_crap"):
-        selection = analysis_step("Elisp selection", _elisp_reuse_selection, root, config, check,
-                                  files, classes, prefix, prior, start, deadline=deadline)
-        if selection is not None:
-            return selection
-    context = analysis_step("reuse context", _reuse_context, root, config, check, files, classes, prior,
-                            deadline=deadline)
-    coverage_dir = session.coverage_path(check) if check.adapter == "python_tests" else None
-    identity = analysis_step("reuse identity", _reuse_identity, check, context, root, coverage_dir,
-                             deadline=deadline)
-    tracer = analysis_step("reuse tracer verification", session._require_tracer, deadline=deadline)
-    reused = analysis_step("reuse lookup", _reuse_lookup, session, check, identity, coverage_dir,
-                           deadline=deadline)
-    if reused is not None:
-        return _reused_result(root, check, start, prefix, reused)
-    return _run_recorded_check(session, identity, root, config, check, files, classes, prefix,
-                               prior, start, tracer)
-
-
-def _reuse_check(
-    root: Path, config: Config, check: CheckDef, files: list[str],
-    classes: dict[str, str], prefix: str, prior: dict[str, CheckResult],
-) -> CheckResult:
-    session = reuse.current()
-    assert session is not None
-    start = time.monotonic()
-    budget = _check_budget(check)
-    try:
-        return _reuse_stages(session, root, config, check, files, classes, prefix, prior, start, budget)
-    except TraceUnavailable as error:
-        return _reuse_unavailable(check, start, prefix, error)
-    except (StepTimeout, WorkerError) as error:
-        return _deadline_failure(check, prefix, start, budget, None, error)
-
-
 def run_check(
     root: Path,
     config: Config,
@@ -2121,11 +1893,7 @@ def run_check(
     prior: dict[str, CheckResult] | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
-    if reuse.current() is None:
-        return _run_check_with_deadline(
-            root, config, check, files, classes, prefix, prior or {}
-        )
-    return _reuse_check(
+    return _run_check_with_deadline(
         root, config, check, files, classes, prefix, prior or {}
     )
 
@@ -2142,10 +1910,9 @@ def _run_check_with_deadline(
     classes: dict[str, str],
     prefix: str,
     prior: dict[str, CheckResult],
-    started: float | None = None,
 ) -> CheckResult:
     budget = _check_budget(check)
-    start = time.monotonic() if started is None else started
+    start = time.monotonic()
     with check_deadline(start, budget) as scope:
         try:
             result = _adapter_runner(
@@ -2699,25 +2466,21 @@ def command_check(
     prune_ids: list[str] | None = None,
     trust: Any = None,
     changed_from: str | None = None,
-    reuse_store: str | None = None,
-    record_fd: int | None = None,
 ) -> int:
-    store = Path(reuse_store).expanduser() if reuse_store else None
     requested = prune_ids or []
-    with reuse.active(store, root, record_fd, tuple(_expand_prune_ids(config, requested))):
-        if trust is None:
-            code, document = _run_check_document(
-                root, config, requested, json_output, changed_from=changed_from
-            )
-        else:
-            try:
-                with trust.activate():
-                    code, document = _run_check_document(
-                        root, config, requested, json_output, trust, changed_from
-                    )
-                code, document = trust.finish(code, document)
-            finally:
-                trust.close()
+    if trust is None:
+        code, document = _run_check_document(
+            root, config, requested, json_output, changed_from=changed_from
+        )
+    else:
+        try:
+            with trust.activate():
+                code, document = _run_check_document(
+                    root, config, requested, json_output, trust, changed_from
+                )
+            code, document = trust.finish(code, document)
+        finally:
+            trust.close()
     if json_output:
         print(
             json.dumps(document, indent=2, allow_nan=False),

@@ -1,4 +1,4 @@
-"""Join the editor's Emacs Lisp complexity with reused Edebug evidence."""
+"""Join the editor's Emacs Lisp complexity with earlier Edebug evidence."""
 from __future__ import annotations
 
 import json

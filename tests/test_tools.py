@@ -97,6 +97,31 @@ class ToolsTests(FixtureCase):
                 archive.writestr(info, target)
         return path
 
+    def make_package(self) -> tuple[Path, bytes]:
+        binary = b"#!/bin/sh\necho fake\n"
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode="w:gz") as archive:
+            member = tarfile.TarInfo("usr/bin/example")
+            member.mode, member.size = 0o755, len(binary)
+            archive.addfile(member, io.BytesIO(binary))
+        contents = bytearray(b"!<arch>\n")
+        for name, payload in (("debian-binary", b"2.0\n"), ("data.tar.gz", data.getvalue())):
+            header = f"{name + '/':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{len(payload):<10}`\n"
+            contents.extend(header.encode("ascii") + payload)
+            if len(payload) % 2:
+                contents.extend(b"\n")
+        package = self.base / "tool.deb"
+        package.write_bytes(contents)
+        return package, binary
+
+    def package_lock(self, package: Path, binary: bytes, *, digest: str | None = None,
+                     payload: str | None = None) -> Path:
+        return self.write_lock(
+            package.as_uri(), digest or self.sha256(package),
+            binary="usr/bin/example", archive_format="deb",
+            payload=payload or hashlib.sha256(binary).hexdigest(),
+        )
+
     def sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -570,6 +595,47 @@ class ToolsTests(FixtureCase):
         self.assertTrue(
             (tools / f"jscpd-{VERSION}" / "pkg" / "mod.py").is_file()
         )
+
+    def test_fetch_package_and_verify_its_binary(self) -> None:
+        package, binary = self.make_package()
+        lock = self.package_lock(package, binary)
+        tools = self.base / "tools"
+        result = self.fetch(lock, tools)
+        self.assertEqual(result.returncode, 0, output(result))
+        directory = tools / f"jscpd-{VERSION}"
+        installed = directory / "usr/bin/example"
+        self.assertEqual(installed.read_bytes(), binary)
+        with lock_override(lock):
+            self.assertEqual(verify_tool_directory("jscpd", directory), directory)
+            installed.write_bytes(b"changed")
+            with self.assertRaisesRegex(UnsupportedError, "payload digest mismatch"):
+                verify_tool_directory("jscpd", directory)
+
+    def test_fetch_package_rejects_invalid_container(self) -> None:
+        package, binary = self.make_package()
+        data = bytearray(package.read_bytes())
+        data[66] = 0
+        package.write_bytes(data)
+        result = self.fetch(self.package_lock(package, binary), self.base / "tools")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("invalid ar header", output(result))
+        self.assert_not_installed(self.base / "tools")
+
+    def test_fetch_package_rejects_wrong_archive_digest(self) -> None:
+        package, binary = self.make_package()
+        lock = self.package_lock(package, binary, digest="0" * 64)
+        result = self.fetch(lock, self.base / "tools")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("sha256 mismatch", output(result))
+        self.assert_not_installed(self.base / "tools")
+
+    def test_fetch_package_rejects_wrong_payload_digest(self) -> None:
+        package, binary = self.make_package()
+        lock = self.package_lock(package, binary, payload="0" * 64)
+        result = self.fetch(lock, self.base / "tools")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("payload sha256 mismatch", output(result))
+        self.assert_not_installed(self.base / "tools")
 
     def test_fetch_wheel_with_wrong_hash_installs_nothing(self) -> None:
         wheel = self.make_wheel()

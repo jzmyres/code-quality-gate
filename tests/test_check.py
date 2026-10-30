@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import unittest
 
@@ -12,6 +13,22 @@ checks = importlib.import_module("quality_gate.checks")
 
 
 class CheckTests(FixtureCase):
+    def test_retired_option_is_rejected(self) -> None:
+        result = self.run_qg("check", "--reuse-store", str(self.base / "store"))
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("unrecognized arguments", result.stderr)
+        self.assertIn("--reuse-store", result.stderr)
+
+    def test_checks_run_again_on_each_invocation(self) -> None:
+        marker = self.base / "runs"
+        code = f"open({str(marker)!r}, 'a').write('x'); print(1)"
+        command = json.dumps([sys.executable, "-I", "-c", code])
+        self.write_config(BASE_CONFIG.replace('["python3", "-c", "print(1)"]', command))
+        for _ in range(2):
+            result = self.run_qg("check")
+            self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(marker.read_text(encoding="utf-8"), "xx")
+
     def test_prune_exit_rejects_refusal_even_when_the_gate_was_accepted(self) -> None:
         self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": False}), 1)
         self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": True}), 0)
