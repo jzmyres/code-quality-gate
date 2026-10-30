@@ -12,6 +12,11 @@ from .ratchet import Finding, Location
 
 
 @dataclass(frozen=True)
+class PythonCrapSpec:
+    requires: str
+
+
+@dataclass(frozen=True)
 class MeasuredFunction:
     identity: str
     path: str

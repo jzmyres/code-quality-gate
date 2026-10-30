@@ -26,6 +26,14 @@ from .runner import (
 from .tools import _jscpd_binary
 
 
+DEFAULT_MIN_TOKENS = 50
+
+
+@dataclass(frozen=True)
+class CloneSpec:
+    min_tokens: int
+
+
 FORMAT_BY_SUFFIX = {
     ".py": "python",
     ".pyi": "python",

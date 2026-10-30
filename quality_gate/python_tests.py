@@ -3,15 +3,64 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from . import policy
 from .coverage_tool import (
     coverage_config_path,
     registry_dir,
     write_coverage_config,
 )
-from .policy import PythonTestsSpec
+from .policy import DEFAULT_TESTS_BUDGET_SECONDS, _config_error, _integer, _test_patterns
 from .tools import installed_tool
+
+
+@dataclass(frozen=True)
+class PythonTestsSpec:
+    run: tuple[str, ...]
+    tests_pattern: str
+    tests_pattern_re: re.Pattern[str]
+    skipped_pattern: str | None
+    skipped_pattern_re: re.Pattern[str] | None
+    budget_seconds: int
+
+
+def _parse_python_tests(
+    raw: dict[str, Any], path: Path, full_key: str
+) -> PythonTestsSpec:
+    run = policy._argv_list(raw, "run", path, f"{full_key}.run")
+    if not run:
+        raise _config_error(
+            path, f"{full_key}.run", "a non-empty argument list", "an empty list"
+        )
+    pattern_text, pattern, skipped_pattern_text, skipped_pattern = _test_patterns(
+        raw, path, full_key
+    )
+    if pattern_text is None or pattern is None:
+        raise _config_error(
+            path,
+            f"{full_key}.tests_pattern",
+            "a regular expression with one capture group",
+            "missing",
+        )
+    budget = _integer(
+        raw,
+        "budget_seconds",
+        path,
+        f"{full_key}.budget_seconds",
+        default=DEFAULT_TESTS_BUDGET_SECONDS,
+        minimum=1,
+    )
+    return PythonTestsSpec(
+        tuple(run),
+        pattern_text,
+        pattern,
+        skipped_pattern_text,
+        skipped_pattern,
+        budget,
+    )
 
 
 def coverage_prefix_values(root: Path, data_dir: Path) -> list[str]:

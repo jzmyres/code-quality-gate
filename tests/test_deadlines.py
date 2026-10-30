@@ -26,6 +26,9 @@ runner = importlib.import_module("quality_gate.runner")
 ratchet = importlib.import_module("quality_gate.ratchet")
 clones = importlib.import_module("quality_gate.clones")
 owners = importlib.import_module("quality_gate.owners")
+python_crap = importlib.import_module("quality_gate.python_crap")
+python_tests = importlib.import_module("quality_gate.python_tests")
+verification = importlib.import_module("quality_gate.verification")
 
 
 class AnalysisDeadlineTests(unittest.TestCase):
@@ -64,11 +67,11 @@ class AnalysisDeadlineTests(unittest.TestCase):
 
     def adapter_spec(self, adapter: str) -> object:
         if adapter == "clones":
-            return policy.CloneSpec(50)
+            return clones.CloneSpec(50)
         if adapter == "crap":
-            return policy.PythonCrapSpec("tests")
+            return python_crap.PythonCrapSpec("tests")
         if adapter == "verification":
-            return policy.VerificationSpec("tests")
+            return verification.VerificationSpec("tests")
         return self.owners_spec()
 
     def check_def(self, adapter: str) -> object:
@@ -141,7 +144,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
 
     def test_coverage_steps_are_stopped_while_running(self) -> None:
         pattern = r"^Ran (\d+) tests? in"
-        spec = policy.PythonTestsSpec(
+        spec = python_tests.PythonTestsSpec(
             (sys.executable, "-c", "print('Ran 1 test in 0.1s')"),
             pattern, re.compile(pattern), None, None, self.budget,
         )

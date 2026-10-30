@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,12 @@ from .json_input import load_json
 from .policy import GateError
 from .ratchet import Domain, Finding, Location
 from .runner import analysis_step, mark_step, record_diagnostics, run
+
+
+@dataclass(frozen=True)
+class ElispCrapSpec:
+    requires: str
+    decision_rules: dict[str, tuple[str, ...]]
 
 
 def selection_failure(context: Any, start: float) -> Any:

@@ -6,17 +6,13 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .elisp_lint import ElispLintSpec
-    from .elisp_tests import ElispTestsSpec
-    from .owners import OwnersSpec
     from .ratchet import BaselineEntry
 
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
-DEFAULT_MIN_TOKENS = 50
 DEFAULT_BUDGET_SECONDS = 600
 DEFAULT_TESTS_BUDGET_SECONDS = 900
 DEFAULT_CRAP_THRESHOLD = 6.0
@@ -72,62 +68,6 @@ class ClassDef:
 
 
 @dataclass(frozen=True)
-class CommandSpec:
-    run: tuple[str, ...]
-    budget_seconds: int
-    must_match: str | None
-    must_match_pattern: re.Pattern[str] | None
-    tests_pattern: str | None = None
-    tests_pattern_re: re.Pattern[str] | None = None
-    skipped_pattern: str | None = None
-    skipped_pattern_re: re.Pattern[str] | None = None
-
-
-@dataclass(frozen=True)
-class CloneSpec:
-    min_tokens: int
-
-
-@dataclass(frozen=True)
-class PythonTestsSpec:
-    run: tuple[str, ...]
-    tests_pattern: str
-    tests_pattern_re: re.Pattern[str]
-    skipped_pattern: str | None
-    skipped_pattern_re: re.Pattern[str] | None
-    budget_seconds: int
-
-
-@dataclass(frozen=True)
-class PythonCrapSpec:
-    requires: str
-
-
-@dataclass(frozen=True)
-class ElispCrapSpec:
-    requires: str
-    decision_rules: dict[str, tuple[str, ...]]
-
-
-@dataclass(frozen=True)
-class VerificationSpec:
-    requires: str | None
-
-
-AdapterSpec = Union[
-    CommandSpec,
-    CloneSpec,
-    PythonTestsSpec,
-    "ElispTestsSpec",
-    "ElispLintSpec",
-    PythonCrapSpec,
-    ElispCrapSpec,
-    VerificationSpec,
-    "OwnersSpec",
-]
-
-
-@dataclass(frozen=True)
 class CheckDef:
     id: str
     adapter: str
@@ -135,7 +75,7 @@ class CheckDef:
     enforcement: str
     metric_version: str
     evidence: tuple[str, ...]
-    spec: AdapterSpec
+    spec: object
     threshold: float | None
     baseline: Path | None
     direction: str = "max"
@@ -444,84 +384,6 @@ def _test_patterns(
     return tests_text, tests_re, skipped_text, skipped_re
 
 
-def _parse_command(
-    raw: dict[str, Any], path: Path, full_key: str
-) -> CommandSpec:
-    run = _argv_list(raw, "run", path, f"{full_key}.run")
-    if not run:
-        raise _config_error(path, f"{full_key}.run", "a non-empty argument list", "an empty list")
-    budget = _integer(
-        raw,
-        "budget_seconds",
-        path,
-        f"{full_key}.budget_seconds",
-        default=DEFAULT_BUDGET_SECONDS,
-        minimum=1,
-    )
-    must_match: str | None = None
-    pattern: re.Pattern[str] | None = None
-    if "must_match" in raw:
-        must_match = _string(raw, "must_match", path, f"{full_key}.must_match")
-        try:
-            pattern = re.compile(must_match)
-        except re.error as error:
-            raise _config_error(
-                path,
-                f"{full_key}.must_match",
-                "a valid regular expression",
-                str(error),
-            ) from error
-    tests_text, tests_re, skipped_text, skipped_re = _test_patterns(
-        raw, path, full_key
-    )
-    return CommandSpec(
-        tuple(run),
-        budget,
-        must_match,
-        pattern,
-        tests_text,
-        tests_re,
-        skipped_text,
-        skipped_re,
-    )
-
-
-def _parse_python_tests(
-    raw: dict[str, Any], path: Path, full_key: str
-) -> PythonTestsSpec:
-    run = _argv_list(raw, "run", path, f"{full_key}.run")
-    if not run:
-        raise _config_error(
-            path, f"{full_key}.run", "a non-empty argument list", "an empty list"
-        )
-    pattern_text, pattern, skipped_pattern_text, skipped_pattern = _test_patterns(
-        raw, path, full_key
-    )
-    if pattern_text is None or pattern is None:
-        raise _config_error(
-            path,
-            f"{full_key}.tests_pattern",
-            "a regular expression with one capture group",
-            "missing",
-        )
-    budget = _integer(
-        raw,
-        "budget_seconds",
-        path,
-        f"{full_key}.budget_seconds",
-        default=DEFAULT_TESTS_BUDGET_SECONDS,
-        minimum=1,
-    )
-    return PythonTestsSpec(
-        tuple(run),
-        pattern_text,
-        pattern,
-        skipped_pattern_text,
-        skipped_pattern,
-        budget,
-    )
-
-
 def _parse_direction(
     raw: dict[str, Any], path: Path, full_key: str
 ) -> str:
@@ -551,9 +413,12 @@ def _requires_match(
 
 
 def _test_producer_refusal(required: CheckDef | None) -> str:
+    from .adapters import adapter_for
+
     if required is None:
         return ""
-    detail = " (no tests_pattern)" if required.adapter == "command" else ""
+    descriptor = adapter_for(required.adapter)
+    detail = descriptor.no_tests_hint if descriptor is not None else ""
     return f" that produces no tests{detail}"
 
 

@@ -4,11 +4,17 @@ from __future__ import annotations
 import io
 import re
 import tokenize
+from dataclasses import dataclass
 from pathlib import Path
 
 from .coverage_tool import PRAGMA_NO_COVER
 from .policy import GateError
 from .ratchet import Finding, Location
+
+
+@dataclass(frozen=True)
+class VerificationSpec:
+    requires: str | None
 
 
 NO_COVER = re.compile(PRAGMA_NO_COVER)

@@ -15,15 +15,8 @@ from . import ratchet
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
-    DEFAULT_MIN_TOKENS,
-    CloneSpec,
-    ElispCrapSpec,
-    PythonCrapSpec,
-    VerificationSpec,
     _integer,
     _number,
-    _parse_command,
-    _parse_python_tests,
     _string,
 )
 
@@ -80,6 +73,7 @@ class AdapterDescriptor:
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
     argument_fields: tuple[str, ...] = ()
+    no_tests_hint: str = ""
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
@@ -110,6 +104,8 @@ def _baseline(raw: dict[str, Any], root: Path, path: Path, full_key: str) -> Pat
 def _command_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
+    from .command import _parse_command
+
     spec = _parse_command(raw, path, full_key)
     evidence = ("tests",) if spec.tests_pattern is not None else ("static",)
     return ParsedSpec(spec, "command-exit/1", evidence)
@@ -118,6 +114,8 @@ def _command_spec(
 def _clones_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
+    from .clones import DEFAULT_MIN_TOKENS, CloneSpec
+
     min_tokens = _integer(
         raw,
         "min_tokens",
@@ -139,6 +137,8 @@ def _clones_spec(
 def _python_tests_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
+    from .python_tests import _parse_python_tests
+
     spec = _parse_python_tests(raw, path, full_key)
     return ParsedSpec(spec, "test-count/1", ("tests",))
 
@@ -186,12 +186,15 @@ def _crap_spec(
 def _python_crap_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
+    from .python_crap import PythonCrapSpec
+
     return _crap_spec(raw, root, path, full_key, PythonCrapSpec, "python-lines/1")
 
 
 def _elisp_crap_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
+    from .elisp_crap import ElispCrapSpec
     from .elisp_rules import parse_rules
 
     rules = parse_rules(raw, path, f"{full_key}.decision_rules")
@@ -202,6 +205,8 @@ def _elisp_crap_spec(
 def _verification_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
+    from .verification import VerificationSpec
+
     requires: str | None = None
     if "requires" in raw:
         requires = _string(raw, "requires", path, f"{full_key}.requires")
@@ -289,6 +294,7 @@ register_adapter(AdapterDescriptor(
     ("run", "budget_seconds", "must_match", "tests_pattern", "skipped_pattern"),
     _command_spec,
     _runner("_run_command"),
+    no_tests_hint=" (no tests_pattern)",
     argument_fields=("run",),
     budget=_spec_budget,
 ))

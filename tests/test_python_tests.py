@@ -895,7 +895,7 @@ class CoverageRegistryTests(unittest.TestCase):
 
 class CoverageDeadlineTests(unittest.TestCase):
     def test_a_combination_after_the_deadline_reports_budget(self) -> None:
-        spec = policy.PythonTestsSpec(
+        spec = python_tests.PythonTestsSpec(
             run=(),
             tests_pattern="",
             tests_pattern_re=re.compile(""),
@@ -935,7 +935,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
     def setUp(self) -> None:
         tests_pattern = r"^Ran ([0-9]+) tests? in"
         skipped_pattern = r"skipped=([0-9]+)"
-        self.spec = policy.PythonTestsSpec(
+        self.spec = python_tests.PythonTestsSpec(
             run=(),
             tests_pattern=tests_pattern,
             tests_pattern_re=re.compile(tests_pattern, re.MULTILINE),
@@ -1195,8 +1195,8 @@ class TestSummaryTests(unittest.TestCase):
         self,
         tests_pattern: str = r"^Ran ([0-9]+) tests? in",
         skipped_pattern: str | None = r"skipped=([0-9]+)",
-    ) -> policy.PythonTestsSpec:
-        return policy.PythonTestsSpec(
+    ) -> python_tests.PythonTestsSpec:
+        return python_tests.PythonTestsSpec(
             run=(),
             tests_pattern=tests_pattern,
             tests_pattern_re=re.compile(tests_pattern, re.MULTILINE),
@@ -1210,7 +1210,7 @@ class TestSummaryTests(unittest.TestCase):
         )
 
     def summarize(
-        self, spec: policy.PythonTestsSpec, output: str
+        self, spec: python_tests.PythonTestsSpec, output: str
     ) -> tuple[int | None, int | None, str | None]:
         patterns = {"tests": spec.tests_pattern}
         if spec.skipped_pattern is not None:
