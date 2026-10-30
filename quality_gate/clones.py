@@ -1,7 +1,6 @@
 """jscpd invocation, SARIF parsing and clone measurement."""
 from __future__ import annotations
 
-import json
 import tempfile
 import urllib.parse
 from collections import Counter
@@ -9,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .json_input import load_json
 from .policy import (
     DEFAULT_MAX_BYTES,
     GateError,
@@ -78,10 +78,10 @@ def _no_completed(report: Path, detail: str) -> UnsupportedError:
 
 def _read_report(report: Path) -> Any:
     try:
-        return json.loads(report.read_text(encoding="utf-8"))
+        return load_json(report.read_text(encoding="utf-8"))
     except OSError as error:
         raise _no_completed(report, f"cannot read report: {error}") from error
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    except (ValueError, UnicodeDecodeError) as error:
         raise _no_completed(report, f"invalid JSON: {error}") from error
 
 

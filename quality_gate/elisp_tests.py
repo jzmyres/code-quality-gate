@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .json_input import load_json
 from .policy import (
     DEFAULT_TESTS_BUDGET_SECONDS,
     _config_error,
@@ -247,7 +248,7 @@ def _error_document(document: Any) -> bool:
 
 def _read_document(path: Path, selected: list[str], version: str) -> dict[str, Any]:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = load_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError(f"a JSON result document, got {error}") from error
     _validate_report_version(document, version)

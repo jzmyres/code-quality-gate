@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import (
     BASE_CONFIG,
@@ -18,6 +19,8 @@ from support import (
 
 sys.path.insert(0, str(GATE))
 regexrun = importlib.import_module("quality_gate.regexrun")
+checks = importlib.import_module("quality_gate.checks")
+runner = importlib.import_module("quality_gate.runner")
 
 
 def process_state(pid: int) -> str | None:
@@ -437,6 +440,17 @@ class CommandCheckTests(FixtureCase):
         self.assertLessEqual(len(diagnostics["output_tail"].encode()), 4096)
 
 class RegexRunnerTests(unittest.TestCase):
+    def test_ambiguous_or_non_json_matching_results_are_refused(self) -> None:
+        for text in ('{"tests": [], "tests": [["1"]]}', '{"tests": NaN}',
+                     '{"tests": Infinity}', '{"tests": -Infinity}'):
+            with self.subTest(text=text):
+                child = runner.RunResult(argv=(), execution="completed", returncode=0,
+                                         stdout=text.encode())
+                with mock.patch.object(checks, "run", return_value=child):
+                    matches, result = checks._pattern_matches({"tests": "pattern"}, "text", 60)
+                self.assertIsNone(matches)
+                self.assertIs(result, child)
+
     def test_evaluate_returns_the_captures_of_every_pattern(self) -> None:
         result = regexrun.evaluate(
             {

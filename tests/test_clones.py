@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -781,6 +782,19 @@ class CloneOutcomeTests(unittest.TestCase):
 class SarifLocationTests(unittest.TestCase):
     root = Path("/repo")
     report = Path("report.sarif")
+
+    def test_duplicate_results_are_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.sarif"
+            report.write_text('{"runs":[{"tool":{"driver":{"name":"jscpd"}},'
+                              '"results":[{}],"results":[]}]}', encoding="utf-8")
+            with self.assertRaises(policy.UnsupportedError) as raised:
+                clones._parse_sarif(report, self.root)
+        message = str(raised.exception)
+        self.assertIn("no completed jscpd run", message)
+        self.assertIn("invalid JSON", message)
+        self.assertIn("duplicate name 'results'", message)
+        self.assertIn(str(report), message)
 
     def location(self, **physical: object) -> dict[str, object]:
         return {"physicalLocation": physical}

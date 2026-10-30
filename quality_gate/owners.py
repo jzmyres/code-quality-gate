@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .files import _shebang_interpreter
+from .json_input import load_json
 from .owners_match import Occurrence, covered
 from .owners_python import python_code, python_events
 from .owners_shell import shell_events
@@ -329,7 +330,7 @@ def _regex_events(jobs: list[dict[str, Any]], deadline: float) -> dict[str, list
     if not jobs:
         return {}
     try:
-        matches = json.loads(_run_regex(jobs, deadline))
+        matches = load_json(_run_regex(jobs, deadline))
         return {
             path: [
                 Occurrence("text-regex", value, line, start, end, ("text", start), frozenset())

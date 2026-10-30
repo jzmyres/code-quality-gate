@@ -26,6 +26,7 @@ from .coverage_tool import (
     coverage_config_text,
 )
 from .files import git_argv, hygiene_result, validate_inventory
+from .json_input import load_json
 from .owners import measure_owners
 from .policy import (
     CheckDef,
@@ -456,7 +457,7 @@ def _pattern_matches(
     if result.execution != "completed" or result.returncode != 0:
         return None, result
     try:
-        return analysis_step("output matching analysis", json.loads, result.stdout_text), result
+        return analysis_step("output matching analysis", load_json, result.stdout_text), result
     except ValueError:
         return None, result
 

@@ -68,6 +68,12 @@ selected, passed and failed, with any named failures. A metric adapter returns f
 prerequisite is every earlier check with `tests` evidence: `python_tests`, `elisp_tests`, and
 `command` checks with `tests_pattern`.
 
+The parent process decodes JSON evidence documents and tool results through one strict loader before
+validating their adapter-specific shape. Duplicate object names at any depth are invalid, even when
+their values agree; the diagnostic names the duplicated name with a bounded excerpt. `NaN`, `Infinity`
+and `-Infinity` are invalid JSON too. Each reader reports these through its existing invalid-JSON path,
+so a later object member cannot erase an earlier failure or measurement.
+
 The descriptor's `subject_noun` labels subjects in failure messages: `"clone"` gives
 `clone X` for an existing baseline entry and `new clone X` for a new subject. The default
 empty noun prints the bare subject. Its `failure_wording` defaults to `"metric"` for

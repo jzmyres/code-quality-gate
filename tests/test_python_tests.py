@@ -868,6 +868,15 @@ class CoverageRegistryTests(unittest.TestCase):
         self.assertIn("is unreadable", message)
         self.assertIn(str(record), message)
 
+    def test_duplicate_dataset_is_unsupported_with_its_path(self) -> None:
+        record = self.record(text='{"dataset":"../unsafe","dataset":".coverage.abc","program":"prog.py"}')
+        with self.assertRaises(policy.UnsupportedError) as raised:
+            self.combine()
+        message = str(raised.exception)
+        self.assertIn("is unreadable", message)
+        self.assertIn("duplicate name 'dataset'", message)
+        self.assertIn(str(record), message)
+
     def test_corrupt_dataset_names_the_invocation_program_and_dataset(
         self,
     ) -> None:

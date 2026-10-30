@@ -270,7 +270,10 @@ class ElispLintTests(FixtureCase):
 
     def lint_report_version(self, version: object, *, exit_code: int = 0) -> None:
         document = {"emacs_version": version, "files": ["src/core.el"], "failed": [], "issues": []}
-        encoded = json.dumps(json.dumps(document))
+        self.lint_report(json.dumps(document), exit_code=exit_code)
+
+    def lint_report(self, report: str, *, exit_code: int = 0) -> None:
+        encoded = json.dumps(report)
         form = f"(progn (require 'json) (defun json-encode (_value) {encoded}))"
         wrapper = self.base / "report-emacs"
         wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
@@ -280,6 +283,15 @@ class ElispLintTests(FixtureCase):
         wrapper.chmod(0o755)
         option = f'emacs = {json.dumps(str(wrapper))}'
         self.write_config(config(options={name: option for name in ("elisp_compile", "elisp_checkdoc")}))
+
+    def test_duplicate_failed_is_unsupported(self) -> None:
+        self.lint_report('{"emacs_version":"30.1","files":["src/core.el"],'
+                         '"failed":["src/core.el"],"failed":[],"issues":[]}')
+        _result, document = self.run_checks(1)
+        for adapter in ("elisp_compile", "elisp_checkdoc"):
+            check = self.assert_check(document, adapter, "unsupported")
+            self.assertIn("JSON lint report", check["reason"])
+            self.assertIn("duplicate name 'failed'", check["reason"])
 
     def test_report_version_must_equal_preflight_before_use(self) -> None:
         for version in REPORT_VERSION_MISMATCHES:

@@ -28,6 +28,8 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .json_input import load_json
+
 CAPTURE_LIMIT = 1024 * 1024
 TAIL_LIMIT = 4096
 GRACE_SECONDS = 5.0
@@ -81,7 +83,7 @@ def _registry_data(registry: _WorkerRegistry):
     with open(registry.path, "r+", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         try:
-            data = json.load(stream)
+            data = load_json(stream.read())
             yield data
             stream.seek(0)
             json.dump(data, stream)

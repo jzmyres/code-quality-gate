@@ -453,6 +453,14 @@ baseline = "crap.toml"
                 self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {encoded})\n")
                 self.assert_outcome("unsupported", "expected", "got")
 
+    def test_duplicate_test_count_is_unsupported(self) -> None:
+        report = ('{"emacs_version":"30.1","selected":1,"passed":1,"failed":1,"failed":0,'
+                  '"skipped":0,"failures":[],"definitions":[]}')
+        self.report_version("30.1")
+        self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {json.dumps(report)})\n")
+        _result, check = self.assert_outcome("unsupported", "JSON result document", "duplicate name 'failed'")
+        self.assertNotIn("test_results", check)
+
     def test_budget_kills_emacs_and_its_process_group(self) -> None:
         marker = self.base / "emacs-pid"
         child_marker = self.base / "child-pid"

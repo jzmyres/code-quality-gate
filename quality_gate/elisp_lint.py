@@ -1,12 +1,12 @@
 """Run isolated Emacs Lisp compilation and checkdoc checks."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
+from .json_input import load_json
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
 
 
@@ -68,7 +68,7 @@ def _content_valid(document: dict[str, Any], files: list[str], mode: str) -> boo
 
 def _read_document(path: Path, files: list[str], mode: str, version: str) -> dict[str, Any]:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = load_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError(f"a JSON lint report, got {error}") from error
     _validate_report_version(document, version)

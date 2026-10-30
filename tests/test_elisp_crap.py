@@ -455,6 +455,26 @@ checks = ["crap"]
             "src/core.el:foo:bar", "src/core.el:foo bar", "src/core.el:λ", "src/core.el:",
         })
 
+    def test_duplicate_complexity_definitions_are_an_error(self) -> None:
+        report = ('{"definitions":[{"file":"src/core.el","name":"sample-used",'
+                  '"line":2,"end_line":3,"start":1,"end":200,"cc":100}],"definitions":[]}')
+        helper = self.base / "duplicate-helper.el"
+        helper.write_text('(defun qg-elisp-complexity-run (_root _files result) '
+                          f'(with-temp-file result (insert {json.dumps(report)})))\n', encoding="utf-8")
+        wrapper = self.base / "emacs-wrapper"
+        wrapper.write_text('#!/bin/sh\ncase "$4" in\n'
+                           f'*qg-elisp-complexity.el) exec emacs -Q --batch -l {shlex.quote(str(helper))} '
+                           '--eval "$6";;\nesac\nexec emacs "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        self.write_config(crap_config().replace('suite = "tests/suite.el"',
+                          f'suite = "tests/suite.el"\nemacs = {json.dumps(str(wrapper))}'))
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("expected a complexity JSON result", check["reason"])
+        self.assertIn("duplicate name 'definitions'", check["reason"])
+        self.assertEqual(check["findings"], [])
+
     def test_suite_runs_only_once(self) -> None:
         counter = self.base / "suite-runs"
         expression = ('(with-temp-buffer (insert "run\\n") '

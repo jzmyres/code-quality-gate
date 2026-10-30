@@ -114,6 +114,21 @@ class ReapTests(unittest.TestCase):
 
 
 class AnalysisWorkerTests(unittest.TestCase):
+    def test_worker_registry_refuses_duplicate_names_and_non_json_constants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "registry.json"
+            registry = runner._WorkerRegistry(str(path))
+            for text in ('{"cancelled":[123],"cancelled":[],"entries":{}}',
+                         '{"cancelled":[],"entries":NaN}',
+                         '{"cancelled":[],"entries":Infinity}',
+                         '{"cancelled":[],"entries":-Infinity}'):
+                with self.subTest(text=text):
+                    path.write_text(text, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        with runner._registry_data(registry):
+                            self.fail("invalid registry was accepted")
+                    self.assertEqual(path.read_text(encoding="utf-8"), text)
+
     def test_process_registration_and_cancellation_are_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "registry.json"

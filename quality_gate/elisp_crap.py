@@ -1,13 +1,13 @@
 """Join Emacs Lisp default or policy decision rules with earlier Edebug evidence."""
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from .elisp_tests import _lisp_string, _temporary, version_failure
+from .json_input import load_json
 from .policy import GateError
 from .ratchet import Domain, Finding, Location
 from .runner import analysis_step, mark_step, record_diagnostics, run
@@ -77,7 +77,7 @@ def _valid_document(document: Any, selected: list[str]) -> bool:
 
 def _read_result(path: Path, selected: list[str]) -> dict[str, Any]:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = load_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise GateError(f"expected a complexity JSON result, got {error}") from error
     if _error_document(document):

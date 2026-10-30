@@ -6,11 +6,11 @@ adapters, and they put the tools cache's coverage install on sys.path first.
 from __future__ import annotations
 
 import configparser
-import json
 import sys
 from pathlib import Path
 from types import ModuleType
 
+from .json_input import load_json
 from .policy import GateError, UnsupportedError, UsageError
 from .tools import installed_tool_dir
 
@@ -137,7 +137,7 @@ def _registry_dataset(path: Path, document: object) -> str:
 
 def _read_registration(path: Path) -> tuple[str, str]:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = load_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise UnsupportedError(
             f"coverage registry record {path} is unreadable: {error}"

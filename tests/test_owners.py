@@ -6,10 +6,11 @@ import json
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from unittest import mock
 
 from support import BASE_CONFIG, FixtureCase, output
 from test_trust import TrustCase
-from quality_gate.owners import _read_regular
+from quality_gate.owners import _read_regular, _regex_events
 from quality_gate.owners_regex import _matches, _run
 from quality_gate.policy import GateError
 
@@ -476,6 +477,14 @@ class RuleAndBaselineTests(OwnerCase):
         with redirect_stdout(buffer):
             _run(str(job))
         self.assertEqual(json.loads(buffer.getvalue()), {"p": expected})
+
+    def test_ambiguous_or_non_json_regex_results_are_errors(self) -> None:
+        for text in ('{"p": [["needle", 1, 0, 6]], "p": []}', '{"p": NaN}',
+                     '{"p": Infinity}', '{"p": -Infinity}'):
+            with self.subTest(text=text):
+                with mock.patch("quality_gate.owners._run_regex", return_value=text):
+                    with self.assertRaisesRegex(GateError, "invalid owners text regular expression results"):
+                        _regex_events([{"path": "p"}], 0.0)
 
 
 class RealCallSiteTests(OwnerCase):
