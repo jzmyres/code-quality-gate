@@ -479,21 +479,6 @@ def subject_direction(adapter: Any, direction: str, subject: str) -> str:
     return descriptor.direction_for_subject(subject, direction)
 
 
-def metric_direction(adapter: Any, direction: str, kind: str) -> str:
-    descriptor = _descriptor(adapter)
-    if descriptor is None:
-        return direction
-    return descriptor.direction(kind, direction)
-
-
-def entry_direction(
-    adapter: Any, direction: str, subject: str, kind: str | None = None
-) -> str:
-    if kind is not None:
-        return metric_direction(adapter, direction, kind)
-    return subject_direction(adapter, direction, subject)
-
-
 def _within(value: float, bound: float, direction: str) -> bool:
     if direction == "min":
         return value >= bound
@@ -893,7 +878,7 @@ def _evaluate_finding(
     adapter: str,
     direction: str,
 ) -> _Verdict:
-    direction = metric_direction(adapter, direction, finding.kind)
+    direction = subject_direction(adapter, direction, finding.subject)
     entry = by_subject.get(finding.subject)
     if direction == "min":
         if entry is None:
@@ -1026,13 +1011,10 @@ def evaluate(
 ) -> RatchetResult:
     today = today or datetime.date.today()
     _finite_inputs(findings, entries, threshold, prefix)
-    kinds = {finding.subject: finding.kind for finding in findings}
     entries = [
         replace(
             entry,
-            direction=entry_direction(
-                adapter, direction, entry.subject, kinds.get(entry.subject)
-            ),
+            direction=subject_direction(adapter, direction, entry.subject),
         )
         for entry in entries
     ]

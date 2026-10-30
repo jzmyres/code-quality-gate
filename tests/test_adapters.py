@@ -166,7 +166,19 @@ class AdapterRegistrationTests(unittest.TestCase):
         with mock.patch.dict(adapters.ADAPTERS):
             with self.assertRaisesRegex(
                 ValueError,
-                r"adapter 'floor-stub': kinds \(floor=min\).*default 'max'.*entry_direction",
+                r"adapter 'floor-stub': kinds \(floor=min\).*'min'.*'max'.*entry_direction",
+            ):
+                adapters.register_adapter(descriptor)
+            self.assertNotIn(descriptor.name, adapters.ADAPTERS)
+
+    def test_matching_descriptor_default_still_requires_subject_directions(self) -> None:
+        descriptor = dataclasses.replace(
+            FLOOR_STUB, default_direction="min", entry_direction=None,
+        )
+        with mock.patch.dict(adapters.ADAPTERS):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"adapter 'floor-stub': kinds \(floor=min\).*'min'.*'max'.*entry_direction",
             ):
                 adapters.register_adapter(descriptor)
             self.assertNotIn(descriptor.name, adapters.ADAPTERS)
@@ -183,15 +195,36 @@ class AdapterRegistrationTests(unittest.TestCase):
                 adapters.register_adapter(descriptor)
             self.assertNotIn(descriptor.name, adapters.ADAPTERS)
 
-    def test_kinds_matching_the_default_register_without_subject_rule(self) -> None:
+    def test_kind_overrides_need_a_rule_for_either_configured_default(self) -> None:
+        for default in (None, "max", "min"):
+            for kind_direction in ("max", "min"):
+                with (
+                    self.subTest(default=default, kind_direction=kind_direction),
+                    mock.patch.dict(adapters.ADAPTERS),
+                ):
+                    descriptor = dataclasses.replace(
+                        FLOOR_STUB, directions={"metric": kind_direction},
+                        default_direction=default, entry_direction=None,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, f"floor-stub.*metric={kind_direction}.*entry_direction"
+                    ):
+                        adapters.register_adapter(descriptor)
+
+    def test_fixed_or_configured_defaults_register_without_subject_rule(self) -> None:
         for default in (None, "max", "min"):
             with self.subTest(default=default), mock.patch.dict(adapters.ADAPTERS):
                 descriptor = dataclasses.replace(
-                    FLOOR_STUB, directions={"metric": default or "max"},
+                    FLOOR_STUB, directions={},
                     default_direction=default, entry_direction=None,
                 )
                 self.assertIs(adapters.register_adapter(descriptor), descriptor)
                 self.assertIs(adapters.adapter_for(descriptor.name), descriptor)
+                for configured in ("max", "min"):
+                    self.assertEqual(
+                        descriptor.direction_for_subject("any-subject", configured),
+                        default or configured,
+                    )
 
     def test_shipped_adapters_register_unchanged(self) -> None:
         names = (
@@ -269,13 +302,13 @@ class StubAdapterTests(unittest.TestCase):
             [finding.subject for finding in verification.findings],
         )
 
-    def test_direction_uses_the_finding_kind_not_its_subject(self) -> None:
+    def test_findings_use_the_same_subject_direction_as_baseline_entries(self) -> None:
         entry = ratchet.BaselineEntry("tests:tests:executed", 4, "floor")
-        maximum = ratchet.Finding(
+        finding = ratchet.Finding(
             "tests:tests:executed", 5, "test summary", kind="metric"
         )
         result = ratchet.evaluate(
-            [maximum],
+            [finding],
             [entry],
             threshold=0,
             enforcement="enforced",
@@ -283,14 +316,15 @@ class StubAdapterTests(unittest.TestCase):
             adapter="verification",
             domain=ratchet.Domain.all(),
         )
-        self.assertEqual(result.findings[0].direction, "max")
-        self.assertTrue(result.findings[0].blocking)
+        self.assertEqual(result.entries[0].direction, "min")
+        self.assertEqual(result.findings[0].direction, "min")
+        self.assertFalse(result.findings[0].blocking)
 
-        minimum = ratchet.Finding(
+        finding = ratchet.Finding(
             "not-a-test-subject", 5, "test summary", kind="executed"
         )
         result = ratchet.evaluate(
-            [minimum],
+            [finding],
             [ratchet.BaselineEntry("not-a-test-subject", 4, "floor")],
             threshold=0,
             enforcement="enforced",
@@ -298,10 +332,11 @@ class StubAdapterTests(unittest.TestCase):
             adapter="verification",
             domain=ratchet.Domain.all(),
         )
-        self.assertEqual(result.findings[0].direction, "min")
-        self.assertFalse(result.findings[0].blocking)
+        self.assertEqual(result.entries[0].direction, "max")
+        self.assertEqual(result.findings[0].direction, "max")
+        self.assertTrue(result.findings[0].blocking)
 
-    def test_descriptor_directions_apply_to_registered_kinds(self) -> None:
+    def test_descriptor_subject_rule_covers_floor_kind(self) -> None:
         entry = ratchet.BaselineEntry("floor-subject", 4, "floor")
         result = ratchet.evaluate(
             [ratchet.Finding("floor-subject", 5, "file:1", kind="floor")],
@@ -314,6 +349,44 @@ class StubAdapterTests(unittest.TestCase):
         )
         self.assertEqual(result.findings[0].direction, "min")
         self.assertFalse(result.findings[0].blocking)
+
+    def test_fixed_descriptor_default_drives_loading_and_evaluation(self) -> None:
+        descriptor = dataclasses.replace(
+            FLOOR_STUB, directions={}, default_direction="min", entry_direction=None,
+        )
+        adapters.register_adapter(descriptor)
+        self.addCleanup(adapters.remove_adapter, descriptor.name)
+        path = self.root / "floor.toml"
+        path.write_text(
+            baseline_text(
+                [{"subject": "anything", "bound": 4, "reason": "floor"}],
+                check="floor", metric_version="stub/1",
+            ),
+            encoding="utf-8",
+        )
+        entries = ratchet.load_baseline(
+            path, check_id="floor", metric_version="stub/1",
+            adapter=descriptor, direction="max",
+        )
+        self.assertEqual(entries[0].direction, "min")
+        result = ratchet.evaluate(
+            [ratchet.Finding("anything", 3, "file:1")], entries,
+            threshold=0, enforcement="enforced", prefix="check: floor",
+            adapter=descriptor, domain=ratchet.Domain.all(), direction="max",
+        )
+        self.assertEqual(result.entries[0].direction, "min")
+        self.assertEqual(result.findings[0].direction, "min")
+        self.assertFalse(result.satisfied)
+
+    def test_finding_without_entry_uses_the_subject_rule(self) -> None:
+        result = ratchet.evaluate(
+            [ratchet.Finding("floor-subject", 5, "file:1", kind="metric")], [],
+            threshold=0, enforcement="enforced", prefix="check: stub",
+            adapter=STUB, domain=ratchet.Domain.all(), direction="max",
+        )
+        self.assertEqual(result.findings[0].direction, "min")
+        self.assertEqual(result.unmeasured, ["floor-subject"])
+        self.assertFalse(result.satisfied)
 
     def test_prune_keeps_a_minimum_metric_at_its_measured_value(self) -> None:
         result = ratchet.evaluate(

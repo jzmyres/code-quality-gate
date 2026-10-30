@@ -64,16 +64,15 @@ parser, run function, location coverage, number display, metric direction per su
 produces test results, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The
 registry is the only list of supported adapters. A test adapter returns normalized test results:
 selected, passed and failed, with any named failures. A metric adapter returns findings. Verification's
-prerequisite is every earlier result from an adapter that produces tests, whatever its language, and
-the ratchet takes each finding's direction from its descriptor and subject kind rather than its subject
-text.
+prerequisite is every earlier result from an adapter that produces tests, whatever its language.
 
-When writing an adapter with minimum kinds, declare its subjects' directions with
-`entry_direction(subject, configured)`, matching the directions used to evaluate their findings.
-`register_adapter` refuses kinds with mixed directions or a direction different from the descriptor's
-default (`max` when unset) unless this per-subject rule is provided. For example,
-`directions={"floor": "min"}` with a `max` default needs a rule identifying its floor subjects, so the
-trusted baseline merge can preserve them before any findings exist.
+An adapter's baseline entries and findings use the same direction for each subject. A descriptor can
+declare `entry_direction(subject, configured)` to choose it; otherwise its `default_direction` applies,
+or the policy's configured `direction` when no descriptor default is set. A descriptor declaring kind
+directions must provide the per-subject rule, even when the kind directions match its own default: the
+policy default may be either `max` or `min`. For example, `directions={"floor": "min"}` needs a rule
+identifying its floor subjects, so the trusted baseline merge can preserve them before findings exist.
+The rule must assign each subject the direction intended for its finding's kind.
 
 The implementer agents' learned memory lives in `.agents/AGENTS.md`, written by the runner's
 reflection step after each batch and reviewed before landing.
@@ -1025,9 +1024,9 @@ identity and then holds `[[entry]]` tables:
 * `bound` is the largest value a `max` entry accepts and the smallest value a `min` entry
   accepts. It must be finite (`inf` and `nan` are errors), and is compared unrounded; exactly at the
   bound passes.
-* An entry's direction is the one the check evaluated for its subject: a measured finding's kind
-  decides it, and a subject with no finding uses the adapter's per-subject rule and otherwise the
-  check's `direction`. Evaluation, pruning and the trusted merge all use that same direction.
+* An entry and its finding use the adapter's direction for their subject, whether or not a finding
+  exists yet. The adapter's per-subject rule, descriptor default or check's configured `direction`
+  decides it. Evaluation, pruning and the trusted merge all use that same direction.
 * `reason` must be non-empty. An empty or missing reason fails the check even if the value is covered.
 * `expires` is optional. A TOML date before today no longer covers its subject and is reported as
   expired. An entry expiring today still covers today.

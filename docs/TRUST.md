@@ -115,10 +115,9 @@ Baselines tighten only:
 * a candidate baseline that cannot be parsed is ignored in full, and every
   `REV` entry is used unchanged.
 
-Each entry's `max` or `min` direction is the one the check evaluated for its
-subject: the measured finding's kind decides it, and a subject with no finding
-uses the adapter's per-subject rule and otherwise the check's configured
-`direction`.
+Each entry and finding use the same `max` or `min` direction for their
+subject. The adapter's per-subject rule, descriptor default or check's
+configured `direction` decides it, including before any finding exists.
 
 The entry set used for the run is therefore `REV`'s entries with candidate
 removals of `max` entries and tightened bounds applied. The entries whose

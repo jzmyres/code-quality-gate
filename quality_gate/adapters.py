@@ -83,15 +83,10 @@ class AdapterDescriptor:
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
 
-    def direction(self, kind: str, configured: str) -> str:
-        if kind in self.directions:
-            return self.directions[kind]
-        return self.default_direction or configured
-
     def direction_for_subject(self, subject: str, configured: str) -> str:
         if self.entry_direction is not None:
             return self.entry_direction(subject, configured)
-        return configured
+        return self.default_direction or configured
 
 
 def _baseline(raw: dict[str, Any], root: Path, path: Path, full_key: str) -> Path:
@@ -257,14 +252,14 @@ ADAPTERS: dict[str, AdapterDescriptor] = {}
 
 
 def register_adapter(descriptor: AdapterDescriptor) -> AdapterDescriptor:
-    default = descriptor.default_direction or "max"
-    if descriptor.entry_direction is None and set(descriptor.directions.values()) - {default}:
+    if descriptor.entry_direction is None and descriptor.directions:
         kinds = ", ".join(
             f"{kind}={direction}" for kind, direction in descriptor.directions.items()
         )
         raise ValueError(
-            f"adapter {descriptor.name!r}: kinds ({kinds}) differ from default "
-            f"{default!r}; expected entry_direction to decide each subject's direction"
+            f"adapter {descriptor.name!r}: kinds ({kinds}) can differ from configured "
+            "direction 'min' or 'max'; expected entry_direction to decide each "
+            "subject's direction"
         )
     ADAPTERS[descriptor.name] = descriptor
     return descriptor

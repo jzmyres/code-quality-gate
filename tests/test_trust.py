@@ -371,7 +371,9 @@ class StubFloorTrustTests(TrustCase):
         super().setUp()
         adapters.register_adapter(FLOOR_STUB)
         self.addCleanup(adapters.remove_adapter, FLOOR_STUB.name)
-        self.write_config(FLOOR_CONFIG)
+        self.write_config(FLOOR_CONFIG.replace(
+            'enforcement = "enforced"', 'enforcement = "enforced"\ndirection = "max"',
+        ))
         self.add_file(
             "floor.toml",
             baseline_text(
@@ -390,10 +392,7 @@ class StubFloorTrustTests(TrustCase):
             baseline_text([], check="floor", metric_version="stub/1"),
         )
 
-    def test_candidate_omitting_a_floor_keeps_the_trusted_bound(self) -> None:
-        self.assertIs(adapters.adapter_for(FLOOR_STUB.name), FLOOR_STUB)
-        prepared = prepare_trust(self.repo, self.revision, [])
-        self.addCleanup(prepared.close)
+    def assert_floor_retained(self, prepared: trust.Trust) -> None:
         entries = prepared.config.checks["floor"].effective_baseline
         self.assertEqual(
             [(entry.subject, entry.bound, entry.direction) for entry in entries],
@@ -404,6 +403,43 @@ class StubFloorTrustTests(TrustCase):
         )
         self.assertEqual(item.status, "ignored")
         self.assertEqual(item.ignored_entries, ("floor-subject",))
+
+    def test_candidate_omitting_a_floor_keeps_the_trusted_bound(self) -> None:
+        self.assertIs(adapters.adapter_for(FLOOR_STUB.name), FLOOR_STUB)
+        prepared = prepare_trust(self.repo, self.revision, [])
+        self.addCleanup(prepared.close)
+        self.assert_floor_retained(prepared)
+
+    def test_all_minimum_kinds_keep_floor_with_max_configured_default(self) -> None:
+        descriptor = replace(
+            FLOOR_STUB,
+            default_direction="min",
+            entry_direction=lambda _subject, _configured: "min",
+        )
+        adapters.register_adapter(descriptor)
+        prepared = prepare_trust(self.repo, self.revision, [])
+        self.addCleanup(prepared.close)
+        check = prepared.config.checks["floor"]
+        self.assertEqual(check.direction, "max")
+        self.assert_floor_retained(prepared)
+        entries = check.effective_baseline
+        for value, satisfied in ((3, False), (4, True), (5, True)):
+            with self.subTest(value=value):
+                result = ratchet.evaluate(
+                    [ratchet.Finding("floor-subject", value, "file:1", kind="floor")],
+                    entries,
+                    threshold=0,
+                    enforcement="enforced",
+                    prefix="check: floor",
+                    adapter=descriptor,
+                    domain=ratchet.Domain.all(),
+                    direction=check.direction,
+                )
+                self.assertEqual(result.entries[0].direction, "min")
+                self.assertEqual(result.findings[0].direction, "min")
+                self.assertEqual(result.satisfied, satisfied)
+                if satisfied:
+                    self.assertEqual(ratchet.pruned_entries(result)[0].bound, value)
 
 
 class PolicyTrustTests(TrustCase):
