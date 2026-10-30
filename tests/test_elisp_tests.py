@@ -300,6 +300,53 @@ baseline = "crap.toml"
                 self.assertEqual(log.read_text().splitlines(),
                                  ["-Q --batch --eval (princ emacs-version)"] * 4)
 
+    def assert_probe_refused(self, wrapper: Path, log: Path, shown: str,
+                            *, truncated: bool = False, exit_code: int = 0) -> None:
+        result, document = self.run_json()
+        self.assertEqual(log.read_text().splitlines(),
+                         ["-Q --batch --eval (princ emacs-version)"] * 4)
+        self.assertEqual(result.returncode, 1, output(result))
+        for name in ("legacy-tests", "crap", "compile", "checkdoc"):
+            check = self.check_by_id(document, name)
+            reason = check["reason"]
+            with self.subTest(check=name):
+                self.assertIn(shown, reason)
+                self.assertEqual(check["outcome"], "unsupported", output(result))
+                self.assertIn(str(wrapper), reason)
+                self.assertLess(len(reason), len(str(wrapper)) + 256)
+                self.assertEqual(check["diagnostics"]["output_truncated"], truncated)
+                self.assertEqual(check["diagnostics"]["exit_code"], exit_code)
+                self.assertNotIn("test_results", check)
+
+    def test_truncated_emacs_version_is_unsupported_before_any_measurement(self) -> None:
+        version = "30.1" + " " * (1024 * 1024) + "suffix"
+        # Also isolate the truncation flag when the captured prefix fits the version bound.
+        for capture_limit in (None, 128):
+            with self.subTest(capture_limit=capture_limit):
+                wrapper, log = self.version_probe(version)
+                if capture_limit is not None:
+                    gate = self.fixture_gate()
+                    runner = gate / "quality_gate/runner.py"
+                    text = runner.read_text(encoding="utf-8")
+                    runner.write_text(text.replace("capture_limit: int | None = CAPTURE_LIMIT",
+                                                   f"capture_limit: int | None = {capture_limit}"),
+                                      encoding="utf-8")
+                    self.fixture_runner = lambda gate=gate: gate / "qg.py"
+                shown = version[:128] + ("..." if capture_limit is None else "")
+                self.assert_probe_refused(wrapper, log, repr(shown), truncated=True)
+
+    def test_emacs_version_size_is_bounded_before_stripping_whitespace(self) -> None:
+        for version in ("30.1" + " " * 125, " " * 125 + "30.1"):
+            with self.subTest(version=version):
+                wrapper, log = self.version_probe(version)
+                self.assert_probe_refused(wrapper, log, repr(version[:128] + "..."))
+
+    def test_failed_emacs_version_probe_has_a_bounded_reason_for_every_check(self) -> None:
+        wrapper, log = self.version_probe("9" * 45000)
+        text = wrapper.read_text(encoding="utf-8")
+        wrapper.write_text(text.replace(";;", "; exit 7;;", 1), encoding="utf-8")
+        self.assert_probe_refused(wrapper, log, "9" * 128 + "...", exit_code=7)
+
     def test_invalid_emacs_version_probe_is_unsupported(self) -> None:
         wrapper = self.base / "emacs"
         for command in ("printf garbage", "exit 7", "exit 0"):

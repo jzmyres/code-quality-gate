@@ -43,10 +43,22 @@ def _version_excerpt(version: str) -> str:
     return version[:_VERSION_TEXT_LIMIT] + ("..." if len(version) > _VERSION_TEXT_LIMIT else "")
 
 
-def _version_reason(child: Any, emacs: str, minimum: str) -> str | None:
+def _version_probe_reason(child: Any, emacs: str) -> str | None:
     if child.execution != "completed" or child.returncode != 0:
+        shown = _version_excerpt(child.error or child.combined_text)
         return (f"expected Emacs command {emacs!r} to report its version, got "
-                f"exit {child.returncode}, execution {child.execution}: {child.error or child.combined_text}")
+                f"exit {child.returncode}, execution {child.execution}: {shown}")
+    if child.output_truncated or len(child.combined_text) > _VERSION_TEXT_LIMIT:
+        shown = _version_excerpt(child.combined_text)
+        return (f"expected complete Emacs version output of at most {_VERSION_TEXT_LIMIT} characters "
+                f"from command {emacs!r}, got {shown!r}")
+    return None
+
+
+def _version_reason(child: Any, emacs: str, minimum: str) -> str | None:
+    failure = _version_probe_reason(child, emacs)
+    if failure is not None:
+        return failure
     version = child.combined_text.strip()
     if not _numeric_version(version):
         shown = _version_excerpt(version)

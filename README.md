@@ -318,6 +318,9 @@ missing, repeated or inconsistent with its headings, reports no `test_results`; 
 
 All Emacs Lisp checks require Emacs 30.1 or later. An older Emacs makes the check `unsupported`,
 naming the version found and the minimum, before any suite or source file is loaded.
+Truncated version-probe output or output over 128 characters before whitespace is stripped also
+makes the check `unsupported`, naming the command and a bounded output excerpt. Failed version
+probes use the same excerpt bound.
 The suite must be a regular file, and every `load_path`
 entry must be a directory in the repository. Unknown keys and invalid configuration are errors. The
 adapter instruments the files of every class listing the check with Edebug, preserving each file's
