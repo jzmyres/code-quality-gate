@@ -1247,13 +1247,16 @@ The check matrix restores the pinned tools cache keyed on the environment name, 
 Ruff, clones, the test suite under coverage, Python CRAP and the Emacs Lisp checks. The separate
 Debian 13 job restores the same Debian tools cache and runs `make mutation`.
 
-The gate step has a 20-minute timeout: `make -k check` on `08c86d4` took 313 seconds in the offline
-sandbox on 2026-10-30. The rule is the smallest multiple of five minutes at least three times the
-measurement: 3 × 313 = 939 seconds, rounded up to 20 minutes. Ubuntu's Emacs source build runs only
-on a cold cache and has its own 30-minute step timeout. Each check job adds a 10-minute setup
-allowance for packages, checkout, cache operations, Python installation and fetching tools: Debian
-has a 30-minute job timeout (20 + 10), Ubuntu 60 minutes (20 + 30 + 10). The mutation step retains
-its 90-minute bound and adds 10 minutes for setup, giving that job a 100-minute timeout.
+Step timeouts use the smallest multiple of five minutes at least three times the measured duration.
+GitHub run `41136060160` on `bd3b0b9` (2026-10-30) measured the gate at 581 seconds on Debian
+and 576 seconds on Ubuntu,
+the cold-cache Ubuntu Emacs build at 99 seconds, and mutation testing at 3809 seconds. Using the
+slower gate measurement gives these bounds: gate 30 minutes (3 × 581 = 1743 seconds), Emacs build
+5 minutes (3 × 99 = 297 seconds), and mutation step 195 minutes (3 × 3809 = 11427 seconds).
+Each job adds a 10-minute setup allowance for packages, checkout, cache operations, Python
+installation and fetching tools: Debian has a 40-minute job timeout (30 + 10), Ubuntu 45 minutes
+(30 + 5 + 10), and mutation 205 minutes (195 + 10). `tests/test_workflow.py` checks the step rule
+and each job's sum, including Ubuntu's Emacs build to allow for a cold cache.
 
 Reproduce it locally with the same tools cache:
 

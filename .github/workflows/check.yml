@@ -27,13 +27,13 @@ jobs:
             image: debian:13
             python: "3.13"
             emacs: "30.1"
-            timeout: 30
+            timeout: 40
           - name: ubuntu2604
             image: ubuntu:26.04
-            timeout: 60
+            timeout: 45
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
-    # Gate 20 + cold-cache Emacs build 30 (Ubuntu only) + setup allowance 10 minutes.
+    # Gate 30 + cold-cache Emacs build 5 (Ubuntu only) + setup allowance 10 minutes.
     # Setup covers packages, checkout, cache operations, Python installation and tool fetching.
     timeout-minutes: ${{ matrix.timeout }}
     env:
@@ -55,7 +55,10 @@ jobs:
           key: ${{ matrix.image }}-${{ runner.arch }}-emacs-${{ env.EMACS_VERSION }}-${{ env.EMACS_SHA256 }}
       - name: Build pinned batch Emacs
         if: matrix.name == 'ubuntu2604' && steps.emacs-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 30
+        # Measured 99 s (cold cache, ubuntu2604) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
+        # Rule: smallest multiple of 5 minutes at least 3 x measured seconds / 60.
+        # 3 x 99 s = 297 s; round up to a multiple of 5 minutes: 5 minutes.
+        timeout-minutes: 5
         run: |
           apt-get install -y --no-install-recommends build-essential libncurses-dev pkg-config texinfo
           curl --fail --location --retry 3 "$EMACS_URL" -o /tmp/emacs.tar.xz
@@ -115,17 +118,17 @@ jobs:
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Run the gate
-        # Rule: smallest multiple of 5 minutes at least three times the measured check time.
-        # 2026-10-30: make -k check on 08c86d4 took 313 s in the offline sandbox.
-        # 3 x 313 s = 939 s; round up to a multiple of 5 minutes: 20 minutes.
-        timeout-minutes: 20
+        # Measured 581 s (debian13; ubuntu2604 took 576 s) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
+        # Rule: smallest multiple of 5 minutes at least 3 x measured seconds / 60.
+        # 3 x 581 s = 1743 s; round up to a multiple of 5 minutes: 30 minutes.
+        timeout-minutes: 30
         run: make -k check
 
   mutation:
     runs-on: ubuntu-latest
     container: debian:13
-    # Mutation step 90 + setup allowance 10 minutes for packages, checkout, cache and tool fetching.
-    timeout-minutes: 100
+    # Mutation step 195 + setup allowance 10 minutes for packages, checkout, cache and tool fetching.
+    timeout-minutes: 205
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
     steps:
@@ -149,5 +152,8 @@ jobs:
         run: python3 -I qg.py tools fetch
       - name: Mutation-test gate decisions
         # Mutations run the complete suite for each decision, with four isolated copies at a time.
-        timeout-minutes: 90
+        # Measured 3809 s on GitHub run 41136060160, bd3b0b9, 2026-10-30.
+        # Rule: smallest multiple of 5 minutes at least 3 x measured seconds / 60.
+        # 3 x 3809 s = 11427 s; round up to a multiple of 5 minutes: 195 minutes.
+        timeout-minutes: 195
         run: make mutation
