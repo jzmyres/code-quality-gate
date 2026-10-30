@@ -60,7 +60,7 @@ argument parser and dispatch. `owners.py` and its matchers enforce declared sing
 `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
-parser, run function, location coverage, number display, metric direction per subject kind,
+parser, run function, location coverage, number display, subject direction rule,
 extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
 configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
 The registry is the only list of supported adapters. A test adapter returns normalized test results:
@@ -70,11 +70,10 @@ prerequisite is every earlier check with `tests` evidence: `python_tests`, `elis
 
 An adapter's baseline entries and findings use the same direction for each subject. A descriptor can
 declare `entry_direction(subject, configured)` to choose it; otherwise its `default_direction` applies,
-or the policy's configured `direction` when no descriptor default is set. A descriptor declaring kind
-directions must provide the per-subject rule, even when the kind directions match its own default: the
-policy default may be either `max` or `min`. For example, `directions={"floor": "min"}` needs a rule
-identifying its floor subjects, so the trusted baseline merge can preserve them before findings exist.
-The rule must assign each subject the direction intended for its finding's kind.
+or the policy's configured `direction` when no descriptor default is set. This subject rule is the
+only source of direction for loading, merging, evaluation and pruning. For example, verification's
+rule identifies executed-test subjects as minimum floors before findings exist, so the trusted
+baseline merge can preserve them even under a maximum default.
 
 The implementer agents' learned memory lives in `.agents/AGENTS.md`, written by the runner's
 reflection step after each batch and reviewed before landing.

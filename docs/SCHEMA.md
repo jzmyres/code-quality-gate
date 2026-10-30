@@ -408,6 +408,11 @@ no payload digest.
 
 ## Baseline files
 
+Baseline entries and findings use the same direction for each subject: the adapter descriptor's
+`entry_direction(subject, configured)` rule, then its `default_direction`, then the policy's
+configured `direction`. Loading, merging, evaluation and pruning all use this rule. Verification's
+executed-test subjects remain minimum floors even under a maximum default.
+
 A baseline is a TOML file with an identity header and zero or more entries:
 
 ```toml

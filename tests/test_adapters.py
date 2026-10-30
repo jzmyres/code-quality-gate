@@ -76,7 +76,6 @@ STUB = adapters.AdapterDescriptor(
     parse_stub,
     run_stub,
     display=lambda value: f"{value:.2f}",
-    directions={"floor": "min"},
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
 )
@@ -87,7 +86,6 @@ FLOOR_STUB = adapters.AdapterDescriptor(
     ("count", "baseline"),
     parse_stub,
     run_stub,
-    directions={"floor": "min"},
     default_direction="max",
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
@@ -159,61 +157,11 @@ baseline = "verification.toml"
 
 
 class AdapterRegistrationTests(unittest.TestCase):
-    def test_minimum_kind_requires_subject_directions(self) -> None:
-        descriptor = dataclasses.replace(FLOOR_STUB, entry_direction=None)
-        with mock.patch.dict(adapters.ADAPTERS):
-            with self.assertRaisesRegex(
-                ValueError,
-                r"adapter 'floor-stub': kinds \(floor=min\).*'min'.*'max'.*entry_direction",
-            ):
-                adapters.register_adapter(descriptor)
-            self.assertNotIn(descriptor.name, adapters.ADAPTERS)
-
-    def test_matching_descriptor_default_still_requires_subject_directions(self) -> None:
-        descriptor = dataclasses.replace(
-            FLOOR_STUB, default_direction="min", entry_direction=None,
-        )
-        with mock.patch.dict(adapters.ADAPTERS):
-            with self.assertRaisesRegex(
-                ValueError,
-                r"adapter 'floor-stub': kinds \(floor=min\).*'min'.*'max'.*entry_direction",
-            ):
-                adapters.register_adapter(descriptor)
-            self.assertNotIn(descriptor.name, adapters.ADAPTERS)
-
-    def test_mixed_kinds_require_subject_directions(self) -> None:
-        descriptor = dataclasses.replace(
-            FLOOR_STUB, directions={"floor": "min", "ceiling": "max"},
-            default_direction="min", entry_direction=None,
-        )
-        with mock.patch.dict(adapters.ADAPTERS):
-            with self.assertRaisesRegex(
-                ValueError, r"floor-stub.*floor=min, ceiling=max.*entry_direction"
-            ):
-                adapters.register_adapter(descriptor)
-            self.assertNotIn(descriptor.name, adapters.ADAPTERS)
-
-    def test_kind_overrides_need_a_rule_for_either_configured_default(self) -> None:
-        for default in (None, "max", "min"):
-            for kind_direction in ("max", "min"):
-                with (
-                    self.subTest(default=default, kind_direction=kind_direction),
-                    mock.patch.dict(adapters.ADAPTERS),
-                ):
-                    descriptor = dataclasses.replace(
-                        FLOOR_STUB, directions={"metric": kind_direction},
-                        default_direction=default, entry_direction=None,
-                    )
-                    with self.assertRaisesRegex(
-                        ValueError, f"floor-stub.*metric={kind_direction}.*entry_direction"
-                    ):
-                        adapters.register_adapter(descriptor)
-
     def test_fixed_or_configured_defaults_register_without_subject_rule(self) -> None:
         for default in (None, "max", "min"):
             with self.subTest(default=default), mock.patch.dict(adapters.ADAPTERS):
                 descriptor = dataclasses.replace(
-                    FLOOR_STUB, directions={},
+                    FLOOR_STUB,
                     default_direction=default, entry_direction=None,
                 )
                 self.assertIs(adapters.register_adapter(descriptor), descriptor)
@@ -350,7 +298,7 @@ class StubAdapterTests(unittest.TestCase):
 
     def test_fixed_descriptor_default_drives_loading_and_evaluation(self) -> None:
         descriptor = dataclasses.replace(
-            FLOOR_STUB, directions={}, default_direction="min", entry_direction=None,
+            FLOOR_STUB, default_direction="min", entry_direction=None,
         )
         adapters.register_adapter(descriptor)
         self.addCleanup(adapters.remove_adapter, descriptor.name)

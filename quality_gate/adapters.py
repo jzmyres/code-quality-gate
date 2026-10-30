@@ -1,15 +1,15 @@
 """The adapter descriptor registry: one declaration per adapter.
 
 Every adapter's identity lives here exactly once: the configuration keys it
-accepts, its parser, its runner, its location coverage, number display, metric
-direction per subject kind, whether it produces normalized test results, the
-baseline extras it trusts, and its baseline and budget handling.
+accepts, its parser, its runner, its location coverage, number display, subject
+direction rule, whether it produces normalized test results, the baseline
+extras it trusts, and its baseline and budget handling.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 from . import ratchet
 from .policy import (
@@ -69,7 +69,6 @@ class AdapterDescriptor:
     run: Callable[..., Any]
     location_coverage: str = "none"
     display: Callable[[float], str] = ratchet._number
-    directions: Mapping[str, str] = field(default_factory=dict)
     default_direction: str | None = None
     extras: tuple[str, ...] = ()
     requires_adapter: str | None = None
@@ -251,15 +250,6 @@ ADAPTERS: dict[str, AdapterDescriptor] = {}
 
 
 def register_adapter(descriptor: AdapterDescriptor) -> AdapterDescriptor:
-    if descriptor.entry_direction is None and descriptor.directions:
-        kinds = ", ".join(
-            f"{kind}={direction}" for kind, direction in descriptor.directions.items()
-        )
-        raise ValueError(
-            f"adapter {descriptor.name!r}: kinds ({kinds}) can differ from configured "
-            "direction 'min' or 'max'; expected entry_direction to decide each "
-            "subject's direction"
-        )
     ADAPTERS[descriptor.name] = descriptor
     return descriptor
 
@@ -348,7 +338,6 @@ register_adapter(AdapterDescriptor(
     _verification_spec,
     _runner("_run_verification"),
     location_coverage="partial",
-    directions={"executed": "min"},
     default_direction="max",
     requires_tests=True,
     entry_direction=_verification_entry_direction,
