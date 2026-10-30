@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -12,6 +13,197 @@ from support import BASE_CONFIG, GATE, FixtureCase, output
 
 sys.path.insert(0, str(GATE))
 files = importlib.import_module("quality_gate.files")
+
+
+class InventoryTrustTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_file("b.py", "print('b')\n")
+        self.add_file("ruff.toml", "line-length = 88\n")
+        config = BASE_CONFIG.replace(
+            "[levels]", '[protect]\npaths = ["ruff.toml"]\n\n[levels]'
+        ).replace(
+            "[classes.python]",
+            '[classes.alternate]\ncode = true\ndescription = "Other Python"\n'
+            'checks = ["smoke"]\n\n[classes.python]',
+        )
+        self.write_config(config)
+        self.commit_all()
+        self.revision = self.git("rev-parse", "HEAD").stdout.strip()
+        self.write_config(
+            config.replace(
+                'pattern = "*.py"\nclass = "python"\nreason = "Python source"',
+                'pattern = "a.py"\nclass = "alternate"\nreason = "First source"\n'
+                '\n[[rule]]\npattern = "b.py"\nclass = "python"\n'
+                'reason = "Second source"',
+            )
+        )
+
+    @staticmethod
+    def gate_messages(result: subprocess.CompletedProcess[str]) -> list[str]:
+        return [
+            line for line in result.stderr.splitlines()
+            if line.startswith(("check:", "inventory:"))
+        ]
+
+    def assert_trust_error_matches_check(self, *args: str) -> str:
+        check = self.run_qg("check", *args)
+        inventory = self.run_qg("inventory", *args)
+        self.assertEqual(check.returncode, 2, output(check))
+        self.assertEqual(inventory.returncode, 2, output(inventory))
+        self.assertEqual(inventory.stdout, "")
+        self.assertEqual(inventory.stderr, check.stderr)
+        return inventory.stderr
+
+    def test_policy_from_uses_revision_classes_and_summary(self) -> None:
+        candidate = self.run_qg("inventory", "--list", "python")
+        trusted = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", self.revision
+        )
+        self.assertEqual(candidate.returncode, 0, output(candidate))
+        self.assertEqual(candidate.stdout, "b.py\n")
+        self.assertEqual(trusted.returncode, 0, output(trusted))
+        self.assertEqual(trusted.stdout, "a.py\nb.py\n")
+        self.assertEqual(self.gate_messages(trusted), [])
+
+        candidate_summary = self.run_qg("inventory")
+        trusted_summary = self.run_qg("inventory", "--policy-from", self.revision)
+        self.assertEqual(candidate_summary.returncode, 0, output(candidate_summary))
+        self.assertEqual(candidate_summary.stdout, "inventory: 6 files match 5 rules\n")
+        self.assertEqual(trusted_summary.returncode, 0, output(trusted_summary))
+        self.assertEqual(trusted_summary.stdout, "inventory: 6 files match 4 rules\n")
+        self.assertEqual(self.gate_messages(trusted_summary), [])
+
+    def test_protected_change_blocks_until_authorized(self) -> None:
+        self.add_file("ruff.toml", "line-length = 120\n")
+        check = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(check.returncode, 1, output(check))
+        blocked = next(line for line in check.stderr.splitlines() if "check: blocked:" in line)
+        self.assertIn("--allow-protected: ruff.toml", blocked)
+        for selection in ((), ("--list", "python")):
+            with self.subTest(selection=selection):
+                result = self.run_qg(
+                    "inventory", *selection, "--policy-from", self.revision
+                )
+                self.assertEqual(result.returncode, 1, output(result))
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.gate_messages(result), [blocked])
+
+        trusted = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", self.revision,
+            "--allow-protected", "./ruff.toml",
+        )
+        self.assertEqual(trusted.returncode, 0, output(trusted))
+        self.assertEqual(trusted.stdout, "a.py\nb.py\n")
+        authorized = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", self.revision,
+            "--allow-protected", "ruff.toml",
+            "--allow-protected", "quality-gate.toml",
+        )
+        self.assertEqual(authorized.returncode, 0, output(authorized))
+        self.assertEqual(authorized.stdout, "b.py\n")
+        self.assertEqual(self.gate_messages(authorized), [])
+
+    def test_trust_option_errors_match_check(self) -> None:
+        cases = (
+            ("--allow-protected", "ruff.toml"),
+            ("--policy-from", "no-such-revision"),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                self.assert_trust_error_matches_check(*args)
+
+    def test_unrecognized_authorization_matches_check(self) -> None:
+        args = ("--policy-from", self.revision, "--allow-protected", "../outside")
+        check = self.run_qg("check", *args)
+        inventory = self.run_qg("inventory", "--list", "python", *args)
+        self.assertEqual(check.returncode, 0, output(check))
+        self.assertEqual(inventory.returncode, 0, output(inventory))
+        self.assertEqual(inventory.stdout, "a.py\nb.py\n")
+        self.assertEqual(self.gate_messages(inventory), [])
+
+    def test_invalid_candidate_policy_is_used_only_when_authorized(self) -> None:
+        self.write_config("[invalid\n")
+        trusted = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", self.revision
+        )
+        self.assertEqual(trusted.returncode, 0, output(trusted))
+        self.assertEqual(trusted.stdout, "a.py\nb.py\n")
+        authorized = self.run_qg(
+            "inventory", "--policy-from", self.revision,
+            "--allow-protected", "quality-gate.toml",
+        )
+        self.assertEqual(authorized.returncode, 2, output(authorized))
+        self.assertEqual(authorized.stdout, "")
+        self.assertIn("valid TOML", authorized.stderr)
+
+    def test_unknown_class_uses_revision_classes(self) -> None:
+        self.write_config(
+            self.read_file("quality-gate.toml").replace(
+                "[classes.alternate]",
+                '[classes.candidate_only]\ncode = false\ndescription = "New"\n\n'
+                '[classes.alternate]',
+            )
+        )
+        candidate = self.run_qg("inventory", "--list", "candidate_only")
+        self.assertEqual(candidate.returncode, 0, output(candidate))
+        self.assertEqual(candidate.stdout, "")
+        result = self.run_qg(
+            "inventory", "--list", "candidate_only", "--policy-from", self.revision
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn("unknown class 'candidate_only'", result.stderr)
+
+    def test_protected_symlink_is_refused_like_check(self) -> None:
+        target = self.base / "outside.toml"
+        target.write_text("line-length = 120\n", encoding="utf-8")
+        (self.repo / "ruff.toml").unlink()
+        (self.repo / "ruff.toml").symlink_to(target)
+        message = self.assert_trust_error_matches_check("--policy-from", self.revision)
+        self.assertIn("ruff.toml", message)
+
+    def test_protected_input_changed_during_inventory_fails_before_output(self) -> None:
+        bin_dir = self.base / "fake-bin"
+        bin_dir.mkdir()
+        script = bin_dir / "git"
+        script.write_text(
+            '#!/bin/sh\ncase "$*" in\n'
+            '  *" ls-files -s -z") printf "line-length = 120\\n" > "$QG_TEST_PROTECTED" ;;\n'
+            'esac\nexec "$QG_REAL_GIT" "$@"\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "QG_REAL_GIT": str(shutil.which("git")),
+            "QG_TEST_PROTECTED": str(self.repo / "ruff.toml"),
+        }
+        result = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", self.revision,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn("protected input ruff.toml changed during the run", result.stderr)
+
+    def test_unchanged_protected_gitlink_does_not_change_inventory_output(self) -> None:
+        config = self.git("show", f"{self.revision}:quality-gate.toml").stdout
+        self.write_config(
+            config.replace('paths = ["ruff.toml"]', 'paths = ["ruff.toml", "vendor"]')
+            + '\n[[rule]]\npattern = "vendor"\nclass = "config"\n'
+            'reason = "a pinned submodule"\n'
+        )
+        self.git("add", "quality-gate.toml")
+        self.git(
+            "update-index", "--add", "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,vendor",
+        )
+        self.git("commit", "-q", "-m", "protect submodule")
+        result = self.run_qg("inventory", "--policy-from", "HEAD")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(result.stdout, "inventory: 7 files match 5 rules\n")
+        self.assertEqual(self.gate_messages(result), [])
 
 
 class InventoryTests(FixtureCase):

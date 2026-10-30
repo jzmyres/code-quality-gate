@@ -112,6 +112,11 @@ def _report_gitlink(item: ProtectedInput) -> None:
     )
 
 
+def _report_gitlinks(protected: list[ProtectedInput]) -> None:
+    for item in protected:
+        _report_gitlink(item)
+
+
 @dataclass
 class Trust:
     root: Path
@@ -168,8 +173,19 @@ class Trust:
             return
         self.prune_writes[relative] = written
 
+    def report_blocked(self) -> bool:
+        blocked = _blocked_paths(self.protected)
+        if not blocked:
+            return False
+        print(
+            f"check: blocked: protected input changed without "
+            f"--allow-protected: {', '.join(blocked)}",
+            file=sys.stderr,
+        )
+        return True
+
     def finish(
-        self, code: int, document: dict[str, Any]
+        self, code: int, document: dict[str, Any], *, report_gitlinks: bool = True
     ) -> tuple[int, dict[str, Any]]:
         after = _capture_identity(self)
         start = self.identity_after_checks or self.identity_before or {}
@@ -184,21 +200,15 @@ class Trust:
         self.identity_after = after
         document["schema"] = RESULT_SCHEMA
         document["trust"] = self.to_json()
-        for item in self.protected:
-            _report_gitlink(item)
+        if report_gitlinks:
+            _report_gitlinks(self.protected)
         if problems:
             message = "; ".join(problems)
             print(f"check: error: {message}", file=sys.stderr)
             document["decision"] = "error"
             document["error"] = message
             return 2, document
-        blocked = _blocked_paths(self.protected)
-        if blocked:
-            print(
-                f"check: blocked: protected input changed without "
-                f"--allow-protected: {', '.join(blocked)}",
-                file=sys.stderr,
-            )
+        if self.report_blocked():
             document["decision"] = "blocked"
             return 1, document
         return code, document

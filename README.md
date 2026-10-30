@@ -141,12 +141,21 @@ regular file.
     python3 -I qg.py inventory
     python3 -I qg.py --repo /path/to/repo inventory
     python3 -I qg.py inventory --list python
+    python3 -I /path/to/trusted-gate/qg.py --repo /path/to/repo inventory --list python --policy-from REV
+    python3 -I /path/to/trusted-gate/qg.py --repo /path/to/repo inventory --policy-from REV --allow-protected quality-gate.toml
 
 The first form prints a summary such as `inventory: 42 files match 7 rules`. `--list CLASS` prints the
 files of one class, one per line, and prints nothing for a known but empty class. It exits 2 for an
 unknown class, so a Makefile can use it as the single source of file lists:
 
     python_files=$(python3 -I qg.py inventory --list python)
+
+`--policy-from REV` classifies the working tree using the effective policy from `REV`, with the same
+protected-input validation as `check`. An unapproved policy edit is ignored; an unapproved change to
+another protected path blocks inventory before it prints a summary or file list. To use a reviewed
+replacement, pass `--allow-protected PATH`; repeat the option for multiple paths. The option requires
+`--policy-from`. Run the gate from a trusted copy outside the candidate, as described under
+[Trust root](#trust-root).
 
 Inventory fails (exit 1) and prints every violation when a file matches no rule, a file matches more
 than one rule, a rule matches no file, a rule has an empty reason, a rule names a class that does not

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sys
 from pathlib import Path
@@ -30,6 +32,24 @@ class _Parser(argparse.ArgumentParser):
         raise UsageError(f"{self.prog}: {message}")
 
 
+def _add_policy_from_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--policy-from",
+        metavar="REV",
+        help="evaluate the working tree against REV's policy and inputs",
+    )
+
+
+def _add_allow_protected_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--allow-protected",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="authorize the candidate's version of a protected path",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="qg.py",
@@ -48,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     inventory.add_argument(
         "--list", dest="list_class", metavar="CLASS", help="print one class's files"
     )
+    _add_policy_from_argument(inventory)
+    _add_allow_protected_argument(inventory)
     commands.add_parser("hygiene", help="check ignored and oversized files")
     clones = commands.add_parser("clones", help="check the duplicate-code ratchet")
     clones.add_argument(
@@ -72,23 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID",
         help="lower one check's baseline after it passes",
     )
-    check.add_argument(
-        "--policy-from",
-        metavar="REV",
-        help="evaluate the working tree against REV's policy and inputs",
-    )
+    _add_policy_from_argument(check)
     check.add_argument(
         "--changed-from",
         metavar="REV",
         help="also reject threshold violations on lines changed since REV",
     )
-    check.add_argument(
-        "--allow-protected",
-        metavar="PATH",
-        action="append",
-        default=[],
-        help="authorize the candidate's version of a protected path",
-    )
+    _add_allow_protected_argument(check)
     check.add_argument(
         "--reuse-store",
         metavar="DIR",
@@ -218,9 +230,27 @@ def _run_trusted_check(root: Path, args: Any) -> int:
     )
 
 
+def _run_trusted_inventory(root: Path, args: Any) -> int:
+    trust = prepare_trust(root, args.policy_from, args.allow_protected)
+    try:
+        if trust.report_blocked():
+            return 1
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = command_inventory(root, trust.config, args.list_class)
+        code, _ = trust.finish(code, {}, report_gitlinks=False)
+        if code == 0:
+            print(stream.getvalue(), end="")
+        return code
+    finally:
+        trust.close()
+
+
 def _run_gate(root: Path, args: Any) -> int:
-    if args.command == "check" and args.policy_from is not None:
-        return _run_trusted_check(root, args)
+    if args.command in ("check", "inventory") and args.policy_from is not None:
+        if args.command == "check":
+            return _run_trusted_check(root, args)
+        return _run_trusted_inventory(root, args)
     if getattr(args, "allow_protected", None):
         raise UsageError(
             "qg.py: --allow-protected: expected --policy-from"
