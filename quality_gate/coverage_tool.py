@@ -22,20 +22,34 @@ PRAGMA_NO_COVER = "pragma: no cover"
 
 def coverage_config_text(root: Path) -> str:
     """The one gate-owned coverage configuration for collection and analysis."""
-    for character, name in ((",", "comma"), ("\n", "newline"), ("\r", "carriage return")):
-        if character in str(root):
-            raise UsageError(
-                f"repository root {str(root)!r} contains {name} {character!r}; "
-                "coverage's 'source' setting cannot represent it"
-            )
-    return (
+    # Keep LF continuations parseable so refusals can name both parsed lists.
+    source = str(root).replace("\n", "\n    ")
+    settings = (
         "[run]\n"
         "branch = False\n"
         "sigterm = true\n"
-        f"source =\n    {root}\n"
+        f"source =\n    {source}\n"
         "[report]\n"
         f"exclude_lines =\n    {PRAGMA_NO_COVER}\n"
     )
+    collection = import_coverage().config.HandyConfigParser(our_file=True)
+    collection.read_string(settings)
+    analysis = configparser.ConfigParser(interpolation=None)
+    analysis.read_string(settings)
+    collection_sources = collection.getlist("run", "source")
+    analysis_sources = _analysis_list(analysis.get("run", "source"))
+    if collection_sources != [str(root)] or analysis_sources != [str(root)]:
+        raise UsageError(
+            f"repository root {str(root)!r} does not round-trip through 'run:source'; "
+            f"expected {[str(root)]!r}; collection parsed {collection_sources!r}; "
+            f"analysis parsed {analysis_sources!r}"
+        )
+    return settings
+
+
+def _analysis_list(value: str) -> list[str]:
+    """Read a list setting exactly as the analysis configuration does."""
+    return [line.strip() for line in value.splitlines() if line.strip()]
 
 
 def coverage_config_data(settings: str, data_file: Path) -> str:
@@ -48,16 +62,12 @@ def coverage_config_data(settings: str, data_file: Path) -> str:
     config.set_option("run:sigterm", parser.getboolean("run", "sigterm"))
     config.set_option(
         "run:source",
-        [line.strip() for line in parser.get("run", "source").splitlines() if line.strip()],
+        _analysis_list(parser.get("run", "source")),
     )
     config.set_option("run:data_file", str(data_file))
     config.set_option(
         "report:exclude_lines",
-        [
-            line.strip()
-            for line in parser.get("report", "exclude_lines").splitlines()
-            if line.strip()
-        ],
+        _analysis_list(parser.get("report", "exclude_lines")),
     )
     config.post_process()
     return ":data:" + config.serialize()

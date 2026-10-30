@@ -1033,36 +1033,62 @@ class CoverageConfigurationAttackTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assert_risky_score(document)
 
-    def test_project_path_that_coverage_would_split_is_refused_before_running(self) -> None:
+    def assert_project_path_is_refused(self, character: str, *, collection_splits: bool) -> None:
         self.add_file(
             "tests/test_started.py",
             PYTHON_TEST_HEADER + "pathlib.Path('coverage-started').touch()\n",
         )
-        for character, name in ((",", "comma"), ("\n", "newline"), ("\r", "carriage return")):
-            with self.subTest(character=name):
-                self.repo = self.repo.rename(self.base / f"project{character}name")
-                result, document = self.run_json(env=self.default_tool_env())
-                self.assertEqual(result.returncode, 2, output(result))
-                self.assertEqual(document["decision"], "error")
-                check = self.check_by_id(document, "tests")
-                self.assertEqual(check["outcome"], "error")
-                self.assertEqual(check["execution"], "error")
-                self.assertIn(repr(str(self.repo)), check["reason"])
-                self.assertIn(f"{name} {character!r}", check["reason"])
-                self.assertIn(
-                    "coverage's 'source' setting cannot represent it", check["reason"]
-                )
-                self.assertIn(check["reason"], result.stderr)
-                self.assertIsNone(check["diagnostics"]["argv"])
-                self.assertFalse((self.repo / "coverage-started").exists())
-                self.assertEqual(self.check_by_id(document, "crap")["findings"], [])
+        self.repo = self.repo.rename(self.base / f"project{character}name")
+        result, document = self.run_json(env=self.default_tool_env())
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        check = self.check_by_id(document, "tests")
+        self.assertEqual(check["outcome"], "error")
+        self.assertEqual(check["execution"], "error")
+        self.assertIn(repr(str(self.repo)), check["reason"])
+        split_sources = [str(self.base / "project"), "name"]
+        collection_sources = split_sources if collection_splits else [str(self.repo)]
+        analysis_sources = [str(self.repo)] if character == "," else split_sources
+        self.assertIn("does not round-trip through 'run:source'", check["reason"])
+        self.assertIn(f"collection parsed {collection_sources!r}", check["reason"])
+        self.assertIn(f"analysis parsed {analysis_sources!r}", check["reason"])
+        self.assertIn(check["reason"], result.stderr)
+        self.assertIsNone(check["diagnostics"]["argv"])
+        self.assertFalse((self.repo / "coverage-started").exists())
+        self.assertEqual(self.check_by_id(document, "crap")["findings"], [])
+
+    def test_project_path_with_comma_is_refused_before_running(self) -> None:
+        self.assert_project_path_is_refused(",", collection_splits=True)
+
+    def test_project_path_with_lf_is_refused_before_running(self) -> None:
+        self.assert_project_path_is_refused("\n", collection_splits=True)
+
+    def test_project_path_with_cr_is_refused_before_running(self) -> None:
+        self.assert_project_path_is_refused("\r", collection_splits=False)
+
+    def test_project_path_with_vertical_tab_is_refused_before_running(self) -> None:
+        self.assert_project_path_is_refused("\v", collection_splits=False)
+
+    def test_project_path_with_u2028_is_refused_before_running(self) -> None:
+        self.assert_project_path_is_refused("\u2028", collection_splits=False)
+
+    def test_project_path_with_other_splitlines_separators_is_refused(self) -> None:
+        for character in ("\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2029"):
+            with self.subTest(character=repr(character)):
+                self.assert_project_path_is_refused(character, collection_splits=False)
 
     def test_project_path_with_spaces_is_one_source_entry(self) -> None:
+        self.assert_project_path_is_one_source_entry("project name")
+
+    def test_project_path_with_non_ascii_letters_is_one_source_entry(self) -> None:
+        self.assert_project_path_is_one_source_entry("projet-été-日本語")
+
+    def assert_project_path_is_one_source_entry(self, name: str) -> None:
         from quality_gate.coverage_tool import (
             coverage_config_data, import_coverage, write_coverage_config,
         )
 
-        self.repo = self.repo.rename(self.base / "project name")
+        self.repo = self.repo.rename(self.base / name)
         data_dir = self.base / "coverage data"
         config_file = write_coverage_config(data_dir, self.repo)
         coverage = import_coverage()
