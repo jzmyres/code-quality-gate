@@ -313,6 +313,25 @@ class PolicyTests(FixtureCase):
                 )
 
 
+    def test_elisp_decision_rules_refuse_invalid_entries(self) -> None:
+        prefix = (BASE_CONFIG + '\n[checks.crap]\nadapter = "elisp_crap"\n'
+                  'tier = 1\nenforcement = "enforced"\nrequires = "smoke"\n'
+                  'baseline = "crap.toml"\n')
+        cases = (
+            ('decision_rules = "bad-table"', "decision_rules", "bad-table"),
+            ('decision_rules = { mystery = ["x"] }', "decision_rules.mystery", "mystery"),
+            ('decision_rules = { branch = "bad-list" }', "decision_rules.branch", "bad-list"),
+            ('decision_rules = { branch = [42] }', "decision_rules.branch[0]", "42"),
+            ('decision_rules = { branch = [""] }', "decision_rules.branch[0]", "''"),
+            ('decision_rules = { branch = ["bad name"] }', "decision_rules.branch[0]", "bad name"),
+            ('decision_rules = { branch = ["bad\\u0000name"] }', "decision_rules.branch[0]", "bad"),
+            ('decision_rules = { branch = ["custom", "custom"] }', "decision_rules.branch[1]", "custom"),
+            ('decision_rules = { branch = ["and"] }', "decision_rules.operands[0]", "and"),
+        )
+        for rules, key, entry in cases:
+            with self.subTest(rules=rules):
+                self.config_error(prefix + rules + "\n", f"checks.crap.{key}", entry)
+
     def test_baseline_check_header_must_match_the_policy(self) -> None:
         self.write_config(
             BASE_CONFIG

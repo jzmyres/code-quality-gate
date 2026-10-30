@@ -1,7 +1,8 @@
 ;;; qg-elisp-complexity.el --- Read Emacs Lisp complexity -*- lexical-binding: t -*-
 
 ;;; Commentary:
-;; Count the editor CRAP gate's decision rules on top-level definitions.
+;; Count the Emacs Lisp default or policy decision rules on top-level definitions.
+;; The caller supplies the effective rules as data.
 ;; This helper reads source and never evaluates or instruments it.
 
 ;;; Code:
@@ -9,26 +10,26 @@
 (require 'cl-lib)
 (require 'json)
 
-(defconst qg-elisp-complexity--rules
-  '(((if when unless while dolist dotimes cl-dolist cl-dotimes cl-do cl-do*
-      dolist-with-progress-reporter ignore-errors bound-and-true-p)
-     . qg-elisp-complexity--branch)
-    ((and or) . qg-elisp-complexity--operands)
-    ((cond) . qg-elisp-complexity--cond)
-    ((if-let if-let* when-let when-let* and-let*) . qg-elisp-complexity--bindings)
-    ((condition-case condition-case-unless-debug) . qg-elisp-complexity--handlers)
-    ((pcase pcase-exhaustive cl-case cl-ecase cl-typecase) . qg-elisp-complexity--case)
-    ((cl-loop) . qg-elisp-complexity--loop))
-  "Decision families and their counters.")
+(defvar qg-elisp-complexity--rules nil
+  "Effective decision families, loop clauses and catch-all symbols.")
 
-(defconst qg-elisp-complexity--loop-clauses
-  '(when if unless while until always never thereis)
-  "Conditional `cl-loop' clause keywords.")
+(defconst qg-elisp-complexity--counters
+  '((branch . qg-elisp-complexity--branch)
+    (operands . qg-elisp-complexity--operands)
+    (cond . qg-elisp-complexity--cond)
+    (bindings . qg-elisp-complexity--bindings)
+    (handlers . qg-elisp-complexity--handlers)
+    (case . qg-elisp-complexity--case)
+    (loop . qg-elisp-complexity--loop))
+  "Decision family counting algorithms.")
 
 (defun qg-elisp-complexity--clauses (clauses)
   "Count CLAUSES except a final catch-all."
   (- (length clauses)
-     (if (memq (car-safe (car (last clauses))) '(t _ otherwise)) 1 0)))
+     (if (and clauses
+              (memq (car-safe (car (last clauses)))
+                    (alist-get 'catch_all qg-elisp-complexity--rules)))
+         1 0)))
 
 (defun qg-elisp-complexity--in (forms)
   "Count decisions in each element of FORMS, which may be dotted."
@@ -67,13 +68,16 @@
 (defun qg-elisp-complexity--loop (args)
   "Count a loop, conditional clause keywords and decisions in ARGS."
   (+ 1
-     (cl-count-if (lambda (arg) (memq arg qg-elisp-complexity--loop-clauses)) args)
+     (cl-count-if (lambda (arg)
+                    (memq arg (alist-get 'loop_clauses qg-elisp-complexity--rules)))
+                  args)
      (qg-elisp-complexity--in args)))
 
 (defun qg-elisp-complexity--rule (head)
   "Return the counter for HEAD, or nil."
-  (cdr (cl-find-if (lambda (rule) (memq head (car rule)))
-                   qg-elisp-complexity--rules)))
+  (cl-loop for (family . counter) in qg-elisp-complexity--counters
+           when (memq head (alist-get family qg-elisp-complexity--rules))
+           return counter))
 
 (defun qg-elisp-complexity--decisions (form)
   "Count decisions in FORM, skipping quoted data."
@@ -117,7 +121,8 @@
     (error (error "Cannot read %s: %s" file (error-message-string failure)))))
 
 (defun qg-elisp-complexity-run (root files result-file)
-  "Read FILES under ROOT and write complexity JSON to RESULT-FILE."
+  "Read FILES under ROOT and write complexity JSON to RESULT-FILE.
+Use the effective rules in `qg-elisp-complexity--rules'."
   (let ((default-directory root)
         (create-lockfiles nil))
     (condition-case failure

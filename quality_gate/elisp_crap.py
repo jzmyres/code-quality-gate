@@ -1,4 +1,4 @@
-"""Join the editor's Emacs Lisp complexity with earlier Edebug evidence."""
+"""Join Emacs Lisp default or policy decision rules with earlier Edebug evidence."""
 from __future__ import annotations
 
 import json
@@ -30,11 +30,18 @@ def selection_failure(context: Any, start: float) -> Any:
     return None
 
 
-def _command(emacs: str, root: Path, files: list[str], result: Path) -> list[str]:
+def _command(
+    emacs: str, root: Path, files: list[str], result: Path, rules: dict[str, tuple[str, ...]],
+) -> list[str]:
     helper = Path(__file__).with_name("elisp") / "qg-elisp-complexity.el"
     names = " ".join(_lisp_string(name) for name in files)
-    form = (f"(qg-elisp-complexity-run {_lisp_string(str(root) + os.sep)} '({names}) "
-            f"{_lisp_string(str(result))})")
+    data = " ".join(
+        f"({family} . ,(mapcar #'intern '({" ".join(_lisp_string(name) for name in values)})))"
+        for family, values in rules.items()
+    )
+    form = (f"(let ((qg-elisp-complexity--rules `({data}))) "
+            f"(qg-elisp-complexity-run {_lisp_string(str(root) + os.sep)} '({names}) "
+            f"{_lisp_string(str(result))}))")
     return [emacs, "-Q", "--batch", "-l", str(helper), "--eval", form]
 
 
@@ -209,7 +216,8 @@ def _complexity(context: Any, selected: list[str], start: float) -> tuple[Any, A
     with _temporary() as temporary:
         result = Path(temporary) / "result.json"
         mark_step("Emacs complexity command")
-        child = run(_command(required.spec.emacs, context.root, selected, result),
+        child = run(_command(required.spec.emacs, context.root, selected, result,
+                             context.check.spec.decision_rules),
                     cwd=context.root, budget_seconds=CLONE_BUDGET_SECONDS)
         record_diagnostics(child.diagnostics())
         if child.execution != "completed":

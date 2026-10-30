@@ -14,6 +14,21 @@
 (require 'qg-elisp-complexity)
 (require 'qg-elisp-lint)
 
+(defconst qg-elisp-tests--rules
+  '((branch if when unless while dolist dotimes cl-dolist cl-dotimes cl-do cl-do*
+            dolist-with-progress-reporter ignore-errors bound-and-true-p)
+    (operands and or)
+    (cond cond)
+    (bindings if-let if-let* when-let when-let* and-let*)
+    (handlers condition-case condition-case-unless-debug)
+    (case pcase pcase-exhaustive cl-case cl-ecase cl-typecase)
+    (loop cl-loop)
+    (loop_clauses when if unless while until always never thereis)
+    (catch_all t _ otherwise))
+  "Emacs Lisp default rules supplied as test data.")
+
+(setq qg-elisp-complexity--rules qg-elisp-tests--rules)
+
 (defconst qg-elisp-tests--complexity-cases
   '(((if x 1 2) . 1)
     ((when x 1) . 1)
@@ -83,6 +98,8 @@
   "Score every complexity rule family on forms given as data."
   (dolist (case qg-elisp-tests--complexity-cases)
     (should (= (qg-elisp-complexity--decisions (car case)) (cdr case))))
+  (let ((qg-elisp-complexity--rules '((catch_all nil))))
+    (should (= (qg-elisp-complexity--clauses nil) 0)))
   (should-not (qg-elisp-complexity--rule 'no-such-rule))
   (should (eq (qg-elisp-complexity--rule 'if)
               'qg-elisp-complexity--branch))

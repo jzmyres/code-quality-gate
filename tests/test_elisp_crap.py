@@ -132,6 +132,69 @@ class ElispCrapTests(FixtureCase):
         self.assertEqual(check["metric_version"], "elisp-edebug/1")
         self.assertEqual(findings["src/core.el:branches"]["location"], "src/core.el:3")
 
+    def test_policy_adds_a_branch_form_once_per_use(self) -> None:
+        self.add_file("src/core.el", "(defun zero (x) (if x 1 2))\n"
+                      "(defun once (x) (if x 1 2) (identity x))\n"
+                      "(defun twice (x) (if x 1 2) (identity x) (identity x))\n")
+        self.add_file("tests/suite.el", simple_suite())
+        self.write_config(crap_config(threshold=100))
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual([item["measurement"]["cc"] for item in check["findings"]], [2, 2, 2])
+        self.write_config(crap_config(threshold=100) + '''
+[checks.crap.decision_rules]
+branch = ["if", "when", "unless", "while", "dolist", "dotimes", "cl-dolist", "cl-dotimes",
+          "cl-do", "cl-do*", "dolist-with-progress-reporter", "ignore-errors", "bound-and-true-p", "identity"]
+''')
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        findings = by_subject(check)
+        for name, expected in (("zero", 2), ("once", 3), ("twice", 4)):
+            with self.subTest(name=name):
+                self.assertEqual(findings[f"src/core.el:{name}"]["measurement"]["cc"], expected)
+
+    def test_policy_replaces_each_family_and_auxiliary_symbols(self) -> None:
+        self.add_file("src/core.el", "(defun fixture (x)\n"
+                      " (if x 1 2) (and x x) (cond (x 1) (t 0))\n"
+                      " (identity x) (list x x x) (progn (x 1) (otherwise 0))\n"
+                      " (let ((a x) (b x)) x)\n"
+                      " (custom-handler err x (error 0) (quit 0))\n"
+                      " (cl-case x ((if x 1 2) (identity x)) (otherwise 0))\n"
+                      " (custom-loop custom-key when))\n")
+        self.add_file("tests/suite.el", simple_suite())
+        self.write_config(crap_config(threshold=10000) + '''
+[checks.crap.decision_rules]
+branch = ["identity"]
+operands = ["list"]
+cond = ["progn"]
+bindings = ["let"]
+handlers = ["custom-handler"]
+case = ["cl-case"]
+loop = ["custom-loop"]
+loop_clauses = ["custom-key"]
+catch_all = ["otherwise"]
+''')
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        # Base 1 + branch 1 + operands 2 + cond 1 + bindings 2 + handlers 2
+        # + case 1 and its branch body 1 + loop 1 and its keyword 1.
+        self.assertEqual(by_subject(check)["src/core.el:fixture"]["measurement"]["cc"], 13)
+
+    def test_empty_rule_lists_disable_decisions_and_catchall_exemption(self) -> None:
+        self.add_file("src/core.el", "(defun fixture (x)\n"
+                      " (if x 1 2) (cl-loop for v in x when v collect v)\n"
+                      " (cond (x 1) (t 0)) (pcase x (_ 0)))\n")
+        self.add_file("tests/suite.el", simple_suite())
+        self.write_config(crap_config(threshold=100) + '''
+[checks.crap.decision_rules]
+branch = []
+loop_clauses = []
+catch_all = []
+''')
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(by_subject(check)["src/core.el:fixture"]["measurement"]["cc"], 5)
+
     def test_scores_and_lambda_attribution(self) -> None:
         body = "(if x (if (eq x 'yes) (+ 1 2) (+ 3 4)) (+ 5 6))"
         self.add_file("src/core.el", f"(defun reached (x) {body})\n"

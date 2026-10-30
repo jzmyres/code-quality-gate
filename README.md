@@ -49,7 +49,7 @@ supported-adapter registry, `files.py` resolves the repository and runs inventor
 `clones.py` measures jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage,
 `python_crap.py` joins coverage with `ast` complexity, `elisp_tests.py` and
 `elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `elisp_crap.py` and
-`elisp/qg-elisp-complexity.el` join that coverage with the editor's complexity rules,
+`elisp/qg-elisp-complexity.el` join that coverage with the Emacs Lisp default or policy decision rules,
 `elisp_lint.py` and `elisp/qg-elisp-lint.el` run byte compilation and checkdoc,
 `verification.py` measures test counts and source
 exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
@@ -458,19 +458,42 @@ Other top-level forms are not subjects. Two definitions with the same identity i
 with both lines reported. A batch Emacs using the required check's `emacs` reads the source without
 evaluating or instrumenting it; an unreadable form fails the check and names the file and error.
 
-Complexity is 1 plus decisions in the body after the argument list. The table below is the editor's
-source-level counting rule; nested functions and lambdas contribute to their enclosing subject.
-Quoted data is skipped.
+Complexity is 1 plus decisions in the body after the argument list. The table below is the
+Emacs Lisp default; nested functions and lambdas contribute to their enclosing subject.
+Quoted data is skipped. Each family uses the listed forms and counting algorithm.
 
-| Form | Decisions added |
-|---|---|
-| `if`, `when`, `unless`, `while`, `dolist`, `dotimes`, `cl-dolist`, `cl-dotimes`, `cl-do`, `cl-do*`, `dolist-with-progress-reporter`, `ignore-errors`, `bound-and-true-p` | One per form. |
-| `and`, `or` | One per operand after the first. |
-| `cond` | One per clause, except a final `t`, `_` or `otherwise` clause. |
-| `if-let`, `if-let*`, `when-let`, `when-let*`, `and-let*` | One per binding. |
-| `condition-case`, `condition-case-unless-debug` | One per handler. |
-| `pcase`, `pcase-exhaustive`, `cl-case`, `cl-ecase`, `cl-typecase` | One per clause, except a final `t`, `_` or `otherwise` clause; patterns are data and are not counted. |
-| `cl-loop` | One for the loop and one for each top-level conditional clause keyword: `when`, `if`, `unless`, `while`, `until`, `always`, `never`, `thereis`. |
+| Family | Default forms | Decisions added |
+|---|---|---|
+| `branch` | `if`, `when`, `unless`, `while`, `dolist`, `dotimes`, `cl-dolist`, `cl-dotimes`, `cl-do`, `cl-do*`, `dolist-with-progress-reporter`, `ignore-errors`, `bound-and-true-p` | One per form. |
+| `operands` | `and`, `or` | One per operand after the first. |
+| `cond` | `cond` | One per clause, except a final `t`, `_` or `otherwise` clause. |
+| `bindings` | `if-let`, `if-let*`, `when-let`, `when-let*`, `and-let*` | One per binding. |
+| `handlers` | `condition-case`, `condition-case-unless-debug` | One per handler. |
+| `case` | `pcase`, `pcase-exhaustive`, `cl-case`, `cl-ecase`, `cl-typecase` | One per clause, except a final `t`, `_` or `otherwise` clause; patterns are data and are not counted. |
+| `loop` | `cl-loop` | One for the loop and one for each top-level conditional clause keyword: `when`, `if`, `unless`, `while`, `until`, `always`, `never`, `thereis`. |
+
+An `elisp_crap` check may set one optional policy key, `decision_rules`, to a table of
+symbol-name arrays. A supplied family **replaces** its default list; omitted families keep the
+Emacs Lisp default. An empty array disables that family. The additional `loop_clauses` and
+`catch_all` lists replace the default loop keywords above and the catch-all symbols
+`["t", "_", "otherwise"]`, respectively. Catch-all exemption applies only to the final clause
+of the `cond` and `case` families. An empty `catch_all` array counts every clause.
+
+For example, this adds `my-branch` to the branching family while retaining its default forms:
+
+```toml
+[checks.legacy-crap.decision_rules]
+branch = ["if", "when", "unless", "while", "dolist", "dotimes", "cl-dolist", "cl-dotimes",
+          "cl-do", "cl-do*", "dolist-with-progress-reporter", "ignore-errors", "bound-and-true-p",
+          "my-branch"]
+```
+
+Only the nine documented family/list keys are accepted. Entries must be non-empty, printable
+symbol names without whitespace, and unique within each list. A form may belong to only one
+of the seven counting families; move it by replacing both affected lists. Loop keywords and
+catch-all symbols may overlap form lists. Invalid rules are configuration errors naming the
+policy key and offending entry. The helper receives these effective rules as data and never
+evaluates symbol names. Omitting `decision_rules` preserves all existing default scores.
 
 Edebug entries are attributed to the first subject in the same physical file whose character span
 contains the entry's position, including the start and excluding the end; symlinks and hard links

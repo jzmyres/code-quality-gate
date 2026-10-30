@@ -196,7 +196,11 @@ def _python_crap_spec(
 def _elisp_crap_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
-    return _crap_spec(raw, root, path, full_key, ElispCrapSpec, "elisp-edebug/1")
+    from .elisp_rules import parse_rules
+
+    rules = parse_rules(raw, path, f"{full_key}.decision_rules")
+    return _crap_spec(raw, root, path, full_key,
+                      lambda requires: ElispCrapSpec(requires, rules), "elisp-edebug/1")
 
 
 def _verification_spec(
@@ -358,7 +362,7 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "elisp_crap",
-    ("requires", "threshold", "baseline"),
+    ("requires", "threshold", "baseline", "decision_rules"),
     _elisp_crap_spec,
     _runner("_run_elisp_crap"),
     minimum_emacs_version=ELISP_MINIMUM_VERSION,

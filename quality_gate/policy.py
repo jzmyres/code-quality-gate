@@ -106,6 +106,7 @@ class PythonCrapSpec:
 @dataclass(frozen=True)
 class ElispCrapSpec:
     requires: str
+    decision_rules: dict[str, tuple[str, ...]]
 
 
 @dataclass(frozen=True)

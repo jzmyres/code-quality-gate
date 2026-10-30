@@ -147,6 +147,22 @@ Rules:
   is a configuration error.
 * `elisp_crap.requires` names an earlier `elisp_tests` check. Every file selected
   for CRAP must belong to a class that also lists that test check.
+* `elisp_crap.decision_rules` is an optional table overriding the
+  [Emacs Lisp default decision rules](../README.md#emacs-lisp-crap). Its only keys
+  are `branch`, `operands`, `cond`, `bindings`, `handlers`, `case`, `loop`,
+  `loop_clauses` and `catch_all`. Each value is an array of non-empty, printable
+  symbol-name strings without whitespace. A supplied array replaces that list;
+  omitted lists retain their defaults and empty arrays are allowed. The first
+  seven keys select forms for the corresponding counting algorithms; a form
+  must occur in only one of those families. `loop_clauses` selects top-level
+  conditional loop keywords, and `catch_all` selects final clause heads exempt
+  from `cond` and `case` clause counts (default `t`, `_`, `otherwise`). Entries
+  must be unique within each array; auxiliary lists may overlap form families.
+  Unknown keys, wrong types, invalid names and duplicate assignments are
+  configuration errors naming the key and offending entry. For example,
+  `decision_rules = { branch = ["if", "my-branch"] }` replaces the entire
+  branching list with those two forms, retaining every other default list.
+  Without this key, scores are unchanged.
 * `elisp_compile` and `elisp_checkdoc` select files from the classes listing
   them. Their optional `load_path` entries are repository-relative directories;
   `emacs` is a command or path and `budget_seconds` is a positive integer.
