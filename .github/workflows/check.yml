@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+env:
+  EMACS_VERSION: "30.1"
+  EMACS_URL: https://ftpmirror.gnu.org/emacs/emacs-30.1.tar.xz
+  EMACS_SHA256: 6ccac1ae76e6af93c6de1df175e8eb406767c23da3dd2a16aa67e3124a6f138f
+  PYTHON_VERSION: "3.12.13"
+  PYTHON_URL: https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-x86_64-unknown-linux-gnu-install_only.tar.gz
+  PYTHON_SHA256: 5bd6f36fd7ef02b909234c94dca9994ef0da06ace3bc3cece4fe27870e9cdbbe
+
 jobs:
   check:
     strategy:
@@ -19,12 +27,9 @@ jobs:
             image: debian:13
             python: "3.13"
             emacs: "30.1"
-          - name: ubuntu2404
-            image: ubuntu:24.04
-            python: "3.12"
-            emacs: "29.3"
+          - name: ubuntu2604
+            image: ubuntu:26.04
     runs-on: ubuntu-latest
-    # Debian 13 ships Python 3.13 and Ubuntu 24.04 ships Python 3.12, the two supported versions.
     container: ${{ matrix.image }}
     # Rule: smallest multiple of 5 minutes at least three times the measured check time.
     # CI run 40188680325 measured the slower job (debian:13) at 101 s; 3 x 101 s = 303 s, so 10.
@@ -35,12 +40,67 @@ jobs:
       - name: Install check tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends \
-            python3 make git ca-certificates emacs-nox
-          python3 --version
+          apt-get install -y --no-install-recommends python3 make git ca-certificates curl xz-utils libncurses6
+      - name: Install Debian Emacs
+        if: matrix.name == 'debian13'
+        run: apt-get install -y --no-install-recommends emacs-nox
+      - name: Restore pinned Emacs
+        if: matrix.name == 'ubuntu2604'
+        id: emacs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/qg-emacs
+          key: ${{ matrix.image }}-${{ runner.arch }}-emacs-${{ env.EMACS_VERSION }}-${{ env.EMACS_SHA256 }}
+      - name: Build pinned batch Emacs
+        if: matrix.name == 'ubuntu2604' && steps.emacs-cache.outputs.cache-hit != 'true'
+        run: |
+          apt-get install -y --no-install-recommends build-essential libncurses-dev pkg-config texinfo
+          curl --fail --location --retry 3 "$EMACS_URL" -o /tmp/emacs.tar.xz
+          actual=$(sha256sum /tmp/emacs.tar.xz)
+          actual=${actual%% *}
+          if [ "$actual" != "$EMACS_SHA256" ]; then
+            printf 'Emacs SHA-256 mismatch: expected %s, actual %s\n' "$EMACS_SHA256" "$actual" >&2
+            exit 1
+          fi
+          mkdir /tmp/emacs-build
+          tar -xJf /tmp/emacs.tar.xz -C /tmp/emacs-build --strip-components=1
+          cd /tmp/emacs-build
+          ./configure --prefix=/opt/qg-emacs --without-all --without-x --without-native-compilation
+          make -j"$(nproc)"
+          make install
+      - name: Restore pinned Python
+        if: matrix.name == 'ubuntu2604'
+        id: python-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/qg-python
+          key: ${{ matrix.image }}-${{ runner.arch }}-python-${{ env.PYTHON_VERSION }}-${{ env.PYTHON_SHA256 }}
+      - name: Install pinned standalone Python
+        if: matrix.name == 'ubuntu2604' && steps.python-cache.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --location --retry 3 "$PYTHON_URL" -o /tmp/python.tar.gz
+          actual=$(sha256sum /tmp/python.tar.gz)
+          actual=${actual%% *}
+          if [ "$actual" != "$PYTHON_SHA256" ]; then
+            printf 'Python SHA-256 mismatch: expected %s, actual %s\n' "$PYTHON_SHA256" "$actual" >&2
+            exit 1
+          fi
+          mkdir /opt/qg-python
+          tar -xzf /tmp/python.tar.gz -C /opt/qg-python --strip-components=1
+      - name: Use pinned Ubuntu runtimes
+        if: matrix.name == 'ubuntu2604'
+        run: |
+          echo /opt/qg-emacs/bin >> "$GITHUB_PATH"
+          echo /opt/qg-python/bin >> "$GITHUB_PATH"
+      - name: Assert runtime versions
+        env:
+          EXPECTED_EMACS: ${{ matrix.emacs || env.EMACS_VERSION }}
+          EXPECTED_PYTHON: ${{ matrix.python || env.PYTHON_VERSION }}
+        run: |
           emacs --version
-          emacs -Q --batch --eval '(unless (equal emacs-version "${{ matrix.emacs }}") (kill-emacs 1))'
-          python3 -c 'import sys; assert ".".join(map(str, sys.version_info[:2])) == "${{ matrix.python }}"'
+          python3 --version
+          emacs -Q --batch --eval '(unless (equal emacs-version (getenv "EXPECTED_EMACS")) (kill-emacs 1))'
+          python3 -c 'import os, sys; expected = os.environ["EXPECTED_PYTHON"]; actual = ".".join(map(str, sys.version_info[:len(expected.split("."))])); assert actual == expected, (expected, actual)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -56,7 +116,7 @@ jobs:
 
   mutation:
     runs-on: ubuntu-latest
-    container: ubuntu:24.04
+    container: debian:13
     # Mutations run the complete suite for each decision, with four isolated copies at a time.
     timeout-minutes: 90
     env:
@@ -67,7 +127,9 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends python3 make git ca-certificates emacs-nox
           emacs --version
-          emacs -Q --batch --eval '(unless (equal emacs-version "29.3") (kill-emacs 1))'
+          python3 --version
+          emacs -Q --batch --eval '(unless (equal emacs-version (getenv "EMACS_VERSION")) (kill-emacs 1))'
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -75,7 +137,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.QG_TOOLS_DIR }}
-          key: ubuntu2404-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
+          key: debian13-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Mutation-test gate decisions

@@ -28,6 +28,9 @@ from .policy import (
 )
 
 
+ELISP_MINIMUM_VERSION = "30.1"
+
+
 def _default_budget(_spec: Any) -> int:
     from .checks import CLONE_BUDGET_SECONDS
 
@@ -79,6 +82,7 @@ class AdapterDescriptor:
     budget: Callable[[Any], int] = _default_budget
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
+    minimum_emacs_version: str | None = None
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
@@ -239,6 +243,13 @@ def _runner(attribute: str) -> Callable[..., Any]:
         context = AdapterContext(
             root, config, check, files, classes, prefix, prior
         )
+        minimum = adapter_for(check.adapter).minimum_emacs_version
+        if minimum is not None:
+            from .elisp_tests import version_failure
+
+            failure = version_failure(context, minimum)
+            if failure is not None:
+                return failure
         return getattr(checks, attribute)(context)
 
     return run
@@ -299,6 +310,7 @@ register_adapter(AdapterDescriptor(
     ("suite", "load_path", "emacs", "budget_seconds"),
     _elisp_tests_spec,
     _runner("_run_elisp_tests"),
+    minimum_emacs_version=ELISP_MINIMUM_VERSION,
     budget=_spec_budget,
     parse_candidate_inputs=True,
 ))
@@ -307,6 +319,7 @@ register_adapter(AdapterDescriptor(
     ("load_path", "emacs", "budget_seconds"),
     _elisp_lint_spec,
     _runner("_run_elisp_lint"),
+    minimum_emacs_version=ELISP_MINIMUM_VERSION,
     budget=_spec_budget,
     parse_candidate_inputs=True,
 ))
@@ -315,6 +328,7 @@ register_adapter(AdapterDescriptor(
     ("load_path", "emacs", "budget_seconds"),
     _elisp_lint_spec,
     _runner("_run_elisp_lint"),
+    minimum_emacs_version=ELISP_MINIMUM_VERSION,
     budget=_spec_budget,
     parse_candidate_inputs=True,
 ))
@@ -332,6 +346,7 @@ register_adapter(AdapterDescriptor(
     ("requires", "threshold", "baseline"),
     _elisp_crap_spec,
     _runner("_run_elisp_crap"),
+    minimum_emacs_version=ELISP_MINIMUM_VERSION,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="elisp_tests",

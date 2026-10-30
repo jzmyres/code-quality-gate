@@ -33,7 +33,7 @@ The archived implementation can be inspected with
 
 * Python 3.12 or later (the command uses `tomllib` and coverage uses `sys.monitoring`).
 * Git.
-* Emacs 29.1 or later for the Emacs Lisp adapters.
+* Emacs 30.1 or later for the Emacs Lisp checks.
 * The pinned jscpd binary in the tools cache for clone checks.
 * The pinned ruff binary in the tools cache for this repository's own command check.
 * The pinned coverage 7.16.2 wheel in the tools cache for the Python adapters.
@@ -310,7 +310,9 @@ missing, repeated or inconsistent with its headings, reports no `test_results`; 
     emacs = "emacs"                       # optional command on PATH or path; the default
     budget_seconds = 900                  # optional; the default
 
-`elisp_tests` requires Emacs 29.1 or later. The suite must be a regular file, and every `load_path`
+All Emacs Lisp checks require Emacs 30.1 or later. An older Emacs makes the check `unsupported`,
+naming the version found and the minimum, before any suite or source file is loaded.
+The suite must be a regular file, and every `load_path`
 entry must be a directory in the repository. Unknown keys and invalid configuration are errors. The
 adapter instruments the files of every class listing the check with Edebug, preserving each file's
 `load-file-name` context; a class may be empty. The suite itself must not be instrumented. A temporary,
@@ -1100,7 +1102,7 @@ human accepts it.
 
 ## Pinned tools and this repository
 
-`tools.lock.toml` in the gate repository is the only place tool versions live. It pins jscpd 5.4.1,
+`tools.lock.toml` in the gate repository pins the external check tools: jscpd 5.4.1,
 ruff 0.17.0 and coverage 7.16.2, including the archive URL, SHA-256, payload SHA-256,
 archive format and binary path.
 `tools fetch` accepts `--lock FILE` for testing or for a private mirror; `file://` URLs exercise
@@ -1132,6 +1134,21 @@ This repository gates itself with `quality-gate.toml`:
 
 `make check` is the single entry point and runs only `python3 -I qg.py check`; Ruff, the tests and
 CRAP are policy checks, so the Makefile does not duplicate them.
+
+CI runs that same gate in the environments we use:
+
+| Job | Container | Emacs | Python | Mirrors |
+| --- | --- | --- | --- | --- |
+| `debian13` | `debian:13` | Debian's 30.1 | Debian's 3.13 | The local Debian 13 machine |
+| `ubuntu2604` | `ubuntu:26.04` | GNU release 30.1 | Standalone 3.12.13 | The planned Docker image, using the local default Python version |
+| `mutation` | `debian:13` | Debian's 30.1 | Debian's 3.13 | The local environment for mutation testing |
+
+Ubuntu 26.04 ships Emacs 30.2 and Python 3.14, so its job installs both runtimes from pins.
+The workflow's top-level `env` holds their versions, download URLs and SHA-256 digests. Each
+archive is verified before unpacking; Emacs is built for batch use without GUI or native compilation.
+Both installations are cached by image, architecture, version and digest. Every job asserts its
+runtime versions before running checks; the standalone Python assertion includes the patch version.
+The workflow itself is proven only by the CI run after landing, which the designer checks.
 
 The tests execute `qg.py` as a subprocess on disposable fixture git repositories. `tests/support.py`
 starts those subprocesses through `QG_PYTHON` when the gate exports it, so the gate's own Python

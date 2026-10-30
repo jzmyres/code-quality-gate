@@ -190,15 +190,17 @@ class ElispLintTests(FixtureCase):
         for adapter in ("elisp_compile", "elisp_checkdoc"):
             self.assertEqual(self.check_by_id(document, adapter)["diagnostics"]["argv"][0], str(wrapper))
         lines = log.read_text().splitlines()
-        self.assertEqual(lines.count("-Q"), 2)
-        self.assertEqual(lines.count("--batch"), 2)
+        self.assertEqual(lines.count("-Q"), 4)
+        self.assertEqual(lines.count("--batch"), 4)
         self.assertEqual(lines.count(str(GATE / "quality_gate/elisp/qg-elisp-lint.el")), 2)
         self.assertTrue(any("qg-elisp-lint-compile" in line for line in lines))
         self.assertTrue(any("qg-elisp-lint-checkdoc" in line for line in lines))
 
     def test_missing_binary_and_missing_report_are_unsupported(self) -> None:
         wrapper = self.base / "no-report"
-        wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(self.emacs)} -Q --batch '
+        wrapper.write_text(f'#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                           f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
+                           f'exec {shlex.quote(self.emacs)} -Q --batch '
                            "--eval '(kill-emacs 0)'\n")
         wrapper.chmod(0o755)
         for adapter in ("elisp_compile", "elisp_checkdoc"):
@@ -236,7 +238,9 @@ class ElispLintTests(FixtureCase):
                     self.assertIn("expected", check["reason"])
                     self.assertIn("got", check["reason"])
                     self.assertIn("src/core.el", result.stderr)
-            wrapper.write_text(f'#!/bin/sh\n{shlex.quote(self.emacs)} "$@"\nexit 7\n')
+            wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                               f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
+                               f'{shlex.quote(self.emacs)} "$@"\nexit 7\n')
             wrapper.chmod(0o755)
             result, returned = self.run_checks(1)
             self.assert_check(returned, adapter, "unsupported")
@@ -247,9 +251,11 @@ class ElispLintTests(FixtureCase):
         self.add_file("src/second.el", MODULE.replace("core.el", "second.el"))
         marker = self.base / "seen"
         wrapper = self.base / "changing-emacs"
-        wrapper.write_text(f'#!/bin/sh\nif [ -f {shlex.quote(str(marker))} ]; then\n'
-                           '  version=fixture-two\nelse\n'
-                           f'  touch {shlex.quote(str(marker))}\n  version=fixture-one\nfi\n'
+        wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                           f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
+                           f'if [ -f {shlex.quote(str(marker))} ]; then\n'
+                           '  version=31.2\nelse\n'
+                           f'  touch {shlex.quote(str(marker))}\n  version=31.1\nfi\n'
                            f'exec {shlex.quote(self.emacs)} -Q --batch '
                            '--eval "(setq emacs-version \\\"$version\\\")" "$@"\n')
         wrapper.chmod(0o755)
@@ -257,8 +263,8 @@ class ElispLintTests(FixtureCase):
         self.write_config(config(("elisp_compile",), {"elisp_compile": option}))
         result, document = self.run_checks(1)
         check = self.assert_check(document, "elisp_compile", "unsupported")
-        self.assertIn("expected Emacs version fixture-one, got fixture-two", result.stderr)
-        self.assertEqual(check["emacs_version"], "fixture-one")
+        self.assertIn("expected Emacs version 31.1, got 31.2", result.stderr)
+        self.assertEqual(check["emacs_version"], "31.1")
 
     def test_no_selected_files_fails(self) -> None:
         text = config(("elisp_compile",)).replace('checks = ["smoke", "elisp_compile"]', 'checks = ["smoke"]')
@@ -301,7 +307,9 @@ reason = "dependency"
                         f'(with-temp-file {json.dumps(str(childfile))} '
                         '(insert (number-to-string (process-id p))))) (sleep-for 20))')
                 wrapper = self.base / f"{adapter}-slow"
-                wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(self.emacs)} -Q --batch '
+                wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                                   f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
+                                   f'exec {shlex.quote(self.emacs)} -Q --batch '
                                    f'--eval {shlex.quote(form)} "$@"\n')
                 wrapper.chmod(0o755)
                 option = f'emacs = {json.dumps(str(wrapper))}\nbudget_seconds = 1'

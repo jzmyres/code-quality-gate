@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -234,6 +235,72 @@ register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_
     def test_missing_emacs_is_unsupported(self) -> None:
         self.write_config(config('emacs = "no-qg-such-emacs-command"'))
         self.assert_outcome("unsupported", "no-qg-such-emacs-command", "expected")
+
+    def test_old_emacs_is_unsupported_for_every_elisp_check_before_any_suite(self) -> None:
+        wrapper = self.base / "emacs"
+        log = self.base / "emacs-calls"
+        wrapper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(log)) + '\n'
+                           'case "$*" in\n'
+                           '  "-Q --batch --eval (princ emacs-version)") printf "29.3";;\n'
+                           '  *) echo "unexpected suite or measurement command" >&2; exit 99;;\n'
+                           'esac\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        option = f'emacs = {json.dumps(str(wrapper))}'
+        text = config(option).replace('checks = ["legacy-tests"]',
+                                      'checks = ["legacy-tests", "crap", "compile", "checkdoc"]')
+        text += '''
+[checks.crap]
+adapter = "elisp_crap"
+tier = 1
+enforcement = "enforced"
+requires = "legacy-tests"
+baseline = "crap.toml"
+'''
+        for name in ("compile", "checkdoc"):
+            text += (f'\n[checks.{name}]\nadapter = "elisp_{name}"\ntier = 1\n'
+                     f'enforcement = "enforced"\n{option}\n')
+        self.write_config(text)
+        self.add_file("crap.toml", baseline_text([], check="crap", metric_version="elisp-edebug/1"))
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        for name in ("legacy-tests", "crap", "compile", "checkdoc"):
+            with self.subTest(check=name):
+                check = self.check_by_id(document, name)
+                self.assertEqual(check["outcome"], "unsupported", output(result))
+                self.assertIn("29.3", check["reason"])
+                self.assertIn("30.1", check["reason"])
+                self.assertNotIn("test_results", check)
+        self.assertEqual(log.read_text().splitlines(),
+                         ["-Q --batch --eval (princ emacs-version)"] * 4)
+
+    def test_invalid_emacs_version_probe_is_unsupported(self) -> None:
+        wrapper = self.base / "emacs"
+        for command in ("printf garbage", "exit 7", "exit 0"):
+            with self.subTest(command=command):
+                wrapper.write_text(f"#!/bin/sh\n{command}\n", encoding="utf-8")
+                wrapper.chmod(0o755)
+                self.write_config(config(f'emacs = {json.dumps(str(wrapper))}'))
+                self.assert_outcome("unsupported", "expected", "got", "version")
+
+    def test_emacs_version_probe_has_the_check_budget(self) -> None:
+        wrapper = self.base / "emacs"
+        wrapper.write_text("#!/bin/sh\nexec sleep 20\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        self.write_config(config(f'emacs = {json.dumps(str(wrapper))}\nbudget_seconds = 1'))
+        _result, check = self.assert_outcome("fail", "version", "budget")
+        self.assertEqual(check["execution"], "budget")
+
+    def test_emacs_minimum_compares_numeric_versions(self) -> None:
+        wrapper = self.base / "emacs"
+        for version, outcome in (("30.0", "unsupported"), ("30.1", "pass"),
+                                 ("30.10", "pass"), ("31.0", "pass")):
+            with self.subTest(version=version):
+                wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                                   f'  printf "{version}"\nelse\n  exec emacs "$@"\nfi\n',
+                                   encoding="utf-8")
+                wrapper.chmod(0o755)
+                self.write_config(config(f'emacs = {json.dumps(str(wrapper))}'))
+                self.assert_outcome(outcome)
 
     def test_kill_emacs_and_malformed_result_are_unsupported(self) -> None:
         for suite in ("(require 'ert)\n(ert-deftest die () (kill-emacs 0))\n"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -26,6 +27,41 @@ class ElispTestsSpec:
     load_path: tuple[str, ...]
     emacs: str
     budget_seconds: int
+
+
+def _version_reason(child: Any, emacs: str, minimum: str) -> str | None:
+    if child.execution != "completed" or child.returncode != 0:
+        return (f"expected Emacs command {emacs!r} to report its version, got "
+                f"exit {child.returncode}, execution {child.execution}: {child.error or child.combined_text}")
+    version = child.combined_text.strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version) is None:
+        return f"expected a numeric Emacs version, got {version!r}; minimum required is {minimum}"
+    if tuple(map(int, version.split("."))) < tuple(map(int, minimum.split("."))):
+        return f"found Emacs {version}; minimum required is Emacs {minimum}"
+    return None
+
+
+def version_failure(context: Any, minimum: str) -> Any:
+    """Refuse an unavailable or older Emacs before loading any measured code."""
+    from .adapters import adapter_for
+    from .checks import _check_result
+
+    start = time.monotonic()
+    spec = context.check.spec
+    if not hasattr(spec, "emacs"):
+        spec = context.config.checks[spec.requires].spec
+    budget = adapter_for(context.check.adapter).budget(context.check.spec)
+    mark_step("Emacs version check")
+    child = run([spec.emacs, "-Q", "--batch", "--eval", "(princ emacs-version)"],
+                cwd=context.root, budget_seconds=remaining_budget(budget))
+    record_diagnostics(child.diagnostics())
+    reason = _version_reason(child, spec.emacs, minimum)
+    if reason is None:
+        return None
+    print(f"{context.prefix}: {reason}", file=sys.stderr)
+    return _check_result(context.check, start, "fail" if child.execution == "budget" else "unsupported",
+                         execution=child.execution, budget_seconds=budget, reason=reason,
+                         diagnostics=child.diagnostics())
 
 
 def _resolved_path(root: Path, target: Path, path: Path, key: str, kind: str) -> Path:
