@@ -751,7 +751,18 @@ a sandbox.
       "location": "pkg/alpha.py:1-6"
     }
   ],
+  "slack": [
+    {
+      "check": "verification",
+      "subject": "tests:tests:executed",
+      "bound": 1,
+      "value": 3,
+      "slack": 2
+    }
+  ],
   "notes": [
+    {"check": "crap", "subject": "other/existing.py:ghost", "reason": "unmeasured"},
+    {"check": "verification", "subject": "tests:missing:executed", "reason": "not measured"},
     {"check": "crap", "subject": "pkg/alpha.py:removed", "reason": "no longer exists"},
     {
       "check": "crap",
@@ -763,14 +774,53 @@ a sandbox.
 }
 ```
 
-Rows hold every baseline entry whose bound is above the check's threshold, ranked by
-`churn_x_value` descending. `churn` is the number of commits `git log --follow` reports for the file in
-the finding's location; `bound`, `value` and `churn_x_value` are the unrounded numbers that were
-compared. The human report displays those three to one decimal.
+All four top-level fields are required: `schema` is the integer version `1`; `rows`, `slack` and
+`notes` are arrays of objects, including empty arrays when there are no entries to report.
 
-Notes hold entries that are not ranked. `reason` is `no longer exists` when the baseline subject has no
-current finding, or `churn not measured` when Git reports no commits for the finding's file; the latter
-also names that `file`. A Git command that fails makes the command exit 1 and write no document.
+`rows` holds only `max` baseline entries whose bound is strictly above the check's threshold, whose
+subject is measured and whose finding's file has Git history. Rows are ranked by `churn_x_value`
+descending. Maximum bounds at or below the threshold do not appear in rows or notes.
+
+| Row field | JSON type | Meaning |
+| --- | --- | --- |
+| `check` | string | Selected check id. |
+| `subject` | string | Baseline subject identifier. |
+| `churn` | integer | Complete number of commits `git log --follow` reports for the finding's file, treating its path literally. |
+| `bound` | number | Baseline maximum allowed value. |
+| `value` | number | Current measured value. |
+| `churn_x_value` | number | `churn * value`, used for ranking. |
+| `location` | string | Finding's display location, such as a file and line range. |
+
+`slack` holds every measured `min` baseline entry, independently of the check's threshold. Minimum
+bounds do not appear in `rows` and need neither a source location nor churn. Maximum bounds have no
+`slack` field or entry; their rows report the current value and maximum bound instead.
+
+| Slack entry field | JSON type | Meaning |
+| --- | --- | --- |
+| `check` | string | Selected check id. |
+| `subject` | string | Baseline subject identifier. |
+| `bound` | number | Baseline minimum required value. |
+| `value` | number | Current measured value. |
+| `slack` | number | `value - bound`: the measured room above the minimum floor. |
+
+Numeric values are unrounded. The human report displays bounds, values, products and slack to one
+decimal.
+
+`notes` holds eligible maximum entries and minimum entries that cannot be reported in `rows` or
+`slack`. Every note has `check` (string check id), `subject` (string baseline subject identifier) and
+`reason` (string from the table below). The optional `file` is a string present only for
+`churn not measured`, naming the finding's file.
+
+| Note reason | Meaning |
+| --- | --- |
+| `unmeasured` | A missing `max` subject lies outside the adapter's completed measurement domain; its absence is not evidence of deletion. |
+| `not measured` | A missing `min` subject lies outside the adapter's completed measurement domain; no slack is fabricated. |
+| `no longer exists` | A missing subject, for either bound direction, is absent within the adapter's completed measurement domain and is classified as resolved. |
+| `churn not measured` | A current maximum-bound finding exists, but Git reports no commits for its file. |
+
+A missing current finding alone does not mean a subject no longer exists: the ratchet's measurement
+domain determines which of the first three states applies. A Git command that fails makes the command
+exit 1 and write no document.
 
 ## Versions and superseded proposals
 

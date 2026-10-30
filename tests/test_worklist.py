@@ -9,7 +9,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from support import FixtureCase, PYTHON_TEST_HEADER, baseline_text, output
+from support import GATE, FixtureCase, PYTHON_TEST_HEADER, baseline_text, output
 from test_python_crap import crap_config
 from test_verification import (
     executed_entry, exclusion_entry, verification_baseline, verification_config,
@@ -699,6 +699,67 @@ class WorklistJsonTests(FixtureCase):
             self.assertIn(line, human.stdout)
         self.assertEqual(document["notes"], [])
         self.assertNotIn("Not ranked:", human.stdout)
+
+
+class WorklistSchemaTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        config = crap_config(threshold=6).replace(
+            '[classes.config]',
+            '[classes.other]\ncode = true\ndescription = "Outside CRAP"\n'
+            'checks = ["tests"]\n\n[classes.config]',
+        ).replace('checks = ["tests", "crap"]', 'checks = ["tests", "crap", "verification"]')
+        config += ('\n[checks.verification]\nadapter = "verification"\ntier = 1\n'
+                   'enforcement = "enforced"\nrequires = "tests"\n'
+                   'baseline = "quality-gate-verification.toml"\n'
+                   '\n[[rule]]\npattern = "other/*.py"\nclass = "other"\nreason = "outside CRAP"\n')
+        self.write_config(config)
+        self.add_file("pkg/alpha.py", ALPHA + "\n" + SIMPLE)
+        self.add_file("other/existing.py", GHOST)
+        self.add_file("tests/test_sample.py", PASSING_TEST)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": subject, "bound": bound, "reason": "schema fixture"}
+            for subject, bound in (
+                ("pkg/alpha.py:alpha", 25), ("pkg/alpha.py:simple", 6),
+                ("other/existing.py:ghost", 15), ("pkg/alpha.py:removed", 25),
+                ("pkg/ghost.py:ghost", 15),
+            )
+        ]))
+        self.add_file("quality-gate-verification.toml", verification_baseline([
+            executed_entry(1),
+            {"subject": "tests:missing:executed", "bound": 1, "reason": "outside domain"},
+        ]))
+        self.commit_all()
+        self.add_file("pkg/ghost.py", GHOST)
+
+    def test_json_keys_and_states_agree_with_schema(self) -> None:
+        schema = (GATE / "docs/SCHEMA.md").read_text(encoding="utf-8")
+        section = schema.split('## Result: `worklist --json`', 1)[1]
+        example = json.loads(section.split("```json\n", 1)[1].split("```", 1)[0])
+        result = run_worklist(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        document = self.parse_json(result)
+        self.assertEqual(set(document), set(example))
+        self.assertEqual(document["schema"], example["schema"])
+        for name in ("rows", "slack"):
+            self.assertTrue(document[name], name)
+            for item in document[name]:
+                with self.subTest(array=name, subject=item["subject"]):
+                    self.assertEqual(set(item), set(example[name][0]))
+        self.assertEqual([row["subject"] for row in document["rows"]], ["pkg/alpha.py:alpha"])
+        self.assertEqual([item["subject"] for item in document["slack"]], ["tests:tests:executed"])
+        documented_notes = {note["reason"]: set(note) for note in example["notes"]}
+        self.assertEqual({note["reason"] for note in document["notes"]}, set(documented_notes))
+        for note in document["notes"]:
+            with self.subTest(reason=note["reason"]):
+                self.assertEqual(set(note), documented_notes[note["reason"]])
+        self.assertEqual({note["subject"]: note["reason"] for note in document["notes"]}, {
+            "other/existing.py:ghost": "unmeasured",
+            "tests:missing:executed": "not measured",
+            "pkg/alpha.py:removed": "no longer exists",
+            "pkg/ghost.py:ghost": "churn not measured",
+        })
 
 
 class WorklistReadOnlyTests(FixtureCase):
