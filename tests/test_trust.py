@@ -10,6 +10,7 @@ import sys
 import time
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 from support import (
     BASE_CONFIG,
@@ -205,6 +206,20 @@ class BaselineTrustTests(TrustCase):
         self.empty_clones_baseline()
         result, document = self.trust_json(revision, env=self.clone_env())
         self.assert_clone_fails_tightened(result, document)
+
+    def test_gitlink_replacing_a_baseline_keeps_the_trusted_entries(self) -> None:
+        self.write_clones_baseline()
+        revision = self.commit_revision()
+        self.git("update-index", "--force-remove", "quality-gate-clones.toml")
+        (self.repo / "quality-gate-clones.toml").unlink()
+        self.git("update-index", "--add", "--cacheinfo",
+                 f"160000,{revision},quality-gate-clones.toml")
+        result, document = self.trust_json(revision, env=self.clone_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        entry = self.protected(document, "quality-gate-clones.toml")
+        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual((entry["rev_kind"], entry["candidate_kind"]), ("file", "gitlink"))
+        self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
 
     def test_lowered_baseline_bound_takes_effect(self) -> None:
         self.write_clones_baseline(bound=5)
@@ -602,6 +617,280 @@ class PolicyTrustTests(TrustCase):
         self.assert_blocked(result, document)
 
 
+class GitlinkTrustTests(TrustCase):
+    path = "vendor/code-quality-gate"
+
+    def sub_git(self, root, *args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            env=self.env(), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def setUp(self) -> None:
+        super().setUp()
+        source = self.base / "gate-source"
+        source.mkdir()
+        self.sub_git(source, "init", "-q", "-b", "main")
+        (source / "gate.py").write_text("trusted\n", encoding="utf-8")
+        self.sub_git(source, "add", "gate.py")
+        self.sub_git(source, "commit", "-q", "-m", "trusted gate")
+        self.old = self.sub_git(source, "rev-parse", "HEAD")
+        (source / "gate.py").write_text("candidate\n", encoding="utf-8")
+        self.sub_git(source, "commit", "-qam", "candidate gate")
+        self.new = self.sub_git(source, "rev-parse", "HEAD")
+        self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                 str(source), self.path)
+        self.checkout(self.old)
+        rules = (
+            '\n[[rule]]\npattern = ".gitmodules"\nclass = "config"\n'
+            'reason = "submodule configuration"\n'
+            f'\n[[rule]]\npattern = "{self.path}"\nclass = "config"\n'
+            'reason = "pinned gate"\n'
+        )
+        self.config = with_protect(BASE_CONFIG, self.path) + rules
+        self.write_config(self.config)
+        self.revision = self.commit_revision()
+
+    def checkout(self, commit: str) -> None:
+        self.sub_git(self.repo / self.path, "checkout", "-q", "--detach", commit)
+
+    def assert_gitlink(self, entry, status, candidate, head) -> None:
+        self.assertEqual(entry["status"], status)
+        self.assertEqual(entry["rev_kind"], "gitlink")
+        self.assertEqual(entry["candidate_kind"], "gitlink")
+        self.assertEqual(entry["rev_commit"], self.old)
+        self.assertEqual(entry["candidate_commit"], candidate)
+        self.assertEqual(entry["candidate_head"], head)
+        self.assertNotIn("rev_sha256", entry)
+        self.assertNotIn("candidate_sha256", entry)
+
+    def kind_change(self, revision: str, rev_kind: str, candidate_kind: str):
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 1, output(result))
+        entry = self.protected(document, self.path)
+        self.assertEqual(
+            (entry["status"], entry["rev_kind"], entry["candidate_kind"]),
+            ("blocked", rev_kind, candidate_kind),
+        )
+        return result, entry
+
+    def file_revision(self) -> str:
+        self.git("rm", "--cached", "-f", self.path)
+        shutil.rmtree(self.repo / self.path)
+        self.add_file(self.path, "ordinary file\n")
+        return self.commit_revision()
+
+    def stage_gitlink(self) -> None:
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.new},{self.path}")
+
+    def vendor_glob_revision(self) -> str:
+        self.write_config(self.config.replace(f'paths = ["{self.path}"]',
+                                              'paths = ["vendor/*"]'))
+        return self.commit_revision()
+
+    def identity_changed_by(self, command):
+        script = f"import subprocess; subprocess.run({command!r}, check=True); print(1)"
+        self.write_config(self.config.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            f"run = {json.dumps([sys.executable, '-c', script])}",
+        ))
+        self.commit_all()
+        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        result, document = self.trust_json(revision)
+        self.assertEqual((result.returncode, document["decision"]), (2, "error"), output(result))
+        self.assertIn(self.path, document["error"])
+        snapshots = document["trust"]
+        return tuple(snapshots[name]["protected"][self.path]
+                     for name in ("identity_before", "identity_after"))
+
+    def test_moved_gitlink_is_blocked_or_authorized(self) -> None:
+        self.checkout(self.new)
+        self.git("add", self.path)
+        result, document = self.trust_json(self.revision)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        self.assert_gitlink(self.protected(document, self.path), "blocked", self.new, self.new)
+        for value in (self.path, self.old, self.new):
+            self.assertIn(value, result.stderr)
+        text = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(text.returncode, 1, output(text))
+        for value in (self.path, self.old, self.new):
+            self.assertIn(value, output(text))
+        allowed, document = self.trust_json(
+            self.revision, "--allow-protected", self.path
+        )
+        self.assertEqual(allowed.returncode, 0, output(allowed))
+        self.assertEqual(document["decision"], "accepted")
+        self.assert_gitlink(self.protected(document, self.path), "authorized", self.new, self.new)
+
+    def test_unchanged_gitlink_passes_checked_out_or_uninitialized(self) -> None:
+        result, document = self.trust_json(self.revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_gitlink(self.protected(document, self.path), "unchanged", self.old, self.old)
+        self.git("submodule", "deinit", "-f", "--", self.path)
+        result, document = self.trust_json(self.revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_gitlink(self.protected(document, self.path), "unchanged", self.old, None)
+        (self.repo / self.path).rmdir()
+        result, document = self.trust_json(self.revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_gitlink(self.protected(document, self.path), "unchanged", self.old, None)
+
+    def test_checked_out_head_different_from_index_is_blocked(self) -> None:
+        self.checkout(self.new)
+        result, document = self.trust_json(self.revision)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        self.assert_gitlink(self.protected(document, self.path), "blocked", self.old, self.new)
+        self.assertIn(self.old, result.stderr)
+        self.assertIn(self.new, result.stderr)
+        allowed, document = self.trust_json(
+            self.revision, "--allow-protected", self.path
+        )
+        self.assertEqual(allowed.returncode, 0, output(allowed))
+        self.assert_gitlink(self.protected(document, self.path), "authorized", self.old, self.new)
+
+    def test_gitlink_replaced_by_file_is_blocked_with_both_kinds(self) -> None:
+        shutil.rmtree(self.repo / self.path)
+        self.git("rm", "--cached", "-f", self.path)
+        self.add_file(self.path, "replacement\n")
+        self.git("add", self.path)
+        result, entry = self.kind_change(self.revision, "gitlink", "file")
+        self.assertEqual(entry["rev_commit"], self.old)
+        self.assertEqual(entry["candidate_sha256"], hashlib.sha256(b"replacement\n").hexdigest())
+        for value in (self.path, "gitlink", "file", self.old):
+            self.assertIn(value, result.stderr)
+
+    def test_gitlink_replaced_by_unstaged_file_is_blocked(self) -> None:
+        shutil.rmtree(self.repo / self.path)
+        self.add_file(self.path, "replacement\n")
+        result, document = self.trust_json(self.revision)
+        self.assertEqual(result.returncode, 1, output(result))
+        entry = self.protected(document, self.path)
+        self.assertEqual((entry["rev_kind"], entry["candidate_kind"]), ("gitlink", "file"))
+        self.assertEqual(entry["candidate_index_commit"], self.old)
+
+    def test_gitlink_replaced_by_directory_is_blocked_with_both_kinds(self) -> None:
+        shutil.rmtree(self.repo / self.path)
+        self.add_file(self.path + "/ordinary.txt", "replacement\n")
+        result, _entry = self.kind_change(self.revision, "gitlink", "directory")
+        self.assertIn("directory", result.stderr)
+        self.assertIn("gitlink", result.stderr)
+
+    def test_file_replaced_by_gitlink_is_blocked_with_both_kinds(self) -> None:
+        revision = self.file_revision()
+        self.git("rm", "--cached", "-f", self.path)
+        (self.repo / self.path).unlink()
+        self.stage_gitlink()
+        result, entry = self.kind_change(revision, "file", "gitlink")
+        self.assertEqual(entry["candidate_commit"], self.new)
+        self.assertIn("file", result.stderr)
+        self.assertIn("gitlink", result.stderr)
+
+    def test_file_cannot_hide_a_staged_gitlink_with_the_same_bytes(self) -> None:
+        revision = self.file_revision()
+        self.git("update-index", "--force-remove", self.path)
+        self.stage_gitlink()
+        _result, entry = self.kind_change(revision, "file", "file")
+        self.assertEqual(entry["candidate_index_commit"], self.new)
+
+    def test_directory_replaced_by_gitlink_is_blocked_with_both_kinds(self) -> None:
+        self.git("rm", "--cached", "-f", self.path)
+        shutil.rmtree(self.repo / self.path)
+        self.add_file(self.path + "/ordinary.txt", "ordinary file\n")
+        self.write_config(self.config.replace(f'pattern = "{self.path}"',
+                                              f'pattern = "{self.path}*"'))
+        revision = self.commit_revision()
+        self.git("rm", "--cached", "-r", "-f", self.path)
+        shutil.rmtree(self.repo / self.path)
+        self.stage_gitlink()
+        result, _entry = self.kind_change(revision, "directory", "gitlink")
+        self.assertIn("directory", result.stderr)
+        self.assertIn("gitlink", result.stderr)
+
+    def test_glob_protects_gitlink(self) -> None:
+        revision = self.vendor_glob_revision()
+        self.checkout(self.new)
+        self.git("add", self.path)
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assert_gitlink(self.protected(document, self.path), "blocked", self.new, self.new)
+
+    def test_unreadable_checked_out_submodule_is_refused(self) -> None:
+        (self.repo / self.path / ".git").write_text("not a git directory\n", encoding="utf-8")
+        result = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(self.path, result.stderr)
+        self.assertIn("unreadable submodule", result.stderr)
+
+    def test_submodule_with_unborn_head_is_refused(self) -> None:
+        self.sub_git(self.repo / self.path, "symbolic-ref", "HEAD", "refs/heads/unborn")
+        result = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("unreadable submodule HEAD", result.stderr)
+
+    def test_submodule_with_a_different_worktree_root_is_refused(self) -> None:
+        other = self.base / "other-worktree"
+        other.mkdir()
+        self.sub_git(self.repo / self.path, "config", "core.worktree", str(other))
+        result = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("a different worktree root", result.stderr)
+
+    def test_gitlink_symlinked_parent_is_refused(self) -> None:
+        shutil.rmtree(self.repo / "vendor")
+        (self.repo / "vendor").symlink_to(self.base, target_is_directory=True)
+        result = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("symlinked parent", result.stderr)
+
+    def test_unmerged_gitlink_is_refused(self) -> None:
+        self.git("update-index", "--force-remove", self.path)
+        records = f"160000 {self.old} 1\t{self.path}\n160000 {self.new} 2\t{self.path}\n"
+        subprocess.run(["git", "update-index", "--index-info"], cwd=self.repo,
+                       env=self.env(), input=records, text=True, check=True)
+        result = self.run_qg("check", "--policy-from", self.revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("unresolved index entries", result.stderr)
+
+    def test_gitlink_changed_during_preparation_is_refused(self) -> None:
+        original = trust.load_tools
+
+        def move_head(path):
+            self.checkout(self.new)
+            return original(path)
+
+        with mock.patch.object(trust, "load_tools", side_effect=move_head):
+            with self.assertRaisesRegex(trust.UsageError, "changed while preparing"):
+                prepared = prepare_trust(self.repo, self.revision, [])
+                prepared.close()
+
+    def test_gitlink_added_under_glob_during_preparation_is_refused(self) -> None:
+        revision = self.vendor_glob_revision()
+        original = trust.load_tools
+
+        def add_gitlink(path):
+            self.git("update-index", "--add", "--cacheinfo", f"160000,{self.new},vendor/added")
+            return original(path)
+
+        with mock.patch.object(trust, "load_tools", side_effect=add_gitlink):
+            with self.assertRaisesRegex(trust.UsageError, "vendor/added changed while preparing"):
+                prepared = prepare_trust(self.repo, revision, [])
+                prepared.close()
+
+    def test_gitlink_index_changed_during_check_is_identity_error(self) -> None:
+        command = ["git", "update-index", "--cacheinfo", f"160000,{self.new},{self.path}"]
+        before, after = self.identity_changed_by(command)
+        self.assertEqual(before["candidate_commit"], self.old)
+        self.assertEqual(after["candidate_commit"], self.new)
+
+    def test_gitlink_head_changed_during_check_is_identity_error(self) -> None:
+        command = ["git", "-C", self.path, "checkout", "-q", "--detach", self.new]
+        before, after = self.identity_changed_by(command)
+        self.assertEqual(before["candidate_head"], self.old)
+        self.assertEqual(after["candidate_head"], self.new)
+
+
 class IdentityDecisionTests(unittest.TestCase):
     def test_trust_identity_comparison_detects_only_changed_gate_and_tool_files(self) -> None:
         before = {
@@ -635,6 +924,15 @@ class IdentityDecisionTests(unittest.TestCase):
         self.assertTrue(trust._allowed_change(before, after, written))
         self.assertFalse(trust._allowed_change(before, other, written))
         self.assertFalse(trust._allowed_change(before, {**after, "rev_sha256": "changed"}, written))
+
+    def test_prune_cannot_hide_a_gitlink_index_change(self) -> None:
+        written = b"trusted, tightened baseline"
+        before = {"rev_sha256": "revision", "candidate_sha256": "old"}
+        after = {"rev_sha256": "revision", "candidate_sha256": trust._sha256(written)}
+        staged = {"rev_kind": "file", "candidate_kind": "file", "candidate_index_commit": "commit"}
+        self.assertFalse(trust._allowed_change(before, {**after, **staged}, written))
+        self.assertFalse(trust._allowed_change({**before, **staged}, after, written))
+        self.assertFalse(trust._allowed_change({**before, **staged}, {**after, **staged}, written))
 
 
 class IdentityTrustTests(TrustCase):

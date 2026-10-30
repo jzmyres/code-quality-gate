@@ -103,6 +103,16 @@ classifies the submodule path and `.gitmodules`:
     class = "config"
     reason = "submodule declarations"
 
+Protect the pin in the policy used with `--policy-from`:
+
+    [protect]
+    paths = ["code-quality-gate"]
+
+The trusted run compares that gitlink's commit with the candidate index and,
+when checked out, its HEAD. A changed pin or a different checked-out HEAD is
+blocked unless the path is explicitly authorized with `--allow-protected`.
+Run the gate from a trusted copy outside the candidate, as described below.
+
 `check` never downloads a tool. If a configured check needs a pinned tool and it is missing, the check's
 outcome is `unsupported` and the message names `python3 -I code-quality-gate/qg.py tools fetch`.
 
@@ -821,11 +831,16 @@ and `REV`'s `[protect] paths`, instead of the candidate's copies. Trusted Git re
 replacement refs and candidate-configured fsmonitors, and a repository with an `info/grafts` file is
 refused. An unauthorized candidate baseline edit can only tighten: a removed `max` entry takes effect,
 a removed `min` floor keeps `REV`'s entry, added or loosened entries are ignored, and a malformed
-candidate baseline keeps every `REV` entry. Protected candidate paths must be regular files reached
-without following a symlink. An unauthorized change to another protected path makes the decision
+candidate baseline keeps every `REV` entry. Protected candidate files must be reached without following
+a symlink. A protected gitlink is compared by commit: the candidate's index must match `REV`, and a
+checked-out submodule's HEAD must match the index. An uninitialized submodule is allowed. A gitlink
+replaced by a file or directory, or the reverse, is a protected change. An unauthorized change to
+another protected path makes the decision
 `blocked` (exit 1), while `--allow-protected PATH` accepts a reviewed replacement and reports it as
-authorized. The gate records protected-input, tool-payload and gate-program digests before the checks,
-again after them before a prune write, and once more after a prune write, re-enumerating the
+authorized. Gitlink results show the commits and kinds, including a checked-out HEAD; file results
+continue to show SHA-256 values. The gate records protected-input, tool-payload and gate-program
+identities before the checks, again after them before a prune write, and once more after a prune write,
+re-enumerating the
 protected scope (including ignored untracked files); an added, removed or changed protected path makes
 the decision `error` (exit 2). A performed prune may change its baseline path only by exactly the bytes
 the gate generated. It refuses to run from a gate program inside the candidate root. The full contract
@@ -992,7 +1007,8 @@ Notes:
   tightening lowers it) or `min` (the value must not fall below its bound and tightening raises it).
 * `[protect] paths` is a list of repository-relative paths or `fnmatch` globs that `--policy-from`
   treats as protected inputs. The list always comes from `REV`, so a candidate cannot unprotect a path;
-  without `--policy-from` it is parsed and ignored. The example protects `ruff.toml` and its Ruff check
+  without `--policy-from` it is parsed and ignored. Include a pinned gate's submodule path to protect
+  its gitlink commit. The example protects `ruff.toml` and its Ruff check
   passes `--config ruff.toml`: a candidate cannot weaken lint policy, and Ruff cannot discover a
   different configuration file elsewhere.
 

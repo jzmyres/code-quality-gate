@@ -39,12 +39,12 @@ For every `--policy-from` run, the protected inputs are, in `REV`:
 * every baseline file the policy names;
 * the tools lock, `tools.lock.toml` at the candidate root; and
 * every path or glob listed in `REV`'s policy under `[protect] paths`, for
-  example `ruff.toml`, `Makefile`, CI workflows, or a test runner such as
-  `tests/run_tests.py`:
+  example the pinned gate submodule, `ruff.toml`, `Makefile`, CI workflows,
+  or a test runner such as `tests/run_tests.py`:
 
   ```toml
   [protect]
-  paths = ["ruff.toml", "Makefile", ".github/workflows/*.yml", "tests/run_tests.py"]
+  paths = ["code-quality-gate", "ruff.toml", "Makefile", ".github/workflows/*.yml", "tests/run_tests.py"]
   ```
 
 This repository's own policy protects `ruff.toml`, and its Ruff check names
@@ -52,23 +52,36 @@ that file with `--config ruff.toml`, so a discovered configuration file
 elsewhere cannot change lint policy.
 
 A literal path is protected whether or not it exists. A glob is matched against
-the union of `REV`'s files and the candidate's tracked and untracked files, so
-a new candidate file under a protected glob is a protected input too. The
-protected list always comes from `REV`; a candidate policy cannot unprotect a
-path.
+the union of `REV`'s files and gitlinks and the candidate's tracked and
+untracked paths, so a new candidate path under a protected glob is a protected
+input too. The protected list always comes from `REV`; a candidate policy
+cannot unprotect a path.
 
-`REV`'s versions of protected inputs are read from Git objects
-(`git cat-file blob`), never from the working tree. Every Git command the
-trust root runs ignores replacement refs (`--no-replace-objects`) and
+`REV`'s file contents are read from Git objects (`git cat-file blob`), and its
+gitlink commits from its tree, never from the working tree. Every Git command
+the trust root runs ignores replacement refs (`--no-replace-objects`) and
 candidate-configured fsmonitors, and a candidate repository with a graft file
 (`info/grafts` under its Git directory) is refused. Candidate versions are
 read from the working tree only to compare them with `REV`, to apply an
 allowed tightening, or after the caller authorizes the path.
 
-A protected path in the candidate must be a regular file reached without
-following a symlink: a symlink, a FIFO or another non-regular file, or a
-symlink among the path's parent components inside the candidate, is refused
-(exit 2) with a message naming the path before anything is read.
+For a protected gitlink, the candidate's value is the commit in its index. If
+the submodule is checked out, its HEAD must also match that index commit. A
+missing or empty uninitialized checkout is allowed. A directory containing
+other files without a submodule checkout is a directory, and an unreadable
+checkout or unresolved index is refused. A gitlink on one side and a file,
+directory or missing path on the other is a protected change; the result and
+text report name both kinds. A file or directory in the worktree cannot hide
+a staged gitlink either. These changes have the same `blocked` and
+`--allow-protected` behavior as other protected paths. Protecting the pinned
+gate path prevents an unreviewed change from becoming the next trusted gate.
+
+A protected file in the candidate must be reached without following a symlink:
+a symlink, a FIFO or another non-regular file, or a symlink among the path's
+parent components inside the candidate, is refused (exit 2) with a message
+naming the path before anything is read. A directory is reported as a changed
+kind when compared with a gitlink; otherwise the regular-file rule still
+applies.
 
 ## Effective inputs
 
@@ -157,7 +170,8 @@ difference fails the run naming the path. The written content is derived from
 Before any check runs, the gate records in `trust.identity_before`:
 
 * `REV`'s commit id;
-* each protected input's `REV` and candidate SHA-256 (stored per path);
+* each protected file's `REV` and candidate SHA-256, or a protected gitlink's
+  kinds, `REV` commit, candidate index commit and checked-out HEAD (stored per path);
 * the effective policy and tool lock file SHA-256, a digest of the captured
   tool pins, and a digest of each effective baseline held in memory;
 * each pinned tool's actual install-tree payload digest (the M2a encoding); and
@@ -176,7 +190,8 @@ snapshot; after a performed prune it records the identity captured once more
 after the write, where only the pruned path may differ and only by exactly the
 bytes the gate generated (see above). A missing tool install is recorded as
 `null`; a tree that has no payload digest is recorded as `invalid`; a candidate
-path that is refused as a non-regular file is recorded as `refused`.
+path that is refused as a non-regular file or unreadable submodule is recorded
+as `refused`.
 
 The `effective_inputs` identity maps `policy quality-gate.toml` and
 `tool lock tools.lock.toml` to file SHA-256 values and `tool pins` to the
@@ -222,7 +237,29 @@ A trust run writes result `schema = 3` and adds:
 ```
 
 `status` is one of `unchanged`, `tightened`, `ignored`, `authorized` or
-`blocked`. Only baseline entries carry `ignored_entries`. The result
+`blocked`. Only baseline entries carry `ignored_entries`. For a comparison
+involving a gitlink, the entry and both identity snapshots use `rev_kind` and
+`candidate_kind` (`gitlink`, `file`, `directory`, `missing`, or `refused` in
+an identity snapshot), `rev_commit`, `candidate_commit` and `candidate_head`.
+The commit values are full Git object IDs; a value is `null` when that side
+has no gitlink, and `candidate_head` is `null` when it is not checked out.
+A file side also carries its `rev_sha256` or `candidate_sha256`. If the
+candidate index contains a gitlink but its worktree path is a file or
+directory, `candidate_index_commit` records that staged commit. For example:
+
+```json
+{
+  "path": "code-quality-gate",
+  "rev_kind": "gitlink",
+  "candidate_kind": "gitlink",
+  "rev_commit": "1111111111111111111111111111111111111111",
+  "candidate_commit": "2222222222222222222222222222222222222222",
+  "candidate_head": "2222222222222222222222222222222222222222",
+  "status": "blocked"
+}
+```
+
+The text report includes those commits and kinds. The result
 `decision` adds `blocked`; exit codes remain `0` for accepted results, `1`
 for `rejected`/blocked or a failed prune, and `2` for usage or configuration
 errors and an identity change. Without `--policy-from`, the result remains

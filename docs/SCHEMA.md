@@ -619,11 +619,18 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
 * `protected` has one entry per protected input. `path` is
   repository-relative; `rev_sha256` and `candidate_sha256` are lowercase
   SHA-256 hex or null when the file is absent (in `identity_after`, `refused`
-  means the candidate path is not a regular file). `status` is `unchanged`,
+  means the candidate file could not be read safely). For a comparison involving
+  a gitlink, `rev_kind` and `candidate_kind` name the sides; `rev_commit` and
+  `candidate_commit` hold the full gitlink commit IDs, or null for another
+  kind, and `candidate_head` holds the checked-out submodule HEAD or null if
+  it is not checked out. A file side carries its corresponding SHA-256 instead.
+  When a staged gitlink's worktree path is a file or directory,
+  `candidate_index_commit` records the staged commit. `status` is `unchanged`,
   `tightened`, `ignored`, `authorized` or `blocked`. A baseline entry also
   carries `ignored_entries`, the subjects whose candidate entry was ignored.
 * `identity_before` and `identity_after` record `REV`'s commit id, each
-  protected input's two SHA-256 values, the effective policy, tool lock, tool
+  protected input's file SHA-256 values or gitlink kinds and commits, the
+  effective policy, tool lock, tool
   pins and each in-memory baseline under `effective_inputs`, every pinned tool's
   `payload_sha256` (or null when not installed, or `invalid` when the tree has
   no digest), and the gate program's own per-file SHA-256 values plus one

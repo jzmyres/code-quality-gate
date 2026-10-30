@@ -193,6 +193,14 @@ DECISIONS = (
         "Only explicitly authorized protected changes take effect.",
     ),
     Decision(
+        "trust_gitlink_head",
+        "quality_gate/trust.py",
+        "_gitlink_changed",
+        "comparison",
+        "candidate.head != candidate.commit",
+        "A checked-out protected gitlink must match its index commit.",
+    ),
+    Decision(
         "trust_min_baseline_merge",
         "quality_gate/trust.py",
         "_merge_revision_entry",
