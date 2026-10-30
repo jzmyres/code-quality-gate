@@ -24,6 +24,15 @@ SUITE = """\
 (ert-deftest sample-two () (should (= (sample-used 4) 5)))
 (ert-run-tests-batch-and-exit t)
 """
+REPORT_VERSION_MISMATCHES = ("29.3", "garbage", "9" * 45000, "30.1 ", "30.01", None, 42, [], {})
+
+
+def assert_report_version_mismatch(case, check, version, limit=256):
+    reason = check["reason"]
+    case.assertIn("expected Emacs version 30.1 from preflight", reason)
+    shown = str(version)[:128] + ("..." if len(str(version)) > 128 else "")
+    case.assertIn(repr(shown), reason)
+    case.assertLess(len(reason), limit)
 
 
 def config(extra: str = "", *, extra_rules: str = "", instrument_suite: bool = False) -> str:
@@ -370,11 +379,40 @@ baseline = "crap.toml"
                                  ("30.10", "pass"), ("31.0", "pass")):
             with self.subTest(version=version):
                 wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
-                                   f'  printf "{version}"\nelse\n  exec emacs "$@"\nfi\n',
+                                   f'  printf "{version}"\nelse\n  exec emacs -Q --batch '
+                                   f"--eval '(setq emacs-version {json.dumps(version)})' \"$@\"\nfi\n",
                                    encoding="utf-8")
                 wrapper.chmod(0o755)
                 self.write_config(config(f'emacs = {json.dumps(str(wrapper))}'))
                 self.assert_outcome(outcome)
+
+    def report_version(self, version: object, *, exit_code: int = 0) -> None:
+        wrapper = self.base / "report-emacs"
+        wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                           '  printf "30.1"\n  exit 0\nfi\n'
+                           f'emacs "$@"\nexit {exit_code}\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        self.write_config(config(f'emacs = {json.dumps(str(wrapper))}'))
+        document = {"emacs_version": version, "selected": 1, "passed": 1, "failed": 0,
+                    "skipped": 0, "failures": [], "definitions": []}
+        encoded = json.dumps(json.dumps(document))
+        self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {encoded})\n")
+
+    def test_report_version_must_equal_preflight_before_use(self) -> None:
+        for version in REPORT_VERSION_MISMATCHES:
+            for exit_code in (0, 7):
+                with self.subTest(version=str(version)[:32], exit_code=exit_code):
+                    self.report_version(version, exit_code=exit_code)
+                    result, check = self.assert_outcome("unsupported")
+                    assert_report_version_mismatch(self, check, version)
+                    self.assertLess(len(result.stderr), 4096)
+                    self.assertNotIn("tool", check)
+                    self.assertNotIn("test_results", check)
+
+    def test_report_matching_preflight_is_accepted(self) -> None:
+        self.report_version("30.1")
+        _result, check = self.assert_outcome("pass")
+        self.assertEqual(check["tool"], {"name": "Emacs", "version": "30.1"})
 
     def test_kill_emacs_and_malformed_result_are_unsupported(self) -> None:
         for suite in ("(require 'ert)\n(ert-deftest die () (kill-emacs 0))\n"

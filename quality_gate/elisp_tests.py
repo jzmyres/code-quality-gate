@@ -69,8 +69,8 @@ def _version_reason(child: Any, emacs: str, minimum: str) -> str | None:
     return None
 
 
-def version_failure(context: Any) -> Any:
-    """Refuse an unavailable or older Emacs before loading any measured code."""
+def probe_version(context: Any) -> tuple[str | None, Any]:
+    """Return the accepted Emacs version or a preflight failure before loading measured code."""
     from .adapters import adapter_for
     from .checks import _check_result
 
@@ -85,11 +85,24 @@ def version_failure(context: Any) -> Any:
     record_diagnostics(child.diagnostics())
     reason = _version_reason(child, spec.emacs, ELISP_MINIMUM_VERSION)
     if reason is None:
-        return None
+        return child.combined_text.strip(), None
     print(f"{context.prefix}: {reason}", file=sys.stderr)
-    return _check_result(context.check, start, "fail" if child.execution == "budget" else "unsupported",
-                         execution=child.execution, budget_seconds=budget, reason=reason,
-                         diagnostics=child.diagnostics())
+    return None, _check_result(context.check, start, "fail" if child.execution == "budget" else "unsupported",
+                               execution=child.execution, budget_seconds=budget, reason=reason,
+                               diagnostics=child.diagnostics())
+
+
+def version_failure(context: Any) -> Any:
+    """Refuse an unavailable or older Emacs for measurements without a version field."""
+    return probe_version(context)[1]
+
+
+def _validate_report_version(document: Any, version: str) -> None:
+    if isinstance(document, dict) and "emacs_version" in document:
+        reported = document["emacs_version"]
+        if reported != version:
+            shown = _version_excerpt(reported if isinstance(reported, str) else repr(reported))
+            raise ValueError(f"Emacs version {version} from preflight, got {shown!r}")
 
 
 def _resolved_path(root: Path, target: Path, path: Path, key: str, kind: str) -> Path:
@@ -196,8 +209,6 @@ def _validate_shape(document: Any) -> None:
 
 
 def _validate_counts(document: dict[str, Any]) -> None:
-    if not isinstance(document["emacs_version"], str) or not document["emacs_version"]:
-        raise ValueError("a non-empty emacs_version")
     if not all(_count(document[key]) for key in ("selected", "passed", "failed", "skipped")):
         raise ValueError("non-negative integer test counts")
     if document["selected"] != document["passed"] + document["failed"] + document["skipped"]:
@@ -234,11 +245,12 @@ def _error_document(document: Any) -> bool:
     return isinstance(error, str) and bool(error)
 
 
-def _read_document(path: Path, selected: list[str]) -> dict[str, Any]:
+def _read_document(path: Path, selected: list[str], version: str) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError(f"a JSON result document, got {error}") from error
+    _validate_report_version(document, version)
     if _error_document(document):
         return document
     try:
@@ -341,7 +353,7 @@ def run_tests(context: Any) -> Any:
     """Run the configured suite and return its check result and evidence."""
     from .checks import _select_files, _tests_result
 
-    failure = version_failure(context)
+    version, failure = probe_version(context)
     if failure is not None:
         return failure
     start = time.monotonic()
@@ -362,7 +374,7 @@ def run_tests(context: Any) -> Any:
     if failure is not None:
         return failure
     try:
-        document = analysis_step("Emacs result validation", _read_document, evidence, selected)
+        document = analysis_step("Emacs result validation", _read_document, evidence, selected, version)
     except ValueError as error:
         reason = f"expected {error}; child exit {child.returncode}, execution {child.execution}"
         return _tests_result(context.check, spec, start, context.prefix, reason, outcome="unsupported",

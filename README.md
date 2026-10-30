@@ -320,7 +320,10 @@ All Emacs Lisp checks require Emacs 30.1 or later. An older Emacs makes the chec
 naming the version found and the minimum, before any suite or source file is loaded.
 Truncated version-probe output or output over 128 characters before whitespace is stripped also
 makes the check `unsupported`, naming the command and a bounded output excerpt. Failed version
-probes use the same excerpt bound.
+probes use the same excerpt bound. Test and lint reports must give an `emacs_version` exactly equal
+to the version accepted by that check's probe. A mismatch is `unsupported`, naming the expected
+version and a bounded excerpt of the reported value before it can be used in output or `tool`.
+Every lint batch is checked against the probed version, including the first batch.
 The suite must be a regular file, and every `load_path`
 entry must be a directory in the repository. Unknown keys and invalid configuration are errors. The
 adapter instruments the files of every class listing the check with Edebug, preserving each file's

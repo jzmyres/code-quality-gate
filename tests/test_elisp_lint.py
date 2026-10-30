@@ -8,6 +8,7 @@ import subprocess
 
 import test_command_checks
 from support import GATE, FixtureCase, output
+from test_elisp_tests import REPORT_VERSION_MISMATCHES, assert_report_version_mismatch
 
 
 MODULE = """\
@@ -253,7 +254,7 @@ class ElispLintTests(FixtureCase):
         marker = self.base / "seen"
         wrapper = self.base / "changing-emacs"
         wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
-                           f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
+                           '  printf "31.1"\n  exit 0\nfi\n'
                            f'if [ -f {shlex.quote(str(marker))} ]; then\n'
                            '  version=31.2\nelse\n'
                            f'  touch {shlex.quote(str(marker))}\n  version=31.1\nfi\n'
@@ -264,8 +265,40 @@ class ElispLintTests(FixtureCase):
         self.write_config(config(("elisp_compile",), {"elisp_compile": option}))
         result, document = self.run_checks(1)
         check = self.assert_check(document, "elisp_compile", "unsupported")
-        self.assertIn("expected Emacs version 31.1, got 31.2", result.stderr)
+        self.assertIn("expected Emacs version 31.1 from preflight, got '31.2'", result.stderr)
         self.assertEqual(check["tool"], {"name": "Emacs", "version": "31.1"})
+
+    def lint_report_version(self, version: object, *, exit_code: int = 0) -> None:
+        document = {"emacs_version": version, "files": ["src/core.el"], "failed": [], "issues": []}
+        encoded = json.dumps(json.dumps(document))
+        form = f"(progn (require 'json) (defun json-encode (_value) {encoded}))"
+        wrapper = self.base / "report-emacs"
+        wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                           '  printf "30.1"\n  exit 0\nfi\n'
+                           f'{shlex.quote(self.emacs)} -Q --batch --eval {shlex.quote(form)} "$@"\n'
+                           f'exit {exit_code}\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        option = f'emacs = {json.dumps(str(wrapper))}'
+        self.write_config(config(options={name: option for name in ("elisp_compile", "elisp_checkdoc")}))
+
+    def test_report_version_must_equal_preflight_before_use(self) -> None:
+        for version in REPORT_VERSION_MISMATCHES:
+            for exit_code in (0, 7):
+                with self.subTest(version=str(version)[:32], exit_code=exit_code):
+                    self.lint_report_version(version, exit_code=exit_code)
+                    result, document = self.run_checks(1)
+                    for adapter in ("elisp_compile", "elisp_checkdoc"):
+                        check = self.assert_check(document, adapter, "unsupported")
+                        assert_report_version_mismatch(self, check, version, limit=300)
+                        self.assertEqual(check["tool"], {"name": "Emacs", "version": "30.1"})
+                    self.assertLess(len(result.stderr), 4096)
+
+    def test_report_matching_preflight_is_accepted(self) -> None:
+        self.lint_report_version("30.1")
+        _result, document = self.run_checks()
+        for adapter in ("elisp_compile", "elisp_checkdoc"):
+            check = self.assert_check(document, adapter, "pass")
+            self.assertEqual(check["tool"], {"name": "Emacs", "version": "30.1"})
 
     def test_no_selected_files_fails(self) -> None:
         text = config(("elisp_compile",)).replace('checks = ["smoke", "elisp_compile"]', 'checks = ["smoke"]')

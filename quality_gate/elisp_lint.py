@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .elisp_tests import _common_spec, _lisp_string, _temporary, version_failure
+from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
 
 
@@ -45,8 +45,7 @@ def _issue_valid(issue: Any, files: list[str]) -> bool:
 def _document_header(document: Any, files: list[str]) -> bool:
     if not isinstance(document, dict) or set(document) != {"emacs_version", "files", "failed", "issues"}:
         return False
-    return (isinstance(document["emacs_version"], str) and bool(document["emacs_version"])
-            and document["files"] == files)
+    return document["files"] == files
 
 
 def _document_valid(document: Any, files: list[str], mode: str) -> bool:
@@ -67,11 +66,12 @@ def _content_valid(document: dict[str, Any], files: list[str], mode: str) -> boo
             and not (issues if mode == "elisp_compile" else failed))
 
 
-def _read_document(path: Path, files: list[str], mode: str) -> dict[str, Any]:
+def _read_document(path: Path, files: list[str], mode: str, version: str) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError(f"a JSON lint report, got {error}") from error
+    _validate_report_version(document, version)
     if not _document_valid(document, files, mode):
         raise ValueError(f"a valid {mode} report for {files!r}, got {document!r}")
     return document
@@ -128,7 +128,7 @@ def _execution_failure(context: Any, start: float, child: Any, version: str | No
 
 
 def _run_batch(context: Any, start: float, files: list[str], directory: Path,
-               version: str | None) -> tuple[Any, Any, Any]:
+               version: str) -> tuple[Any, Any, Any]:
     spec, mode = context.check.spec, context.check.adapter
     report = directory / "result.json"
     report.unlink(missing_ok=True)
@@ -140,14 +140,14 @@ def _run_batch(context: Any, start: float, files: list[str], directory: Path,
     if failure is not None:
         return None, child, failure
     try:
-        document = analysis_step("Emacs lint report validation", _read_document, report, files, mode)
+        document = analysis_step("Emacs lint report validation", _read_document, report, files, mode, version)
     except ValueError as error:
-        reason = f"expected {error}; child exit {child.returncode}, execution {child.execution}"
+        reason = f"expected {error} for {files!r}; child exit {child.returncode}, execution {child.execution}"
         return None, child, _failure(context, start, reason, version=version, outcome="unsupported",
                                      execution=child.execution, diagnostics=child.diagnostics())
     if child.returncode != 0:
         reason = f"expected child exit 0 with a lint report, got exit {child.returncode}"
-        return None, child, _failure(context, start, reason, version=document["emacs_version"],
+        return None, child, _failure(context, start, reason, version=version,
                                      outcome="unsupported", execution=child.execution,
                                      diagnostics=child.diagnostics())
     return document, child, None
@@ -170,18 +170,9 @@ def _finish(context: Any, start: float, version: str, problems: list[str], diagn
 
 @dataclass
 class _State:
-    version: str | None = None
+    version: str
     problems: list[str] = field(default_factory=list)
     diagnostics: Any = None
-
-
-def _version_failure(context: Any, start: float, state: _State, document: dict[str, Any], child: Any) -> Any:
-    if state.version is not None and state.version != document["emacs_version"]:
-        reason = f"expected Emacs version {state.version}, got {document['emacs_version']}"
-        return _failure(context, start, reason, version=state.version, outcome="unsupported",
-                        diagnostics=child.diagnostics())
-    state.version = document["emacs_version"]
-    return None
 
 
 def _record_problem(context: Any, state: _State, document: dict[str, Any], child: Any) -> None:
@@ -197,9 +188,6 @@ def _collect_batch(context: Any, start: float, batch: list[str], directory: Path
     document, child, failure = _run_batch(context, start, batch, directory, state.version)
     if failure is not None:
         return failure
-    failure = _version_failure(context, start, state, document, child)
-    if failure is not None:
-        return failure
     _record_problem(context, state, document, child)
     return None
 
@@ -208,18 +196,17 @@ def run_lint(context: Any) -> Any:
     """Run each selected source through the configured lint check."""
     from .checks import _adapter_selection, _class_text
 
-    failure = version_failure(context)
+    version, failure = probe_version(context)
     if failure is not None:
         return failure
     _spec, start, selected, names = _adapter_selection(context)
     if not selected:
         reason = f"no files selected (classes: {_class_text(names)}); zero inputs is not a pass"
         return _failure(context, start, reason)
-    state = _State()
+    state = _State(version)
     with _temporary() as temporary:
         for batch in _batches(context.check.adapter, selected):
             failure = _collect_batch(context, start, batch, Path(temporary), state)
             if failure is not None:
                 return failure
-    assert state.version is not None
     return _finish(context, start, state.version, state.problems, state.diagnostics)
