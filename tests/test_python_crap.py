@@ -1033,6 +1033,30 @@ class CoverageConfigurationAttackTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assert_risky_score(document)
 
+    def test_project_path_that_coverage_would_split_is_refused_before_running(self) -> None:
+        self.add_file(
+            "tests/test_started.py",
+            PYTHON_TEST_HEADER + "pathlib.Path('coverage-started').touch()\n",
+        )
+        for character, name in ((",", "comma"), ("\n", "newline"), ("\r", "carriage return")):
+            with self.subTest(character=name):
+                self.repo = self.repo.rename(self.base / f"project{character}name")
+                result, document = self.run_json(env=self.default_tool_env())
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                check = self.check_by_id(document, "tests")
+                self.assertEqual(check["outcome"], "error")
+                self.assertEqual(check["execution"], "error")
+                self.assertIn(repr(str(self.repo)), check["reason"])
+                self.assertIn(f"{name} {character!r}", check["reason"])
+                self.assertIn(
+                    "coverage's 'source' setting cannot represent it", check["reason"]
+                )
+                self.assertIn(check["reason"], result.stderr)
+                self.assertIsNone(check["diagnostics"]["argv"])
+                self.assertFalse((self.repo / "coverage-started").exists())
+                self.assertEqual(self.check_by_id(document, "crap")["findings"], [])
+
     def test_project_path_with_spaces_is_one_source_entry(self) -> None:
         from quality_gate.coverage_tool import (
             coverage_config_data, import_coverage, write_coverage_config,

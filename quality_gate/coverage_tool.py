@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from .policy import GateError, UnsupportedError
+from .policy import GateError, UnsupportedError, UsageError
 from .tools import installed_tool_dir
 
 
@@ -22,6 +22,12 @@ PRAGMA_NO_COVER = "pragma: no cover"
 
 def coverage_config_text(root: Path) -> str:
     """The one gate-owned coverage configuration for collection and analysis."""
+    for character, name in ((",", "comma"), ("\n", "newline"), ("\r", "carriage return")):
+        if character in str(root):
+            raise UsageError(
+                f"repository root {str(root)!r} contains {name} {character!r}; "
+                "coverage's 'source' setting cannot represent it"
+            )
     return (
         "[run]\n"
         "branch = False\n"

@@ -227,7 +227,9 @@ version and payload digest from the effective tool lock, the gate-owned coverage
 and the registry directory. The adapter writes and every child uses one
 gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`, `source` the
 repository root, `exclude_lines` exactly the `pragma: no cover` expression) for collection,
-combination and analysis. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
+combination and analysis. Repository roots containing spaces are supported. A root containing a
+comma, newline or carriage return is refused before coverage runs: coverage's `source` setting
+cannot represent it as one entry. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
 `pyproject.toml` configuration is ignored, and every `COVERAGE_*` environment variable other than
 `COVERAGE_CORE` is removed before the test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
 --source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so

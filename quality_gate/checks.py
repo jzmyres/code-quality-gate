@@ -1163,6 +1163,13 @@ def _tests_setup(
             execution="error",
             diagnostics=Diagnostics(error=str(error)),
         )
+    except UsageError as error:
+        return _tests_result(
+            check, spec, start, prefix, str(error),
+            outcome="error", execution="error",
+            diagnostics=Diagnostics(error=str(error)),
+            configuration_error=True,
+        )
     except OSError as error:
         message = f"cannot create coverage data directory: {error}"
         return _tests_result(
