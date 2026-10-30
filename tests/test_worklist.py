@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -883,6 +884,56 @@ class WorklistOriginalArgumentTests(FixtureCase):
                 self.assertEqual(result.returncode, 0, output(result))
                 self.assertIn("check: tests", result.stderr)
                 self.assertEqual(snapshot_tree(self.repo), before)
+
+    def assert_resolution_refused(self, argument: str, error: str) -> None:
+        self.writer_command("tests/absolute_writer.py", argument)
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual((result.returncode, result.stdout), (1, ""), output(result))
+        self.assertEqual(snapshot_tree(self.repo), before)
+        self.assertFalse((self.repo / "tests/written.txt").exists())
+        self.assertNotRegex(result.stderr, r"Traceback|check: ")
+        self.assertRegex(
+            result.stderr,
+            rf"(?m)^worklist: check 'tests': cannot resolve argument {re.escape(repr(argument))}: "
+            rf"[^\n]*{re.escape(error)}[^\n]*$",
+        )
+
+    def patch_runner(self, code: str) -> None:
+        self.fixture_gate()
+        runner = FixtureCase.fixture_runner(self)
+        source = runner.read_text(encoding="utf-8")
+        runner.write_text(source.replace("runpy.run_path(", code + "\nrunpy.run_path(", 1),
+                          encoding="utf-8")
+        self.fixture_runner = lambda: runner
+
+    def test_nul_argument_is_refused_before_any_check(self) -> None:
+        # Policy already rejects NUL; bypass that guard only in this fixture
+        # so the worklist's resolution boundary sees the decoded argument.
+        self.patch_runner("policy = importlib.import_module('quality_gate.policy')\n"
+                          "policy._argv_list = policy._string_list\n")
+        path = str(self.base / "invalid\x00argument")
+        for argument in (path, f"--output={path}"):
+            with self.subTest(argument=argument):
+                self.assert_resolution_refused(argument, "embedded null")
+                self.assertIn(r"\u0000", (self.repo / "quality-gate.toml").read_text())
+
+    def test_resolution_errors_are_refused_before_any_check(self) -> None:
+        path = str(self.base / "unresolvable")
+        for error in ("RuntimeError", "OSError"):
+            for argument in (path, f"--output={path}"):
+                with self.subTest(error=error, argument=argument):
+                    self.patch_runner(f'''
+from pathlib import Path
+from unittest.mock import patch
+_real_resolve = Path.resolve
+def _failing_resolve(path, *args, **kwargs):
+    if str(path) == {path!r}:
+        raise {error}("injected resolution failure")
+    return _real_resolve(path, *args, **kwargs)
+patch.object(Path, "resolve", _failing_resolve).start()
+''')
+                    self.assert_resolution_refused(argument, "injected resolution failure")
 
 
 class WorklistCopyTests(FixtureCase):

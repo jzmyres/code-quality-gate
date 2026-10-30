@@ -734,7 +734,8 @@ A selected check or prerequisite whose command arguments contain the original re
 path or resolved real path is refused before any check runs. Absolute arguments, including values in
 `--name=VALUE` options, are also resolved through symlinks and refused if they point into the original
 repository. The error names the check, argument and resolved repository path; use repository-relative
-paths.
+paths. An argument that cannot be resolved is also refused before any check runs; the error names
+the check, argument and underlying resolution error.
 
 A check's writes through its working directory, relative paths and configured paths land in the copy;
 baselines are relocated there. The copy is not a sandbox. Code that computes absolute paths
