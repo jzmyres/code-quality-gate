@@ -27,13 +27,15 @@ def _valid_symbol(value: str) -> bool:
 
 def _symbols(raw: dict[str, Any], family: str, path: Path, key: str) -> tuple[str, ...]:
     values = _string_list(raw, family, path, key)
+    seen: set[str] = set()
     for index, value in enumerate(values):
         if not _valid_symbol(value):
             raise _config_error(
                 path, f"{key}[{index}]", "a non-empty symbol name without whitespace or controls", repr(value)
             )
-        if value in values[:index]:
+        if value in seen:
             raise _config_error(path, f"{key}[{index}]", "a unique symbol name", repr(value))
+        seen.add(value)
     return values
 
 

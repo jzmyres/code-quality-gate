@@ -195,6 +195,20 @@ catch_all = []
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(by_subject(check)["src/core.el:fixture"]["measurement"]["cc"], 5)
 
+    def test_duplicate_rule_names_report_the_key_and_first_duplicate_index(self) -> None:
+        for family in ("branch", "loop_clauses", "catch_all"):
+            with self.subTest(family=family):
+                self.write_config(crap_config() + '\n[checks.crap.decision_rules]\n'
+                                  f'{family} = ["custom", "other", "custom", "other"]\n')
+                result, document = self.run_json()
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn(
+                    f"{self.repo / 'quality-gate.toml'}: checks.crap.decision_rules.{family}[2]: "
+                    "expected a unique symbol name, got 'custom'",
+                    result.stderr,
+                )
+
     def test_scores_and_lambda_attribution(self) -> None:
         body = "(if x (if (eq x 'yes) (+ 1 2) (+ 3 4)) (+ 5 6))"
         self.add_file("src/core.el", f"(defun reached (x) {body})\n"
