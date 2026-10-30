@@ -527,8 +527,20 @@ def _run_copied(
         return _run_selected(copied_root, copied_config, copied_checks)
 
 
+def _original_argument_target(root: Path, argument: str) -> Path | None:
+    values = (argument, argument.partition("=")[2]) if argument.startswith("--") else (argument,)
+    for value in values:
+        path = Path(value)
+        if path.is_absolute():
+            resolved = path.resolve()
+            if resolved.is_relative_to(root):
+                return resolved
+    return None
+
+
 def _reject_original_arguments(root: Path, config: Config, selected: list[CheckDef]) -> None:
-    paths = {str(root.absolute()), str(root.resolve())}
+    canonical_root = root.resolve()
+    paths = {str(root.absolute()), str(canonical_root)}
     for identifier in _needed_order(config, selected):
         check = config.checks[identifier]
         arguments = (*getattr(check.spec, "run", ()), getattr(check.spec, "emacs", ""))
@@ -537,6 +549,12 @@ def _reject_original_arguments(root: Path, config: Config, selected: list[CheckD
                 raise GateError(
                     f"check {identifier!r}: argument {argument!r} contains the original repository's "
                     "absolute path; use a repository-relative path"
+                )
+            target = _original_argument_target(canonical_root, argument)
+            if target is not None:
+                raise GateError(
+                    f"check {identifier!r}: argument {argument!r} resolves into the original "
+                    f"repository at {str(target)!r}; use a repository-relative path"
                 )
 
 

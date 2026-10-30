@@ -821,6 +821,70 @@ class WorklistReadOnlyTests(FixtureCase):
         self.assertEqual(snapshot_tree(self.repo), before)
 
 
+class WorklistOriginalArgumentTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_debt_fixture(self)
+        self.add_file("tests/absolute_writer.py",
+                      "from pathlib import Path\n"
+                      "Path(__file__).with_name('written.txt').write_text('changed')\n"
+                      "print('Ran 1 test in 0.0s')\n")
+        self.alias = self.base / "alias"
+        self.alias.symlink_to(self.repo, target_is_directory=True)
+
+    def writer_command(self, *arguments: str) -> None:
+        self.write_config(crap_config().replace(
+            '["{python}", "-m", "unittest", "discover", "-s", "tests"]',
+            json.dumps(["{python}", *arguments]),
+        ))
+
+    def assert_argument_refused(self, argument: str, *, repo: Path | None = None) -> None:
+        before = snapshot_tree(self.repo)
+        result = self.run_qg("worklist", "--json", "crap", repo=repo,
+                             env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("check 'tests'", result.stderr)
+        self.assertIn(argument, result.stderr)
+        self.assertIn("resolves into the original repository", result.stderr)
+        self.assertIn(str(self.repo / "tests/absolute_writer.py"), result.stderr)
+        self.assertIn("repository-relative path", result.stderr)
+        self.assertNotIn("check: ", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse((self.repo / "tests/written.txt").exists())
+        self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_repo_alias_script_is_refused_before_any_check(self) -> None:
+        argument = str(self.alias / "tests/absolute_writer.py")
+        self.writer_command(argument)
+        self.assert_argument_refused(argument, repo=self.alias)
+
+    def test_unrelated_alias_script_is_refused_before_any_check(self) -> None:
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        other_alias = elsewhere / "another-alias"
+        other_alias.symlink_to(self.repo, target_is_directory=True)
+        argument = str(other_alias / "tests/absolute_writer.py")
+        self.writer_command(argument)
+        self.assert_argument_refused(argument)
+
+    def test_option_value_through_alias_is_refused_before_any_check(self) -> None:
+        argument = f"--output={self.alias / 'tests/absolute_writer.py'}"
+        self.writer_command("tests/absolute_writer.py", argument)
+        self.assert_argument_refused(argument)
+
+    def test_absolute_paths_outside_repository_are_accepted(self) -> None:
+        interpreter = shutil.which("python3")
+        self.assertIsNotNone(interpreter)
+        for argument in (interpreter, f"--interpreter={interpreter}"):
+            with self.subTest(argument=argument):
+                self.writer_command("tests/absolute_writer.py", argument)
+                before = snapshot_tree(self.repo)
+                result = run_worklist(self, "--json", "crap")
+                self.assertEqual(result.returncode, 0, output(result))
+                self.assertIn("check: tests", result.stderr)
+                self.assertEqual(snapshot_tree(self.repo), before)
+
+
 class WorklistCopyTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()

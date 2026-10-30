@@ -726,7 +726,10 @@ even if ignored, stops the worklist before any check runs; the error names the p
 carries Git's enumeration configuration, including an absolute `core.excludesFile`, and its inventory
 file list must match the original's; a difference stops the worklist and names the differing paths.
 A selected check or prerequisite whose command arguments contain the original repository's absolute
-path or resolved real path is refused before any check runs; use repository-relative paths.
+path or resolved real path is refused before any check runs. Absolute arguments, including values in
+`--name=VALUE` options, are also resolved through symlinks and refused if they point into the original
+repository. The error names the check, argument and resolved repository path; use repository-relative
+paths.
 
 A check's writes through its working directory, relative paths and configured paths land in the copy;
 baselines are relocated there. The copy is not a sandbox. Code that computes absolute paths
