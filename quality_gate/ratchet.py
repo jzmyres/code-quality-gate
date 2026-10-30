@@ -460,9 +460,11 @@ def _adapter_name(adapter: Any) -> str:
 
 
 def _subject_label(subject: str, adapter: Any, has_entry: bool) -> str:
-    if _adapter_name(adapter) == "clones":
-        return f"clone {subject}" if has_entry else f"new clone {subject}"
-    return subject
+    descriptor = _descriptor(adapter)
+    if descriptor is None or not descriptor.subject_noun:
+        return subject
+    label = f"{descriptor.subject_noun} {subject}"
+    return label if has_entry else f"new {label}"
 
 
 def _display_number(value: float, adapter: Any) -> str:

@@ -1,8 +1,10 @@
 """One adapter descriptor drives parsing, running, display, direction and verification."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
+import io
 import sys
 import tempfile
 import unittest
@@ -247,6 +249,35 @@ class StubAdapterTests(unittest.TestCase):
             "tests:stub:executed",
             [finding.subject for finding in verification.findings],
         )
+
+    def test_subject_labels_come_from_the_descriptor(self) -> None:
+        for noun, existing, new in (
+            ("", "existing", "added"),
+            ("widget", "widget existing", "new widget added"),
+        ):
+            descriptor = dataclasses.replace(STUB, subject_noun=noun)
+            adapters.register_adapter(descriptor)
+            for adapter in (descriptor, descriptor.name):
+                with self.subTest(noun=noun, adapter=adapter):
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        result = ratchet.evaluate(
+                            [
+                                ratchet.Finding("existing", 2, "file:1"),
+                                ratchet.Finding("added", 2, "file:2"),
+                            ],
+                            [ratchet.BaselineEntry("existing", 1, "accepted")],
+                            threshold=0, enforcement="enforced", prefix="check: stub",
+                            adapter=adapter, domain=ratchet.Domain.all(),
+                        )
+                    self.assertFalse(result.satisfied)
+                    self.assertEqual(
+                        errors.getvalue(),
+                        f"check: stub: {existing}: value 2.00 exceeds threshold 0.00"
+                        " and baseline bound 1.00 at file:1\n"
+                        f"check: stub: {new}: value 2.00 exceeds threshold 0.00"
+                        " at file:2\n",
+                    )
 
     def test_findings_use_the_same_subject_direction_as_baseline_entries(self) -> None:
         entry = ratchet.BaselineEntry("tests:tests:executed", 4, "floor")

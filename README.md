@@ -60,13 +60,17 @@ argument parser and dispatch. `owners.py` and its matchers enforce declared sing
 `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
-parser, run function, location coverage, number display, subject direction rule,
+parser, run function, location coverage, number display, subject noun and direction rule,
 extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
 configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
 The registry is the only list of supported adapters. A test adapter returns normalized test results:
 selected, passed and failed, with any named failures. A metric adapter returns findings. Verification's
 prerequisite is every earlier check with `tests` evidence: `python_tests`, `elisp_tests`, and
 `command` checks with `tests_pattern`.
+
+The descriptor's `subject_noun` labels subjects in failure messages: `"clone"` gives
+`clone X` for an existing baseline entry and `new clone X` for a new subject. The default
+empty noun prints the bare subject.
 
 An adapter's baseline entries and findings use the same direction for each subject. A descriptor can
 declare `entry_direction(subject, configured)` to choose it; otherwise its `default_direction` applies,

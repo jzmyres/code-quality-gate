@@ -2,7 +2,7 @@
 
 Every adapter's identity lives here exactly once: the configuration keys it
 accepts, its parser, its runner, its location coverage, number display, subject
-direction rule, whether it produces normalized test results, the baseline
+noun and direction rule, whether it produces normalized test results, the baseline
 extras it trusts, and its baseline and budget handling.
 """
 from __future__ import annotations
@@ -69,6 +69,7 @@ class AdapterDescriptor:
     run: Callable[..., Any]
     location_coverage: str = "none"
     display: Callable[[float], str] = ratchet._number
+    subject_noun: str = ""
     default_direction: str | None = None
     extras: tuple[str, ...] = ()
     requires_adapter: str | None = None
@@ -281,6 +282,7 @@ register_adapter(AdapterDescriptor(
     _clones_spec,
     _runner("_run_clones"),
     location_coverage="complete",
+    subject_noun="clone",
     extras=("files",),
 ))
 register_adapter(AdapterDescriptor(
