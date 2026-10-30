@@ -154,10 +154,11 @@ unknown class, so a Makefile can use it as the single source of file lists:
 
 `--policy-from REV` classifies the working tree using the effective policy from `REV`, with the same
 protected-input validation as `check`. An unapproved policy edit is ignored; an unapproved change to
-another protected path blocks inventory before it prints a summary or file list. To use a reviewed
-replacement, pass `--allow-protected PATH`; repeat the option for multiple paths. The option requires
-`--policy-from`. Run the gate from a trusted copy outside the candidate, as described under
-[Trust root](#trust-root).
+another protected path blocks inventory before it prints a summary or file list. It uses the same
+blocked report as `check`, naming the path, both kinds, and the trusted and candidate file hashes or
+gitlink commits. To use a reviewed replacement, pass `--allow-protected PATH`; repeat the option for
+multiple paths. The option requires `--policy-from`. Run the gate from a trusted copy outside the
+candidate, as described under [Trust root](#trust-root).
 
 Inventory fails (exit 1) and prints every violation when a file matches no rule, a file matches more
 than one rule, a rule matches no file, a rule has an empty reason, a rule names a class that does not

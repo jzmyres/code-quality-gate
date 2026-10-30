@@ -112,9 +112,28 @@ def _report_gitlink(item: ProtectedInput) -> None:
     )
 
 
-def _report_gitlinks(protected: list[ProtectedInput]) -> None:
+def _report_gitlinks(
+    protected: list[ProtectedInput], *, include_blocked: bool
+) -> None:
     for item in protected:
+        if include_blocked or item.status != "blocked":
+            _report_gitlink(item)
+
+
+def _file_description(sha256: str | None) -> str:
+    return f"file {sha256}" if sha256 is not None else "missing -"
+
+
+def _report_blocked_detail(item: ProtectedInput) -> None:
+    if item.gitlink is not None:
         _report_gitlink(item)
+        return
+    print(
+        f"check: protected input {item.path}: REV "
+        f"{_file_description(item.rev_sha256)}; candidate "
+        f"{_file_description(item.candidate_sha256)}; {item.status}",
+        file=sys.stderr,
+    )
 
 
 @dataclass
@@ -177,6 +196,9 @@ class Trust:
         blocked = _blocked_paths(self.protected)
         if not blocked:
             return False
+        for item in self.protected:
+            if item.status == "blocked":
+                _report_blocked_detail(item)
         print(
             f"check: blocked: protected input changed without "
             f"--allow-protected: {', '.join(blocked)}",
@@ -201,7 +223,8 @@ class Trust:
         document["schema"] = RESULT_SCHEMA
         document["trust"] = self.to_json()
         if report_gitlinks:
-            _report_gitlinks(self.protected)
+            # Blocked gitlinks are reported below unless identity changed.
+            _report_gitlinks(self.protected, include_blocked=bool(problems))
         if problems:
             message = "; ".join(problems)
             print(f"check: error: {message}", file=sys.stderr)

@@ -151,6 +151,28 @@ class TrustCase(FixtureCase):
             self.protected(document, "ruff.toml")["status"], "blocked"
         )
 
+    def assert_inventory_block_report(self, revision: str, *details: str) -> None:
+        check = self.run_qg("check", "--policy-from", revision)
+        self.assertEqual(check.returncode, 1, output(check))
+        reported_details = [
+            line for line in check.stderr.splitlines()
+            if line.startswith("check: protected input ") and line.endswith("; blocked")
+        ]
+        self.assertEqual(reported_details, list(details), output(check))
+        summary = next(
+            line for line in check.stderr.splitlines()
+            if line.startswith("check: blocked:")
+        )
+        for selection in ((), ("--list", "python")):
+            with self.subTest(selection=selection):
+                inventory = self.run_qg(
+                    "inventory", *selection, "--policy-from", revision
+                )
+                self.assertEqual(inventory.returncode, 1, output(inventory))
+                self.assertEqual(inventory.stdout, "")
+                lines = [line for line in inventory.stderr.splitlines() if line.startswith("check:")]
+                self.assertEqual(lines, [*details, summary])
+
     def assert_clone_fails_tightened(
         self,
         result: subprocess.CompletedProcess[str],
@@ -635,6 +657,31 @@ class PolicyTrustTests(TrustCase):
         self.assert_blocked(result, document)
         self.assertIn("ruff.toml", result.stderr)
 
+    def test_changed_protected_file_blocks_inventory_with_check_report(self) -> None:
+        revision = self.commit_ruff_revision()
+        self.change_ruff()
+        old = hashlib.sha256(b"line-length = 100\n").hexdigest()
+        new = hashlib.sha256(b"line-length = 200\n").hexdigest()
+        detail = (
+            f"check: protected input ruff.toml: REV file {old}; "
+            f"candidate file {new}; blocked"
+        )
+        self.assert_inventory_block_report(revision, detail)
+
+    def test_inventory_reports_missing_protected_file_sides(self) -> None:
+        self.write_config(with_protect(BASE_CONFIG, "ruff.toml", "new.toml"))
+        self.add_file("ruff.toml", "trusted\n")
+        revision = self.commit_revision()
+        (self.repo / "ruff.toml").unlink()
+        self.add_file("new.toml", "candidate\n")
+        old = hashlib.sha256(b"trusted\n").hexdigest()
+        new = hashlib.sha256(b"candidate\n").hexdigest()
+        details = [
+            f"check: protected input new.toml: REV missing -; candidate file {new}; blocked",
+            f"check: protected input ruff.toml: REV file {old}; candidate missing -; blocked",
+        ]
+        self.assert_inventory_block_report(revision, *details)
+
     def test_authorized_protected_change_passes(self) -> None:
         revision = self.commit_ruff_revision()
         self.change_ruff()
@@ -703,6 +750,13 @@ class GitlinkTrustTests(TrustCase):
 
     def checkout(self, commit: str) -> None:
         self.sub_git(self.repo / self.path, "checkout", "-q", "--detach", commit)
+
+    def moved_gitlink_detail(self) -> str:
+        return (
+            f"check: protected input {self.path}: REV gitlink {self.old}; "
+            f"candidate gitlink {self.new}; index {self.new}; "
+            f"HEAD {self.new}; blocked"
+        )
 
     def assert_gitlink(self, entry, status, candidate, head) -> None:
         self.assertEqual(entry["status"], status)
@@ -773,6 +827,11 @@ class GitlinkTrustTests(TrustCase):
         self.assertEqual(document["decision"], "accepted")
         self.assert_gitlink(self.protected(document, self.path), "authorized", self.new, self.new)
 
+    def test_moved_gitlink_blocks_inventory_with_check_report(self) -> None:
+        self.checkout(self.new)
+        self.git("add", self.path)
+        self.assert_inventory_block_report(self.revision, self.moved_gitlink_detail())
+
     def test_unchanged_gitlink_passes_checked_out_or_uninitialized(self) -> None:
         result, document = self.trust_json(self.revision)
         self.assertEqual(result.returncode, 0, output(result))
@@ -807,9 +866,33 @@ class GitlinkTrustTests(TrustCase):
         self.git("add", self.path)
         result, entry = self.kind_change(self.revision, "gitlink", "file")
         self.assertEqual(entry["rev_commit"], self.old)
-        self.assertEqual(entry["candidate_sha256"], hashlib.sha256(b"replacement\n").hexdigest())
+        digest = hashlib.sha256(b"replacement\n").hexdigest()
+        self.assertEqual(entry["candidate_sha256"], digest)
         for value in (self.path, "gitlink", "file", self.old):
             self.assertIn(value, result.stderr)
+        detail = (
+            f"check: protected input {self.path}: REV gitlink {self.old}; "
+            f"candidate file {digest}; index -; HEAD not checked out; blocked"
+        )
+        self.assert_inventory_block_report(self.revision, detail)
+
+    def test_multiple_blocked_inputs_have_the_same_inventory_report(self) -> None:
+        self.write_config(self.config.replace(
+            f'paths = ["{self.path}"]', f'paths = ["{self.path}", "ruff.toml"]'
+        ))
+        self.add_file("ruff.toml", "trusted\n")
+        revision = self.commit_revision()
+        self.add_file("ruff.toml", "candidate\n")
+        old = hashlib.sha256(b"trusted\n").hexdigest()
+        new = hashlib.sha256(b"candidate\n").hexdigest()
+        detail = (
+            f"check: protected input ruff.toml: REV file {old}; "
+            f"candidate file {new}; blocked"
+        )
+        self.assert_inventory_block_report(revision, detail)
+        self.checkout(self.new)
+        self.git("add", self.path)
+        self.assert_inventory_block_report(revision, detail, self.moved_gitlink_detail())
 
     def test_gitlink_replaced_by_unstaged_file_is_blocked(self) -> None:
         shutil.rmtree(self.repo / self.path)

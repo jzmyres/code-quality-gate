@@ -80,6 +80,10 @@ class InventoryTrustTests(FixtureCase):
         self.assertEqual(check.returncode, 1, output(check))
         blocked = next(line for line in check.stderr.splitlines() if "check: blocked:" in line)
         self.assertIn("--allow-protected: ruff.toml", blocked)
+        detail = next(
+            line for line in check.stderr.splitlines()
+            if line.startswith("check: protected input ruff.toml:")
+        )
         for selection in ((), ("--list", "python")):
             with self.subTest(selection=selection):
                 result = self.run_qg(
@@ -87,7 +91,7 @@ class InventoryTrustTests(FixtureCase):
                 )
                 self.assertEqual(result.returncode, 1, output(result))
                 self.assertEqual(result.stdout, "")
-                self.assertEqual(self.gate_messages(result), [blocked])
+                self.assertEqual(self.gate_messages(result), [detail, blocked])
 
         trusted = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision,
