@@ -545,11 +545,15 @@ def _requires_match(
     if descriptor.requires_adapter is not None:
         return required.adapter == descriptor.requires_adapter
     if descriptor.requires_tests:
-        from .adapters import adapter_for
-
-        target = adapter_for(required.adapter)
-        return target is not None and target.produces_tests
+        return "tests" in required.evidence
     return True
+
+
+def _test_producer_refusal(required: CheckDef | None) -> str:
+    if required is None:
+        return ""
+    detail = " (no tests_pattern)" if required.adapter == "command" else ""
+    return f" that produces no tests{detail}"
 
 
 def _validate_requires(
@@ -569,10 +573,14 @@ def _validate_requires(
         if required is None
         else f"{requires!r} is a {required.adapter} check"
     )
+    expected = f"the id of a {descriptor.requires_adapter} check declared earlier"
+    if descriptor.requires_tests:
+        expected = "the id of an earlier check that produces tests"
+        actual += _test_producer_refusal(required)
     raise _config_error(
         path,
         f"checks.{name}.requires",
-        f"the id of a {descriptor.requires_adapter or 'python_tests'} check declared earlier",
+        expected,
         actual,
     )
 

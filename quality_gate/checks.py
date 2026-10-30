@@ -495,7 +495,7 @@ def _pattern_failure(
     )
 
 
-def _tests_measurement(
+def _command_test_fields(
     check: CheckDef,
     spec: Any,
     start: float,
@@ -503,15 +503,15 @@ def _tests_measurement(
     matches: dict[str, Any],
     diagnostics: Diagnostics,
     combined: str,
-) -> tuple[dict[str, Any] | None, CheckResult | None]:
+) -> tuple[dict[str, Any], CheckResult | None]:
     if spec.tests_pattern_re is None:
-        return None, None
+        return {}, None
     ran, skipped, count_error = analysis_step(
         "test count analysis", summarize_matches,
         spec, matches.get("tests", []), matches.get("skipped", []),
     )
     if count_error is not None:
-        return None, _command_failure(
+        return {}, _command_failure(
             check,
             spec,
             start,
@@ -524,7 +524,7 @@ def _tests_measurement(
     assert ran is not None and skipped is not None
     executed = ran - skipped
     if executed == 0:
-        return None, _command_failure(
+        return {}, _command_failure(
             check,
             spec,
             start,
@@ -535,7 +535,11 @@ def _tests_measurement(
             measurement={"tests": 0},
             combined=combined,
         )
-    return {"tests": executed}, None
+    return {
+        "measurement": {"tests": executed},
+        "tests_ran": ran,
+        "tests_skipped": skipped,
+    }, None
 
 
 def _command_evidence(
@@ -560,7 +564,7 @@ def _command_evidence(
             return _pattern_failure(
                 check, spec, start, prefix, diagnostics, evaluation
             )
-    measurement, failure = _tests_measurement(
+    fields, failure = _command_test_fields(
         check, spec, start, prefix, matches, diagnostics, combined
     )
     if failure is not None:
@@ -573,8 +577,8 @@ def _command_evidence(
             prefix,
             f"output did not match must_match {spec.must_match!r}",
             diagnostics=diagnostics,
-            measurement=measurement,
             combined=combined,
+            **fields,
         )
     outcome = _check_result(
         check,
@@ -582,7 +586,7 @@ def _command_evidence(
         "pass",
         budget_seconds=spec.budget_seconds,
         diagnostics=diagnostics,
-        measurement=measurement,
+        **fields,
     )
     print(
         f"{prefix}: passed (exit 0, {outcome.duration_seconds:.2f}s)",
@@ -1619,11 +1623,6 @@ def _run_python_crap(context: AdapterContext) -> CheckResult:
         )
     return outcome
 
-def _produces_tests(adapter: str) -> bool:
-    descriptor = adapter_for(adapter)
-    return descriptor is not None and descriptor.produces_tests
-
-
 def _verification_test_checks(
     check: CheckDef, prior: Mapping[str, CheckResult | CheckDef]
 ) -> list[str]:
@@ -1633,7 +1632,7 @@ def _verification_test_checks(
     return [
         identifier
         for identifier, result in prior.items()
-        if _produces_tests(result.adapter)
+        if "tests" in result.evidence
     ]
 
 

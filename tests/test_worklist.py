@@ -628,7 +628,7 @@ def _bridge_run(root, config, check, files, classes, *, prefix, prior):
                          tests_ran=required.tests_ran, tests_skipped=required.tests_skipped)
 
 register_adapter(AdapterDescriptor("bridge", ("requires",), _bridge_parse, _bridge_run,
-                                   produces_tests=True, requires_adapter="python_tests"))
+                                   requires_adapter="python_tests"))
 ''')
         self.fixture_runner = lambda: gate / "qg.py"
         bridge = ('[checks.bridge]\nadapter = "bridge"\ntier = 1\n'

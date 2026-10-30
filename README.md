@@ -60,11 +60,13 @@ argument parser and dispatch. `owners.py` and its matchers enforce declared sing
 `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
-parser, run function, location coverage, number display, metric direction per subject kind, whether it
-produces test results, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The
-registry is the only list of supported adapters. A test adapter returns normalized test results:
+parser, run function, location coverage, number display, metric direction per subject kind,
+extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
+configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
+The registry is the only list of supported adapters. A test adapter returns normalized test results:
 selected, passed and failed, with any named failures. A metric adapter returns findings. Verification's
-prerequisite is every earlier result from an adapter that produces tests, whatever its language.
+prerequisite is every earlier check with `tests` evidence: `python_tests`, `elisp_tests`, and
+`command` checks with `tests_pattern`.
 
 An adapter's baseline entries and findings use the same direction for each subject. A descriptor can
 declare `entry_direction(subject, configured)` to choose it; otherwise its `default_direction` applies,
@@ -973,7 +975,7 @@ Notes:
   and names `qg.py tools fetch`. A check using `{files}` with no selected files fails: zero inputs is
   not a pass. A command check without `tests_pattern` produces `static` evidence; with a one-group
   `tests_pattern` it produces `tests` evidence, counts executed tests as `ran - skipped`, and fails when
-  none executed.
+  none executed. Its recorded ran and skipped counts are available to verification.
 * A clone check's files come from the classes that list it. Clone baselines use the generic ratchet
   format below; the old top-level `[clones]` table and the old `[[clone]]` baseline are gone.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
@@ -987,8 +989,10 @@ Notes:
   `emacs` and `budget_seconds` settings are optional and independent for each check.
 * An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and a `baseline` path.
   Its `threshold` defaults to 6 and must be finite. Every selected file's class must list both checks.
-* A `verification` check needs a `baseline` path. Its optional `requires` names an earlier
-  test-producing check, whatever its language; without it every earlier test-producing check is used. It
+* A `verification` check needs a `baseline` path. Its optional `requires` names an earlier check with
+  `tests` evidence: `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.
+  A reference to a check without test evidence is a configuration error; for a command the error
+  identifies its missing `tests_pattern`. Without `requires` every earlier test-producing check is used. It
   measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
   lines, inline `# noqa` comments and file-wide lint suppressions for the selected Python files, without
   running the tests again. An empty Python selection has nothing to scan, but the test counts still come

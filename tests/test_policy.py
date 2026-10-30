@@ -387,14 +387,29 @@ class PolicyTests(FixtureCase):
             "sideways",
         )
 
-    def test_verification_requires_a_python_tests_check(self) -> None:
+    def test_verification_requires_refuses_command_without_tests_pattern(self) -> None:
         self.config_error(
-            BASE_CONFIG
+            BASE_CONFIG.replace("tests_pattern = '(\\d+)'\n", "")
             + '\n[checks.verification]\nadapter = "verification"\n'
             'tier = 1\nenforcement = "enforced"\nrequires = "smoke"\n'
             'baseline = "verification.toml"\n',
             "checks.verification.requires",
             "'smoke' is a command check",
+            "produces no tests",
+            "no tests_pattern",
+            "an earlier check that produces tests",
+        )
+
+    def test_verification_requires_refuses_adapter_without_test_evidence(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.duplicates]\nadapter = "clones"\n'
+            'tier = 1\nenforcement = "enforced"\nbaseline = "clones.toml"\n'
+            '\n[checks.verification]\nadapter = "verification"\n'
+            'tier = 1\nenforcement = "enforced"\nrequires = "duplicates"\n'
+            'baseline = "verification.toml"\n',
+            "checks.verification.requires",
+            "'duplicates' is a clones check that produces no tests",
         )
 
     def test_command_argument_with_nul_is_a_configuration_error(self) -> None:

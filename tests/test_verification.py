@@ -237,6 +237,55 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(check["outcome"], "fail")
         return result, document, check
 
+    def command_producer(self, summary: str, *, requires: str | None = None) -> None:
+        self.add_tests(1)
+        text = verification_config(requires=requires).replace(
+            'adapter = "python_tests"', 'adapter = "command"'
+        ).replace(
+            'run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]',
+            f"run = {json.dumps([sys.executable, '-c', f'print({summary!r})'])}",
+        )
+        self.write_config(text)
+
+    def test_command_producer_feeds_implicit_verification_counts_and_floor(self) -> None:
+        self.command_producer("Ran 3 tests in 0.1s\nskipped=1")
+        self.write_verification_baseline([executed_entry(2), skipped_entry(1)])
+        result, document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.check_by_id(document, "tests")["outcome"], "pass")
+        self.assertEqual(self.finding(check, "tests:tests:executed")["value"], 2)
+        self.assertEqual(self.finding(check, "tests:tests:skipped")["value"], 1)
+
+        self.command_producer("Ran 2 tests in 0.1s\nskipped=1")
+        result, document, check = self.failed_verification()
+        self.assertEqual(self.check_by_id(document, "tests")["outcome"], "pass")
+        finding = self.finding(check, "tests:tests:executed")
+        self.assertEqual((finding["value"], finding["bound"]), (1, 2))
+        self.assertIn("tests:tests:executed: value 1 falls below baseline bound 2", result.stderr)
+
+    def test_verification_requires_accepts_command_producer(self) -> None:
+        self.command_producer("Ran 1 test in 0.1s", requires="tests")
+        self.write_verification_baseline([executed_entry(1)])
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.finding(check, "tests:tests:executed")["value"], 1)
+        self.assertEqual(self.finding(check, "tests:tests:skipped")["value"], 0)
+
+    def test_unmatched_command_summary_leaves_verification_unmeasured(self) -> None:
+        self.command_producer("no test summary")
+        self.write_verification_baseline([executed_entry(1)])
+        result, document, check = self.run_verification()
+        self.assertEqual(result.returncode, 1, output(result))
+        producer = self.check_by_id(document, "tests")
+        self.assertEqual(producer["outcome"], "unsupported")
+        self.assertIn("tests_pattern", producer["reason"])
+        self.assertIn("did not match", producer["reason"])
+        self.assertNotIn("measurement", producer)
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertEqual(check["findings"], [])
+        self.assertNotIn("measurement", check)
+        self.assertIn("test counts unreliable: tests did not pass", check["reason"])
+
     def test_deleted_test_lowers_executed_below_its_floor(self) -> None:
         self.add_tests(2)
         self.write_verification_baseline([executed_entry(2)])

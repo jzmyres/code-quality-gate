@@ -153,8 +153,11 @@ Rules:
   The defaults are no load paths, `emacs`, and 900 seconds. An empty selection
   fails.
 * `verification.requires`, when present, names an earlier test-producing
-  check, whatever its language. Without it the adapter uses every earlier
-  test-producing check.
+  check: a check whose parsed evidence includes `tests` (`python_tests`,
+  `elisp_tests`, or `command` with `tests_pattern`). Without it the adapter
+  uses every earlier check with that evidence. A reference to a check that
+  produces no tests is a configuration error naming its id and adapter;
+  for a command it also identifies the missing `tests_pattern`.
 * A baseline path must be used by exactly one check. Two checks naming the
   same resolved path is a configuration error.
 * Every class named by a rule and every check named by a class must exist.
@@ -169,7 +172,9 @@ Rules:
 
 ### Evidence and obligations
 
-Each adapter declares the evidence it produces:
+Each adapter's parser declares the evidence for the configured check.
+The same `tests` evidence identifies producers for verification and its
+`requires` validation, and for evidence obligations:
 
 | Adapter | Evidence |
 |---|---|
@@ -213,6 +218,10 @@ contributes one to the file-wide count, separate from the inline count. The lint
 directives are recognized in comment tokens using their directive syntax;
 matching text inside a string does not count. The file-wide finding's location
 includes the first directive and its line.
+
+Command producers supply their parsed ran and skipped counts through the same
+normalized count fields as the test adapters. A missing or unmatched summary
+leaves verification's counts unmeasured, never zero.
 
 Test counts do not depend on Python files being selected: an empty selection
 scans no suppressions, while no valid producer result means no measured

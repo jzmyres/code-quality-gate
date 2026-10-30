@@ -77,7 +77,6 @@ STUB = adapters.AdapterDescriptor(
     run_stub,
     display=lambda value: f"{value:.2f}",
     directions={"floor": "min"},
-    produces_tests=True,
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
 )
@@ -90,7 +89,6 @@ FLOOR_STUB = adapters.AdapterDescriptor(
     run_stub,
     directions={"floor": "min"},
     default_direction="max",
-    produces_tests=True,
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
 )

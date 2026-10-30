@@ -71,7 +71,6 @@ class AdapterDescriptor:
     display: Callable[[float], str] = ratchet._number
     directions: Mapping[str, str] = field(default_factory=dict)
     default_direction: str | None = None
-    produces_tests: bool = False
     extras: tuple[str, ...] = ()
     requires_adapter: str | None = None
     requires_tests: bool = False
@@ -299,7 +298,6 @@ register_adapter(AdapterDescriptor(
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     _python_tests_spec,
     _runner("_run_python_tests"),
-    produces_tests=True,
     budget=_spec_budget,
 ))
 register_adapter(AdapterDescriptor(
@@ -307,7 +305,6 @@ register_adapter(AdapterDescriptor(
     ("suite", "load_path", "emacs", "budget_seconds"),
     _elisp_tests_spec,
     _runner("_run_elisp_tests"),
-    produces_tests=True,
     budget=_spec_budget,
     parse_candidate_inputs=True,
 ))
