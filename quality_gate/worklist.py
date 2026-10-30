@@ -548,8 +548,9 @@ def _reject_original_arguments(root: Path, config: Config, selected: list[CheckD
     paths = {str(root.absolute()), str(canonical_root)}
     for identifier in _needed_order(config, selected):
         check = config.checks[identifier]
-        arguments = (*getattr(check.spec, "run", ()), getattr(check.spec, "emacs", ""))
-        for argument in arguments:
+        descriptor = adapter_for(check.adapter)
+        assert descriptor is not None
+        for argument in descriptor.arguments(check.spec):
             if any(path in argument for path in paths):
                 raise GateError(
                     f"check {identifier!r}: argument {argument!r} contains the original repository's "

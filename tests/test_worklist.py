@@ -269,6 +269,21 @@ class WorklistElispTests(FixtureCase):
         self.assertEqual(rows[0]["value"], 12.0)
         self.assertEqual(rows[0]["churn_x_value"], 12.0)
 
+    def test_emacs_through_an_alias_is_refused_before_any_check(self) -> None:
+        alias = self.base / "emacs-alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        argument = str(alias / "src/core.el")
+        self.write_config(combined_config().replace(
+            'suite = "tests/suite.el"', f'suite = "tests/suite.el"\nemacs = {json.dumps(argument)}'))
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "elisp-crap")
+        self.assertEqual((result.returncode, result.stdout), (1, ""), output(result))
+        self.assertIn("check 'legacy-tests'", result.stderr)
+        self.assertIn("resolves into the original repository", result.stderr)
+        self.assertIn(argument, result.stderr)
+        self.assertNotIn("check: ", result.stderr)
+        self.assertEqual(snapshot_tree(self.repo), before)
+
 
 class WorklistNoteTests(FixtureCase):
     def setUp(self) -> None:
@@ -839,9 +854,10 @@ class WorklistOriginalArgumentTests(FixtureCase):
             json.dumps(["{python}", *arguments]),
         ))
 
-    def assert_argument_refused(self, argument: str, *, repo: Path | None = None) -> None:
+    def assert_argument_refused(self, argument: str, *, repo: Path | None = None,
+                                check_id: str = "crap") -> None:
         before = snapshot_tree(self.repo)
-        result = self.run_qg("worklist", "--json", "crap", repo=repo,
+        result = self.run_qg("worklist", "--json", check_id, repo=repo,
                              env=self.default_tool_env())
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn("check 'tests'", result.stderr)
@@ -872,6 +888,41 @@ class WorklistOriginalArgumentTests(FixtureCase):
         argument = f"--output={self.alias / 'tests/absolute_writer.py'}"
         self.writer_command("tests/absolute_writer.py", argument)
         self.assert_argument_refused(argument)
+
+    def test_command_through_an_alias_is_refused_before_any_check(self) -> None:
+        argument = str(self.alias / "tests/absolute_writer.py")
+        text = verification_config().replace('adapter = "python_tests"', 'adapter = "command"')
+        text = text.replace('["{python}", "-m", "unittest", "discover", "-s", "tests"]',
+                            json.dumps(["python3", argument]))
+        self.write_config(text)
+        self.assert_argument_refused(argument, check_id="verification")
+
+    def test_new_adapter_command_field_through_an_alias_is_refused(self) -> None:
+        self.patch_runner('''
+from types import SimpleNamespace
+from quality_gate.adapters import AdapterDescriptor, ParsedSpec, register_adapter
+from quality_gate.checks import TestResults, _check_result
+from quality_gate.runner import run
+import time
+
+def _fixture_parse(raw, root, path, key):
+    return ParsedSpec(SimpleNamespace(launch=tuple(raw["launch"])), "fixture/1", ("tests",))
+
+def _fixture_run(root, config, check, files, classes, *, prefix, prior):
+    start = time.monotonic()
+    child = run(check.spec.launch, cwd=root, budget_seconds=10)
+    return _check_result(check, start, "pass" if child.returncode == 0 else "fail",
+                         test_results=TestResults(1, 1, 0))
+
+register_adapter(AdapterDescriptor("fixture-command", ("launch", "tests_pattern", "skipped_pattern"),
+                                   _fixture_parse, _fixture_run, argument_fields=("launch",)))
+''')
+        argument = str(self.alias / "tests/absolute_writer.py")
+        text = verification_config().replace('adapter = "python_tests"', 'adapter = "fixture-command"')
+        text = text.replace('run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]',
+                            f'launch = {json.dumps(["python3", argument])}')
+        self.write_config(text)
+        self.assert_argument_refused(argument, check_id="verification")
 
     def test_absolute_paths_outside_repository_are_accepted(self) -> None:
         interpreter = shutil.which("python3")

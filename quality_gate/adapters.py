@@ -1,7 +1,7 @@
 """The adapter descriptor registry: one declaration per adapter.
 
 Every adapter's identity lives here exactly once: the configuration keys it
-accepts, its parser, its runner, its location coverage, number display, subject
+accepts, its parser, its runner, its argument fields, location coverage, number display, subject
 noun, failure wording and direction rule, whether it produces normalized test results, the baseline
 extras it trusts, and its baseline and budget handling.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import ratchet
 from .policy import (
@@ -83,9 +83,19 @@ class AdapterDescriptor:
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
     minimum_emacs_version: str | None = None
+    argument_fields: tuple[str, ...] = ()
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
+
+    def arguments(self, spec: Any) -> Iterator[str]:
+        """Yield command and path arguments from the declared spec fields."""
+        for name in self.argument_fields:
+            value = getattr(spec, name)
+            if isinstance(value, str):
+                yield value
+            else:
+                yield from value
 
     def direction_for_subject(self, subject: str, configured: str) -> str:
         if self.entry_direction is not None:
@@ -286,6 +296,7 @@ register_adapter(AdapterDescriptor(
     ("run", "budget_seconds", "must_match", "tests_pattern", "skipped_pattern"),
     _command_spec,
     _runner("_run_command"),
+    argument_fields=("run",),
     budget=_spec_budget,
 ))
 register_adapter(AdapterDescriptor(
@@ -303,6 +314,7 @@ register_adapter(AdapterDescriptor(
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     _python_tests_spec,
     _runner("_run_python_tests"),
+    argument_fields=("run",),
     budget=_spec_budget,
 ))
 register_adapter(AdapterDescriptor(
@@ -310,6 +322,7 @@ register_adapter(AdapterDescriptor(
     ("suite", "load_path", "emacs", "budget_seconds"),
     _elisp_tests_spec,
     _runner("_run_elisp_tests"),
+    argument_fields=("emacs", "suite", "load_path"),
     minimum_emacs_version=ELISP_MINIMUM_VERSION,
     budget=_spec_budget,
     parse_candidate_inputs=True,
@@ -319,6 +332,7 @@ register_adapter(AdapterDescriptor(
     ("load_path", "emacs", "budget_seconds"),
     _elisp_lint_spec,
     _runner("_run_elisp_lint"),
+    argument_fields=("emacs", "load_path"),
     minimum_emacs_version=ELISP_MINIMUM_VERSION,
     budget=_spec_budget,
     parse_candidate_inputs=True,
@@ -328,6 +342,7 @@ register_adapter(AdapterDescriptor(
     ("load_path", "emacs", "budget_seconds"),
     _elisp_lint_spec,
     _runner("_run_elisp_lint"),
+    argument_fields=("emacs", "load_path"),
     minimum_emacs_version=ELISP_MINIMUM_VERSION,
     budget=_spec_budget,
     parse_candidate_inputs=True,

@@ -107,7 +107,8 @@ class ElispLintTests(FixtureCase):
         for adapter in ("elisp_compile", "elisp_checkdoc"):
             with self.subTest(adapter=adapter):
                 check = self.assert_check(document, adapter, "pass")
-                self.assertEqual(check["emacs_version"], version)
+                self.assertEqual(check["tool"], {"name": "Emacs", "version": version})
+                self.assertNotIn("emacs_version", check)
                 self.assertIn(f"{adapter}: passed (Emacs {version}", result.stderr)
 
     def test_free_variable_fails_compilation_but_not_checkdoc(self) -> None:
@@ -119,7 +120,7 @@ class ElispLintTests(FixtureCase):
         self.assertIn("free variable", result.stderr)
         self.assertIn("core-missing-variable", compile_check["reason"])
         doc_check = self.check_by_id(document, "elisp_checkdoc")
-        self.assertEqual(compile_check["emacs_version"], doc_check["emacs_version"])
+        self.assertEqual(compile_check["tool"], doc_check["tool"])
 
     def test_each_file_compiles_in_its_own_emacs(self) -> None:
         self.add_file("src/core.el", ";;; core.el -*- lexical-binding: t -*-\n"
@@ -264,7 +265,7 @@ class ElispLintTests(FixtureCase):
         result, document = self.run_checks(1)
         check = self.assert_check(document, "elisp_compile", "unsupported")
         self.assertIn("expected Emacs version 31.1, got 31.2", result.stderr)
-        self.assertEqual(check["emacs_version"], "31.1")
+        self.assertEqual(check["tool"], {"name": "Emacs", "version": "31.1"})
 
     def test_no_selected_files_fails(self) -> None:
         text = config(("elisp_compile",)).replace('checks = ["smoke", "elisp_compile"]', 'checks = ["smoke"]')

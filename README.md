@@ -60,8 +60,8 @@ argument parser and dispatch. `owners.py` and its matchers enforce declared sing
 `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
-parser, run function, location coverage, number display, subject noun, failure wording and direction rule,
-extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
+parser, run function, argument fields, location coverage, number display, subject noun, failure wording,
+direction rule, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
 configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
 The registry is the only list of supported adapters. A test adapter returns normalized test results:
 selected, passed and failed, with any named failures. A metric adapter returns findings. Verification's
@@ -74,6 +74,12 @@ empty noun prints the bare subject. Its `failure_wording` defaults to `"metric"`
 `value X exceeds threshold Y` (or minimum-bound wording). The `"occurrences"` form used
 by clones prints `occurs X time(s), exceeding threshold Y`. These choices come from
 the descriptor, including when it is registered under another name.
+
+The descriptor's `argument_fields` names the spec fields holding commands or paths. Each field is
+a string or a sequence of argument strings. The worklist checks exactly those fields for references
+to the original repository before running checks in its copy; the default empty tuple checks none.
+Command and Python test descriptors declare `run`; Emacs Lisp test and lint descriptors declare
+`emacs` and `load_path`, with `suite` also declared by the test descriptor.
 
 An adapter's baseline entries and findings use the same direction for each subject. A descriptor can
 declare `entry_direction(subject, configured)` to choose it; otherwise its `default_direction` applies,
@@ -331,8 +337,9 @@ a timeout reports `execution = "budget"`. A missing Emacs command or a child tha
 writes an invalid result without completing a valid measurement is `unsupported`. Errors identify the
 input, and invalid-result messages state what was expected and found.
 
-The check reports `emacs_version`, normalized `test_results`, and `definitions` in JSON; the human
-report includes the Emacs version. Each definition entry, including generated lambda symbols, gives its
+The check reports `tool` (`{"name": "Emacs", "version": "30.1"}`), normalized `test_results`,
+and `definitions` in JSON; the human report includes the Emacs version. Each definition entry,
+including generated lambda symbols, gives its
 repository-relative file, character position, total stop points and reached stop points. This evidence
 is retained for a later check that requires it.
 
@@ -366,8 +373,8 @@ reports the file and compiler messages. Checkdoc runs once for all selected file
 and is reported with its file, line and message.
 
 An expired budget fails with `execution = "budget"`. A missing Emacs command or a process that does
-not produce a valid report is `unsupported`. Completed measurements report `emacs_version` in JSON
-and in the human output.
+not produce a valid report is `unsupported`. Completed measurements report the measured Emacs
+version in the generic `tool` object in JSON and in the human output.
 
 ### Python CRAP
 
@@ -687,7 +694,8 @@ With `--changed-from`, `changed_from` is the full resolved commit id.
 `satisfied`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
 `resolved_baseline_entries`, `unmeasured_baseline_entries`, `location_coverage` and `reason` (a structured explanation of
 a non-passing adapter verdict, null otherwise); a measuring check may also carry a `measurement`
-object (for example `{"tests": 12}`).
+object (for example `{"tests": 12}`). Any adapter can report its measured tool identity as
+`tool`, an object with string `name` and `version` fields; it is absent when no identity is reported.
 
 `execution` is `completed`, `budget`, `signal` or `error`. `outcome` is the adapter's raw verdict:
 `pass`, `fail`, `unsupported` or `error`; later tier-3 adapters add `proved`, `no_counterexample` and

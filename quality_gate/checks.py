@@ -123,7 +123,7 @@ class CheckResult:
     configuration_error: bool = False
     change_scoped_failure: bool = False
     incomplete_locations: bool = False
-    emacs_version: str | None = None
+    tool: dict[str, str] | None = None
     definitions: list[dict[str, Any]] | None = None
 
     def is_satisfied(self) -> bool:
@@ -172,8 +172,8 @@ class CheckResult:
                 "skipped": self.test_results.skipped,
                 "failures": list(self.test_results.failures),
             }
-        if self.emacs_version is not None:
-            fields["emacs_version"] = self.emacs_version
+        if self.tool is not None:
+            fields["tool"] = self.tool
         if self.definitions is not None:
             fields["definitions"] = self.definitions
         return fields

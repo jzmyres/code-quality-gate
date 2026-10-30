@@ -232,7 +232,7 @@ def apply_document(result: Any, document: dict[str, Any]) -> None:
     result.tests_ran = document["selected"]
     result.tests_skipped = document["skipped"]
     result.measurement = {"tests": document["selected"] - document["skipped"]}
-    result.emacs_version = document["emacs_version"]
+    result.tool = {"name": "Emacs", "version": document["emacs_version"]}
     result.definitions = document["definitions"]
 
 
@@ -268,9 +268,9 @@ def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any
                            temporary=temporary)
     apply_document(result, document)
     if reason:
-        print(f"{prefix}: {reason} (Emacs {result.emacs_version})", file=sys.stderr)
+        print(f"{prefix}: {reason} (Emacs {document['emacs_version']})", file=sys.stderr)
     else:
-        print(f"{prefix}: passed ({result.measurement['tests']} tests, Emacs {result.emacs_version}, "
+        print(f"{prefix}: passed ({result.measurement['tests']} tests, Emacs {document['emacs_version']}, "
               f"{result.duration_seconds:.2f}s)", flush=True)
     return result
 

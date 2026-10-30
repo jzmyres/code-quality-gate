@@ -695,9 +695,10 @@ Check keys:
   `FAIL:` and `ERROR:` test headings, naming each test by its id; a failing run without that
   consistent result data has no `test_results`. The Emacs Lisp adapter reads them from its child
   result document. Passed counts expected results; selected equals passed plus failed plus skipped.
-* `emacs_version` - the Emacs version string for a completed Elisp measurement,
-  including compile and checkdoc checks. It is absent
-  when no process has reported a version, such as when Emacs is missing.
+* `tool` - optional measured tool identity supplied by any adapter: an object with string
+  `name` and `version` fields, for example `{"name": "Emacs", "version": "30.1"}` for an
+  Emacs Lisp test, compile or checkdoc measurement. It is absent when no identity has been
+  reported, such as when Emacs is missing. This replaces `emacs_version`.
 * `definitions` - the Elisp measurement's array of objects with `symbol`, repository-relative `file`,
   one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
   These counts are also retained as evidence for later checks.
@@ -740,7 +741,10 @@ history. Symlinks keep their targets unchanged. FIFOs, sockets and devices, incl
 stop the worklist before any check runs, naming the path and type. Git configuration used by inventory
 enumeration is carried over, including `core.excludesFile` as an absolute path. The enumerated file
 lists must match in the original and copy; differences stop the worklist and name the paths.
-Command arguments in selected checks and prerequisites must not contain the original repository's
+Each adapter descriptor declares `argument_fields`: spec fields holding a command or path string
+or a sequence of argument strings. The worklist checks exactly these fields for every selected check
+and prerequisite; the default empty tuple checks none.
+Declared arguments in selected checks and prerequisites must not contain the original repository's
 absolute path or resolved real path. A violation stops the worklist before any check runs, naming the
 check and argument and asking for a repository-relative path. These failures exit 1 with no document.
 

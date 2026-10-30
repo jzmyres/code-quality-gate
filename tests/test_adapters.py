@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from support import GATE, baseline_text
@@ -159,6 +160,15 @@ baseline = "verification.toml"
 
 
 class AdapterRegistrationTests(unittest.TestCase):
+    def test_arguments_use_only_declared_fields(self) -> None:
+        spec = SimpleNamespace(run=("ignored",), emacs="ignored", launch=("tool", "--flag"),
+                               path="some/path")
+        for fields, expected in (((), []), (("launch",), ["tool", "--flag"]),
+                                 (("path", "launch"), ["some/path", "tool", "--flag"])):
+            with self.subTest(fields=fields):
+                descriptor = dataclasses.replace(STUB, argument_fields=fields)
+                self.assertEqual(list(descriptor.arguments(spec)), expected)
+
     def test_fixed_or_configured_defaults_register_without_subject_rule(self) -> None:
         for default in (None, "max", "min"):
             with self.subTest(default=default), mock.patch.dict(adapters.ADAPTERS):
@@ -249,6 +259,15 @@ class StubAdapterTests(unittest.TestCase):
             "tests:stub:executed",
             [finding.subject for finding in verification.findings],
         )
+
+    def test_any_adapter_can_report_its_tool_identity(self) -> None:
+        config = self.config(STUB_CONFIG)
+        result = run_stub(self.root, config, config.checks["stub"], [], {}, prefix="stub", prior={})
+        self.assertNotIn("tool", result.to_json())
+        result.tool = {"name": "fixture compiler", "version": "2.3"}
+        document = result.to_json()
+        self.assertEqual(document["tool"], result.tool)
+        self.assertNotIn("emacs_version", document)
 
     def test_subject_labels_come_from_the_descriptor(self) -> None:
         for noun, existing, new in (

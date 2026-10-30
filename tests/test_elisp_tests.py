@@ -132,7 +132,8 @@ class ElispTests(FixtureCase):
         self.assertTrue(all(item["file"] == "src/core.el" for item in definitions))
         version = subprocess.run(["emacs", "-Q", "--batch", "--eval", "(princ emacs-version)"],
                                  check=True, capture_output=True, text=True).stdout
-        self.assertEqual(check["emacs_version"], version)
+        self.assertEqual(check["tool"], {"name": "Emacs", "version": version})
+        self.assertNotIn("emacs_version", check)
         self.assertIn(f"Emacs {version}", result.stderr)
 
     def test_evidence_document_reaches_a_dependent_check(self) -> None:
@@ -168,7 +169,7 @@ register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_
         self.assertEqual(evidence["selected"], 2)
         self.assertTrue(evidence["definitions"])
         self.assertEqual(evidence["definitions"], measured["definitions"])
-        self.assertEqual(evidence["emacs_version"], measured["emacs_version"])
+        self.assertEqual(evidence["emacs_version"], measured["tool"]["version"])
 
     def test_redefined_symbols_keep_each_definition_and_position(self) -> None:
         self.add_file("src/core.el", "(defun redefined () (+ 0 1))\n(defun redefined () (+ 1 1))\n")

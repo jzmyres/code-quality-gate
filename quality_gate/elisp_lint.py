@@ -113,7 +113,7 @@ def _failure(context: Any, start: float, reason: str, *, version: str | None = N
         reason += f" (Emacs {version})"
     return _tests_result(context.check, context.check.spec, start, context.prefix, reason,
                          outcome=outcome, execution=execution, diagnostics=diagnostics,
-                         emacs_version=version)
+                         tool={"name": "Emacs", "version": version} if version is not None else None)
 
 
 def _execution_failure(context: Any, start: float, child: Any, version: str | None) -> Any:
@@ -163,7 +163,7 @@ def _finish(context: Any, start: float, version: str, problems: list[str], diagn
     if problems:
         return _failure(context, start, "\n".join(problems), version=version, diagnostics=diagnostics)
     result = _check_result(context.check, start, "pass", budget_seconds=context.check.spec.budget_seconds,
-                           diagnostics=diagnostics, emacs_version=version)
+                           diagnostics=diagnostics, tool={"name": "Emacs", "version": version})
     print(f"{context.prefix}: passed (Emacs {version}, {result.duration_seconds:.2f}s)", flush=True)
     return result
 
