@@ -1,8 +1,10 @@
 """End-to-end tests for the churn x current-value worklist."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import subprocess
 import unittest
 from pathlib import Path
@@ -422,11 +424,14 @@ class WorklistGitFailureTests(FixtureCase):
                 self.assertEqual(snapshot_tree(self.repo), before)
 
     def test_failure_to_copy_working_files_ranks_nothing(self) -> None:
-        (self.repo / "broken-link").symlink_to("missing-target")
-        result = run_worklist(self, "--json", "crap")
+        os.mkfifo(self.repo / "blocked-pipe")
+        result = self.run_qg("worklist", "--json", "crap", timeout=10,
+                             env=self.default_tool_env())
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn("cannot copy repository", result.stderr)
-        self.assertIn("broken-link", result.stderr)
+        self.assertIn("blocked-pipe", result.stderr)
+        self.assertIn("FIFO", result.stderr)
+        self.assertNotIn("check: tests", result.stderr)
         self.assertEqual(result.stdout, "")
 
 
@@ -554,6 +559,23 @@ class WorklistMinimumTests(FixtureCase):
             ]),
         )
         self.commit_all()
+
+    def test_later_prerequisite_with_an_embedded_original_path_prevents_all_runs(self) -> None:
+        argument = f"--output={self.repo / 'written.txt'}"
+        second = ('[checks.second-tests]\nadapter = "python_tests"\ntier = 1\n'
+                  'enforcement = "enforced"\n'
+                  f'run = ["{{python}}", "-c", "print(1)", {json.dumps(argument)}]\n'
+                  "tests_pattern = '(\\d+)'\n\n")
+        self.write_config(verification_config(requires=None).replace(
+            "[checks.verification]", second + "[checks.verification]"))
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "verification")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("check 'second-tests'", result.stderr)
+        self.assertIn(argument, result.stderr)
+        self.assertIn("repository-relative path", result.stderr)
+        self.assertNotIn("check: ", result.stderr)
+        self.assertEqual(snapshot_tree(self.repo), before)
 
     def test_implicit_verification_runs_every_earlier_producer(self) -> None:
         second = ('[checks.second-tests]\nadapter = "python_tests"\ntier = 1\n'
@@ -724,9 +746,9 @@ class WorklistReadOnlyTests(FixtureCase):
         self.assertEqual(snapshot_tree(linked), before_linked)
         self.assertEqual(snapshot_tree(self.repo), before_repo)
 
-    def test_writing_through_a_link_does_not_change_the_original_target(self) -> None:
+    def test_writing_through_a_relative_link_stays_in_the_copy(self) -> None:
         self.add_file(".gitignore", "__pycache__/\npkg/data-link\n")
-        (self.repo / "pkg/data-link").symlink_to(self.repo / "pkg/alpha.py")
+        (self.repo / "pkg/data-link").symlink_to("alpha.py")
         self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
                       + "\nclass Sample(unittest.TestCase):\n"
                       + "    def test_link(self):\n"
@@ -735,6 +757,154 @@ class WorklistReadOnlyTests(FixtureCase):
         before = snapshot_tree(self.repo)
         result = run_worklist(self, "--json", "crap")
         self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(snapshot_tree(self.repo), before)
+
+
+class WorklistCopyTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_debt_fixture(self)
+
+    def test_repository_symlinks_keep_their_targets_under_check_and_worklist(self) -> None:
+        self.add_file(".gitignore", "__pycache__/\nlinks/\n")
+        links = self.repo / "links"
+        links.mkdir()
+        (links / "relative").symlink_to("../pkg/alpha.py")
+        (links / "absolute").symlink_to(self.repo / "pkg/alpha.py")
+        (links / "directory").symlink_to("../pkg", target_is_directory=True)
+        (self.repo / "links.md").symlink_to("README.md")
+        self.git("add", "links.md")
+        targets = {"relative": "../pkg/alpha.py", "absolute": str(self.repo / "pkg/alpha.py"),
+                   "directory": "../pkg"}
+        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                      + "\nimport os\n\nclass Sample(unittest.TestCase):\n"
+                      + "    def test_links(self):\n"
+                      + "        self.assertTrue(pathlib.Path('links.md').is_symlink())\n"
+                      + "        self.assertEqual(os.readlink('links.md'), 'README.md')\n"
+                      + f"        targets = {targets!r}\n"
+                      + "        for name, target in targets.items():\n"
+                      + "            link = pathlib.Path('links') / name\n"
+                      + "            self.assertTrue(link.is_symlink(), str(link))\n"
+                      + "            self.assertEqual(os.readlink(link), target)\n")
+        check = self.run_qg("check", env=self.default_tool_env())
+        self.assertEqual(check.returncode, 0, output(check))
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_dangling_link_is_copied_without_opening_its_target(self) -> None:
+        self.add_file(".gitignore", "__pycache__/\nbroken-link\n")
+        (self.repo / "broken-link").symlink_to("missing-target")
+        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                      + "\nimport os\n\nclass Sample(unittest.TestCase):\n"
+                      + "    def test_dangling(self):\n"
+                      + "        self.assertTrue(pathlib.Path('broken-link').is_symlink())\n"
+                      + "        self.assertEqual(os.readlink('broken-link'), 'missing-target')\n")
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+
+    def test_ignored_link_to_external_fifo_is_never_opened(self) -> None:
+        fifo = self.base / "external-fifo"
+        os.mkfifo(fifo)
+        self.add_file(".gitignore", "__pycache__/\nfifo-link\n")
+        (self.repo / "fifo-link").symlink_to(fifo)
+        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                      + "\nimport os\n\nclass Sample(unittest.TestCase):\n"
+                      + "    def test_fifo_link(self):\n"
+                      + "        self.assertTrue(pathlib.Path('fifo-link').is_symlink())\n"
+                      + f"        self.assertEqual(os.readlink('fifo-link'), {str(fifo)!r})\n")
+        result = self.run_qg("worklist", "--json", "crap", timeout=15,
+                             env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
+
+    def test_ignored_special_files_stop_before_any_check(self) -> None:
+        self.add_file(".gitignore", "__pycache__/\nblocked\n")
+        path = self.repo / "blocked"
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(path))
+            self.assert_special_file_refused("socket")
+        path.unlink()
+        os.mkfifo(path)
+        self.assert_special_file_refused("FIFO")
+
+    def assert_special_file_refused(self, kind: str) -> None:
+        result = self.run_qg("worklist", "--json", "crap", timeout=10,
+                             env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("blocked", result.stderr)
+        self.assertIn(kind, result.stderr)
+        self.assertNotIn("check: tests", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def local_excludes_fixture(self, excludes_path: str) -> None:
+        excludes = self.repo / ".git" / "local-excludes"
+        excludes.write_text("private-data\n", encoding="utf-8")
+        self.git("config", "core.excludesFile", excludes_path)
+        self.add_file("private-data", "ignored only by local configuration\n")
+
+    def test_local_excludes_file_is_preserved_as_an_absolute_path(self) -> None:
+        for excludes_path in (".git/local-excludes", str(self.repo / ".git/local-excludes")):
+            with self.subTest(excludes_path=excludes_path):
+                self.local_excludes_fixture(excludes_path)
+                self.add_file("tests/test_sample.py", PASSING_TEST)
+                check = self.run_qg("check", env=self.default_tool_env())
+                self.assertEqual(check.returncode, 0, output(check))
+                self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                              + "\nimport subprocess\n\nclass Sample(unittest.TestCase):\n"
+                              + "    def test_excludes(self):\n"
+                              + "        value = subprocess.check_output(\n"
+                              + "            ['git', 'config', '--path', 'core.excludesFile'],\n"
+                              + "            text=True).strip()\n"
+                              + "        self.assertTrue(pathlib.Path(value).is_absolute())\n")
+                before = snapshot_tree(self.repo)
+                result = run_worklist(self, "--json", "crap")
+                self.assertEqual(result.returncode, 0, output(result))
+                self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_missing_config_carry_over_reports_enumeration_difference(self) -> None:
+        self.local_excludes_fixture(".git/local-excludes")
+        gate = self.fixture_gate()
+        module = gate / "quality_gate/worklist.py"
+        with module.open("a", encoding="utf-8") as stream:
+            stream.write("\n_copy_enumeration_config = lambda root, destination: None\n")
+        self.fixture_runner = lambda: gate / "qg.py"
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("copy inventory differs from original", result.stderr)
+        self.assertIn("private-data", result.stderr)
+        self.assertNotIn("check: tests", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_local_case_matching_is_preserved(self) -> None:
+        self.git("config", "core.ignoreCase", "true")
+        self.add_file(".gitignore", "__pycache__/\nPRIVATE-DATA\n")
+        self.add_file("private-data", "ignored with local case matching\n")
+        check = self.run_qg("check", env=self.default_tool_env())
+        self.assertEqual(check.returncode, 0, output(check))
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+
+    def test_original_paths_in_prerequisite_arguments_stop_all_checks(self) -> None:
+        script = self.add_file("tests/absolute_writer.py",
+                               "from pathlib import Path\n"
+                               "Path(__file__).with_name('written.txt').write_text('changed')\n"
+                               "print('1 test')\n")
+        config = crap_config().replace(
+            '["{python}", "-m", "unittest", "discover", "-s", "tests"]',
+            json.dumps(["{python}", str(script)]),
+        )
+        self.write_config(config)
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("check 'tests'", result.stderr)
+        self.assertIn(str(script), result.stderr)
+        self.assertIn("use a repository-relative path", result.stderr)
+        self.assertNotIn("check: tests", result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertEqual(snapshot_tree(self.repo), before)
 
 

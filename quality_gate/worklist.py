@@ -5,15 +5,17 @@ import contextlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .adapters import adapter_for
 from .checks import CheckResult, _inventory_check, _verification_test_checks, run_check
-from .files import git_argv
+from .files import _type_name, enumerate_files, git_argv
 from .policy import CheckDef, Config, GateError, UsageError
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
 from .runner import RunResult, run
@@ -208,12 +210,62 @@ def _copy_exclude(root: Path, destination: Path) -> None:
         shutil.copy2(exclude, destination / ".git" / "info" / "exclude")
 
 
+def _enumeration_config(root: Path, key: str) -> str | None:
+    value_type = "--path" if key == "core.excludesFile" else "--bool"
+    result = run(
+        git_argv(root, "config", "--null", value_type, "--get", key),
+        budget_seconds=GIT_BUDGET_SECONDS, capture_limit=None,
+    )
+    if result.execution == "completed" and result.returncode == 1:
+        return None
+    _expect_git(result, f"cannot read Git configuration {key}")
+    return os.fsdecode(result.stdout).removesuffix("\0")
+
+
+def _copy_enumeration_config(root: Path, destination: Path) -> None:
+    # Read effective values, including local includes and worktree configuration.
+    # These control excludes, filename matching and deleted-file detection.
+    for key in ("core.excludesFile", "core.ignoreCase", "core.precomposeUnicode", "core.symlinks"):
+        value = _enumeration_config(root, key)
+        if value is None:
+            continue
+        if key == "core.excludesFile" and value:
+            value = os.path.abspath(root / value)
+        result = run(
+            git_argv(destination, "config", "--local", key, value),
+            budget_seconds=GIT_BUDGET_SECONDS,
+        )
+        _expect_git(result, f"cannot copy Git configuration {key}")
+
+
+def _copy_regular_file(source: str, destination: str) -> str:
+    mode = Path(source).lstat().st_mode
+    if not stat.S_ISREG(mode):
+        kind = _type_name(mode) or stat.filemode(mode)
+        raise GateError(f"cannot copy repository path {source}: unsupported file type {kind}")
+    return shutil.copy2(source, destination)
+
+
+def _compare_enumeration(root: Path, destination: Path) -> None:
+    original = Counter(enumerate_files(root))
+    copied = Counter(enumerate_files(destination))
+    if original != copied:
+        missing = sorted((original - copied).elements())
+        added = sorted((copied - original).elements())
+        raise GateError(
+            f"copy inventory differs from original: missing paths {missing!r}; added paths {added!r}"
+        )
+
+
 def _copy_tree(root: Path, destination: Path) -> None:
     _clone_repository(root, destination)
     try:
-        shutil.copytree(root, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
+        shutil.copytree(root, destination, dirs_exist_ok=True, symlinks=True,
+                        copy_function=_copy_regular_file, ignore=shutil.ignore_patterns(".git"))
         _copy_index(root, destination)
         _copy_exclude(root, destination)
+        _copy_enumeration_config(root, destination)
+        _compare_enumeration(root, destination)
     except (OSError, shutil.Error) as error:
         raise GateError(f"cannot copy repository {root}: {error}") from error
 
@@ -466,12 +518,26 @@ def _collect_slack(
 def _run_copied(
     root: Path, config: Config, selected: list[CheckDef]
 ) -> tuple[CheckResult, dict[str, CheckResult], list[str]]:
+    _reject_original_arguments(root, config, selected)
     with tempfile.TemporaryDirectory(prefix="qg-worklist-") as temporary:
         copied_root = Path(temporary) / "repo"
         _copy_tree(root, copied_root)
         copied_config = _copy_config(config, copied_root)
         copied_checks = [copied_config.checks[check.id] for check in selected]
         return _run_selected(copied_root, copied_config, copied_checks)
+
+
+def _reject_original_arguments(root: Path, config: Config, selected: list[CheckDef]) -> None:
+    paths = {str(root.absolute()), str(root.resolve())}
+    for identifier in _needed_order(config, selected):
+        check = config.checks[identifier]
+        arguments = (*getattr(check.spec, "run", ()), getattr(check.spec, "emacs", ""))
+        for argument in arguments:
+            if any(path in argument for path in paths):
+                raise GateError(
+                    f"check {identifier!r}: argument {argument!r} contains the original repository's "
+                    "absolute path; use a repository-relative path"
+                )
 
 
 def _worklist_report(

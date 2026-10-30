@@ -721,6 +721,20 @@ gate evaluation.
 
 ## Result: `worklist --json`
 
+Selected checks and their prerequisites run in a temporary working-tree copy with its Git index and
+history. Symlinks keep their targets unchanged. FIFOs, sockets and devices, including ignored ones,
+stop the worklist before any check runs, naming the path and type. Git configuration used by inventory
+enumeration is carried over, including `core.excludesFile` as an absolute path. The enumerated file
+lists must match in the original and copy; differences stop the worklist and name the paths.
+Command arguments in selected checks and prerequisites must not contain the original repository's
+absolute path or resolved real path. A violation stops the worklist before any check runs, naming the
+check and argument and asking for a repository-relative path. These failures exit 1 with no document.
+
+A check's writes through its working directory, relative paths and configured paths land in the copy;
+baselines are relocated there. The copy is not a sandbox: code that computes an absolute path to the
+original, or follows a symlink targeting the original, can still write there. Run untrusted code under
+a sandbox.
+
 `worklist --json` writes exactly one JSON document to stdout. Its schema is 1:
 
 ```json

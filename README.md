@@ -712,7 +712,19 @@ configured check that has a baseline and a threshold; with ids it covers exactly
 each selected check it runs the check and every check it requires, in policy order, using the same
 producer selection as `check`, including every earlier test producer needed by verification when
 `requires` is omitted. The checks run in a temporary copy of the working tree, with its Git index and
-history, so files they write do not change the original tree. It lists every `max` baseline entry whose
+history. Symlinks keep their targets unchanged. A FIFO, socket or device anywhere in the copied tree,
+even if ignored, stops the worklist before any check runs; the error names the path and type. The copy
+carries Git's enumeration configuration, including an absolute `core.excludesFile`, and its inventory
+file list must match the original's; a difference stops the worklist and names the differing paths.
+A selected check or prerequisite whose command arguments contain the original repository's absolute
+path or resolved real path is refused before any check runs; use repository-relative paths.
+
+A check's writes through its working directory, relative paths and configured paths land in the copy;
+baselines are relocated there. The copy is not a sandbox. Code that computes absolute paths
+to the original, or writes through a symlink targeting the original, can still write there. Run
+untrusted code under a sandbox.
+
+The report lists every `max` baseline entry whose
 bound is above the check's threshold, ranked by churn times the current measured value, highest first.
 Churn is the complete number of commits `git log --follow` reports for the file in the finding's
 location; the filename is treated literally. A row gives churn, bound, current value, churn x value,
@@ -732,7 +744,7 @@ subject is a note reading `no longer exists`. A floor outside the measured domai
 The command exits 0 after writing the report. It exits 1, ranking nothing, when a selected check or one
 it requires does not pass, when the tree cannot be copied, or when Git fails or its output is truncated;
 the error names the problem. It exits 2 for an unknown or repeated check id, or a check with no baseline
-or threshold. `worklist` does not write to the original tree.
+or threshold.
 
 ### New and changed lines
 
