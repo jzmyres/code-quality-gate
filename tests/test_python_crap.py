@@ -1,12 +1,17 @@
 """Tests for the python_crap adapter, its CC table and its ratchet."""
 from __future__ import annotations
 
+import configparser
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
 import tomllib
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from support import (
     PYTHON_COMMON_RULE_LINES,
@@ -1033,7 +1038,95 @@ class CoverageConfigurationAttackTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assert_risky_score(document)
 
-    def assert_project_path_is_refused(self, character: str, *, collection_splits: bool) -> None:
+    def test_settings_text_needs_no_coverage_installation(self) -> None:
+        from quality_gate.coverage_tool import coverage_config_text
+
+        with mock.patch("quality_gate.coverage_tool.import_coverage") as load:
+            with mock.patch("quality_gate.coverage_tool.coverage_installation") as lookup:
+                settings = coverage_config_text(self.repo)
+        self.assertIsInstance(settings, str)
+        self.assertIn(f"source =\n    {self.repo}\n", settings)
+        load.assert_not_called()
+        lookup.assert_not_called()
+
+    def test_root_rule_matches_both_pinned_list_parsers(self) -> None:
+        from quality_gate.coverage_tool import import_coverage
+
+        coverage = import_coverage()
+        whitespace = [chr(code) for code in range(sys.maxunicode + 1) if chr(code).isspace()]
+        corpus = [f"/project{chr(code)}name" for code in range(128)]
+        corpus.extend(f"{character}/project" for character in whitespace)
+        corpus.extend(f"/project{character}" for character in whitespace)
+        corpus.extend(f"/project{character}name" for character in whitespace)
+        corpus.extend([
+            "/plain-ASCII_123", "/project name", "/projet-été-日本語",
+            "/project${UNDEFINED?}name", "/project${UNDEFINED}name",
+            "/project${UNDEFINED-default}name", "/project$$name",
+        ])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for source in corpus:
+                with self.subTest(root=source):
+                    self.assert_root_rule_matches_parsers(Path(source), coverage)
+
+    def assert_root_rule_matches_parsers(self, root: Path, coverage: object) -> None:
+        from quality_gate.coverage_tool import _analysis_list, coverage_config_text
+        from quality_gate.policy import UsageError
+
+        source = str(root)
+        # Construct refused settings independently, keeping LF continuations parseable.
+        settings = "[run]\nsource =\n    " + source.replace("\n", "\n    ") + "\n"
+        collection = coverage.config.HandyConfigParser(our_file=True)
+        collection.read_string(settings)
+        analysis = configparser.ConfigParser(interpolation=None)
+        analysis.read_string(settings)
+        try:
+            collection_sources = collection.getlist("run", "source")
+        except coverage.CoverageException:
+            collection_sources = []
+        analysis_sources = _analysis_list(analysis.get("run", "source"))
+        unchanged = collection_sources == analysis_sources == [source]
+        try:
+            actual_settings = coverage_config_text(root)
+        except UsageError:
+            accepted = False
+        else:
+            accepted = True
+        self.assertEqual(accepted, unchanged, (collection_sources, analysis_sources))
+        if accepted:
+            collection.read_string(actual_settings)
+            analysis.read_string(actual_settings)
+            self.assertEqual(collection.getlist("run", "source"), [source])
+            self.assertEqual(_analysis_list(analysis.get("run", "source")), [source])
+
+    def test_coverage_verification_failure_after_tests_is_structured_unsupported(self) -> None:
+        from quality_gate.coverage_tool import coverage_installation
+
+        installation = coverage_installation()
+        tools = self.base / "tools"
+        disposable = tools / installation.name
+        shutil.copytree(installation, disposable)
+        self.add_covering_test(False)
+        self.add_file(
+            "tests/test_tamper.py",
+            PYTHON_TEST_HEADER
+            + f"pathlib.Path({str(disposable / 'tampered')!r}).touch()\n"
+            + "class Sample(unittest.TestCase):\n"
+            + "    def test_ok(self):\n        self.assertTrue(True)\n",
+        )
+        result, document = self.run_json(env={"QG_TOOLS_DIR": str(tools)})
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        check = self.check_by_id(document, "tests")
+        self.assertEqual(check["outcome"], "unsupported")
+        self.assertEqual(check["diagnostics"]["exit_code"], 0)
+        self.assertIn("coverage combination failed", check["reason"])
+        self.assertIn("payload digest mismatch", check["reason"])
+        self.assertIn(str(disposable), check["reason"])
+        self.assertIn(check["reason"], result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.check_by_id(document, "crap")["findings"], [])
+
+    def assert_project_path_is_refused(self, character: str) -> None:
         self.add_file(
             "tests/test_started.py",
             PYTHON_TEST_HEADER + "pathlib.Path('coverage-started').touch()\n",
@@ -1046,36 +1139,36 @@ class CoverageConfigurationAttackTests(FixtureCase):
         self.assertEqual(check["outcome"], "error")
         self.assertEqual(check["execution"], "error")
         self.assertIn(repr(str(self.repo)), check["reason"])
-        split_sources = [str(self.base / "project"), "name"]
-        collection_sources = split_sources if collection_splits else [str(self.repo)]
-        analysis_sources = [str(self.repo)] if character == "," else split_sources
-        self.assertIn("does not round-trip through 'run:source'", check["reason"])
-        self.assertIn(f"collection parsed {collection_sources!r}", check["reason"])
-        self.assertIn(f"analysis parsed {analysis_sources!r}", check["reason"])
+        offending = "$" if "$" in character else character
+        self.assertIn(f"character {offending!r}", check["reason"])
+        self.assertIn("coverage's 'source' setting cannot represent it", check["reason"])
         self.assertIn(check["reason"], result.stderr)
         self.assertIsNone(check["diagnostics"]["argv"])
         self.assertFalse((self.repo / "coverage-started").exists())
         self.assertEqual(self.check_by_id(document, "crap")["findings"], [])
 
     def test_project_path_with_comma_is_refused_before_running(self) -> None:
-        self.assert_project_path_is_refused(",", collection_splits=True)
+        self.assert_project_path_is_refused(",")
+
+    def test_project_path_with_substitution_is_refused_before_running(self) -> None:
+        self.assert_project_path_is_refused("${UNDEFINED?}")
 
     def test_project_path_with_lf_is_refused_before_running(self) -> None:
-        self.assert_project_path_is_refused("\n", collection_splits=True)
+        self.assert_project_path_is_refused("\n")
 
     def test_project_path_with_cr_is_refused_before_running(self) -> None:
-        self.assert_project_path_is_refused("\r", collection_splits=False)
+        self.assert_project_path_is_refused("\r")
 
     def test_project_path_with_vertical_tab_is_refused_before_running(self) -> None:
-        self.assert_project_path_is_refused("\v", collection_splits=False)
+        self.assert_project_path_is_refused("\v")
 
     def test_project_path_with_u2028_is_refused_before_running(self) -> None:
-        self.assert_project_path_is_refused("\u2028", collection_splits=False)
+        self.assert_project_path_is_refused("\u2028")
 
     def test_project_path_with_other_splitlines_separators_is_refused(self) -> None:
         for character in ("\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2029"):
             with self.subTest(character=repr(character)):
-                self.assert_project_path_is_refused(character, collection_splits=False)
+                self.assert_project_path_is_refused(character)
 
     def test_project_path_with_spaces_is_one_source_entry(self) -> None:
         self.assert_project_path_is_one_source_entry("project name")

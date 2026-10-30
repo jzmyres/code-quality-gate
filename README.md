@@ -237,10 +237,12 @@ and the registry directory. The adapter writes and every child uses one
 gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`, `source` the
 repository root, `exclude_lines` exactly the `pragma: no cover` expression) for collection,
 combination and analysis. Repository roots containing spaces or non-ASCII letters are supported.
-Before coverage runs, both the pinned coverage list parser and the analysis parser must read the
-canonical `run:source` setting back as exactly one entry equal to the repository root. Otherwise the
-check refuses the root, naming the path and both parsed lists. This includes commas and line breaks
-such as LF, CR, vertical tab and U+2028. Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
+Before coverage runs, a pure rule refuses roots containing a comma, `$`, any `str.splitlines()`
+separator (including LF, CR, vertical tab, U+0085, U+2028 and U+2029), or leading or trailing
+whitespace, naming the root and offending character. These characters let coverage's list parser
+or the analysis parser split, substitute or strip the root. A persistent test checks the rule against
+the pinned coverage parser and the analysis parser; building the settings text needs no coverage import.
+Repository `.coveragerc`, `setup.cfg`, `tox.ini` and
 `pyproject.toml` configuration is ignored, and every `COVERAGE_*` environment variable other than
 `COVERAGE_CORE` is removed before the test command and by `covrun.py`. The prefix runs `coverage run --data-file=DATA_DIR/.coverage.ID
 --source=ROOT --rcfile=GATE_CONFIG` with `COVERAGE_CORE=sysmon` on the rest of the arguments, so

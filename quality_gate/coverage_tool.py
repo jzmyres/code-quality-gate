@@ -22,9 +22,18 @@ PRAGMA_NO_COVER = "pragma: no cover"
 
 def coverage_config_text(root: Path) -> str:
     """The one gate-owned coverage configuration for collection and analysis."""
-    # Keep LF continuations parseable so refusals can name both parsed lists.
-    source = str(root).replace("\n", "\n    ")
-    settings = (
+    source = str(root)
+    # Coverage splits commas/LF, substitutes variables and strips whitespace;
+    # analysis also splits every str.splitlines() separator.
+    for index, character in enumerate(source):
+        if character in ",$\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029" or (
+            character.isspace() and index in (0, len(source) - 1)
+        ):
+            raise UsageError(
+                f"repository root {source!r} contains character {character!r}; "
+                "coverage's 'source' setting cannot represent it unchanged"
+            )
+    return (
         "[run]\n"
         "branch = False\n"
         "sigterm = true\n"
@@ -32,19 +41,6 @@ def coverage_config_text(root: Path) -> str:
         "[report]\n"
         f"exclude_lines =\n    {PRAGMA_NO_COVER}\n"
     )
-    collection = import_coverage().config.HandyConfigParser(our_file=True)
-    collection.read_string(settings)
-    analysis = configparser.ConfigParser(interpolation=None)
-    analysis.read_string(settings)
-    collection_sources = collection.getlist("run", "source")
-    analysis_sources = _analysis_list(analysis.get("run", "source"))
-    if collection_sources != [str(root)] or analysis_sources != [str(root)]:
-        raise UsageError(
-            f"repository root {str(root)!r} does not round-trip through 'run:source'; "
-            f"expected {[str(root)]!r}; collection parsed {collection_sources!r}; "
-            f"analysis parsed {analysis_sources!r}"
-        )
-    return settings
 
 
 def _analysis_list(value: str) -> list[str]:
