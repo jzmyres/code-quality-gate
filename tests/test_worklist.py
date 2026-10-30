@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -163,7 +164,7 @@ def snapshot_tree(repo: Path) -> dict[str, bytes]:
     snapshot: dict[str, bytes] = {}
     for path in sorted(repo.rglob("*")):
         relative = path.relative_to(repo)
-        if ".git" in relative.parts or not path.is_file():
+        if not path.is_file():
             continue
         snapshot[str(relative)] = path.read_bytes()
     return snapshot
@@ -196,6 +197,36 @@ class WorklistOrderTests(FixtureCase):
         self.assertEqual(rows[1]["value"], 12.0)
         self.assertEqual(rows[1]["churn_x_value"], 36.0)
         self.assertTrue(rows[1]["location"].startswith("pkg/beta.py:"))
+
+    def test_equal_displayed_products_are_sorted_by_their_actual_values(self) -> None:
+        (self.repo / "pkg/alpha.py").unlink()
+        (self.repo / "pkg/beta.py").unlink()
+        assignments = "".join(f"    value += {number}\n" for number in range(10))
+        source = (
+            "def smaller(flag):\n    value = 0\n" + assignments
+            + "    if flag:\n        value += 1\n    return value\n\n"
+            + "def bigger(flag):\n    value = 0\n" + assignments
+            + "    if flag:\n        value += 1\n        value += 2\n    return value\n"
+        )
+        self.add_file("pkg/fractions.py", source)
+        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                      + "\nfrom pkg.fractions import smaller, bigger\n"
+                      + "\nclass Sample(unittest.TestCase):\n"
+                      + "    def test_both(self):\n"
+                      + "        smaller(False)\n        bigger(False)\n")
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/fractions.py:smaller", "bound": 7, "reason": "smaller"},
+            {"subject": "pkg/fractions.py:bigger", "bound": 7, "reason": "bigger"},
+        ]))
+        self.commit_all("fractional scores")
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+        rows = self.parse_json(result)["rows"]
+        self.assertEqual([row["subject"] for row in rows], [
+            "pkg/fractions.py:bigger", "pkg/fractions.py:smaller",
+        ])
+        self.assertGreater(rows[0]["churn_x_value"], rows[1]["churn_x_value"])
+        self.assertEqual(f"{rows[0]['churn_x_value']:.1f}", f"{rows[1]['churn_x_value']:.1f}")
 
 
 class WorklistElispTests(FixtureCase):
@@ -281,6 +312,33 @@ class WorklistNoteTests(FixtureCase):
         self.assertEqual(notes[("pkg/ghost.py:ghost", "churn not measured")]["file"],
                          "pkg/ghost.py")
 
+    def test_outside_selected_files_is_unmeasured_and_deleted_subject_is_absent(self) -> None:
+        config = crap_config().replace(
+            'checks = ["tests"]\n\n[classes.config]',
+            'checks = ["tests"]\n\n[classes.other]\ncode = true\n'
+            'description = "Other Python"\nchecks = ["tests"]\n\n[classes.config]',
+        )
+        config += ('\n[[rule]]\npattern = "other/*.py"\nclass = "other"\n'
+                   'reason = "outside the crap selection"\n')
+        self.write_config(config)
+        (self.repo / "pkg/ghost.py").unlink()
+        self.add_file("other/existing.py", GHOST)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "other/existing.py:ghost", "bound": 15, "reason": "outside scope"},
+            {"subject": "pkg/alpha.py:removed", "bound": 25, "reason": "removed"},
+        ]))
+        check, document = self.run_json(env=self.default_tool_env())
+        self.assertEqual(check.returncode, 0, output(check))
+        crap = self.check_by_id(document, "crap")
+        self.assertIn("other/existing.py:ghost", crap["unmeasured_baseline_entries"])
+        self.assertIn("pkg/alpha.py:removed", crap["resolved_baseline_entries"])
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.parse_json(result)["notes"], [
+            {"check": "crap", "subject": "other/existing.py:ghost", "reason": "unmeasured"},
+            {"check": "crap", "subject": "pkg/alpha.py:removed", "reason": "no longer exists"},
+        ])
+
 
 class WorklistUnreliableTests(FixtureCase):
     def setUp(self) -> None:
@@ -318,17 +376,17 @@ class WorklistGitFailureTests(FixtureCase):
         super().setUp()
         write_debt_fixture(self)
 
-    def fake_git_failing_log(self) -> dict[str, str]:
+    def fake_git_failing(self, argument: str) -> dict[str, str]:
         bin_dir = self.base / "fake-bin-log"
-        bin_dir.mkdir()
+        bin_dir.mkdir(exist_ok=True)
         real_git = shutil.which("git")
         assert real_git is not None
         script = bin_dir / "git"
         script.write_text(
             "#!/bin/bash\n"
             'for arg in "$@"; do\n'
-            '  if [ "$arg" = "log" ]; then\n'
-            '    echo "fatal: simulated log failure" >&2\n'
+            f'  if [ "$arg" = "{argument}" ]; then\n'
+            '    echo "fatal: simulated Git failure" >&2\n'
             "    exit 128\n"
             "  fi\n"
             "done\n"
@@ -342,13 +400,113 @@ class WorklistGitFailureTests(FixtureCase):
 
     def test_failed_git_invocation_exits_one_and_names_command(self) -> None:
         result = run_worklist(
-            self, "--json", "crap", env=self.fake_git_failing_log()
+            self, "--json", "crap", env=self.fake_git_failing("log")
         )
         self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("git log --follow --format=%H --", result.stderr)
+        self.assertIn("log --follow --format=%H --", result.stderr)
         self.assertIn("expected exit status 0", result.stderr)
         self.assertIn("128", result.stderr)
         self.assertNotIn("CHURN", result.stdout)
+
+    def test_failure_to_prepare_the_copy_ranks_nothing_and_preserves_the_tree(self) -> None:
+        for argument, message in (("clone", "cannot copy Git repository"),
+                                  ("--git-path", "cannot locate Git index"),
+                                  ("pack-objects", "cannot copy staged Git objects")):
+            with self.subTest(argument=argument):
+                before = snapshot_tree(self.repo)
+                result = run_worklist(self, "--json", "crap", env=self.fake_git_failing(argument))
+                self.assertEqual(result.returncode, 1, output(result))
+                self.assertIn(message, result.stderr)
+                self.assertIn("simulated Git failure", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_failure_to_copy_working_files_ranks_nothing(self) -> None:
+        (self.repo / "broken-link").symlink_to("missing-target")
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("cannot copy repository", result.stderr)
+        self.assertIn("broken-link", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
+class WorklistChurnTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.write_config(crap_config())
+        self.add_file("tests/test_sample.py", PASSING_TEST)
+
+    def test_metacharacters_in_paths_are_literal(self) -> None:
+        self.add_file("pkg/a[1].py", ALPHA)
+        self.add_file("pkg/a1.py", BETA)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/a[1].py:alpha", "bound": 25, "reason": "brackets"},
+            {"subject": "pkg/a1.py:beta", "bound": 15, "reason": "plain"},
+        ]))
+        self.commit_all()
+        for number in range(3):
+            self.add_file("pkg/a1.py", BETA + f"# change {number}\n")
+            self.commit_all(f"plain {number}")
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+        rows = self.parse_json(result)["rows"]
+        self.assertEqual(len(rows), 2)
+        plain, bracketed = rows
+        self.assertEqual((plain["subject"], plain["churn"], plain["churn_x_value"]),
+                         ("pkg/a1.py:beta", 4, 48))
+        self.assertEqual((bracketed["subject"], bracketed["churn"], bracketed["churn_x_value"]),
+                         ("pkg/a[1].py:alpha", 1, 20))
+
+    def test_history_over_capture_limit_is_complete_or_reports_truncation(self) -> None:
+        self.add_file("pkg/alpha.py", ALPHA)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/alpha.py:alpha", "bound": 25, "reason": "debt"},
+        ]))
+        self.commit_all()
+        touches = 26_002
+        parent = self.git("rev-parse", "HEAD").stdout.strip()
+        records = []
+        for number in range(touches - 1):
+            content = ALPHA + f"# change {number}\n"
+            records.append(
+                "commit refs/heads/main\n"
+                "committer qg test <qg@example.invalid> 1700000000 +0000\n"
+                "data 1\nx\n"
+                + (f"from {parent}\n" if number == 0 else "")
+                + f"M 100644 inline pkg/alpha.py\ndata {len(content.encode())}\n"
+                f"{content}\n"
+            )
+        imported = subprocess.run(
+            ["git", "fast-import", "--quiet"], cwd=self.repo, env=self.env(),
+            input="".join(records), text=True, capture_output=True,
+        )
+        self.assertEqual(imported.returncode, 0, output(imported))
+        result = run_worklist(self, "--json", "crap")
+        if result.returncode == 1:
+            self.assertIn("truncat", result.stderr.lower(), output(result))
+            self.assertEqual(result.stdout, "")
+        else:
+            self.assertEqual(result.returncode, 0, output(result))
+            self.assertEqual(self.parse_json(result)["rows"][0]["churn"], touches)
+
+
+class WorklistEmptyHistoryTests(FixtureCase):
+    def test_uncommitted_repository_reports_git_failure_without_changing_tree(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.write_config(crap_config())
+        self.add_file("pkg/alpha.py", ALPHA)
+        self.add_file("tests/test_sample.py", PASSING_TEST)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/alpha.py:alpha", "bound": 25, "reason": "new debt"},
+        ]))
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("expected exit status 0", result.stderr)
+        self.assertIn("pkg/alpha.py", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(snapshot_tree(self.repo), before)
 
 
 class WorklistArgumentTests(FixtureCase):
@@ -361,6 +519,19 @@ class WorklistArgumentTests(FixtureCase):
         result = self.run_qg("worklist", "smoke")
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("expected a baseline, got none", result.stderr)
+
+    def test_no_eligible_checks_produces_an_empty_report(self) -> None:
+        result = run_worklist(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.parse_json(result), {"schema": 1, "rows": [], "slack": [], "notes": []})
+
+    def test_repeated_check_id_exits_two_and_names_the_id(self) -> None:
+        write_debt_fixture(self)
+        result = run_worklist(self, "--json", "crap", "crap")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("crap", result.stderr)
+        self.assertIn("duplicate", result.stderr)
+        self.assertNotIn("rows", self.parse_json(result))
 
 
 class WorklistMinimumTests(FixtureCase):
@@ -383,6 +554,74 @@ class WorklistMinimumTests(FixtureCase):
             ]),
         )
         self.commit_all()
+
+    def test_implicit_verification_runs_every_earlier_producer(self) -> None:
+        second = ('[checks.second-tests]\nadapter = "python_tests"\ntier = 1\n'
+                  'enforcement = "enforced"\n'
+                  'run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]\n'
+                  "tests_pattern = '^Ran (\\d+) tests? in'\n\n")
+        self.write_config(verification_config(requires=None).replace(
+            "[checks.verification]", second + "[checks.verification]"))
+        self.add_file("quality-gate-verification.toml", verification_baseline([
+            executed_entry(1),
+            {"subject": "tests:second-tests:executed", "bound": 1, "reason": "second producer"},
+            exclusion_entry("pkg/mod.py", "noqa", 2),
+        ]))
+        check, _document = self.run_json(env=self.default_tool_env())
+        self.assertEqual(check.returncode, 0, output(check))
+        result = run_worklist(self, "--json", "verification")
+        self.assertEqual(result.returncode, 0, output(result))
+        slack = self.parse_json(result)["slack"]
+        self.assertEqual({item["subject"]: item["value"] for item in slack}, {
+            "tests:tests:executed": 3, "tests:second-tests:executed": 3,
+        })
+
+    def test_explicit_verification_runs_only_its_named_producer(self) -> None:
+        second = ('[checks.second-tests]\nadapter = "python_tests"\ntier = 1\n'
+                  'enforcement = "enforced"\n'
+                  'run = ["{python}", "-c", "raise SystemExit(1)"]\n'
+                  "tests_pattern = '^Ran (\\d+) tests? in'\n\n")
+        self.write_config(verification_config(requires="tests").replace(
+            "[checks.verification]", second + "[checks.verification]"))
+        result = run_worklist(self, "--json", "verification")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertNotIn("check: second-tests", result.stderr)
+        self.assertEqual(self.parse_json(result)["slack"][0]["value"], 3)
+
+    def test_a_selected_producer_also_runs_its_own_prerequisite(self) -> None:
+        gate = self.fixture_gate()
+        adapters = gate / "quality_gate/adapters.py"
+        with adapters.open("a", encoding="utf-8") as stream:
+            stream.write('''
+def _bridge_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "bridge/1", ("tests",),
+                      requires=raw["requires"])
+
+def _bridge_run(root, config, check, files, classes, *, prefix, prior):
+    import time
+    from .checks import _check_result
+    required = prior[check.spec.requires]
+    return _check_result(check, time.monotonic(), required.outcome,
+                         tests_ran=required.tests_ran, tests_skipped=required.tests_skipped)
+
+register_adapter(AdapterDescriptor("bridge", ("requires",), _bridge_parse, _bridge_run,
+                                   produces_tests=True, requires_adapter="python_tests"))
+''')
+        self.fixture_runner = lambda: gate / "qg.py"
+        bridge = ('[checks.bridge]\nadapter = "bridge"\ntier = 1\n'
+                  'enforcement = "enforced"\nrequires = "tests"\n\n')
+        self.write_config(verification_config(requires="bridge").replace(
+            "[checks.verification]", bridge + "[checks.verification]"))
+        self.add_file("quality-gate-verification.toml", verification_baseline([
+            {"subject": "tests:bridge:executed", "bound": 1, "reason": "bridge producer"},
+            exclusion_entry("pkg/mod.py", "noqa", 2),
+        ]))
+        result = run_worklist(self, "--json", "verification")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.parse_json(result)["slack"][0]["value"], 3)
+        self.assertIn("check: tests (python_tests)", result.stderr)
+        self.assertIn("check: bridge (bridge)", result.stderr)
 
     def test_minimum_slack_is_reported_beside_maximum_debt(self) -> None:
         human = run_worklist(self, "verification")
@@ -443,11 +682,58 @@ class WorklistJsonTests(FixtureCase):
 class WorklistReadOnlyTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
-        write_debt_fixture(self)
+        writer = (PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+                  "    def test_write(self):\n"
+                  "        pathlib.Path('test-results.json').write_text('{}')\n"
+                  "        source = pathlib.Path('pkg/alpha.py')\n"
+                  "        source.write_text(source.read_text() + '# changed by test\\n')\n")
+        write_debt_fixture(self, test_body=writer)
 
     def test_tree_and_baselines_are_byte_identical(self) -> None:
         before = snapshot_tree(self.repo)
         result = run_worklist(self)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse((self.repo / "test-results.json").exists(), "test wrote into the original tree")
+        self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_copy_preserves_staged_contents_for_checks_that_use_git(self) -> None:
+        self.add_file("pkg/alpha.py", ALPHA + "# staged\n")
+        self.git("add", "pkg/alpha.py")
+        self.add_file("pkg/alpha.py", ALPHA + "# unstaged\n")
+        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                      + "\nimport subprocess\n\nclass Sample(unittest.TestCase):\n"
+                      + "    def test_index(self):\n"
+                      + "        cmd = ['git', 'show', ':pkg/alpha.py']\n"
+                      + "        staged = subprocess.check_output(cmd, text=True)\n"
+                      + "        self.assertIn('# staged', staged)\n"
+                      + "        self.assertNotIn('# unstaged', staged)\n")
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(snapshot_tree(self.repo), before)
+
+    def test_linked_worktree_runs_without_writing_its_shared_git_directory(self) -> None:
+        linked = self.base / "linked"
+        self.git("worktree", "add", "--detach", str(linked))
+        before_repo = snapshot_tree(self.repo)
+        before_linked = snapshot_tree(linked)
+        result = self.run_qg("worklist", "--json", "crap", repo=linked,
+                             env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse((linked / "test-results.json").exists())
+        self.assertEqual(snapshot_tree(linked), before_linked)
+        self.assertEqual(snapshot_tree(self.repo), before_repo)
+
+    def test_writing_through_a_link_does_not_change_the_original_target(self) -> None:
+        self.add_file(".gitignore", "__pycache__/\npkg/data-link\n")
+        (self.repo / "pkg/data-link").symlink_to(self.repo / "pkg/alpha.py")
+        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
+                      + "\nclass Sample(unittest.TestCase):\n"
+                      + "    def test_link(self):\n"
+                      + "        link = pathlib.Path('pkg/data-link')\n"
+                      + "        link.write_text(link.read_text() + '# from link\\n')\n")
+        before = snapshot_tree(self.repo)
+        result = run_worklist(self, "--json", "crap")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(snapshot_tree(self.repo), before)
 

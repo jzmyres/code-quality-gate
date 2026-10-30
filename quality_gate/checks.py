@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from functools import partial
@@ -1631,7 +1632,7 @@ def _produces_tests(adapter: str) -> bool:
 
 
 def _verification_test_checks(
-    check: CheckDef, prior: dict[str, CheckResult]
+    check: CheckDef, prior: Mapping[str, CheckResult | CheckDef]
 ) -> list[str]:
     spec = check.spec
     if spec.requires is not None:

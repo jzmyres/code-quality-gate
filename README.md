@@ -706,12 +706,14 @@ bound fails.
     python3 -I qg.py --repo /path/to/repo worklist crap elisp-crap
 
 `worklist` ranks the debt a reasoned baseline still carries. With no `CHECK` it covers every
-configured check that has a baseline; with ids it covers exactly those checks. For
-each selected check it runs the check and every check it requires, in policy order, exactly as `check`
-runs them, including earlier test producers needed by verification. It lists every `max` baseline
-entry whose bound is above the check's threshold, ranked by churn
-times the current measured value, highest first. Churn is the number of commits `git log --follow`
-reports for the file in the finding's location. A row gives churn, bound, current value, churn x value,
+configured check that has a baseline and a threshold; with ids it covers exactly those checks. For
+each selected check it runs the check and every check it requires, in policy order, using the same
+producer selection as `check`, including every earlier test producer needed by verification when
+`requires` is omitted. The checks run in a temporary copy of the working tree, with its Git index and
+history, so files they write do not change the original tree. It lists every `max` baseline entry whose
+bound is above the check's threshold, ranked by churn times the current measured value, highest first.
+Churn is the complete number of commits `git log --follow` reports for the file in the finding's
+location; the filename is treated literally. A row gives churn, bound, current value, churn x value,
 subject and location. Unrounded values are compared; the human report displays them to one decimal.
 
 Alongside that debt, the report lists each measured `min` entry's bound, current value and slack
@@ -719,15 +721,16 @@ Alongside that debt, the report lists each measured `min` entry's bound, current
 adds a `slack` array containing `check`, `subject`, `bound`, `value` and `slack` for each floor;
 the existing `rows` for `max` entries are unchanged.
 
-An entry whose subject is no longer measured is a note instead of a row, reading `no longer exists`. A
-floor outside the measured domain is a note reading `not measured`. A finding whose file Git cannot
-follow is a note reading `churn not measured`. `--json` writes one
-machine-readable document of rows and notes; its schema is in `docs/SCHEMA.md`.
+The ratchet distinguishes entries outside the measured domain from subjects absent from a completed
+measurement. A missing `max` subject outside the domain is a note reading `unmeasured`; an absent
+subject is a note reading `no longer exists`. A floor outside the measured domain is a note reading
+`not measured`. A finding whose file Git cannot follow is a note reading `churn not measured`.
+`--json` writes one machine-readable document of rows and notes; its schema is in `docs/SCHEMA.md`.
 
 The command exits 0 after writing the report. It exits 1, ranking nothing, when a selected check or one
-it requires does not pass, naming the check and expected versus actual, or when Git fails, naming the
-`git log --follow` command and expected versus actual. It exits 2 for an unknown check id or a check with
-no baseline. `worklist` never writes a baseline or any other file.
+it requires does not pass, when the tree cannot be copied, or when Git fails or its output is truncated;
+the error names the problem. It exits 2 for an unknown or repeated check id, or a check with no baseline
+or threshold. `worklist` does not write to the original tree.
 
 ### Result reuse by recorded reads
 
