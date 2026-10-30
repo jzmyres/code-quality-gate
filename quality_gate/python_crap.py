@@ -583,14 +583,14 @@ def _analyse_file(
 
 
 def _analyse_coverage(
-    root: Path, selected: list[str], evidence: Path,
+    root: Path, selected: list[str], evidence: Path, settings: str,
     parsed: dict[str, tuple[str, list[MeasuredFunction]]], failures: list[str],
 ) -> list[Finding]:
     if not evidence.is_file():
         raise GateError(f"combined coverage data is missing at {evidence}")
     coverage = import_coverage()
     cover = coverage.Coverage(
-        config_file=coverage_config_data(root, evidence)
+        config_file=coverage_config_data(settings, evidence)
     )
     findings: list[Finding] = []
     try:
@@ -609,12 +609,13 @@ def measure_crap(
     root: Path,
     selected: list[str],
     evidence: Path,
+    settings: str,
 ) -> CrapMeasurement:
     """Measure every function and outside-function subject in SELECTED."""
     parsed, failures = _parse_selected(root, selected)
     if failures:
         return CrapMeasurement([], failures)
-    findings = _analyse_coverage(root, selected, evidence, parsed, failures)
+    findings = _analyse_coverage(root, selected, evidence, settings, parsed, failures)
     if failures:
         return CrapMeasurement([], failures)
     findings.sort(key=lambda item: item.subject)

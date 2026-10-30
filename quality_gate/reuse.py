@@ -403,10 +403,10 @@ def _record_evidence(document: dict[str, Any], result: Any) -> None:
     evidence = getattr(result, "evidence_path", None)
     if evidence is None:
         return
-    configuration = getattr(result, "coverage_config", None)
-    if configuration is not None:
+    settings = getattr(result, "coverage_settings", None)
+    if settings is not None:
         document["coverage_data"] = base64.b64encode(evidence.read_bytes()).decode("ascii")
-        document["coverage_config"] = base64.b64encode(configuration.read_bytes()).decode("ascii")
+        document["coverage_config"] = base64.b64encode(settings.encode("utf-8")).decode("ascii")
     elif getattr(result, "adapter", None) == "elisp_tests":
         document["elisp_result"] = _json_loads(evidence.read_text(encoding="utf-8"))
 

@@ -32,15 +32,18 @@ def coverage_config_text(root: Path) -> str:
     )
 
 
-def coverage_config_data(root: Path, data_file: Path) -> str:
+def coverage_config_data(settings: str, data_file: Path) -> str:
     """The canonical configuration as coverage's in-memory `:data:` value."""
     parser = configparser.ConfigParser(interpolation=None)
-    parser.read_string(coverage_config_text(root))
+    parser.read_string(settings)
     install = import_coverage()
     config = install.config.CoverageConfig()
     config.set_option("run:branch", parser.getboolean("run", "branch"))
     config.set_option("run:sigterm", parser.getboolean("run", "sigterm"))
-    config.set_option("run:source", parser.get("run", "source").split())
+    config.set_option(
+        "run:source",
+        [line.strip() for line in parser.get("run", "source").splitlines() if line.strip()],
+    )
     config.set_option("run:data_file", str(data_file))
     config.set_option(
         "report:exclude_lines",
@@ -167,14 +170,14 @@ def _check_datasets(datasets: list[tuple[str, str, Path]]) -> None:
 def combine_coverage(
     data_dir: Path,
     combined_file: Path,
-    root: Path,
+    settings: str,
 ) -> None:
     """Combine every registered dataset under DATA_DIR into COMBINED_FILE."""
     coverage = import_coverage()
     _check_datasets(registered_datasets(data_dir))
     combined_file.parent.mkdir(parents=True, exist_ok=True)
     cover = coverage.Coverage(
-        config_file=coverage_config_data(root, combined_file)
+        config_file=coverage_config_data(settings, combined_file)
     )
     try:
         cover.combine(data_paths=[str(data_dir)], strict=True)

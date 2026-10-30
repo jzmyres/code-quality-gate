@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -117,6 +119,7 @@ class CheckResult:
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     evidence_path: Path | None = None
     coverage_config: Path | None = None
+    coverage_settings: str | None = None
     temporary: Any = field(default=None, repr=False, compare=False)
     configuration_error: bool = False
     change_scoped_failure: bool = False
@@ -1105,7 +1108,7 @@ def _combine_tests_evidence(
     spec: Any,
     start: float,
     prefix: str,
-    root: Path,
+    settings: str,
     data_dir: Path,
     combined_file: Path,
     diagnostics: Diagnostics,
@@ -1115,7 +1118,7 @@ def _combine_tests_evidence(
     try:
         analysis_step(
             "coverage combination", combine_coverage,
-            data_dir, combined_file, root, deadline=deadline,
+            data_dir, combined_file, settings, deadline=deadline,
         )
     except StepTimeout:
         return _tests_result(
@@ -1265,13 +1268,49 @@ def _tests_counts(
     return (ran, skipped, executed), None
 
 
-def _coverage_config_problem(root: Path, data_dir: Path) -> str | None:
+def _coverage_file_kind(mode: int) -> str:
+    return {
+        "d": "directory", "p": "FIFO", "l": "symlink", "s": "socket",
+        "c": "character device", "b": "block device",
+    }.get(stat.filemode(mode)[0], "non-regular file")
+
+
+def _open_coverage_config(path: Path) -> int:
+    try:
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise GateError("expected a regular file, got symlink") from error
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            raise error from None
+        if not stat.S_ISREG(mode):
+            raise GateError(f"expected a regular file, got {_coverage_file_kind(mode)}") from error
+        raise
+
+
+def _read_coverage_config(path: Path) -> str:
+    descriptor = _open_coverage_config(path)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            raise GateError(f"expected a regular file, got {_coverage_file_kind(mode)}")
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(descriptor)
+
+
+def _coverage_config_problem(data_dir: Path, settings: str) -> str | None:
     path = coverage_config_path(data_dir)
     try:
-        actual = path.read_text(encoding="utf-8")
+        actual = _read_coverage_config(path)
+    except GateError as error:
+        return f"coverage configuration {path}: {error}"
     except (OSError, UnicodeDecodeError) as error:
         return f"coverage configuration {path} cannot be read: {error}"
-    if actual != coverage_config_text(root):
+    if actual != settings:
         return (
             f"coverage configuration {path} differs from the "
             "gate-owned configuration after the test run"
@@ -1293,7 +1332,11 @@ def _tests_evidence(
     diagnostics: Diagnostics,
     deadline: float,
 ) -> CheckResult:
-    problem = _coverage_config_problem(root, data_dir)
+    settings = coverage_config_text(root)
+    problem = analysis_step(
+        "coverage configuration validation", _coverage_config_problem,
+        data_dir, settings, deadline=deadline,
+    )
     if problem is not None:
         return _tests_result(
             check,
@@ -1313,7 +1356,7 @@ def _tests_evidence(
         spec,
         start,
         prefix,
-        root,
+        settings,
         data_dir,
         combined_file,
         diagnostics,
@@ -1333,6 +1376,7 @@ def _tests_evidence(
         tests_skipped=skipped,
         evidence_path=combined_file,
         coverage_config=config_file,
+        coverage_settings=settings,
         temporary=temporary,
     )
     print(
@@ -1430,7 +1474,7 @@ def _file_present(path: Path | None) -> bool:
 def _crap_missing_evidence(required: CheckResult) -> str | None:
     if not _file_present(required.evidence_path):
         return "combined coverage data"
-    if not _file_present(required.coverage_config):
+    if not _file_present(required.coverage_config) or required.coverage_settings is None:
         return "gate coverage configuration"
     return None
 
@@ -1439,25 +1483,26 @@ def _crap_required(
     prior: dict[str, CheckResult],
     spec: Any,
     prefix: str,
-) -> tuple[Path | None, Diagnostics | None, str | None]:
+) -> tuple[Path | None, str | None, Diagnostics | None, str | None]:
     required = prior.get(spec.requires)
     if required is None or required.outcome != "pass":
         message = f"coverage unreliable: {spec.requires} did not pass"
     else:
         missing = _crap_missing_evidence(required)
         if missing is None:
-            return required.evidence_path, None, None
+            return required.evidence_path, required.coverage_settings, None, None
         message = (
             f"coverage unreliable: {spec.requires} produced no {missing}"
         )
     print(f"{prefix}: {message}", file=sys.stderr)
-    return None, Diagnostics(error=message), message
+    return None, None, Diagnostics(error=message), message
 
 
 def _crap_measure(
     root: Path,
     selected: list[str],
     evidence_path: Path | None,
+    settings: str | None,
     check: CheckDef,
     start: float,
     prefix: str,
@@ -1468,6 +1513,7 @@ def _crap_measure(
             root,
             selected,
             evidence_path,
+            settings,
             deadline=start + CLONE_BUDGET_SECONDS,
         )
     except StepTimeout:
@@ -1505,7 +1551,7 @@ def _run_python_crap(context: AdapterContext) -> CheckResult:
         print(f"{prefix}: {reason}", file=sys.stderr)
         return _ratchet_result(check, start, "fail", reason=reason)
 
-    evidence_path, failure_diagnostics, message = analysis_step(
+    evidence_path, settings, failure_diagnostics, message = analysis_step(
         "coverage evidence validation", _crap_required, prior, spec, prefix
     )
     if message is not None:
@@ -1521,6 +1567,7 @@ def _run_python_crap(context: AdapterContext) -> CheckResult:
         root,
         selected,
         evidence_path,
+        settings,
         check,
         start,
         prefix,
@@ -1842,7 +1889,7 @@ def _adapter_runner(
 
 
 def _reused_result(
-    check: CheckDef, start: float, prefix: str, reused: reuse.Reused
+    root: Path, check: CheckDef, start: float, prefix: str, reused: reuse.Reused
 ) -> CheckResult:
     record = reused.record
     result = _check_result(
@@ -1856,6 +1903,8 @@ def _reused_result(
         emacs_version=record.get("emacs_version"),
     )
     reuse.restore_coverage(record, result)
+    if result.coverage_config is not None:
+        result.coverage_settings = coverage_config_text(root)
     if result.tests_ran is not None and result.tests_skipped is not None:
         result.test_results = TestResults(result.tests_ran, result.tests_ran - result.tests_skipped, 0)
     if "elisp_result" in record:
@@ -2039,7 +2088,7 @@ def _reuse_stages(
     reused = analysis_step("reuse lookup", _reuse_lookup, session, check, identity, coverage_dir,
                            deadline=deadline)
     if reused is not None:
-        return _reused_result(check, start, prefix, reused)
+        return _reused_result(root, check, start, prefix, reused)
     return _run_recorded_check(session, identity, root, config, check, files, classes, prefix,
                                prior, start, tracer)
 

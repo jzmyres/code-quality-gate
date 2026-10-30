@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import time
 import tomllib
 import unittest
 
@@ -926,9 +929,7 @@ class CoverageConfigurationAttackTests(FixtureCase):
             "--policy-from", revision, env=self.default_tool_env()
         )
 
-    def test_untouched_run_scores_exactly_as_before(self) -> None:
-        result, document = self.run_attack(tamper=False)
-        self.assertEqual(result.returncode, 0, output(result))
+    def assert_risky_score(self, document: dict[str, object]) -> None:
         check = self.check_by_id(document, "crap")
         finding = next(
             item
@@ -937,6 +938,11 @@ class CoverageConfigurationAttackTests(FixtureCase):
         )
         self.assertAlmostEqual(finding["value"], 343 / 81 + 3, places=12)
         self.assertEqual(finding["measurement"]["excluded_lines"], [])
+
+    def test_untouched_run_scores_exactly_as_before(self) -> None:
+        result, document = self.run_attack(tamper=False)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_risky_score(document)
 
     def test_a_test_cannot_rewrite_the_coverage_configuration(self) -> None:
         result, document = self.run_attack(tamper=True)
@@ -951,6 +957,102 @@ class CoverageConfigurationAttackTests(FixtureCase):
         crap = self.check_by_id(document, "crap")
         self.assertEqual(crap["outcome"], "unsupported")
         self.assertEqual(crap["findings"], [])
+
+    def test_non_regular_coverage_configuration_is_refused_within_the_budget(self) -> None:
+        self.write_config(crap_config(threshold=8).replace(
+            '[checks.tests]\n', '[checks.tests]\nbudget_seconds = 1\n'
+        ))
+        replacements = {
+            "FIFO": "os.mkfifo(configuration)",
+            "symlink": "configuration.symlink_to('elsewhere')",
+            "directory": "configuration.mkdir()",
+            "socket": "sock = socket.socket(socket.AF_UNIX)\n        sock.bind(str(configuration))",
+        }
+        for kind, replace in replacements.items():
+            with self.subTest(kind=kind):
+                self.add_file(
+                    "tests/test_risky.py",
+                    PYTHON_TEST_HEADER
+                    + "import json\nimport os\nimport socket\n"
+                    + "class Sample(unittest.TestCase):\n"
+                    + "    def test_replace(self):\n"
+                    + "        configuration = pathlib.Path(json.loads(os.environ['QG_PYTHON'])[8])\n"
+                    + "        configuration.unlink()\n"
+                    + f"        {replace}\n",
+                )
+                self.commit_all(kind)
+                revision = self.git("rev-parse", "HEAD").stdout.strip()
+                started = time.monotonic()
+                result = self.run_qg(
+                    "check", "--json", "--policy-from", revision,
+                    env=self.default_tool_env(), timeout=8,
+                )
+                elapsed = time.monotonic() - started
+                document = self.parse_json(result)
+                check = self.check_by_id(document, "tests")
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertEqual(check["execution"], "error")
+                self.assertIn("coverage.ini", check["reason"])
+                self.assertIn("expected a regular file", check["reason"])
+                self.assertIn(kind, check["reason"])
+                self.assertIn(check["reason"], result.stderr)
+                self.assertLess(check["duration_seconds"], 1.0)
+                self.assertLess(elapsed, 8.0)
+
+    def test_settings_stay_canonical_after_validation(self) -> None:
+        self.add_covering_test(False)
+        shadow = self.base / "shadow"
+        shadow.mkdir()
+        (shadow / "risky.py").write_text(RISKY_SOURCE, encoding="utf-8")
+        checks_file = self.gate / "quality_gate" / "checks.py"
+        with checks_file.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n_original_coverage_config_problem = _coverage_config_problem\n"
+                "def _change_config_after_validation(data_dir, settings):\n"
+                "    problem = _original_coverage_config_problem(data_dir, settings)\n"
+                "    if problem is None:\n"
+                f"        root = Path({str(self.repo)!r})\n"
+                "        path = coverage_config_path(data_dir)\n"
+                "        with path.open('a', encoding='utf-8') as config:\n"
+                "            config.write('    dead\\n[paths]\\nalias =\\n'\n"
+                "                         + f'    {root.parent / \"shadow\"}\\n'\n"
+                "                         + f'    {root / \"pkg\"}\\n')\n"
+                "    return problem\n"
+                "_coverage_config_problem = _change_config_after_validation\n"
+            )
+        self.commit_all()
+        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        result = subprocess.run(
+            [sys.executable, "-I", str(self.gate / "qg.py"), "--repo", str(self.repo),
+             "check", "--json", "--policy-from", revision],
+            cwd=self.repo, env=self.default_tool_env(), capture_output=True,
+            text=True, timeout=30,
+        )
+        document = self.parse_json(result)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_risky_score(document)
+
+    def test_project_path_with_spaces_is_one_source_entry(self) -> None:
+        from quality_gate.coverage_tool import (
+            coverage_config_data, import_coverage, write_coverage_config,
+        )
+
+        self.repo = self.repo.rename(self.base / "project name")
+        data_dir = self.base / "coverage data"
+        config_file = write_coverage_config(data_dir, self.repo)
+        coverage = import_coverage()
+        collection = coverage.Coverage(config_file=str(config_file))
+        analysis = coverage.Coverage(
+            config_file=coverage_config_data(
+                config_file.read_text(encoding="utf-8"), data_dir / ".coverage"
+            )
+        )
+        self.assertEqual(collection.get_option("run:source"), [str(self.repo)])
+        self.assertEqual(analysis.get_option("run:source"), [str(self.repo)])
+        result, document = self.run_attack(tamper=False)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_risky_score(document)
 
 
 if __name__ == "__main__":

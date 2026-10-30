@@ -1,6 +1,7 @@
 """Tests for result reuse by recorded reads."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import datetime
@@ -194,6 +195,20 @@ class ReuseUnitTests(unittest.TestCase):
         (self.root / "listing").mkdir()
         (self.root / "listing" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
         (self.root / "read.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    def test_recorded_coverage_settings_do_not_reread_the_file(self) -> None:
+        evidence = self.root / ".coverage"
+        evidence.write_bytes(b"coverage evidence")
+        configuration = self.root / "coverage.ini"
+        configuration.write_text("changed after validation", encoding="utf-8")
+        result = SimpleNamespace(
+            evidence_path=evidence, coverage_config=configuration,
+            coverage_settings="validated settings", adapter="python_tests",
+        )
+        record = {}
+        reuse._record_evidence(record, result)
+        self.assertEqual(base64.b64decode(record["coverage_data"]), b"coverage evidence")
+        self.assertEqual(base64.b64decode(record["coverage_config"]), b"validated settings")
 
     def test_padded_process_ids_preserve_an_unfinished_child_stat(self) -> None:
         listing = self.root / "listing"

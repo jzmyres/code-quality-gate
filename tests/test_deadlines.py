@@ -87,6 +87,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
             outcome="pass", execution="completed", duration_seconds=0,
             budget_seconds=1, tests_ran=1, tests_skipped=0,
             evidence_path=self.evidence, coverage_config=self.config_file,
+            coverage_settings="canonical settings",
         )
 
     def assert_timeout(self, result: object, step: str, elapsed: float) -> None:
@@ -138,7 +139,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
                 )
         return result, time.monotonic() - start
 
-    def test_coverage_combination_is_stopped_while_running(self) -> None:
+    def test_coverage_steps_are_stopped_while_running(self) -> None:
         pattern = r"^Ran (\d+) tests? in"
         spec = policy.PythonTestsSpec(
             (sys.executable, "-c", "print('Ran 1 test in 0.1s')"),
@@ -148,17 +149,23 @@ class AnalysisDeadlineTests(unittest.TestCase):
             self.check_def("verification"), id="tests", adapter="python_tests",
             spec=spec, evidence=("tests",), threshold=None,
         )
-        start = time.monotonic()
-        with mock.patch.object(checks, "coverage_prefix", return_value=[]):
-            with mock.patch.object(
-                checks, "_coverage_config_problem", return_value=None
-            ):
-                with mock.patch.object(checks, "combine_coverage", side_effect=self.stall):
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        result = checks.run_check(self.root, self.config, check, [], {}, prefix="check")
-        self.assert_timeout(result, "coverage combination", time.monotonic() - start)
-        self.assertEqual(result.diagnostics.exit_code, 0)
-        self.assertIn("Ran 1 test", result.diagnostics.output_tail)
+        for step in ("coverage configuration validation", "coverage combination"):
+            with self.subTest(step=step):
+                self.started.unlink(missing_ok=True)
+                validation = self.stall if step == "coverage configuration validation" else None
+                start = time.monotonic()
+                with mock.patch.object(checks, "coverage_prefix", return_value=[]):
+                    with mock.patch.object(
+                        checks, "_coverage_config_problem", side_effect=validation, return_value=None
+                    ):
+                        with mock.patch.object(checks, "combine_coverage", side_effect=self.stall):
+                            with contextlib.redirect_stderr(io.StringIO()):
+                                result = checks.run_check(
+                                    self.root, self.config, check, [], {}, prefix="check"
+                                )
+                self.assert_timeout(result, step, time.monotonic() - start)
+                self.assertEqual(result.diagnostics.exit_code, 0)
+                self.assertIn("Ran 1 test", result.diagnostics.output_tail)
 
     def test_crap_analysis_is_stopped_while_running(self) -> None:
         with mock.patch.object(checks, "measure_crap", side_effect=self.stall):

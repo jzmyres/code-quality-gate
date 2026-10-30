@@ -562,7 +562,7 @@ class CovrunTests(unittest.TestCase):
         coverage_tool.combine_coverage(
             self.data_dir,
             self.base / "combined" / ".coverage",
-            self.source_root,
+            coverage_tool.coverage_config_text(self.source_root),
         )
 
     def test_program_imports_its_own_quality_gate_package(self) -> None:
@@ -822,7 +822,7 @@ class CoverageRegistryTests(unittest.TestCase):
         coverage_tool.combine_coverage(
             self.data_dir,
             self.data_dir / "combined" / ".coverage",
-            self.data_dir,
+            coverage_tool.coverage_config_text(self.data_dir),
         )
 
     def test_no_registration_is_unsupported(self) -> None:
@@ -910,7 +910,7 @@ class CoverageDeadlineTests(unittest.TestCase):
             spec,
             0.0,
             "check: tests",
-            Path("/nonexistent-root"),
+            "canonical settings",
             Path("/nonexistent-data"),
             Path("combined"),
             runner.Diagnostics(),
@@ -956,6 +956,19 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             runner.Diagnostics(),
             time.monotonic() + 60,
         )
+
+    def test_missing_or_unreadable_coverage_configuration_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            settings = coverage_tool.coverage_config_text(data_dir)
+            missing = checks._coverage_config_problem(data_dir, settings)
+            self.assertIn("coverage.ini", missing)
+            self.assertIn("cannot be read", missing)
+            coverage_tool.write_coverage_config(data_dir, data_dir)
+            with mock.patch.object(checks.os, "open", side_effect=PermissionError("denied")):
+                unreadable = checks._coverage_config_problem(data_dir, settings)
+            self.assertIn("coverage.ini", unreadable)
+            self.assertIn("denied", unreadable)
 
     def test_setup_returns_the_data_directory_and_prefix(self) -> None:
         with mock.patch.object(
@@ -1109,14 +1122,14 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         self.assertEqual(counts, (3, 1, 2))
         self.assertIsNone(failure)
 
-    def test_evidence_reports_a_combination_after_the_deadline(self) -> None:
+    def test_evidence_refuses_configuration_validation_after_the_deadline(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         data_dir = Path(temporary.name) / "data"
         data_dir.mkdir()
         coverage_tool.write_coverage_config(data_dir, data_dir)
-        with contextlib.redirect_stderr(io.StringIO()):
-            result = checks._tests_evidence(
+        with self.assertRaisesRegex(runner.StepTimeout, "coverage configuration validation"):
+            checks._tests_evidence(
                 self.check,
                 self.spec,
                 0.0,
@@ -1130,9 +1143,6 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 runner.Diagnostics(),
                 0.0,
             )
-        self.assertEqual(result.outcome, "fail")
-        self.assertEqual(result.execution, "budget")
-        self.assertIn("coverage combination exceeded", result.reason)
 
     def test_evidence_builds_the_pass_result(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -1166,6 +1176,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             Path(temporary.name) / "combined" / ".coverage",
         )
         self.assertEqual(result.coverage_config, data_dir / "coverage.ini")
+        self.assertEqual(result.coverage_settings, coverage_tool.coverage_config_text(data_dir))
         self.assertIs(result.temporary, temporary)
         self.assertIn("passed (2 tests", stdout.getvalue())
 

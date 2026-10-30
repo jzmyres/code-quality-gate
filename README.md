@@ -247,8 +247,9 @@ adapter combines with the test process's data. The adapter creates the one gate-
 configuration before the test command starts, and every child consumes it instead of rewriting it.
 Combination and CRAP analysis never read that file: they use the same canonical configuration held in
 memory, so a test that edits it cannot change which lines are excluded from the measurement. After the
-test command the gate compares the file with the canonical text, and any difference fails the tests
-check as a configuration error naming the file.
+test command the gate opens the file without following symlinks or blocking, requires a regular file,
+and compares it with the canonical text within the check's deadline. A non-regular file or difference
+fails the tests check as a configuration error naming the file.
 Each coverage invocation registers itself under `registry/` in the data directory before it runs,
 naming the dataset it will write and the program it runs (the script path or `-m MODULE`, not its
 arguments). Combination requires every registered dataset to exist and load. Complete means saved: a

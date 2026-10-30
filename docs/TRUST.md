@@ -92,6 +92,13 @@ by an authorized policy, are held in memory and supplied directly to the
 checks. Candidate commands cannot change the entries by editing a temporary
 file or the original baseline. No baseline file is passed to a child process.
 
+Python coverage collection uses a gate-owned configuration file. After the
+tests, the gate opens it without following symlinks or blocking, requires a
+regular file and compares its contents with the canonical settings in a worker
+bounded by the check's remaining deadline. A difference or non-regular file is a
+configuration error. Coverage combination and CRAP analysis use the canonical
+settings passed as data, even if the file changes after that comparison.
+
 For each protected input whose candidate content differs from `REV`:
 
 ### Baseline files
