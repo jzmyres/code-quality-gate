@@ -1632,7 +1632,7 @@ def _verification_counts(
 ) -> tuple[list[tuple[str, int, int]] | None, str | None]:
     identifiers = _verification_test_checks(check, prior)
     if not identifiers:
-        return None, "no test-producing check to measure"
+        return None, "no test adapter check to measure"
     counts: list[tuple[str, int, int]] = []
     for identifier in identifiers:
         result = prior.get(identifier)

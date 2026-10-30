@@ -267,6 +267,19 @@ schema 2 and has no `trust` key.
 
 ## Out of scope
 
+* **Evidence produced by test code.** Tests are executed candidate code, and
+  the gate trusts their measurements. A Python test process can write a
+  coverage dataset that is merged even with the gate-owned configuration. An
+  ERT suite runs in the same Emacs as the staged helper and can redefine it or
+  write its result file. In-process measurement cannot be protected from the
+  process being measured. Review test diffs, use `--changed-from` to reject
+  located threshold violations on changed lines, and use mutation testing to
+  assess the tests. These mitigations do not make in-process evidence
+  tamper-proof.
+* **A consumer's pinned gate commit.** The submodule pin is a candidate input
+  unless its path is listed or matched by a glob in `REV`'s `[protect] paths`.
+  An unprotected pin can change and become the trusted gate in a later run
+  whose trusted base contains that change.
 * **CI trust.** The workflow file is part of the candidate; branch protection
   and review cover it. A `[protect]` glob can still block an unreviewed change
   to it.

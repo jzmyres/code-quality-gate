@@ -845,6 +845,9 @@ protected scope (including ignored untracked files); an added, removed or change
 the decision `error` (exit 2). A performed prune may change its baseline path only by exactly the bytes
 the gate generated. It refuses to run from a gate program inside the candidate root. The full contract
 is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in [`docs/SCHEMA.md`](docs/SCHEMA.md).
+Test-process measurements are trusted, and a consumer's pinned gate commit is a candidate input until
+its submodule path is protected. See the [out-of-scope limits](docs/TRUST.md#out-of-scope) and their
+mitigations.
 
 ### Exit codes
 

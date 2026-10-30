@@ -509,8 +509,8 @@ reason = "source"
         self.empty_verification_baseline()
         result, _document, check = self.run_verification()
         self.assertEqual(check["outcome"], "unsupported")
-        self.assertIn("no test-producing check to measure", check["reason"])
-        self.assertIn("no test-producing check to measure", result.stderr)
+        self.assertIn("no test adapter check to measure", check["reason"])
+        self.assertIn("no test adapter check to measure", result.stderr)
 
 
 class VerificationTrustTests(FindingMixin, TrustCase):
