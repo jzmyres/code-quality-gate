@@ -22,11 +22,6 @@ bound = 12.17283950617284
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
-subject = "quality_gate/clones.py:command_clones"
-bound = 15
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/files.py:_shebang_interpreter"
 bound = 8.087791495198903
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"

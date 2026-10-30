@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import urllib.parse
 from collections import Counter
@@ -10,14 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .files import validate_inventory
 from .policy import (
     DEFAULT_MAX_BYTES,
-    Config,
     GateError,
     UnsupportedError,
 )
-from .ratchet import Finding, Location, pruned_entries, write_baseline
+from .ratchet import Finding, Location
 from .runner import (
     Diagnostics,
     analysis_step,
@@ -568,79 +565,3 @@ def measure_clones(
     return CloneMeasurement(
         analysis_step("clone findings", _clone_findings, clones, files), diagnostics, execution
     )
-
-
-def _prune_clone(check: Any, result: Any) -> tuple[bool, bool]:
-    assert check.baseline is not None
-    if result.ratchet is None:
-        print(
-            f"clones: prune refused because check {check.id} produced "
-            "no ratchet result; nothing written",
-            file=sys.stderr,
-        )
-        return False, True
-    existed = check.baseline.exists()
-    try:
-        write_baseline(
-            check.baseline,
-            pruned_entries(result.ratchet),
-            check_id=check.id,
-            metric_version=check.metric_version,
-        )
-    except GateError as error:
-        print(f"clones: {error}", file=sys.stderr)
-        return True, False
-    if check.baseline.exists():
-        print(f"clones: baseline updated at {check.baseline}")
-    elif existed:
-        print(f"clones: baseline removed at {check.baseline}")
-    return False, False
-
-
-def command_clones(root: Path, config: Config, prune: bool = False) -> int:
-    clone_checks = [
-        check for check in config.checks.values() if check.adapter == "clones"
-    ]
-    if not clone_checks:
-        print(
-            f"clones: no check with adapter 'clones' is configured in "
-            f"{config.path}",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        files, classes, violations = validate_inventory(root, config)
-    except GateError as error:
-        print(f"clones: {error}", file=sys.stderr)
-        return 1
-    if violations:
-        for violation in violations:
-            print(f"clones: inventory: {violation}", file=sys.stderr)
-        return 1
-
-    from .checks import run_check
-
-    failed = False
-    refused = False
-    for check in clone_checks:
-        result = run_check(
-            root, config, check, files, classes, prefix="clones"
-        )
-        if not result.is_satisfied():
-            failed = True
-            if prune:
-                print(
-                    f"clones: prune refused because check {check.id} "
-                    "did not pass; nothing written",
-                    file=sys.stderr,
-                )
-                refused = True
-            continue
-        if not prune:
-            continue
-        write_failed, write_refused = _prune_clone(check, result)
-        failed = failed or write_failed
-        refused = refused or write_refused
-    if failed or refused:
-        return 1
-    return 0

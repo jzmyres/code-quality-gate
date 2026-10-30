@@ -184,17 +184,18 @@ Hygiene fails (exit 1) when a tracked file matches the repository's ignore rules
 enumeration or a size measurement fails. Sizes are measured with `lstat`, so a symlink is never
 followed. It prints every offending path and, for oversized files, the actual and allowed sizes.
 
-### clones
+### Clone checks
 
-    python3 -I qg.py clones
-    python3 -I qg.py clones --prune
+    python3 -I qg.py check
+    python3 -I qg.py check --prune clones
 
-`clones` runs every configured check whose adapter is `clones`. It takes the files of the classes that
-list that check from the inventory, runs jscpd with its JSON and SARIF reporters in a temporary directory,
-groups the SARIF clone fingerprints into subjects, and sends every fingerprint occurrence count through the
-generic ratchet. The adapter owns the detection configuration: an empty `--config`, the configured
-`--min-tokens`, `--min-lines 5`, `--max-size` at the hygiene limit, an ignore pattern that matches
-nothing, `--no-gitignore` and a format list covering the selected extensions when they are all known.
+`check` runs every configured check, including those whose adapter is `clones`. Each clone check takes
+the files of the classes that list it from the inventory, runs jscpd with its JSON and SARIF reporters
+in a temporary directory, groups the SARIF clone fingerprints into subjects, and sends every fingerprint
+occurrence count through the generic ratchet. The adapter owns the detection configuration: an empty
+`--config`, the configured `--min-tokens`, `--min-lines 5`, `--max-size` at the hygiene limit, an ignore
+pattern that matches nothing, `--no-gitignore` and a format list covering the selected extensions when
+they are all known.
 The JSON report's `statistics.total.sources` must equal the number of selected files; a mismatch is
 `unsupported` and names the files jscpd did not analyse. The SARIF report must contain exactly one run
 produced by jscpd with a `results` list; absent, malformed or foreign evidence is `unsupported`
@@ -208,8 +209,9 @@ cannot be scoped and is resolved by the completed scan. A budget or signal termi
 raw outcome `fail` with its execution and diagnostics; `unsupported` remains for unavailable or
 invalid evidence such as a missing report or a source-count mismatch.
 
-`clones --prune` lowers each surviving bound to the measured occurrence count and drops resolved entries.
-It never adds an entry and never raises a bound, and it refuses (exit 1, writing nothing) while that
+`check --prune clones` lowers each surviving bound in the `clones` check to the measured occurrence count
+and drops resolved entries. It never adds an entry and never raises a bound, and it refuses (exit 1,
+writing nothing) while that
 check fails. Add a new exception by hand, with a reason. A baseline that would be empty is removed
 instead of written.
 

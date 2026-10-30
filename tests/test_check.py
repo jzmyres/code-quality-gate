@@ -13,6 +13,13 @@ checks = importlib.import_module("quality_gate.checks")
 
 
 class CheckTests(FixtureCase):
+    def test_retired_clones_command_is_rejected(self) -> None:
+        for args in (("clones",), ("clones", "--prune")):
+            with self.subTest(args=args):
+                result = self.run_qg(*args)
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertIn("invalid choice: 'clones'", result.stderr)
+
     def test_retired_option_is_rejected(self) -> None:
         result = self.run_qg("check", "--reuse-store", str(self.base / "store"))
         self.assertEqual(result.returncode, 2, output(result))

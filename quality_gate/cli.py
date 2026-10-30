@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from .checks import command_check
-from .clones import command_clones
 from .files import command_hygiene, command_inventory, resolve_repo
 from .gate_result import error_document
 from .policy import UsageError, load_config
@@ -70,10 +69,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_policy_from_argument(inventory)
     _add_allow_protected_argument(inventory)
     commands.add_parser("hygiene", help="check ignored and oversized files")
-    clones = commands.add_parser("clones", help="check the duplicate-code ratchet")
-    clones.add_argument(
-        "--prune", action="store_true", help="remove resolved baseline entries"
-    )
     tools = commands.add_parser("tools", help="manage pinned external tools")
     tool_commands = tools.add_subparsers(
         dest="tools_command", required=True, parser_class=_Parser
@@ -158,8 +153,6 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         return command_inventory(root, config, args.list_class)
     if args.command == "hygiene":
         return command_hygiene(root, config)
-    if args.command == "clones":
-        return command_clones(root, config, args.prune)
     if args.command == "worklist":
         return command_worklist(root, config, args.check_ids, args.json)
     return command_check(

@@ -100,7 +100,7 @@ class CloneGateTests(FixtureCase):
     def clone_failure(
         self, env: dict[str, str], *needles: str, prune: bool = False
     ) -> str:
-        command = ("clones", "--prune") if prune else ("clones",)
+        command = ("check", "--prune", "clones") if prune else ("check",)
         result = self.run_qg(*command, env=env)
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
@@ -143,7 +143,7 @@ class CloneGateTests(FixtureCase):
                 }
             ],
         )
-        result = self.run_qg("clones", env=env)
+        result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("clones: 1 clone within baseline", result.stdout)
 
@@ -180,7 +180,7 @@ class CloneGateTests(FixtureCase):
         env = self.repeated_clone_env(
             [{"fingerprint": "fp1", "count": 2, "reason": "two accepted copies"}]
         )
-        result = self.run_qg("clones", env=env)
+        result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
 
     def test_empty_baseline_reason_fails(self) -> None:
@@ -197,7 +197,7 @@ class CloneGateTests(FixtureCase):
             [],
             [{"fingerprint": "fp-old", "files": ["old.py"], "reason": "gone"}],
         )
-        result = self.run_qg("clones", env=env)
+        result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("resolved fp-old", result.stdout)
 
@@ -229,7 +229,7 @@ class CloneGateTests(FixtureCase):
             check["unmeasured_baseline_entries"], ["fp-other"]
         )
         self.assertIn("unmeasured fp-other", result.stderr)
-        result = self.run_qg("clones", "--prune", env=env)
+        result = self.run_qg("check", "--prune", "clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         loaded = tomllib.loads(self.read_file("quality-gate-clones.toml"))
         self.assertEqual(loaded["entry"][0]["subject"], "fp-other")
@@ -266,7 +266,7 @@ class CloneGateTests(FixtureCase):
 
     def test_absent_baseline_with_no_clones_passes(self) -> None:
         env = self.clone_env([])
-        result = self.run_qg("clones", env=env)
+        result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("clones: 0 clones", result.stdout)
 
@@ -328,7 +328,7 @@ class CloneGateTests(FixtureCase):
         env = self.install_fake_jscpd(
             sarif_report([]), args_file=args_file
         )
-        result = self.run_qg("clones", env=env)
+        result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         arguments = args_file.read_text(encoding="utf-8").split("\n")
         self.assertIn("--fail-on-empty", arguments)
@@ -461,7 +461,7 @@ class CloneGateTests(FixtureCase):
             self.mirror_entries()
             + [{"fingerprint": "fp-old", "files": ["old.py"], "reason": "gone"}],
         )
-        result = self.run_qg("clones", "--prune", env=env)
+        result = self.run_qg("check", "--prune", "clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         entry = self.single_baseline("fp1", "deliberate mirror")
         self.assertEqual(entry["files"], ["a.py", "b.py"])
@@ -471,14 +471,14 @@ class CloneGateTests(FixtureCase):
             [],
             [{"fingerprint": "fp-old", "reason": "gone"}],
         )
-        result = self.run_qg("clones", "--prune", env=env)
+        result = self.run_qg("check", "--prune", "clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertFalse((self.repo / "quality-gate-clones.toml").exists())
         self.assertIn("baseline removed", result.stdout)
 
     def test_prune_with_absent_baseline_creates_nothing(self) -> None:
         env = self.clone_env([])
-        result = self.run_qg("clones", "--prune", env=env)
+        result = self.run_qg("check", "--prune", "clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertFalse((self.repo / "quality-gate-clones.toml").exists())
         self.assertNotIn("baseline removed", result.stdout)
@@ -512,26 +512,10 @@ class CloneGateTests(FixtureCase):
         self.clone_failure(env, "empty reason", prune=True)
         self.assertEqual(self.read_file("quality-gate-clones.toml"), before)
 
-    def test_enumeration_failure_fails_clones(self) -> None:
-        self.write_config(with_clones())
-        env = self.fake_git_failing_ls_files()
-        self.clone_failure(env, "file enumeration failed")
-
     def test_missing_tool_names_tools_fetch(self) -> None:
         self.write_config(with_clones())
         env = {"QG_TOOLS_DIR": str(self.base / "empty-tools")}
         self.clone_failure(env, "tools fetch")
-
-    def test_clones_not_configured_exits_2(self) -> None:
-        result = self.run_qg("clones")
-        text = output(result)
-        self.assertEqual(result.returncode, 2, text)
-        self.assertIn("no check with adapter 'clones'", text)
-
-    def test_invalid_inventory_blocks_clones(self) -> None:
-        self.add_file("mystery.txt", "x\n")
-        self.write_config(with_clones())
-        self.clone_failure({}, "clones: inventory:", "mystery.txt")
 
     def test_no_files_in_clone_classes_fails(self) -> None:
         self.write_config(with_clones(classes='["empty"]'))
@@ -731,7 +715,7 @@ tests_pattern = "^Ran (\\\\d+) tests? in"
         self.add_file("a.sh", SHELL_SOURCE)
         self.add_file("b.sh", SHELL_SOURCE)
 
-        result = self.run_qg("clones", env=self.default_tool_env())
+        result = self.run_qg("check", env=self.default_tool_env())
         text = output(result)
         if "not installed" in text and "tools fetch" in text:
             self.fail(
