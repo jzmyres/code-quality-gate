@@ -27,13 +27,15 @@ jobs:
             image: debian:13
             python: "3.13"
             emacs: "30.1"
+            timeout: 30
           - name: ubuntu2604
             image: ubuntu:26.04
+            timeout: 60
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
-    # Rule: smallest multiple of 5 minutes at least three times the measured check time.
-    # CI run 40188680325 measured the slower job (debian:13) at 101 s; 3 x 101 s = 303 s, so 10.
-    timeout-minutes: 10
+    # Gate 20 + cold-cache Emacs build 30 (Ubuntu only) + setup allowance 10 minutes.
+    # Setup covers packages, checkout, cache operations, Python installation and tool fetching.
+    timeout-minutes: ${{ matrix.timeout }}
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
     steps:
@@ -53,6 +55,7 @@ jobs:
           key: ${{ matrix.image }}-${{ runner.arch }}-emacs-${{ env.EMACS_VERSION }}-${{ env.EMACS_SHA256 }}
       - name: Build pinned batch Emacs
         if: matrix.name == 'ubuntu2604' && steps.emacs-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
         run: |
           apt-get install -y --no-install-recommends build-essential libncurses-dev pkg-config texinfo
           curl --fail --location --retry 3 "$EMACS_URL" -o /tmp/emacs.tar.xz
@@ -112,13 +115,17 @@ jobs:
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Run the gate
+        # Rule: smallest multiple of 5 minutes at least three times the measured check time.
+        # 2026-10-30: make -k check on 08c86d4 took 313 s in the offline sandbox.
+        # 3 x 313 s = 939 s; round up to a multiple of 5 minutes: 20 minutes.
+        timeout-minutes: 20
         run: make -k check
 
   mutation:
     runs-on: ubuntu-latest
     container: debian:13
-    # Mutations run the complete suite for each decision, with four isolated copies at a time.
-    timeout-minutes: 90
+    # Mutation step 90 + setup allowance 10 minutes for packages, checkout, cache and tool fetching.
+    timeout-minutes: 100
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
     steps:
@@ -141,4 +148,6 @@ jobs:
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Mutation-test gate decisions
+        # Mutations run the complete suite for each decision, with four isolated copies at a time.
+        timeout-minutes: 90
         run: make mutation

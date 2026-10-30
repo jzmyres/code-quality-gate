@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .elisp_tests import _lisp_string, _temporary
+from .elisp_tests import _lisp_string, _temporary, version_failure
 from .policy import GateError
 from .ratchet import Domain, Finding, Location
 from .runner import analysis_step, mark_step, record_diagnostics, run
@@ -270,6 +270,13 @@ def _ratchet(context: Any, start: float, selected: list[str], findings: list[Fin
 
 def run_crap(context: Any) -> Any:
     """Read complexity once and score it against an earlier Edebug run."""
+    failure = version_failure(context)
+    if failure is not None:
+        return failure
+    return _run_crap(context)
+
+
+def _run_crap(context: Any) -> Any:
     from .checks import _adapter_selection, _class_text
 
     _spec, start, selected, names = _adapter_selection(context)

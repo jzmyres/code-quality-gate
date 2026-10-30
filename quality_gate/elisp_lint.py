@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .elisp_tests import _common_spec, _lisp_string, _temporary
+from .elisp_tests import _common_spec, _lisp_string, _temporary, version_failure
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
 
 
@@ -208,6 +208,9 @@ def run_lint(context: Any) -> Any:
     """Run each selected source through the configured lint check."""
     from .checks import _adapter_selection, _class_text
 
+    failure = version_failure(context)
+    if failure is not None:
+        return failure
     _spec, start, selected, names = _adapter_selection(context)
     if not selected:
         reason = f"no files selected (classes: {_class_text(names)}); zero inputs is not a pass"

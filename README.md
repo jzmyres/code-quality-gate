@@ -1166,21 +1166,6 @@ This repository gates itself with `quality-gate.toml`:
 `make check` is the single entry point and runs only `python3 -I qg.py check`; Ruff, the tests and
 CRAP are policy checks, so the Makefile does not duplicate them.
 
-CI runs that same gate in the environments we use:
-
-| Job | Container | Emacs | Python | Mirrors |
-| --- | --- | --- | --- | --- |
-| `debian13` | `debian:13` | Debian's 30.1 | Debian's 3.13 | The local Debian 13 machine |
-| `ubuntu2604` | `ubuntu:26.04` | GNU release 30.1 | Standalone 3.12.13 | The planned Docker image, using the local default Python version |
-| `mutation` | `debian:13` | Debian's 30.1 | Debian's 3.13 | The local environment for mutation testing |
-
-Ubuntu 26.04 ships Emacs 30.2 and Python 3.14, so its job installs both runtimes from pins.
-The workflow's top-level `env` holds their versions, download URLs and SHA-256 digests. Each
-archive is verified before unpacking; Emacs is built for batch use without GUI or native compilation.
-Both installations are cached by image, architecture, version and digest. Every job asserts its
-runtime versions before running checks; the standalone Python assertion includes the patch version.
-The workflow itself is proven only by the CI run after landing, which the designer checks.
-
 The tests execute `qg.py` as a subprocess on disposable fixture git repositories. `tests/support.py`
 starts those subprocesses through `QG_PYTHON` when the gate exports it, so the gate's own Python
 programs are measured by the `crap` check. Clone-gate tests use a fake jscpd in a temporary
@@ -1226,12 +1211,37 @@ killed.
 
 ## Continuous integration
 
-Every push to `main` and every pull request runs `.github/workflows/check.yml` on GitHub Actions;
-the workflow can also be dispatched manually. A matrix runs the job in `debian:13` with Python 3.13
-and in `ubuntu:24.04` with Python 3.12, the two supported interpreter versions. It restores the pinned
-tools cache keyed on the image and `tools.lock.toml`, fetches any missing pinned tools (including the
-coverage wheel), and runs `make -k check`, which is the gate's self-check: Ruff, clones, the test suite
-under coverage and Python CRAP. A separate Ubuntu job runs `make mutation`.
+Every push to `main` and every pull request runs [`.github/workflows/check.yml`](.github/workflows/check.yml)
+on GitHub Actions; the workflow can also be dispatched manually. Jobs use the `ubuntu-latest`
+runner with the containers below.
+
+The check matrix and separate mutation job use these environments:
+
+| Job | Container | Emacs | Python | Mirrors |
+| --- | --- | --- | --- | --- |
+| `debian13` | `debian:13` | Debian's 30.1 | Debian's 3.13 | The local Debian 13 machine |
+| `ubuntu2604` | `ubuntu:26.04` | GNU release 30.1 | Standalone 3.12.13 | The planned Docker image, using the local default Python version |
+| `mutation` | `debian:13` | Debian's 30.1 | Debian's 3.13 | The local environment for mutation testing |
+
+Ubuntu 26.04 ships Emacs 30.2 and Python 3.14, so its job installs both runtimes from pins.
+The workflow's top-level `env` holds their versions, download URLs and SHA-256 digests. Each
+archive is verified before unpacking; Emacs is built for batch use without GUI or native compilation.
+Both installations are cached by image, architecture, version and digest. Every job asserts its
+runtime versions before running checks; the standalone Python assertion includes the patch version.
+The workflow itself is proven only by the CI run after landing, which the designer checks.
+
+The check matrix restores the pinned tools cache keyed on the environment name, architecture and
+`tools.lock.toml`, fetches any missing tools (including the coverage wheel), and runs `make -k check`:
+Ruff, clones, the test suite under coverage, Python CRAP and the Emacs Lisp checks. The separate
+Debian 13 job restores the same Debian tools cache and runs `make mutation`.
+
+The gate step has a 20-minute timeout: `make -k check` on `08c86d4` took 313 seconds in the offline
+sandbox on 2026-10-30. The rule is the smallest multiple of five minutes at least three times the
+measurement: 3 × 313 = 939 seconds, rounded up to 20 minutes. Ubuntu's Emacs source build runs only
+on a cold cache and has its own 30-minute step timeout. Each check job adds a 10-minute setup
+allowance for packages, checkout, cache operations, Python installation and fetching tools: Debian
+has a 30-minute job timeout (20 + 10), Ubuntu 60 minutes (20 + 30 + 10). The mutation step retains
+its 90-minute bound and adds 10 minutes for setup, giving that job a 100-minute timeout.
 
 Reproduce it locally with the same tools cache:
 

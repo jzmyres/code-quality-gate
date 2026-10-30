@@ -21,6 +21,10 @@ from .policy import (
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
 
 
+ELISP_MINIMUM_VERSION = "30.1"
+_VERSION_TEXT_LIMIT = 128
+
+
 @dataclass(frozen=True)
 class ElispTestsSpec:
     suite: str
@@ -29,19 +33,31 @@ class ElispTestsSpec:
     budget_seconds: int
 
 
+def _numeric_version(version: str) -> bool:
+    # Bound both total work and each integer conversion, independently of Python's limit.
+    return (len(version) <= _VERSION_TEXT_LIMIT
+            and re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9})+", version) is not None)
+
+
+def _version_excerpt(version: str) -> str:
+    return version[:_VERSION_TEXT_LIMIT] + ("..." if len(version) > _VERSION_TEXT_LIMIT else "")
+
+
 def _version_reason(child: Any, emacs: str, minimum: str) -> str | None:
     if child.execution != "completed" or child.returncode != 0:
         return (f"expected Emacs command {emacs!r} to report its version, got "
                 f"exit {child.returncode}, execution {child.execution}: {child.error or child.combined_text}")
     version = child.combined_text.strip()
-    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version) is None:
-        return f"expected a numeric Emacs version, got {version!r}; minimum required is {minimum}"
+    if not _numeric_version(version):
+        shown = _version_excerpt(version)
+        return (f"expected a numeric Emacs version from command {emacs!r}, got {shown!r}; "
+                f"minimum required is {minimum}")
     if tuple(map(int, version.split("."))) < tuple(map(int, minimum.split("."))):
         return f"found Emacs {version}; minimum required is Emacs {minimum}"
     return None
 
 
-def version_failure(context: Any, minimum: str) -> Any:
+def version_failure(context: Any) -> Any:
     """Refuse an unavailable or older Emacs before loading any measured code."""
     from .adapters import adapter_for
     from .checks import _check_result
@@ -55,7 +71,7 @@ def version_failure(context: Any, minimum: str) -> Any:
     child = run([spec.emacs, "-Q", "--batch", "--eval", "(princ emacs-version)"],
                 cwd=context.root, budget_seconds=remaining_budget(budget))
     record_diagnostics(child.diagnostics())
-    reason = _version_reason(child, spec.emacs, minimum)
+    reason = _version_reason(child, spec.emacs, ELISP_MINIMUM_VERSION)
     if reason is None:
         return None
     print(f"{context.prefix}: {reason}", file=sys.stderr)
@@ -313,6 +329,9 @@ def run_tests(context: Any) -> Any:
     """Run the configured suite and return its check result and evidence."""
     from .checks import _select_files, _tests_result
 
+    failure = version_failure(context)
+    if failure is not None:
+        return failure
     start = time.monotonic()
     spec = context.check.spec
     selected, _classes = _select_files(context.config, context.check, context.files, context.classes)

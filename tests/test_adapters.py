@@ -160,6 +160,10 @@ baseline = "verification.toml"
 
 
 class AdapterRegistrationTests(unittest.TestCase):
+    def test_descriptor_has_no_language_version_fields(self) -> None:
+        fields = {field.name for field in dataclasses.fields(adapters.AdapterDescriptor)}
+        self.assertFalse({"minimum_emacs_version", "emacs_version", "minimum_python_version"} & fields)
+
     def test_arguments_use_only_declared_fields(self) -> None:
         spec = SimpleNamespace(run=("ignored",), emacs="ignored", launch=("tool", "--flag"),
                                path="some/path")
