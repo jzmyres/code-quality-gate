@@ -343,10 +343,22 @@ class ReuseUnitTests(unittest.TestCase):
         link = self.root / "coverage"
         link.symlink_to(self.root / "missing")
         lookup = mock.Mock()
-        session = SimpleNamespace(prune_id=None, lookup=lookup)
+        session = SimpleNamespace(prune_ids=(), lookup=lookup)
         check = SimpleNamespace(id="tests")
         self.assertIsNone(_reuse_lookup(session, check, {"identity": "x"}, link))
         lookup.assert_not_called()
+
+    def test_every_requested_prune_bypasses_the_reuse_store(self) -> None:
+        from quality_gate.checks import _reuse_lookup
+
+        cached = SimpleNamespace(record={})
+        session = SimpleNamespace(prune_ids=("first", "second"), lookup=mock.Mock(return_value=cached))
+        for identifier in ("first", "second"):
+            check = SimpleNamespace(id=identifier, adapter="verification")
+            self.assertIsNone(_reuse_lookup(session, check, {"identity": "x"}, None))
+        session.lookup.assert_not_called()
+        other = SimpleNamespace(id="other", adapter="verification")
+        self.assertIs(_reuse_lookup(session, other, {"identity": "x"}, None), cached)
 
     def test_record_json_preserves_non_utf8_filesystem_paths(self) -> None:
         path = os.fsdecode(b"/tmp/non-utf8-\xff")

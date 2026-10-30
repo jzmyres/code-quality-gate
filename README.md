@@ -643,6 +643,8 @@ The default tools directory is shared by every repository using the gate on this
     python3 -I qg.py check
     python3 -I qg.py check --json
     python3 -I qg.py check --prune clones
+    python3 -I qg.py check --prune clones --prune verification
+    python3 -I qg.py check --prune all
     python3 -I qg.py check --policy-from REV
     python3 -I qg.py check --policy-from REV --allow-protected ruff.toml
     python3 -I qg.py check --changed-from REV
@@ -703,21 +705,28 @@ bound fails.
     python3 -I qg.py --repo /path/to/repo worklist crap elisp-crap
 
 `worklist` ranks the debt a reasoned baseline still carries. With no `CHECK` it covers every
-configured check that has a baseline and a `max` metric; with ids it covers exactly those checks. For
+configured check that has a baseline; with ids it covers exactly those checks. For
 each selected check it runs the check and every check it requires, in policy order, exactly as `check`
-runs them. It lists every baseline entry whose bound is above the check's threshold, ranked by churn
+runs them, including earlier test producers needed by verification. It lists every `max` baseline
+entry whose bound is above the check's threshold, ranked by churn
 times the current measured value, highest first. Churn is the number of commits `git log --follow`
 reports for the file in the finding's location. A row gives churn, bound, current value, churn x value,
 subject and location. Unrounded values are compared; the human report displays them to one decimal.
 
+Alongside that debt, the report lists each measured `min` entry's bound, current value and slack
+(current value minus bound). These floors do not need a source location or a churn count. `--json`
+adds a `slack` array containing `check`, `subject`, `bound`, `value` and `slack` for each floor;
+the existing `rows` for `max` entries are unchanged.
+
 An entry whose subject is no longer measured is a note instead of a row, reading `no longer exists`. A
-finding whose file Git cannot follow is a note reading `churn not measured`. `--json` writes one
+floor outside the measured domain is a note reading `not measured`. A finding whose file Git cannot
+follow is a note reading `churn not measured`. `--json` writes one
 machine-readable document of rows and notes; its schema is in `docs/SCHEMA.md`.
 
 The command exits 0 after writing the report. It exits 1, ranking nothing, when a selected check or one
 it requires does not pass, naming the check and expected versus actual, or when Git fails, naming the
-`git log --follow` command and expected versus actual. It exits 2 for an unknown check id, a check with
-no baseline, or a check with no `max` metric. `worklist` never writes a baseline or any other file.
+`git log --follow` command and expected versus actual. It exits 2 for an unknown check id or a check with
+no baseline. `worklist` never writes a baseline or any other file.
 
 ### Result reuse by recorded reads
 
@@ -818,12 +827,15 @@ tier 1 unsatisfied and rejects. Tier 2 needs `properties` or `fuzzing`; tiers 3 
 `bounded` and `proof`. No version-2 adapter produces those evidence names yet, so a required tier above
 1 is exempted by a `[[not_applicable]]` entry until its adapter lands.
 
-`prune` reports `requested` (the requested check ids), `performed` and `reason`. `check --prune ID`
-runs the same checks, then prunes only check `ID` when it is satisfied; an unknown id or a check without
-a baseline exits 2. A refused or failed prune writes nothing, makes the command exit 1, and leaves
-`decision` reporting the gate evaluation. Under `--policy-from`, the run identity is validated after
-the checks and before the write, and after the write the pruned path may differ only by the exact
-bytes the gate generated; any other difference is an identity error (exit 2).
+`prune` reports `requested` (the supplied ids or `all`), `performed` and `reason`. Repeat
+`--prune ID` to tighten several baselines in one run, or use `--prune all` to select every configured
+baseline. Each selected check must be satisfied; `all` also requires every other check to be satisfied.
+The gate validates the entire request before writing, so a failed check refuses all requested prunes.
+An unknown id or a check without a baseline exits 2. A refused or failed prune makes the command exit 1
+and leaves `decision` reporting the gate evaluation. If a write itself fails, earlier writes in the
+same request may already have completed. Under `--policy-from`, the run identity is validated after
+the checks and before any write, and each pruned path may differ only by the exact bytes the gate
+generated; any other difference is an identity error (exit 2).
 
 The decision is `error` (exit 2) for invalid policy, usage or configuration, `rejected` (exit 1) when
 inventory, hygiene, any enforced check or any obligation is not satisfied, or a located threshold

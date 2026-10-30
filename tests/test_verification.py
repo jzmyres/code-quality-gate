@@ -130,6 +130,24 @@ def verification_baseline(entries: list[dict[str, object]]) -> str:
     )
 
 
+def multi_verification_config() -> str:
+    extra = (
+        '[checks.second]\nadapter = "verification"\ntier = 1\n'
+        'enforcement = "enforced"\nrequires = "tests"\n'
+        'baseline = "second.toml"\n\n'
+    )
+    return verification_config().replace(
+        'checks = ["tests", "verification"]',
+        'checks = ["tests", "verification", "second"]',
+    ).replace("[[rule]]", extra + "[[rule]]", 1)
+
+
+def second_baseline(bound: int) -> str:
+    return baseline_text(
+        [executed_entry(bound)], check="second", metric_version=METRIC_VERSION
+    )
+
+
 def executed_entry(bound: int) -> dict[str, object]:
     return {
         "subject": "tests:tests:executed",
@@ -154,6 +172,20 @@ def exclusion_entry(
         "bound": bound,
         "reason": ADOPTION_REASON,
     }
+
+
+def prepare_multiple_prune(case: FixtureCase) -> None:
+    (case.repo / "a.py").unlink()
+    case.write_config(multi_verification_config())
+    case.add_file("pkg/mod.py", "VALUE = 1\n")
+    case.add_file(
+        "tests/test_sample.py",
+        PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+        "    def test_one(self): self.assertTrue(True)\n"
+        "    def test_two(self): self.assertTrue(True)\n",
+    )
+    case.add_file(BASELINE, verification_baseline([executed_entry(1)]))
+    case.add_file("second.toml", second_baseline(1))
 
 
 class VerificationTests(FindingMixin, FixtureCase):
@@ -511,6 +543,121 @@ reason = "source"
         self.assertEqual(check["outcome"], "unsupported")
         self.assertIn("no test adapter check to measure", check["reason"])
         self.assertIn("no test adapter check to measure", result.stderr)
+
+
+class MultiplePruneTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        prepare_multiple_prune(self)
+
+    def assert_both_bounds(self, bound: int) -> None:
+        self.assertIn(f"bound = {bound}", self.read_file(BASELINE))
+        self.assertIn(f"bound = {bound}", self.read_file("second.toml"))
+
+    def test_repeated_prune_tightens_both_baselines(self) -> None:
+        result, document = self.run_json(
+            "--prune", "verification", "--prune", "second", env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_both_bounds(2)
+        self.assertEqual(document["prune"]["requested"], ["verification", "second"])
+        self.assertTrue(document["prune"]["performed"])
+
+    def test_prune_all_tightens_every_baseline(self) -> None:
+        result, document = self.run_json("--prune", "all", env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["prune"]["requested"], ["all"])
+        self.assertTrue(document["prune"]["performed"])
+        self.assert_both_bounds(2)
+
+    def test_failing_check_refuses_all_requested_prunes(self) -> None:
+        self.add_file("second.toml", second_baseline(3))
+        before = [self.read_file(BASELINE), self.read_file("second.toml")]
+        result, document = self.run_json("--prune", "all", env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertFalse(document["prune"]["performed"])
+        self.assertIn("second: prune refused", result.stderr)
+        self.assertEqual([self.read_file(BASELINE), self.read_file("second.toml")], before)
+
+    def test_invalid_later_request_writes_nothing(self) -> None:
+        before = self.read_file(BASELINE)
+        result, document = self.run_json(
+            "--prune", "verification", "--prune", "missing", env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("unknown check 'missing'", result.stderr)
+        self.assertEqual(document["prune"]["requested"], ["verification", "missing"])
+        self.assertEqual(self.read_file(BASELINE), before)
+
+    def test_repeated_prune_refuses_a_failing_check_before_either_write(self) -> None:
+        self.add_file("second.toml", second_baseline(3))
+        before = [self.read_file(BASELINE), self.read_file("second.toml")]
+        result, document = self.run_json(
+            "--prune", "verification", "--prune", "second", env=self.default_tool_env()
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertFalse(document["prune"]["performed"])
+        self.assertEqual([self.read_file(BASELINE), self.read_file("second.toml")], before)
+
+    def test_all_refuses_a_failing_check_without_a_baseline(self) -> None:
+        self.write_config(multi_verification_config().replace(
+            "[checks.tests]", "[checks.fails]\nadapter = \"command\"\ntier = 1\n"
+            "enforcement = \"enforced\"\nrun = [\"python3\", \"-c\", \"exit(1)\"]\n\n"
+            "[checks.tests]", 1,
+        ))
+        before = self.read_file(BASELINE)
+        result, document = self.run_json("--prune", "all", env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertFalse(document["prune"]["performed"])
+        self.assertIn("fails: prune refused", result.stderr)
+        self.assertEqual(self.read_file(BASELINE), before)
+
+    def test_repeated_ids_and_all_write_each_baseline_once(self) -> None:
+        result, document = self.run_json(
+            "--prune", "verification", "--prune", "all", "--prune", "second",
+            env=self.default_tool_env(),
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue(document["prune"]["performed"])
+        self.assertEqual(result.stderr.count("baseline updated at"), 2)
+        self.assert_both_bounds(2)
+
+
+class MultiplePruneTrustTests(TrustCase):
+    def setUp(self) -> None:
+        super().setUp()
+        prepare_multiple_prune(self)
+
+    def test_trusted_prune_all_records_each_exact_write(self) -> None:
+        revision = self.commit_revision()
+        result, document = self.trust_json(revision, "--prune", "all", env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue(document["prune"]["performed"])
+        for path in (BASELINE, "second.toml"):
+            self.assertIn("bound = 2", self.read_file(path))
+            before = document["trust"]["identity_before"]["protected"][path]
+            after = document["trust"]["identity_after"]["protected"][path]
+            self.assertNotEqual(before["candidate_sha256"], after["candidate_sha256"])
+
+    def test_changed_protected_input_prevents_all_writes(self) -> None:
+        writer = (
+            "import pathlib; "
+            "pathlib.Path('second.toml').write_text('altered'); print(1)"
+        )
+        self.write_config(multi_verification_config().replace(
+            "[checks.tests]", "[checks.rewrite]\nadapter = \"command\"\ntier = 1\n"
+            "enforcement = \"enforced\"\nrun = " + json.dumps([sys.executable, "-c", writer])
+            + "\n\n[checks.tests]", 1,
+        ))
+        revision = self.commit_revision()
+        before = self.read_file(BASELINE)
+        result, document = self.trust_json(revision, "--prune", "all", env=self.default_tool_env())
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertFalse(document["prune"]["performed"])
+        self.assertIn("second.toml", document["error"])
+        self.assertEqual(self.read_file(BASELINE), before)
+        self.assertEqual(self.read_file("second.toml"), "altered")
 
 
 class VerificationTrustTests(FindingMixin, TrustCase):

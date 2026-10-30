@@ -91,8 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.add_argument(
         "--prune",
-        metavar="ID",
-        help="lower one check's baseline after it passes",
+        metavar="ID|all",
+        action="append",
+        default=[],
+        help="tighten a check's baseline after it passes (repeatable; all selects every baseline)",
     )
     _add_policy_from_argument(check)
     check.add_argument(
@@ -124,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
         "check_ids",
         metavar="CHECK",
         nargs="*",
-        help="check id (default: every check with a baseline and a max metric)",
+        help="check id (default: every check with a baseline)",
     )
     reuse = commands.add_parser("reuse", help="manage recorded check results")
     reuse_commands = reuse.add_subparsers(
@@ -185,7 +187,7 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         root,
         config,
         json_output=args.json,
-        prune_id=args.prune,
+        prune_ids=args.prune,
         changed_from=args.changed_from,
         reuse_store=args.reuse_store,
         record_fd=args.record_fd,
@@ -222,7 +224,7 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         root,
         trust.config,
         json_output=args.json,
-        prune_id=args.prune,
+        prune_ids=args.prune,
         trust=trust,
         changed_from=args.changed_from,
         reuse_store=args.reuse_store,

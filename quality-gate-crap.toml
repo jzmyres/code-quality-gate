@@ -12,23 +12,8 @@ bound = 8
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/checks.py:_run_clones"
-bound = 7.003544560185185
-reason = "above 6 after QF1 (2026-10-25); worklist"
-
-[[entry]]
 subject = "quality_gate/checks.py:_run_python_crap"
-bound = 12.155363374298286
-reason = "above 6 after QF1 (2026-10-25); worklist"
-
-[[entry]]
-subject = "quality_gate/clones.py:_parse_sarif"
-bound = 21.166180758017493
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
-subject = "quality_gate/clones.py:_sarif_location"
-bound = 12.073728
+bound = 11.003367003367003
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
@@ -87,23 +72,18 @@ bound = 7
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/python_crap.py:measure_crap"
-bound = 11.133953831645414
-reason = "above 6 after QF1 (2026-10-25); worklist"
-
-[[entry]]
 subject = "quality_gate/ratchet.py:_toml_value"
 bound = 12
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
 subject = "quality_gate/ratchet.py:load_baseline"
-bound = 7.192885260242018
+bound = 7.165375
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
 subject = "quality_gate/ratchet.py:write_baseline"
-bound = 12.544270303277019
+bound = 12.143347050754459
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]

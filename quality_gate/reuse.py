@@ -278,7 +278,7 @@ class ReuseSession:
     store: Path
     root: Path
     record_fd: int | None = None
-    prune_id: str | None = None
+    prune_ids: tuple[str, ...] = ()
     program: str = field(default="")
     temporary: tempfile.TemporaryDirectory[str] = field(
         default_factory=lambda: tempfile.TemporaryDirectory(prefix="qg-reuse-")
@@ -451,13 +451,13 @@ def current() -> ReuseSession | None:
 @contextlib.contextmanager
 def active(
     store: Path | None, root: Path, record_fd: int | None,
-    prune_id: str | None = None,
+    prune_ids: tuple[str, ...] = (),
 ) -> Iterator[ReuseSession | None]:
     global _session
     if store is None:
         yield None
         return
-    session = ReuseSession(store, root, record_fd, prune_id)
+    session = ReuseSession(store, root, record_fd, prune_ids)
     previous = _session
     _session = session
     try:

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .adapters import adapter_for
 from .checks import CheckResult, _inventory_check, run_check
 from .files import git_argv
 from .policy import CheckDef, Config, GateError, UsageError
@@ -61,19 +62,34 @@ class Note:
         return document
 
 
+@dataclass(frozen=True)
+class Slack:
+    check: str
+    subject: str
+    bound: float
+    value: float
+
+    @property
+    def amount(self) -> float:
+        return self.value - self.bound
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "check": self.check,
+            "subject": self.subject,
+            "bound": self.bound,
+            "value": self.value,
+            "slack": self.amount,
+        }
+
+
 def _qualifies(check: CheckDef) -> bool:
-    return (
-        check.baseline is not None
-        and check.direction == "max"
-        and check.threshold is not None
-    )
+    return check.baseline is not None and check.threshold is not None
 
 
-def _max_problem(check: CheckDef) -> str | None:
-    if check.direction != "max":
-        return f"expected a max metric, got {check.direction!r}"
+def _metric_problem(check: CheckDef) -> str | None:
     if check.threshold is None:
-        return "expected a max metric with a threshold, got none"
+        return "expected a metric with a threshold, got none"
     return None
 
 
@@ -88,7 +104,7 @@ def _requested_check(config: Config, identifier: str) -> CheckDef:
         raise UsageError(
             f"qg.py worklist: check {identifier!r}: expected a baseline, got none"
         )
-    problem = _max_problem(check)
+    problem = _metric_problem(check)
     if problem is not None:
         raise UsageError(f"qg.py worklist: check {identifier!r}: {problem}")
     return check
@@ -115,9 +131,25 @@ def _needed_order(config: Config, selected: list[CheckDef]) -> list[str]:
     needed = {check.id for check in selected}
     for check in selected:
         needed.update(_required(config, check))
+        needed.update(_implicit_tests(config, check))
     return [
         check.id for check in config.checks.values() if check.id in needed
     ]
+
+
+def _implicit_tests(config: Config, check: CheckDef) -> list[str]:
+    descriptor = adapter_for(check.adapter)
+    assert descriptor is not None
+    if not descriptor.requires_tests or check.spec.requires is not None:
+        return []
+    prior = list(config.checks.values())
+    prior = prior[:prior.index(check)]
+    return [item.id for item in prior if _produces_tests(item)]
+
+
+def _produces_tests(check: CheckDef) -> bool:
+    descriptor = adapter_for(check.adapter)
+    return descriptor is not None and descriptor.produces_tests
 
 
 def _run_selected(
@@ -284,27 +316,73 @@ def _collect(
     return rows, notes
 
 
+def _slack_for_check(check: CheckDef, result: CheckResult) -> tuple[list[Slack], list[Note]]:
+    ratchet = result.ratchet
+    if ratchet is None:
+        return [], []
+    return _slack_for_entries(check.id, ratchet)
+
+
+def _slack_for_entries(check_id: str, ratchet: Any) -> tuple[list[Slack], list[Note]]:
+    slack: list[Slack] = []
+    notes: list[Note] = []
+    for entry in _minimum_entries(ratchet.entries):
+        item, note = _slack_entry(check_id, entry, ratchet)
+        if item is not None:
+            slack.append(item)
+        if note is not None:
+            notes.append(note)
+    return slack, notes
+
+
+def _minimum_entries(entries: list[BaselineEntry]) -> list[BaselineEntry]:
+    return [entry for entry in entries if entry.direction == "min"]
+
+
+def _slack_entry(check_id: str, entry: BaselineEntry, ratchet: Any) -> tuple[Slack | None, Note | None]:
+    value = ratchet.measured.get(entry.subject)
+    if value is None:
+        if entry.subject in ratchet.resolved:
+            return None, Note(check_id, entry.subject, "no longer exists")
+        else:
+            return None, Note(check_id, entry.subject, "not measured")
+    return Slack(check_id, entry.subject, entry.bound, value), None
+
+
+def _collect_slack(
+    selected: list[CheckDef], results: dict[str, CheckResult]
+) -> tuple[list[Slack], list[Note]]:
+    slack: list[Slack] = []
+    notes: list[Note] = []
+    for check in selected:
+        check_slack, check_notes = _slack_for_check(check, results[check.id])
+        slack.extend(check_slack)
+        notes.extend(check_notes)
+    return slack, notes
+
+
 def _worklist_report(
     root: Path, config: Config, check_ids: list[str]
-) -> tuple[int, list[Row], list[Note]]:
+) -> tuple[int, list[Row], list[Slack], list[Note]]:
     selected = _select_checks(config, check_ids)
     if not selected:
-        return 0, [], []
+        return 0, [], [], []
     inventory, results, order = _run_selected(root, config, selected)
     if not _passes(inventory):
         print(_failure_message(inventory), file=sys.stderr)
-        return 1, [], []
+        return 1, [], [], []
     failure = _first_failure(results, order)
     if failure is not None:
         print(_failure_message(failure), file=sys.stderr)
-        return 1, [], []
+        return 1, [], [], []
     try:
         rows, notes = _collect(root, selected, results)
     except GateError as error:
         print(f"worklist: {error}", file=sys.stderr)
-        return 1, [], []
+        return 1, [], [], []
     rows.sort(key=lambda row: row.product, reverse=True)
-    return 0, rows, notes
+    slack, slack_notes = _collect_slack(selected, results)
+    return 0, rows, slack, notes + slack_notes
 
 
 def _note_text(note: Note) -> str:
@@ -313,7 +391,7 @@ def _note_text(note: Note) -> str:
     return f"{note.reason} ({note.file})"
 
 
-def _print_report(rows: list[Row], notes: list[Note]) -> None:
+def _print_report(rows: list[Row], slack: list[Slack], notes: list[Note]) -> None:
     print("worklist: churn x current value")
     print(
         f"{'CHURN':>5} {'BOUND':>7} {'VALUE':>7} {'CHURNxVALUE':>12}  "
@@ -325,17 +403,33 @@ def _print_report(rows: list[Row], notes: list[Note]) -> None:
             f"{row.product:>12.1f}  {row.check}  {row.subject}  "
             f"{row.location}"
         )
+    if slack:
+        _print_slack(slack)
     if notes:
-        print("")
-        print("Not ranked:")
-        for note in notes:
-            print(f"  {note.check}: {note.subject}: {_note_text(note)}")
+        _print_notes(notes)
 
 
-def _document(rows: list[Row], notes: list[Note]) -> dict[str, Any]:
+def _print_slack(slack: list[Slack]) -> None:
+    print("")
+    print("Minimum bounds:")
+    print(f"{'BOUND':>7} {'VALUE':>7} {'SLACK':>7}  CHECK  SUBJECT")
+    for item in slack:
+        print(f"{item.bound:>7.1f} {item.value:>7.1f} {item.amount:>7.1f}  "
+              f"{item.check}  {item.subject}")
+
+
+def _print_notes(notes: list[Note]) -> None:
+    print("")
+    print("Not ranked:")
+    for note in notes:
+        print(f"  {note.check}: {note.subject}: {_note_text(note)}")
+
+
+def _document(rows: list[Row], slack: list[Slack], notes: list[Note]) -> dict[str, Any]:
     return {
         "schema": 1,
         "rows": [row.to_json() for row in rows],
+        "slack": [item.to_json() for item in slack],
         "notes": [note.to_json() for note in notes],
     }
 
@@ -345,13 +439,13 @@ def command_worklist(
 ) -> int:
     if json_output:
         with contextlib.redirect_stdout(sys.stderr):
-            code, rows, notes = _worklist_report(root, config, check_ids)
+            code, rows, slack, notes = _worklist_report(root, config, check_ids)
         if code == 0:
             print(
-                json.dumps(_document(rows, notes), indent=2, allow_nan=False)
+                json.dumps(_document(rows, slack, notes), indent=2, allow_nan=False)
             )
         return code
-    code, rows, notes = _worklist_report(root, config, check_ids)
+    code, rows, slack, notes = _worklist_report(root, config, check_ids)
     if code == 0:
-        _print_report(rows, notes)
+        _print_report(rows, slack, notes)
     return code

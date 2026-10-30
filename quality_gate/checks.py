@@ -1972,7 +1972,7 @@ def _usable_reuse(check: CheckDef, reused: Any) -> Any:
 
 
 def _reuse_lookup(session: Any, check: CheckDef, identity: Any, coverage_dir: Path | None) -> Any:
-    if identity is None or check.id == session.prune_id:
+    if identity is None or check.id in session.prune_ids:
         return None
     if coverage_dir is not None and os.path.lexists(coverage_dir):
         return None
@@ -2231,7 +2231,7 @@ def _run_inventory(
 
 
 def _prune_option_error(
-    root: Path, config: Config, prune_id: str, message: str
+    root: Path, config: Config, requested: list[str], message: str
 ) -> tuple[int, dict[str, Any]]:
     print(message, file=sys.stderr)
     return 2, gate_result.error_document(
@@ -2239,7 +2239,7 @@ def _prune_option_error(
         config.path,
         message,
         prune={
-            "requested": [prune_id],
+            "requested": requested,
             "performed": False,
             "reason": message,
         },
@@ -2313,26 +2313,21 @@ def _write_pruned(
     return True, None
 
 
-def _prune_refusal(prune_id: str) -> dict[str, Any]:
+def _prune_refusal(prune_id: str, requested: list[str]) -> dict[str, Any]:
     reason = "the check did not pass; nothing written"
     print(
         f"check: {prune_id}: prune refused because the check did not "
         "pass; nothing written",
         file=sys.stderr,
     )
-    return {"requested": [prune_id], "performed": False, "reason": reason}
+    return {"requested": requested, "performed": False, "reason": reason}
 
 
 def _checked_prune_destination(
     config: Config,
     prune_id: str,
     destination: Path,
-    trust: Any = None,
 ) -> tuple[Path | None, str | None]:
-    if trust is not None:
-        refusal = trust.before_prune()
-        if refusal is not None:
-            return None, refusal
     if prune_id not in config.prune_paths:
         return destination, None
     try:
@@ -2358,35 +2353,75 @@ def _prune_allowed(results: list[CheckResult], target: CheckResult) -> bool:
 
 def _perform_prune(
     config: Config,
-    prune_id: str | None,
+    requested: list[str],
     results: list[CheckResult],
     trust: Any = None,
 ) -> dict[str, Any]:
-    if prune_id is None:
+    if not requested:
         return {"requested": [], "performed": False, "reason": None}
-    target = _prune_check_result(results, prune_id)
-    check = config.checks[prune_id]
-    if not _prune_allowed(results, target):
-        return _prune_refusal(prune_id)
-    assert check.baseline is not None
-    destination = config.prune_paths.get(prune_id, check.baseline)
-    destination, refusal = _checked_prune_destination(
-        config, prune_id, destination, trust
-    )
-    if destination is None:
-        return {
-            "requested": [prune_id],
-            "performed": False,
-            "reason": refusal,
-        }
-    performed, reason = _write_pruned(
-        check, target, destination, trust
-    )
-    return {
-        "requested": [prune_id],
-        "performed": performed,
-        "reason": reason,
-    }
+    ids = _expand_prune_ids(config, requested)
+    refusal = _prune_targets_refusal(results, ids, requested)
+    if refusal is not None:
+        return refusal
+    return _guarded_prune(config, ids, requested, results, trust)
+
+
+def _guarded_prune(
+    config: Config, ids: list[str], requested: list[str],
+    results: list[CheckResult], trust: Any,
+) -> dict[str, Any]:
+    if trust is not None:
+        reason = trust.before_prune()
+        if reason is not None:
+            return {"requested": requested, "performed": False, "reason": reason}
+    destinations, reason = _prune_destinations(config, ids)
+    if reason is not None:
+        return {"requested": requested, "performed": False, "reason": reason}
+    return _write_prune_set(config, results, requested, destinations, trust)
+
+
+def _write_prune_set(
+    config: Config, results: list[CheckResult], requested: list[str],
+    destinations: list[tuple[str, Path]], trust: Any,
+) -> dict[str, Any]:
+    for identifier, destination in destinations:
+        target = _prune_check_result(results, identifier)
+        performed, reason = _write_pruned(config.checks[identifier], target, destination, trust)
+        if not performed:
+            return {"requested": requested, "performed": False, "reason": reason}
+    return {"requested": requested, "performed": True, "reason": None}
+
+
+def _prune_targets_refusal(
+    results: list[CheckResult], ids: list[str], requested: list[str]
+) -> dict[str, Any] | None:
+    if "all" in requested:
+        failure = _first_unsatisfied(results)
+        if failure is not None:
+            return _prune_refusal(failure.id, requested)
+    for identifier in ids:
+        if not _prune_allowed(results, _prune_check_result(results, identifier)):
+            return _prune_refusal(identifier, requested)
+    return None
+
+
+def _first_unsatisfied(results: list[CheckResult]) -> CheckResult | None:
+    return next((result for result in results if not result.is_satisfied()), None)
+
+
+def _prune_destinations(
+    config: Config, ids: list[str]
+) -> tuple[list[tuple[str, Path]], str | None]:
+    destinations = []
+    for identifier in ids:
+        check = config.checks[identifier]
+        assert check.baseline is not None
+        path = config.prune_paths.get(identifier, check.baseline)
+        destination, reason = _checked_prune_destination(config, identifier, path)
+        if destination is None:
+            return [], reason
+        destinations.append((identifier, destination))
+    return destinations, None
 
 
 def _builtin_failures(results: list[CheckResult]) -> list[str]:
@@ -2449,8 +2484,8 @@ def _result_document(
     }
 
 
-def _prune_request_problem(config: Config, prune_id: str | None) -> str | None:
-    if prune_id is None:
+def _prune_id_problem(config: Config, prune_id: str) -> str | None:
+    if prune_id == "all":
         return None
     if prune_id not in config.checks:
         return (
@@ -2460,6 +2495,23 @@ def _prune_request_problem(config: Config, prune_id: str | None) -> str | None:
     if config.checks[prune_id].baseline is None:
         return f"check: {prune_id}: no baseline to prune"
     return None
+
+
+def _prune_request_problem(config: Config, requested: list[str]) -> str | None:
+    return next((problem for identifier in requested
+                 if (problem := _prune_id_problem(config, identifier)) is not None), None)
+
+
+def _expand_prune_ids(config: Config, requested: list[str]) -> list[str]:
+    return list(dict.fromkeys(
+        choice for identifier in requested for choice in _prune_choices(config, identifier)
+    ))
+
+
+def _prune_choices(config: Config, identifier: str) -> list[str]:
+    if identifier == "all":
+        return [check.id for check in config.checks.values() if check.baseline is not None]
+    return [identifier]
 
 
 def _inventory_check(root: Path, config: Config) -> tuple[CheckResult, list[str], dict[str, str], int]:
@@ -2527,24 +2579,24 @@ def _print_decision(
 
 
 
-def _decision_exit_code(decision: str, prune_id: str | None, prune: dict[str, Any]) -> int:
+def _decision_exit_code(decision: str, prune_ids: list[str], prune: dict[str, Any]) -> int:
     if decision == "error":
         return 2
     if decision not in ("accepted", "accepted_with_exceptions"):
         return 1
-    return 1 if prune_id is not None and not prune["performed"] else 0
+    return 1 if prune_ids and not prune["performed"] else 0
 
 
 def _finalize_check(
     root: Path, config: Config, results: list[CheckResult],
-    prune_id: str | None, trust: Any,
+    prune_ids: list[str], trust: Any,
 ) -> tuple[int, dict[str, Any]]:
     obligations = gate_result.obligations(config, results)
-    prune_document = _perform_prune(config, prune_id, results, trust)
+    prune_document = _perform_prune(config, prune_ids, results, trust)
     configuration_error = next((result.reason for result in results if result.configuration_error), None)
     decision = "error" if configuration_error is not None else gate_result.decision(results, obligations)
     _print_decision(decision, configuration_error, results, obligations)
-    exit_code = _decision_exit_code(decision, prune_id, prune_document)
+    exit_code = _decision_exit_code(decision, prune_ids, prune_document)
     document = _result_document(
         root, config, decision, results, obligations, prune_document, trust
     )
@@ -2556,21 +2608,20 @@ def _finalize_check(
 def _check_command(
     root: Path,
     config: Config,
-    prune_id: str | None,
+    prune_ids: list[str],
     trust: Any = None,
     changed_from: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     revision = resolve_revision(root, changed_from) if changed_from is not None else None
-    problem = _prune_request_problem(config, prune_id)
+    problem = _prune_request_problem(config, prune_ids)
     if problem is not None:
-        assert prune_id is not None
-        return _prune_option_error(root, config, prune_id, problem)
+        return _prune_option_error(root, config, prune_ids, problem)
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
     results.extend(_run_policy_checks(root, config, files, classes, code))
     if revision is not None:
         apply_changes(results, changed_lines(root, revision, files))
-    exit_code, document = _finalize_check(root, config, results, prune_id, trust)
+    exit_code, document = _finalize_check(root, config, results, prune_ids, trust)
     if revision is not None:
         document["changed_from"] = revision
     return exit_code, document
@@ -2579,15 +2630,15 @@ def _check_command(
 def _run_check_document(
     root: Path,
     config: Config,
-    prune_id: str | None,
+    prune_ids: list[str],
     json_output: bool,
     trust: Any = None,
     changed_from: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     if not json_output:
-        return _check_command(root, config, prune_id, trust, changed_from)
+        return _check_command(root, config, prune_ids, trust, changed_from)
     with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_id, trust, changed_from)
+        return _check_command(root, config, prune_ids, trust, changed_from)
 
 
 def command_check(
@@ -2595,23 +2646,24 @@ def command_check(
     config: Config,
     *,
     json_output: bool = False,
-    prune_id: str | None = None,
+    prune_ids: list[str] | None = None,
     trust: Any = None,
     changed_from: str | None = None,
     reuse_store: str | None = None,
     record_fd: int | None = None,
 ) -> int:
     store = Path(reuse_store).expanduser() if reuse_store else None
-    with reuse.active(store, root, record_fd, prune_id):
+    requested = prune_ids or []
+    with reuse.active(store, root, record_fd, tuple(_expand_prune_ids(config, requested))):
         if trust is None:
             code, document = _run_check_document(
-                root, config, prune_id, json_output, changed_from=changed_from
+                root, config, requested, json_output, changed_from=changed_from
             )
         else:
             try:
                 with trust.activate():
                     code, document = _run_check_document(
-                        root, config, prune_id, json_output, trust, changed_from
+                        root, config, requested, json_output, trust, changed_from
                     )
                 code, document = trust.finish(code, document)
             finally:

@@ -8,6 +8,9 @@ from pathlib import Path
 
 from support import FixtureCase, PYTHON_TEST_HEADER, baseline_text, output
 from test_python_crap import crap_config
+from test_verification import (
+    executed_entry, exclusion_entry, verification_baseline, verification_config,
+)
 
 
 ALPHA = """def alpha(value):
@@ -359,16 +362,59 @@ class WorklistArgumentTests(FixtureCase):
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("expected a baseline, got none", result.stderr)
 
-    def test_check_without_max_metric_exits_two(self) -> None:
-        self.write_config(
-            crap_config().replace(
-                "[checks.crap]\n",
-                '[checks.crap]\ndirection = "min"\n',
-            )
+
+class WorklistMinimumTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.write_config(verification_config(requires=None))
+        self.add_file("pkg/mod.py", "VALUE = 1  # noqa: E501\n")
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_one(self): self.assertTrue(True)\n"
+            "    def test_two(self): self.assertTrue(True)\n"
+            "    def test_three(self): self.assertTrue(True)\n",
         )
-        result = self.run_qg("worklist", "crap")
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("expected a max metric, got 'min'", result.stderr)
+        self.add_file(
+            "quality-gate-verification.toml",
+            verification_baseline([
+                executed_entry(1), exclusion_entry("pkg/mod.py", "noqa", 2),
+            ]),
+        )
+        self.commit_all()
+
+    def test_minimum_slack_is_reported_beside_maximum_debt(self) -> None:
+        human = run_worklist(self, "verification")
+        self.assertEqual(human.returncode, 0, output(human))
+        self.assertIn("SLACK", human.stdout)
+        self.assertIn("1.0     3.0     2.0  verification  tests:tests:executed", human.stdout)
+        self.assertIn("exclusions:pkg/mod.py:noqa", human.stdout)
+        machine = run_worklist(self, "--json")
+        self.assertEqual(machine.returncode, 0, output(machine))
+        document = self.parse_json(machine)
+        self.assertEqual(document["slack"], [{
+            "check": "verification", "subject": "tests:tests:executed",
+            "bound": 1, "value": 3, "slack": 2,
+        }])
+        self.assertEqual(document["rows"][0]["subject"], "exclusions:pkg/mod.py:noqa")
+        self.assertEqual(document["rows"][0]["bound"], 2)
+        self.assertEqual(document["rows"][0]["value"], 1)
+
+    def test_unmeasured_minimum_is_a_note_without_fabricated_slack(self) -> None:
+        missing = {"subject": "tests:missing:executed", "bound": 5, "reason": "old producer"}
+        self.add_file(
+            "quality-gate-verification.toml",
+            verification_baseline([executed_entry(1), missing]),
+        )
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        result = run_worklist(self, "--json", "verification")
+        self.assertEqual(result.returncode, 0, output(result))
+        document = self.parse_json(result)
+        self.assertEqual(len(document["slack"]), 1)
+        self.assertEqual(document["notes"], [{
+            "check": "verification", "subject": "tests:missing:executed", "reason": "not measured",
+        }])
 
 
 class WorklistJsonTests(FixtureCase):
