@@ -454,11 +454,6 @@ def _descriptor(adapter: Any) -> Any:
     return adapter_for(adapter)
 
 
-def _adapter_name(adapter: Any) -> str:
-    descriptor = _descriptor(adapter)
-    return descriptor.name if descriptor is not None else str(adapter)
-
-
 def _subject_label(subject: str, adapter: Any, has_entry: bool) -> str:
     descriptor = _descriptor(adapter)
     if descriptor is None or not descriptor.subject_noun:
@@ -505,7 +500,7 @@ def _expiry_detail(entry: BaselineEntry | None, expired: bool) -> str:
     return ""
 
 
-def _clone_detail(
+def _occurrence_detail(
     finding: Finding,
     entry: BaselineEntry | None,
     expired: bool,
@@ -570,8 +565,9 @@ def _format_failure(
     direction: str = "max",
 ) -> str:
     label = _subject_label(finding.subject, adapter, entry is not None)
-    if _adapter_name(adapter) == "clones":
-        detail = _clone_detail(finding, entry, expired, threshold)
+    descriptor = _descriptor(adapter)
+    if descriptor is not None and descriptor.failure_wording == "occurrences":
+        detail = _occurrence_detail(finding, entry, expired, threshold)
     else:
         detail = _metric_detail(
             finding, entry, expired, threshold, adapter, direction

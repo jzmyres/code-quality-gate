@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
 import importlib
 import io
@@ -16,6 +17,7 @@ from support import GATE
 sys.path.insert(0, str(GATE))
 ratchet = importlib.import_module("quality_gate.ratchet")
 policy = importlib.import_module("quality_gate.policy")
+adapters = importlib.import_module("quality_gate.adapters")
 
 
 class RatchetTests(unittest.TestCase):
@@ -61,6 +63,33 @@ class RatchetTests(unittest.TestCase):
         self.assertIn("new", errors)
         self.assertIn("threshold 0", errors)
         self.assertIn("file:1", errors)
+
+    def test_renamed_clone_descriptor_preserves_failure_wording(self) -> None:
+        original = adapters.adapter_for("clones")
+        renamed = dataclasses.replace(original, name="repeated-code")
+        adapters.register_adapter(renamed)
+        self.addCleanup(adapters.remove_adapter, renamed.name)
+        expected = (
+            "check: metric: new clone added: occurs 2 times, exceeding threshold 0"
+            " at file:1\n"
+            "check: metric: clone existing: occurs 1 time, exceeding threshold 0"
+            " and baseline bound 0 at file:1\n"
+            "check: metric: clone expired: occurs 2 times, exceeding threshold 0"
+            " (baseline entry expired 2000-01-01) at file:1\n"
+        )
+        for adapter in (original, original.name, renamed, renamed.name):
+            with self.subTest(adapter=adapter):
+                result, _out, errors = self.decide(
+                    [("added", 2), ("existing", 1), ("expired", 2)],
+                    [
+                        ("existing", 0, "accepted", None),
+                        ("expired", 3, "old", datetime.date(2000, 1, 1)),
+                    ],
+                    adapter=adapter,
+                    today=datetime.date(2026, 10, 30),
+                )
+                self.assertFalse(result.satisfied)
+                self.assertEqual(errors, expected)
 
     def test_exactly_at_bound_passes_through_the_baseline(self) -> None:
         result, _out, _errors = self.decide(
