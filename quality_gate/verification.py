@@ -123,10 +123,15 @@ def _noqa_lines(
     return lines, file_suppressions
 
 
+def _source_lines(source: str) -> list[str]:
+    """Number lines at '\n', as Git and the tokenizer do."""
+    return source.split("\n")
+
+
 def _no_cover_lines(source: str) -> list[int]:
     return [
         number
-        for number, line in enumerate(source.splitlines(), 1)
+        for number, line in enumerate(_source_lines(source), 1)
         if NO_COVER.search(line)
     ]
 

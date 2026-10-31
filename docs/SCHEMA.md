@@ -233,7 +233,9 @@ forms, and isort's `# isort: skip_file` (also recognized by Ruff). Each directiv
 contributes one to the file-wide count, separate from the inline count. The lint
 directives are recognized in comment tokens using their directive syntax;
 matching text inside a string does not count. The file-wide finding's location
-includes the first directive and its line.
+includes the first directive and its line. Exclusion locations are numbered at
+each `\n` after universal-newline decoding, as Git and the tokenizer number
+them, so other Unicode line separators do not shift a later line.
 
 Command producers supply their parsed ran and skipped counts through the same
 normalized count fields as the test adapters. A missing or unmatched summary

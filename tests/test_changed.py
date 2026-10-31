@@ -314,6 +314,46 @@ class ChangedVerificationTests(FixtureCase):
         self.assertEqual([item["start_line"] for item in finding["locations"]], [1, 2])
         self.assertTrue(finding["on_changed_lines"])
 
+    def test_no_cover_after_a_unicode_separator_uses_git_line_numbers(self) -> None:
+        pragma = "# pragma: " "no cover"
+        base = f'"""Module."""\nVALUE = 1  {pragma}\nOTHER = 2\n'
+        self.add_file("pkg/mod.py", base)
+        self.add_file(
+            "quality-gate-verification.toml",
+            verification_baseline([
+                executed_entry(1),
+                exclusion_entry("pkg/mod.py", "no-cover", 1),
+            ]),
+        )
+        self.commit_all("baseline no-cover")
+        for separator in ("\u2028", "\u2029", "\u0085"):
+            with self.subTest(separator=separator):
+                self.add_file(
+                    "pkg/mod.py",
+                    f'"""Module.{separator}More."""\n'
+                    "VALUE = 1\n"
+                    f"{pragma}\n"
+                    "OTHER = 2\n",
+                )
+                result, document = self.run_json(
+                    "--policy-from", "HEAD", "--changed-from", "HEAD",
+                    env=self.default_tool_env(),
+                )
+                self.assertEqual(result.returncode, 1, output(result))
+                self.assertEqual(document["decision"], "rejected")
+                check = self.check_by_id(document, "verification")
+                finding = next(
+                    item for item in check["findings"]
+                    if item["subject"] == "exclusions:pkg/mod.py:no-cover"
+                )
+                self.assertEqual(finding["value"], 1)
+                self.assertTrue(finding["covered_by_baseline"])
+                self.assertTrue(finding["on_changed_lines"])
+                self.assertTrue(finding["blocking"])
+                self.assertEqual(finding["locations"], [
+                    {"path": "pkg/mod.py", "start_line": 3, "end_line": 3},
+                ])
+
 
 class ChangedOwnersTests(FixtureCase):
     def setUp(self) -> None:

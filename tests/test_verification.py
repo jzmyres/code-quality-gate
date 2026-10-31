@@ -15,6 +15,8 @@ from support import (
 )
 from test_trust import TrustCase
 
+from quality_gate.verification import measure_exclusions
+
 BASELINE = "quality-gate-verification.toml"
 METRIC_VERSION = "verification/1"
 ADOPTION_REASON = "measured at adoption (M2c, 2026-10-25)"
@@ -354,6 +356,24 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(finding["value"], 1)
         self.assertEqual(finding["bound"], None)
         self.assertIn("exclusions:pkg/mod.py:no-cover", result.stderr)
+
+    def test_measure_exclusions_numbers_lines_at_newline_only(self) -> None:
+        source = f'"""doc\u2028more"""\nVALUE = 1  {NO_COVER}  # noqa: E501\n'
+        findings = {
+            finding.subject.rsplit(":", 1)[-1]: finding
+            for finding in measure_exclusions("pkg/mod.py", source)
+        }
+        for metric in ("no-cover", "noqa"):
+            with self.subTest(metric=metric):
+                finding = findings[metric]
+                self.assertEqual(finding.value, 1)
+                self.assertEqual(
+                    [
+                        (location.start_line, location.end_line)
+                        for location in finding.locations
+                    ],
+                    [(2, 2)],
+                )
 
     def test_added_noqa_comment_fails(self) -> None:
         self.add_tests(1)
