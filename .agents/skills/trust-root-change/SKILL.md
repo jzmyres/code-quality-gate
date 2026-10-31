@@ -1,9 +1,9 @@
 ---
 name: trust-root-change
 description: Checklist for changing the gate's trust root, protected inputs, baseline merge, prune or run identity.
-verified: 2026-10-29
-commit: 697d33f
-paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py
+verified: 2026-10-31
+commit: 563d187
+paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py, tests/test_changed.py
 ---
 
 # Changing the trust root
@@ -14,26 +14,32 @@ closure: the suite covers the probes below, but a new trust path needs its own a
 
 1. **Read the contract.** `docs/TRUST.md` defines protected inputs, statuses, the baseline merge and identity;
    `docs/SCHEMA.md` has the `trust` result and exit codes. `tests/test_trust.py` builds fixture repositories with
-   `git init`; follow its helpers. If a check depends on a configuration file, add that file to `[protect] paths`
-   and pass it explicitly (Ruff uses `--config ruff.toml`); otherwise a candidate changes tool behavior without
-   touching a protected input.
+   `git init`; follow its helpers. With `--policy-from`, `trust._refuse_inside` refuses a gate program inside the
+   candidate root, so run a trusted copy outside it. A protected path may be a gitlink; the candidate's index
+   commit and checked-out HEAD must agree with the trusted tree, while a missing uninitialized checkout is
+   allowed. If a check depends on a configuration file, add that file to `[protect] paths` and pass it explicitly
+   (Ruff uses `--config ruff.toml`); otherwise a candidate changes tool behavior without touching a protected
+   input.
 2. **One Git invocation policy.** `files.git_argv` builds every command the gate runs on a candidate repository:
    `git --no-replace-objects -c safe.directory=ROOT -c core.fsmonitor=false -C ROOT`; `trust._git`,
-   `files._git` and `gate_result._git` call it, and `checks` and `changes` use it directly for inventory/
-   hygiene argv and worktree diffs. Blobs are read with `git cat-file blob`, and `_refuse_graft` runs
-   before the revision is read. A new bare `git` call or a hand-built argument list loses replacement-ref and
-   fsmonitor isolation.
+   `files._git` and `gate_result._git` call it, and `checks`, `changes` and `worklist` use it directly for
+   inventory/hygiene argv, worktree diffs, pack/clone and churn. Blobs are read with `git cat-file blob`, and
+   `_refuse_graft` runs before the revision is read. A new bare `git` call or a hand-built argument list loses
+   replacement-ref and fsmonitor isolation.
 3. **Candidate reads are regular files.** `_open_candidate` opens with `O_NOFOLLOW|O_NONBLOCK`, and
    `_read_regular` requires `fstat` to report a regular file; `_candidate_parent` rejects a symlinked parent.
    `Path.read_text()` follows symlinks and can block on a FIFO; do not use it for a protected input.
-4. **Respect metric direction in the merge.** `load_baseline` sets each `BaselineEntry.direction` with
-   `subject_direction`; `_merge_revision_entry` reads that direction, keeps a trusted `min` floor when the
-   candidate omits it, applies a candidate removal only for `max`, and preserves every trusted entry when the
-   candidate baseline cannot be parsed. `evaluate` re-derives the direction with `entry_direction`, which takes a
-   measured finding's `kind` first. A merge that parses a bad candidate as empty, recomputes direction locally, or
-   drops floors loosens the ratchet (QF44). The merged tuple goes on `CheckDef.effective_baseline`;
-   `checks._baseline_entries` returns it first, and no check passes a baseline path to a child process. An
-   authorized policy's new baseline is read from the candidate, but still validated before the checks.
+4. **Use the subject's direction everywhere.** `load_baseline` and `evaluate` both set each
+   `BaselineEntry.direction` with `ratchet.subject_direction`, which asks the adapter's
+   `entry_direction(subject, configured)`, then its `default_direction`, then the policy's `direction`.
+   `_evaluate_finding` asks the same rule before choosing `_min_verdict` or `_max_verdict`, and
+   `_merge_revision_entry`/`_prune_entry` read `entry.direction` rather than asking the adapter again. A merge or
+   prune that recomputed direction locally, or dropped a floor, loosens the ratchet (QF44). `_merge_revision_entry`
+   keeps a trusted `min` floor when the candidate omits it, applies a candidate removal only for `max`, and
+   preserves every trusted entry when the candidate baseline cannot be parsed. The merged tuple goes on
+   `CheckDef.effective_baseline`; `checks._baseline_entries` returns it first, and no check passes a baseline path
+   to a child process. An authorized policy's new baseline is read from the candidate, but still validated before
+   the checks.
 5. **Identity and prune.** `_capture_identity` runs before the checks and records `protected`,
    `effective_inputs` (policy, lock, tool pins and each effective baseline digest), `tools` and `gate`; when
    a prune is requested, `Trust.before_prune` captures it again after the checks and must find no difference
@@ -52,6 +58,7 @@ closure: the suite covers the probes below, but a new trust path needs its own a
 7. **Probe the cases.** Cover a replacement ref (`git replace A B`, checked with `git --no-replace-objects
    show A:FILE`), an `info/grafts` file, a candidate that omits a `min` floor, a malformed candidate baseline,
    a protected symlink, FIFO and symlinked parent, a prune through a symlinked parent, a protected file created
-   during a check, a check that rewrites an authorized baseline then requests a prune, a candidate `ruff.toml`
-   that weakens lint, and a candidate repository with `core.fsmonitor` set (record it with a marker file). Run
+   during a check, a check that rewrites an authorized baseline then requests a prune, a gate program inside the
+   candidate, a moved or inconsistent protected gitlink, a candidate `ruff.toml` that weakens lint, and a
+   candidate repository with `core.fsmonitor` set (record it with a marker file). Run
    `python3 -I -m unittest discover -s tests -p 'test_trust.py'`, then `make -k check`.
