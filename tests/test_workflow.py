@@ -3,6 +3,7 @@
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def blocks(text: str, pattern: str) -> list[tuple[str, str]]:
@@ -19,18 +20,20 @@ class WorkflowTimeoutTests(unittest.TestCase):
         self.jobs = blocks(workflow.split("jobs:\n", 1)[1], r"^  ([\w-]+):$")
         self.assertTrue(self.jobs, "expected workflow jobs, actual none")
 
-    def step_bounds(self, job: str) -> list[tuple[str, int]]:
+    def step_bounds(self, job: str) -> list[tuple[str, str, int]]:
         bounds = []
-        for _name, step in blocks(job, r"^      - (?:name|uses): (.+)$"):
-            timeout = re.search(r"^        timeout-minutes: (.+)$", step, re.MULTILINE)
+        steps = job.split("    steps:\n", 1)[1]
+        for position, (_first, step) in enumerate(blocks(steps, r"^      - (.*)$"), 1):
+            timeout = re.search(r"^(?:      - |        )timeout-minutes: (.+)$", step, re.MULTILINE)
             if timeout is not None:
-                bounds.append((step, int(timeout[1])))
+                name = re.search(r"^(?:      - |        )name: (.+)$", step, re.MULTILINE)
+                label = name[1] if name else f"step {position}"
+                bounds.append((label, step, int(timeout[1])))
         return bounds
 
     def test_step_timeouts_follow_measurements(self) -> None:
         for job_name, job in self.jobs:
-            for step, actual in self.step_bounds(job):
-                name = step.splitlines()[0].strip().removeprefix("- name: ")
+            for name, step, actual in self.step_bounds(job):
                 with self.subTest(job=job_name, step=name):
                     comments = "\n".join(re.findall(r"^        #.*$", step, re.MULTILINE))
                     measured = re.search(r"\bMeasured (\d+) s\b", comments)
@@ -56,8 +59,9 @@ class WorkflowTimeoutTests(unittest.TestCase):
             for name, entry in entries:
                 with self.subTest(job=job_name, entry=name):
                     expected = int(allowance[1])
-                    for step, bound in self.step_bounds(job):
-                        only = re.search(r"^        if: matrix\.name == '([^']+)'", step, re.MULTILINE)
+                    for _label, step, bound in self.step_bounds(job):
+                        only = re.search(
+                            r"^(?:      - |        )if: matrix\.name == '([^']+)'", step, re.MULTILINE)
                         if only is None or only[1] == name:
                             expected += bound
                     value = re.search(r"^            timeout: (.+)$", entry, re.MULTILINE) if (
@@ -66,3 +70,51 @@ class WorkflowTimeoutTests(unittest.TestCase):
                     actual = int(value[1])
                     self.assertEqual(actual, expected,
                                      f"{job_name}/{name}: expected {expected} minutes, actual {actual}")
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    def check_workflow(self, step: str, job_timeout: int, method: str) -> unittest.TestResult:
+        workflow = (
+            "jobs:\n"
+            "  example:\n"
+            "    # setup allowance 10 minutes\n"
+            f"    timeout-minutes: {job_timeout}\n"
+            "    steps:\n"
+            "      - name: Previous step\n"
+            "        # Measured 60 s\n"
+            "        timeout-minutes: 5\n"
+            "        run: echo previous\n"
+            "      - run: echo untimed\n"
+            f"{step}"
+        )
+        result = unittest.TestResult()
+        with patch.object(Path, "read_text", return_value=workflow):
+            WorkflowTimeoutTests(method).run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.skipped, [])
+        return result
+
+    def test_unnamed_timeout_requires_measurement(self) -> None:
+        result = self.check_workflow(
+            "      - run: sleep 900\n"
+            "        timeout-minutes: 1\n",
+            15, "test_step_timeouts_follow_measurements")
+        self.assertEqual(len(result.failures), 1)
+        failed_test, traceback = result.failures[0]
+        failure = f"{failed_test}\n{traceback}"
+        self.assertIn("job='example'", failure)
+        self.assertIn("step='step 3'", failure)
+        self.assertIn("expected measurement in seconds, actual missing", failure)
+
+    def test_unnamed_measured_timeout_counts_in_job_sum(self) -> None:
+        for first in ("run: sleep 60", "id: unnamed", "uses: example/action@v1",
+                      "if: matrix.name == 'example'", "timeout-minutes: 5"):
+            with self.subTest(first=first):
+                step = f"      - {first}\n        # Measured 60 s\n"
+                if first != "timeout-minutes: 5":
+                    step += "        timeout-minutes: 5\n"
+                for method in ("test_step_timeouts_follow_measurements",
+                               "test_job_timeouts_sum_applicable_steps_and_setup"):
+                    result = self.check_workflow(step, 20, method)
+                    self.assertEqual(result.failures, [])
