@@ -371,7 +371,7 @@ def run_tests(context: Any) -> Any:
     collision = _suite_collision(context, selected, start)
     if collision is not None:
         return collision
-    temporary = _temporary()
+    temporary = context.temporary_directory(prefix="qg-elisp-")
     directory = Path(temporary.name)
     stage = _stage(directory)
     evidence = directory / "result.json"

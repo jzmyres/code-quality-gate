@@ -5,7 +5,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -376,10 +375,10 @@ def _tests_setup(
     spec: Any,
     start: float,
     prefix: str,
-) -> tuple[tempfile.TemporaryDirectory, Path, list[str]] | Any:
+    temporary: Any,
+) -> tuple[Any, Path, list[str]] | Any:
     from .checks import _tests_result
 
-    temporary = tempfile.TemporaryDirectory(prefix="qg-coverage-")
     data_dir = Path(temporary.name) / "data"
     try:
         data_dir.mkdir()
@@ -516,7 +515,7 @@ def _tests_evidence(
     spec: Any,
     start: float,
     prefix: str,
-    temporary: tempfile.TemporaryDirectory,
+    temporary: Any,
     root: Path,
     data_dir: Path,
     ran: int,
@@ -594,7 +593,8 @@ def _run_python_tests(context: Any) -> Any:
     spec = check.spec
     start = time.monotonic()
     deadline = start + spec.budget_seconds
-    setup = _tests_setup(root, check, spec, start, prefix)
+    temporary = context.temporary_directory(prefix="qg-coverage-")
+    setup = _tests_setup(root, check, spec, start, prefix, temporary)
     if isinstance(setup, CheckResult):
         return setup
     temporary, data_dir, python_prefix = setup

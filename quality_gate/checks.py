@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -92,6 +93,7 @@ class CheckResult:
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     evidence_path: Path | None = None
     adapter_data: Any = None
+    # Owned by the core until the last dependent check finishes.
     temporary: Any = field(default=None, repr=False, compare=False)
     configuration_error: bool = False
     change_scoped_failure: bool = False
@@ -407,8 +409,36 @@ def _adapter_runner(
     prefix: str,
     prior: dict[str, CheckResult],
 ) -> CheckResult:
-    context = AdapterContext(root, config, check, files, classes, prefix, prior)
-    return _check_descriptor(check).run(context)
+    temporaries: list[Any] = []
+    context = AdapterContext(
+        root, config, check, files, classes, prefix, prior,
+        partial(_new_evidence_directory, temporaries),
+    )
+    result = None
+    try:
+        result = _check_descriptor(check).run(context)
+        return result
+    finally:
+        for temporary in temporaries:
+            if result is None or temporary is not result.temporary:
+                _cleanup_evidence(temporary, check.id, result)
+
+
+def _new_evidence_directory(temporaries: list[Any], **options: Any) -> Any:
+    temporary = tempfile.TemporaryDirectory(**options)
+    temporaries.append(temporary)
+    return temporary
+
+
+def _cleanup_evidence(temporary: Any, identifier: str, result: CheckResult | None) -> None:
+    try:
+        temporary.cleanup()
+    except Exception as error:
+        message = f"check: {identifier}: cannot remove evidence directory {temporary.name}: {error}"
+        print(message, file=sys.stderr)
+        if result is not None:
+            previous = result.diagnostics.error
+            result.diagnostics.error = f"{previous}; {message}" if previous else message
 
 
 def run_check(
@@ -442,6 +472,7 @@ def _run_check_with_deadline(
 ) -> CheckResult:
     budget = _check_budget(check)
     start = time.monotonic()
+    result = None
     with check_deadline(start, budget) as scope:
         try:
             result = _adapter_runner(
@@ -454,6 +485,8 @@ def _run_check_with_deadline(
             failure = None
     if failure is None:
         return result
+    if result is not None:
+        _release_evidence([result], {})
     return _deadline_failure(check, prefix, start, budget, scope.diagnostics, failure)
 
 
@@ -601,29 +634,60 @@ def _run_policy_checks(
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
-    for check in config.checks.values():
-        if inventory_code != 0:
-            print(
-                f"check: {check.id}: skipped because inventory failed",
-                file=sys.stderr,
+    last_users = _evidence_last_users(config)
+    try:
+        for check in config.checks.values():
+            if inventory_code != 0:
+                print(
+                    f"check: {check.id}: skipped because inventory failed",
+                    file=sys.stderr,
+                )
+                skipped = _skipped(check)
+                results.append(skipped)
+                prior[check.id] = skipped
+                continue
+            print(f"check: {check.id} ({check.adapter})", flush=True)
+            outcome = run_check(
+                root,
+                config,
+                check,
+                files,
+                classes,
+                prefix=f"check: {check.id}",
+                prior=prior,
             )
-            skipped = _skipped(check)
-            results.append(skipped)
-            prior[check.id] = skipped
-            continue
-        print(f"check: {check.id} ({check.adapter})", flush=True)
-        outcome = run_check(
-            root,
-            config,
-            check,
-            files,
-            classes,
-            prefix=f"check: {check.id}",
-            prior=prior,
-        )
-        results.append(outcome)
-        prior[check.id] = outcome
+            results.append(outcome)
+            prior[check.id] = outcome
+            _release_evidence(results, last_users, check.id)
+    finally:
+        _release_evidence(results, last_users)
     return results
+
+
+def _evidence_last_users(config: Config) -> dict[str, str]:
+    last_users: dict[str, str] = {}
+    prior: dict[str, CheckDef] = {}
+    for check in config.checks.values():
+        last_users[check.id] = check.id
+        dependencies = (
+            _test_check_dependencies(check, prior)
+            if _check_descriptor(check).requires_tests
+            else [getattr(check.spec, "requires", None)]
+        )
+        for identifier in dependencies:
+            if identifier is not None:
+                last_users[identifier] = check.id
+        prior[check.id] = check
+    return last_users
+
+
+def _release_evidence(
+    results: list[CheckResult], last_users: dict[str, str], finished: str | None = None,
+) -> None:
+    for result in results:
+        if result.temporary is not None and (finished is None or last_users[result.id] == finished):
+            temporary, result.temporary = result.temporary, None
+            _cleanup_evidence(temporary, result.id, result)
 
 
 def _record_prune(

@@ -981,11 +981,13 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             self.assertIn("denied", unreadable)
 
     def test_setup_returns_the_data_directory_and_prefix(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         with mock.patch.object(
             python_tests, "coverage_prefix", return_value=["prefix"]
         ) as prefix:
             setup = python_tests._tests_setup(
-                Path("/repo"), self.check, self.spec, 0.0, "check: tests"
+                Path("/repo"), self.check, self.spec, 0.0, "check: tests", temporary
             )
         assert not isinstance(setup, checks.CheckResult)
         temporary, data_dir, python_prefix = setup
@@ -995,11 +997,13 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         prefix.assert_called_once_with(Path("/repo"), data_dir)
 
     def setup_failure(self, error: Exception) -> checks.CheckResult:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         with mock.patch.object(
             python_tests, "coverage_prefix", side_effect=error
         ), contextlib.redirect_stderr(io.StringIO()):
             setup = python_tests._tests_setup(
-                Path("/repo"), self.check, self.spec, 0.0, "check: tests"
+                Path("/repo"), self.check, self.spec, 0.0, "check: tests", temporary
             )
         assert isinstance(setup, checks.CheckResult)
         return setup

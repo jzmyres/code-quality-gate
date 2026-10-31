@@ -300,7 +300,9 @@ negative or non-numeric count is invalid. It is `unsupported` when `tests_patter
 matches more than once (`ambiguous test summary`), `skipped_pattern` matches more than once
 (`ambiguous skipped summary`), a captured count is not a non-negative integer, or coverage is not
 installed. On `pass` the adapter combines the registered coverage datasets and keeps the combined data
-as the evidence for checks that require it. Pattern matching runs in an interruptible child bounded by
+as the evidence for checks that require it. The core explicitly removes test evidence directories
+after their last dependent check, including when a check fails or exceeds its budget, and reports
+cleanup failures as diagnostics. Pattern matching runs in an interruptible child bounded by
 the check's remaining budget, together with coverage combination.
 
 A completed run that executed tests also reports normalized `test_results`. `selected` is the parsed

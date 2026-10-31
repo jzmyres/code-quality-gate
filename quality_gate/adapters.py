@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, Iterator
 
 from . import (
@@ -40,6 +41,7 @@ class AdapterContext:
     classes: dict[str, str]
     prefix: str
     prior: dict[str, Any]
+    temporary_directory: Callable[..., Any] = TemporaryDirectory
 
 
 @dataclass(frozen=True)

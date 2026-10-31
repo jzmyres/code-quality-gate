@@ -122,6 +122,21 @@ class PythonCrapTests(FixtureCase):
             for finding in check["findings"]
         }
 
+    def test_evidence_is_explicitly_removed_after_crap(self) -> None:
+        self.add_file("pkg/one.py", "def one():\n    return 1\n")
+        self.add_tests("    def test_one(self):\n        from pkg.one import one\n"
+                       "        self.assertEqual(one(), 1)\n")
+        self.add_file("quality-gate-crap.toml", baseline_text(
+            [], check="crap", metric_version="python-lines/1",
+        ))
+        _result, document = self.run_evidence_check()
+        self.assertEqual(self.check_by_id(document, "tests")["outcome"], "pass")
+        crap = self.check_by_id(document, "crap")
+        self.assertEqual(crap["outcome"], "pass")
+        measurement = self.findings(crap)["pkg/one.py:one"]["measurement"]
+        self.assertGreater(measurement["executed"], 0)
+        self.assertEqual(measurement["executed"], measurement["statements"])
+
     def test_untested_cc3_fails(self) -> None:
         self.add_default_test()
         self.add_file(

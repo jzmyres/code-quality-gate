@@ -352,6 +352,38 @@ class FixtureCase(unittest.TestCase):
         result = self.run_qg("check", "--json", *args, env=env)
         return result, self.parse_json(result)
 
+    def run_evidence_check(self) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+        """Run real adapters with fatal resource warnings and record their evidence directories."""
+        paths = self.base / "evidence-paths.jsonl"
+        runner = self.base / "evidence-runner.py"
+        runner.write_text(
+            "import json, runpy, sys\n"
+            f"sys.path.insert(0, {str(GATE)!r})\n"
+            "from quality_gate import checks\n"
+            "original = checks._new_evidence_directory\n"
+            "def record(directories, **options):\n"
+            "    temporary = original(directories, **options)\n"
+            f"    with open({str(paths)!r}, 'a', encoding='utf-8') as stream:\n"
+            "        stream.write(json.dumps(temporary.name) + '\\n')\n"
+            "    return temporary\n"
+            "checks._new_evidence_directory = record\n"
+            f"runpy.run_path({str(QG)!r}, run_name='__main__')\n",
+            encoding="utf-8",
+        )
+        prefix = self.python_prefix()
+        command = [prefix[0], "-W", "error::ResourceWarning", *prefix[1:], str(runner),
+                   "--repo", str(self.repo), "check", "--json"]
+        result = subprocess.run(command, cwd=self.repo, env=self.env(self.default_tool_env()),
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertNotIn("ResourceWarning", result.stderr)
+        self.assertNotIn("Implicitly cleaning up", result.stderr)
+        directories = [Path(json.loads(line)) for line in paths.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(directories, output(result))
+        for directory in directories:
+            self.assertFalse(directory.exists(), str(directory))
+        return result, self.parse_json(result)
+
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         env = os.environ.copy()
         for key in (

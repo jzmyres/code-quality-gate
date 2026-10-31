@@ -118,6 +118,14 @@ class ElispCrapTests(FixtureCase):
         result, document = self.run_json(*args)
         return result, document, self.check_by_id(document, "crap")
 
+    def test_evidence_is_explicitly_removed_after_crap(self) -> None:
+        self.add_file("crap.toml", baseline_text([], check="crap", metric_version="elisp-edebug/1"))
+        _result, document = self.run_evidence_check()
+        self.assertEqual(self.check_by_id(document, "legacy-tests")["outcome"], "pass")
+        crap = self.check_by_id(document, "crap")
+        self.assertEqual(crap["outcome"], "pass")
+        self.assertTrue(crap["findings"])
+
     def test_complexity_table_and_subjects(self) -> None:
         self.add_file("src/core.el", COMPLEXITY_SOURCE)
         self.add_file("tests/suite.el", simple_suite())
