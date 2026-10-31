@@ -1,6 +1,6 @@
 """The one bounded subprocess runner.
 
-Every subprocess the gate starts (git helpers, command checks, jscpd and
+Every subprocess the gate starts (repository helpers, command checks and
 test runs) goes through `run`: the child starts in its own process group, the whole group is
 terminated at the budget (SIGTERM, then SIGKILL after a grace period) and
 reaped, and output is captured up to a fixed byte limit.  Bytes beyond the
@@ -24,7 +24,6 @@ import sys
 import tempfile
 import time
 import uuid
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -165,72 +164,34 @@ def mark_step(step: str) -> None:
         scope.step = step
 
 
-def _current_coverage() -> Any:
-    module = sys.modules.get("coverage")
-    return module.Coverage.current() if module is not None else None
+@dataclass(frozen=True)
+class WorkerMeasurement:
+    """Per-worker measurement callbacks; snapshots must be pickleable."""
+
+    start: Callable[[], Any]
+    snapshot: Callable[[Any], Any]
+    merge: Callable[[Any], None]
 
 
-def _start_worker_coverage() -> Any:
-    current = _current_coverage()
-    if current is None:
-        return None
-    # A fork has its own memory. Record its real execution separately, then
-    # send it back to the already-active collector in the parent.
-    module = sys.modules["coverage"]
-    child = module.Coverage(
-        data_file=None,
-        config_file=False,
-        source=current.get_option("run:source"),
-        branch=current.get_option("run:branch"),
-        include=current.get_option("run:include"),
-        omit=current.get_option("run:omit"),
-    )
-    child.start()
-    return child
+_worker_measurement: WorkerMeasurement | None = None
 
 
-def _finish_worker_coverage(child: Any) -> tuple[bool, dict[str, Any]] | None:
-    if child is None:
-        return None
-    child.stop()
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="No data was collected.*")
-        data = child.get_data()
-    return _coverage_snapshot(data)
-
-
-def _coverage_snapshot(data: Any) -> tuple[bool, dict[str, Any]] | None:
-    arcs = data.has_arcs()
-    recorded = {
-        name: (data.arcs(name) if arcs else data.lines(name))
-        for name in data.measured_files()
-    }
-    recorded = {name: lines for name, lines in recorded.items() if lines}
-    return (arcs, recorded) if recorded else None
-
-
-def _merge_worker_coverage(snapshot: tuple[bool, dict[str, Any]] | None) -> None:
-    if snapshot is None:
-        return
-    current = _current_coverage()
-    if current is None:
-        return
-    arcs, recorded = snapshot
-    if arcs:
-        current.get_data().add_arcs(recorded)
-    else:
-        current.get_data().add_lines(recorded)
+def install_worker_measurement(measurement: WorkerMeasurement | None) -> None:
+    """Install measurement for subsequent workers, or disable it with None."""
+    global _worker_measurement
+    _worker_measurement = measurement
 
 
 def _worker_payload(function: Callable[..., Any], args: tuple[Any, ...]) -> bytes:
     stdout, stderr = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        coverage = _start_worker_coverage()
+        measurement = _worker_measurement
+        state = measurement.start() if measurement is not None else None
         try:
             success, result = True, function(*args)
         except BaseException as error:
             success, result = False, error
-        snapshot = _finish_worker_coverage(coverage)
+        snapshot = measurement.snapshot(state) if measurement is not None else None
     response = (
         success, result, stdout.getvalue(), stderr.getvalue(), snapshot
     )
@@ -490,7 +451,8 @@ def _decode_worker(data: bytes, step: str) -> Any:
         success, result, stdout, stderr, snapshot = pickle.loads(data)
     except Exception as error:
         raise WorkerError(f"{step} worker returned invalid data: {error}") from error
-    _merge_worker_coverage(snapshot)
+    if _worker_measurement is not None:
+        _worker_measurement.merge(snapshot)
     sys.stdout.write(stdout)
     sys.stderr.write(stderr)
     if not success:

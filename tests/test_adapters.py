@@ -1,6 +1,7 @@
 """One adapter descriptor drives parsing, running, display, direction and verification."""
 from __future__ import annotations
 
+import ast
 import contextlib
 import dataclasses
 import importlib
@@ -149,6 +150,46 @@ tier = 1
 enforcement = "enforced"
 baseline = "verification.toml"
 """
+
+
+def _package_imports(tree: ast.AST):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                names = (
+                    [f"quality_gate.{node.module}"] if node.module
+                    else [f"quality_gate.{alias.name}" for alias in node.names]
+                )
+            elif node.module == "quality_gate":
+                names = [f"quality_gate.{alias.name}" for alias in node.names]
+            else:
+                names = [node.module or ""]
+        else:
+            continue
+        for name in names:
+            if name.startswith("quality_gate."):
+                yield name.split(".")[1]
+
+
+class ArchitectureTests(unittest.TestCase):
+    def test_core_imports_only_core_modules(self) -> None:
+        core = {
+            "__init__", "adapters", "changes", "checks", "cli", "files", "gate_result",
+            "json_input", "output_patterns", "payload", "policy", "ratchet", "regexrun",
+            "runner", "tools", "trust", "worklist",
+        }
+        for module in sorted(core):
+            path = GATE / "quality_gate" / f"{module}.py"
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for imported in _package_imports(tree):
+                if module != "adapters":
+                    with self.subTest(module=module, imported=imported):
+                        self.assertIn(
+                            imported, core,
+                            f"quality_gate.{module} imports quality_gate.{imported} outside the core",
+                        )
 
 
 class AdapterRegistrationTests(unittest.TestCase):

@@ -1,6 +1,7 @@
 """Shared helpers for the code-quality-gate tests."""
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -19,6 +20,9 @@ RUFF_VERSION = "0.17.0"
 TOOLS_LOCK = GATE / "tools.lock.toml"
 if str(GATE) not in sys.path:
     sys.path.insert(0, str(GATE))
+
+# The test process can itself run under covrun, just like the gate entry point.
+importlib.import_module("quality_gate.coverage_tool").install_worker_measurement()
 
 BASE_CONFIG = """\
 schema = 2

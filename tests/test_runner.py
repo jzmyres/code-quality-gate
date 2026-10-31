@@ -191,6 +191,26 @@ class AnalysisWorkerTests(unittest.TestCase):
                     with self.assertRaisesRegex(runner.WorkerError, "cannot start analysis worker"):
                         runner.analysis_step("analysis", lambda: None, deadline=time.monotonic() + 5)
 
+    def test_worker_measurement_accepts_an_opaque_snapshot(self) -> None:
+        merged = []
+        measurement = runner.WorkerMeasurement(
+            start=os.getpid,
+            snapshot=lambda pid: {"worker": pid, "snapshot": os.getpid()},
+            merge=lambda snapshot: merged.append((os.getpid(), snapshot)),
+        )
+        with mock.patch.object(runner, "_worker_measurement", measurement):
+            with runner.check_deadline(time.monotonic(), 5):
+                result = runner.analysis_step("measured analysis", os.getpid)
+        self.assertNotEqual(result, os.getpid())
+        self.assertEqual(merged, [(os.getpid(), {"worker": result, "snapshot": result})])
+
+    def test_no_measurement_hook_does_no_measurement_work(self) -> None:
+        with mock.patch.object(runner, "_worker_measurement", None):
+            with mock.patch.object(coverage_tool, "_current_coverage") as current:
+                payload = runner._worker_payload(lambda: 42, ())
+                self.assertEqual(runner._decode_worker(payload, "analysis"), 42)
+        current.assert_not_called()
+
     def test_worker_execution_is_included_in_active_coverage(self) -> None:
         coverage = coverage_tool.import_coverage()
         for branch in (False, True):
@@ -199,6 +219,7 @@ class AnalysisWorkerTests(unittest.TestCase):
                     data_file=None, config_file=False, source=[str(GATE)], branch=branch
                 )
                 collector.start()
+                coverage_tool.install_worker_measurement()
                 try:
                     with runner.check_deadline(time.monotonic(), 5):
                         runner.analysis_step(

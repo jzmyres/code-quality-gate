@@ -11,6 +11,8 @@ implementation is the `quality_gate/` package (`policy`, `command`, `files`, `to
 `trust`, `cli`);
 `qg.py` is only the entry point. Each adapter module owns its specification type and
 adapter-specific parser; `policy` holds shared value readers and policy validation.
+Core package modules import only core package modules, with `adapters.py` the sole registry allowed to
+import adapters.
 `check --policy-from REV` takes its policy, baselines, tool lock and protected paths from `REV`;
 `docs/TRUST.md` is the contract.
 
