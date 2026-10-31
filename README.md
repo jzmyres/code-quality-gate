@@ -1215,14 +1215,16 @@ possible change.
 
 Each copied module records its own run in a marker file: a line when the import starts, one when
 the import completes, and a traceback for any uncaught exception or `unittest` error, including errors
-in subtests and in child processes that import the module. A mutant first runs only the tests the
+in subtests and in child processes that import the module. A failed fixture assertion in `setUp`,
+`tearDown` or a cleanup is recorded as a fixture failure in the parent run and in a child process
+that imports the module. A mutant first runs only the tests the
 probe recorded as reaching its target, in their original order, stopping at the first assertion
 failure. That failure is a kill only when the mutant's module was loaded and imported, the marker
 records no import or execution error or fixture failure, and the same selection passes on an
 unmutated copy; each distinct selection is checked once unmutated and reused. A mutant whose selected
 tests all pass, one that no test reached, one with unattributed hits, or one whose selection fails
 unmutated gets the complete-suite run: it is killed only when the same complete suite runs, loads and imports that
-mutant, and fails an assertion while the marker file records no import or execution failure;
+mutant, and fails an assertion while the marker file records no import, execution or fixture failure;
 assertion text is never inspected. Any recorded error makes the mutant an error even if the parent
 suite passes. Survivors are therefore mutants that survived the complete suite, so the kill and
 survival guarantees are unchanged. Survivors, timeouts, a missing or incomplete marker, a recorded

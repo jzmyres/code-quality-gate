@@ -452,6 +452,19 @@ def _insert_reached(source: str, decisions: tuple[Decision, ...]) -> str:
     return source
 
 
+_FIXTURE_FRAMES = (
+    "_callSetUp",
+    "_callTearDown",
+    "_callCleanup",
+    "setUpClass",
+    "tearDownClass",
+    "setUpModule",
+    "tearDownModule",
+    "doClassCleanups",
+    "doModuleCleanups",
+)
+
+
 def _instrument(
     source: str, marker: Path, token: str, reached: tuple[Decision, ...] = ()
 ) -> str:
@@ -480,6 +493,7 @@ def _instrument(
         "traceback as _qg_mutation_traceback, unittest as _qg_mutation_unittest\n"
         f"_qg_mutation_marker = {str(marker)!r}\n"
         f"_qg_mutation_token = {token!r}\n"
+        f"_qg_mutation_fixture_frames = {_FIXTURE_FRAMES!r}\n"
         "def _qg_mutation_record(event, detail=''):\n"
         "    test = _qg_mutation_os.environ.get('QG_MUTATION_TEST') or 'unattributed'\n"
         "    with open(_qg_mutation_marker, 'a', encoding='utf-8') as _qg_mutation_file:\n"
@@ -497,6 +511,18 @@ def _instrument(
         "def _qg_mutation_test_error(error):\n"
         "    detail = ''.join(_qg_mutation_traceback.format_exception(*error))\n"
         "    _qg_mutation_record('error', detail)\n"
+        "def _qg_mutation_test_fixture(test, error):\n"
+        "    trace = error[2]\n"
+        "    while trace is not None:\n"
+        "        if trace.tb_frame.f_code.co_name in _qg_mutation_fixture_frames:\n"
+        "            _qg_mutation_record('fixture', test.id())\n"
+        "            return\n"
+        "        trace = trace.tb_next\n"
+        "def _qg_mutation_wrap_failure(original):\n"
+        "    def add_failure(self, test, error):\n"
+        "        _qg_mutation_test_fixture(test, error)\n"
+        "        return original(self, test, error)\n"
+        "    return add_failure\n"
         "def _qg_mutation_wrap_error(original):\n"
         "    def add_error(self, test, error):\n"
         "        _qg_mutation_test_error(error)\n"
@@ -509,6 +535,8 @@ def _instrument(
         "        return original(self, test, subtest, error)\n"
         "    return add_subtest\n"
         "def _qg_mutation_wrap_result(result):\n"
+        "    if 'addFailure' in result.__dict__:\n"
+        "        result.addFailure = _qg_mutation_wrap_failure(result.addFailure)\n"
         "    if 'addError' in result.__dict__:\n"
         "        result.addError = _qg_mutation_wrap_error(result.addError)\n"
         "    if 'addSubTest' in result.__dict__:\n"
@@ -576,13 +604,9 @@ class _TestResult(unittest.TextTestResult):
             os.environ[_CURRENT_TEST_ENV] = previous
 
     def addFailure(self, test, error):
-        fixture_frames = {
-            "_callSetUp", "_callTearDown", "_callCleanup", "setUpClass", "tearDownClass",
-            "setUpModule", "tearDownModule", "doClassCleanups", "doModuleCleanups",
-        }
         trace = error[2]
         while trace is not None:
-            if trace.tb_frame.f_code.co_name in fixture_frames:
+            if trace.tb_frame.f_code.co_name in _FIXTURE_FRAMES:
                 self.fixture_failures.append(test.id())
                 break
             trace = trace.tb_next
@@ -734,7 +758,7 @@ def _marker_events(marker: Path, token: str) -> list[dict]:
         if (
             isinstance(event, dict)
             and event.get("token") == token
-            and event.get("event") in ("loaded", "imported", "failure", "error", "reached")
+            and event.get("event") in ("loaded", "imported", "failure", "error", "fixture", "reached")
             and isinstance(event.get("detail"), str)
             and isinstance(event.get("test", ""), str)
         ):
@@ -745,6 +769,11 @@ def _marker_events(marker: Path, token: str) -> list[dict]:
 def _marker_failure(events: list[dict]) -> str | None:
     failures = [event["detail"] for event in events if event["event"] in ("failure", "error")]
     return failures[-1][-5000:] if failures else None
+
+
+def _marker_fixture(events: list[dict]) -> str | None:
+    fixtures = [event["detail"] for event in events if event["event"] == "fixture"]
+    return fixtures[-1] if fixtures else None
 
 
 def _probe(
@@ -888,6 +917,9 @@ def _targeted(
     failure = _marker_failure(events)
     if failure is not None:
         return "selected run recorded an import or execution failure"
+    fixture = _marker_fixture(events)
+    if fixture is not None:
+        return f"selected run recorded a test setup or cleanup failure: {fixture}"
     if status in ("error", "timed out"):
         return f"selected run {status}"
     if not any(event["event"] == "loaded" for event in events):
@@ -924,9 +956,12 @@ def _full(
     status, result, detail = _run_suite(root, tests, base, timeout, driver)
     events = _marker_events(marker, token)
     failure = _marker_failure(events)
+    fixture = _marker_fixture(events)
     prefix = f"full suite: {reason}"
     if failure is not None:
         return Outcome(decision.name, "error", prefix + ": mutant import or execution failure: " + failure)
+    if fixture is not None:
+        return Outcome(decision.name, "error", prefix + ": test setup or cleanup failure: " + fixture)
     if status in ("error", "timed out"):
         return Outcome(decision.name, status, f"{prefix}: {detail}")
     if not any(event["event"] == "loaded" for event in events):

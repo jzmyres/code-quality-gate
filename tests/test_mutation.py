@@ -32,6 +32,18 @@ class MutationRunnerTests(unittest.TestCase):
     def write_tests(self, code: str) -> None:
         (self.root / "tests" / "test_sample.py").write_text(code, encoding="utf-8")
 
+    def write_parent_child(self, child: str, assertion: str) -> None:
+        self.write_tests(
+            "import pathlib, subprocess, sys, unittest\n"
+            "class ParentTests(unittest.TestCase):\n"
+            "    def test_child(self):\n"
+            "        root = str(pathlib.Path(__file__).resolve().parent.parent)\n"
+            f"        code = {child!r}\n"
+            "        result = subprocess.run([sys.executable, '-I', '-c', code, root], "
+            "capture_output=True, text=True)\n"
+            f"        {assertion}\n"
+        )
+
     def write_child_unittest(
         self, body: str, assertion: str, *, result_class: str = "", result_before_import: bool = False,
         import_before_tests: bool = True,
@@ -50,16 +62,19 @@ class MutationRunnerTests(unittest.TestCase):
             + "".join(f"        {line}\n" for line in body.splitlines())
             + f"unittest.main({runner}argv=[sys.argv[0]])\n"
         )
-        self.write_tests(
-            "import pathlib, subprocess, sys, unittest\n"
-            "class ParentTests(unittest.TestCase):\n"
-            "    def test_child(self):\n"
-            "        root = str(pathlib.Path(__file__).resolve().parent.parent)\n"
-            f"        code = {child!r}\n"
-            "        result = subprocess.run([sys.executable, '-I', '-c', code, root], "
-            "capture_output=True, text=True)\n"
-            f"        {assertion}\n"
+        self.write_parent_child(child, assertion)
+
+    def write_child_fixture(
+        self, methods: str, assertion: str = "self.assertEqual(result.returncode, 0)"
+    ) -> None:
+        child = (
+            "import sys, unittest\nsys.path.insert(0, sys.argv[1])\n"
+            "from sample.decision import decision\n"
+            "class ChildTests(unittest.TestCase):\n"
+            + "".join(f"    {line}\n" for line in methods.splitlines())
+            + "unittest.main(argv=[sys.argv[0]])\n"
         )
+        self.write_parent_child(child, assertion)
 
     def decision(
         self,
@@ -378,6 +393,39 @@ class MutationRunnerTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assert_child_assertion_kills(name, body)
+
+    def assert_child_fixture_is_not_a_kill(self, name: str, methods: str) -> None:
+        self.source("def decision():\n    return True\n")
+        self.write_child_fixture(methods)
+        report = self.run_fixture(self.decision(name, "decision", "return True", operator="opposite_return"))
+        self.assertFalse(report.passed, str(report))
+        self.assertEqual(report.outcomes[0].status, "error")
+        self.assertIn("test setup or cleanup failure", report.outcomes[0].detail)
+        self.assertIn("ChildTests.test_value", report.outcomes[0].detail)
+
+    def test_child_setUp_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_child_fixture_is_not_a_kill(
+            "child_setup",
+            "def setUp(self):\n    self.assertTrue(decision())\ndef test_value(self):\n    pass",
+        )
+
+    def test_child_tearDown_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_child_fixture_is_not_a_kill(
+            "child_teardown",
+            "def test_value(self):\n    pass\ndef tearDown(self):\n    self.assertTrue(decision())",
+        )
+
+    def test_child_addCleanup_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_child_fixture_is_not_a_kill(
+            "child_cleanup",
+            "def setUp(self):\n    self.addCleanup(self.cleanup)\n"
+            "def cleanup(self):\n    self.assertTrue(decision())\n"
+            "def test_value(self):\n    pass",
+        )
+
+    def test_child_test_body_assertion_is_still_a_kill(self) -> None:
+        self.source("def decision():\n    return True\n")
+        self.assert_child_assertion_kills("child_body", "self.assertTrue(decision())")
 
     def test_child_unittest_custom_results_distinguish_errors_and_assertions(self) -> None:
         self.source(
