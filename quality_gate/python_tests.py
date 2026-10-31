@@ -9,7 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import output_patterns, policy
 from .coverage_tool import (
@@ -40,6 +40,10 @@ from .runner import (
 from .tools import installed_tool
 
 
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
+
+
 @dataclass(frozen=True)
 class PythonTestsSpec:
     run: tuple[str, ...]
@@ -48,6 +52,15 @@ class PythonTestsSpec:
     skipped_pattern: str | None
     skipped_pattern_re: re.Pattern[str] | None
     budget_seconds: int
+
+
+def _python_tests_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec
+
+    spec = _parse_python_tests(raw, path, full_key)
+    return ParsedSpec(spec, "test-count/1", ("tests",))
 
 
 def _parse_python_tests(

@@ -5,19 +5,34 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .elisp_tests import _lisp_string, _temporary, version_failure
+from .elisp_tests import _lisp_string, _temporary, probe_version
 from .json_input import load_json
 from .policy import GateError
 from .ratchet import Domain, Finding, Location
 from .runner import analysis_step, mark_step, record_diagnostics, run
 
 
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
+
+
 @dataclass(frozen=True)
 class ElispCrapSpec:
     requires: str
     decision_rules: dict[str, tuple[str, ...]]
+
+
+def _elisp_crap_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import _crap_spec
+    from .elisp_rules import parse_rules
+
+    rules = parse_rules(raw, path, f"{full_key}.decision_rules")
+    return _crap_spec(raw, root, path, full_key,
+                      lambda requires: ElispCrapSpec(requires, rules), "elisp-edebug/1")
 
 
 def selection_failure(context: Any, start: float) -> Any:
@@ -277,7 +292,7 @@ def _ratchet(context: Any, start: float, selected: list[str], findings: list[Fin
 
 def run_crap(context: Any) -> Any:
     """Read complexity once and score it against an earlier Edebug run."""
-    failure = version_failure(context)
+    _version, failure = probe_version(context)
     if failure is not None:
         return failure
     return _run_crap(context)

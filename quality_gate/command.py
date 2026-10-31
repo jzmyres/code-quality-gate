@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import output_patterns, policy
 from .policy import (
@@ -13,6 +13,10 @@ from .policy import (
 )
 from .runner import Diagnostics, RunResult, analysis_step, mark_step, record_diagnostics, run
 from .tools import current_tools, tool_binary
+
+
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,16 @@ class CommandSpec:
     tests_pattern_re: re.Pattern[str] | None = None
     skipped_pattern: str | None = None
     skipped_pattern_re: re.Pattern[str] | None = None
+
+
+def _command_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec
+
+    spec = _parse_command(raw, path, full_key)
+    evidence = ("tests",) if spec.tests_pattern is not None else ("static",)
+    return ParsedSpec(spec, "command-exit/1", evidence)
 
 
 def _parse_command(

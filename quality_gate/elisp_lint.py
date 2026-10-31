@@ -3,11 +3,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
 from .json_input import load_json
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
+
+
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,14 @@ class ElispLintSpec:
     load_path: tuple[str, ...]
     emacs: str
     budget_seconds: int
+
+
+def _elisp_lint_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec
+
+    return ParsedSpec(parse_spec(raw, root, path, full_key), "elisp-lint/1", ("static",))
 
 
 def parse_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ElispLintSpec:

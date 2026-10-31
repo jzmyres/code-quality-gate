@@ -230,7 +230,7 @@ class AnalysisWorkerTests(unittest.TestCase):
                     collector.stop()
                 filename = str(GATE / "quality_gate" / "verification.py")
                 data = collector.get_data()
-                self.assertIn(107, data.lines(filename) or [])
+                self.assertIn(136, data.lines(filename) or [])
                 self.assertEqual(data.has_arcs(), branch)
 
 

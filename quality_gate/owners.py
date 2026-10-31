@@ -14,7 +14,7 @@ import time
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .files import _shebang_interpreter
 from .json_input import load_json
@@ -24,6 +24,10 @@ from .owners_shell import shell_events
 from .policy import CheckDef, ConfigError, GateError, _check_keys, _config_error, _string, _string_list
 from .ratchet import Domain, Finding, Location
 from .runner import analysis_step, run
+
+
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
 
 
 KINDS = (
@@ -63,6 +67,21 @@ class OwnerRule:
 @dataclass(frozen=True)
 class OwnersSpec:
     rules: tuple[OwnerRule, ...]
+
+
+def _owners_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec, _baseline
+
+    baseline = _baseline(raw, root, path, full_key)
+    return ParsedSpec(
+        parse_owners(raw, path, full_key),
+        "owners/1",
+        ("static",),
+        threshold=0,
+        baseline=baseline,
+    )
 
 
 def _nonempty_list(raw: dict[str, Any], key: str, path: Path, where: str) -> tuple[str, ...]:

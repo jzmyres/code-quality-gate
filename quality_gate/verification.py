@@ -8,17 +8,46 @@ import time
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .coverage_tool import PRAGMA_NO_COVER
-from .policy import CheckDef, Config, GateError
+from .policy import CheckDef, Config, GateError, _string
 from .ratchet import Domain, Finding, Location
 from .runner import Diagnostics, StepTimeout, analysis_step
+
+
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
 
 
 @dataclass(frozen=True)
 class VerificationSpec:
     requires: str | None
+
+
+def _verification_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec, _baseline
+
+    requires: str | None = None
+    if "requires" in raw:
+        requires = _string(raw, "requires", path, f"{full_key}.requires")
+    baseline = _baseline(raw, root, path, full_key)
+    return ParsedSpec(
+        VerificationSpec(requires),
+        "verification/1",
+        (),
+        threshold=0,
+        baseline=baseline,
+        requires=requires,
+    )
+
+
+def _verification_entry_direction(subject: str, configured: str) -> str:
+    if subject.startswith("tests:") and subject.endswith(":executed"):
+        return "min"
+    return "max"
 
 
 NO_COVER = re.compile(PRAGMA_NO_COVER)

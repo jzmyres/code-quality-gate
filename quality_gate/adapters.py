@@ -18,7 +18,6 @@ from . import (
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
-    _integer,
     _number,
     _string,
 )
@@ -104,64 +103,6 @@ def _baseline(raw: dict[str, Any], root: Path, path: Path, full_key: str) -> Pat
     return baseline
 
 
-def _command_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .command import _parse_command
-
-    spec = _parse_command(raw, path, full_key)
-    evidence = ("tests",) if spec.tests_pattern is not None else ("static",)
-    return ParsedSpec(spec, "command-exit/1", evidence)
-
-
-def _clones_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .clones import DEFAULT_MIN_TOKENS, CloneSpec
-
-    min_tokens = _integer(
-        raw,
-        "min_tokens",
-        path,
-        f"{full_key}.min_tokens",
-        default=DEFAULT_MIN_TOKENS,
-        minimum=1,
-    )
-    baseline = _baseline(raw, root, path, full_key)
-    return ParsedSpec(
-        CloneSpec(min_tokens),
-        "jscpd-clone-occurrences/1",
-        ("duplication",),
-        threshold=0,
-        baseline=baseline,
-    )
-
-
-def _python_tests_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .python_tests import _parse_python_tests
-
-    spec = _parse_python_tests(raw, path, full_key)
-    return ParsedSpec(spec, "test-count/1", ("tests",))
-
-
-def _elisp_tests_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .elisp_tests import parse_spec
-
-    return ParsedSpec(parse_spec(raw, root, path, full_key), "test-count/1", ("tests",))
-
-
-def _elisp_lint_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .elisp_lint import parse_spec
-
-    return ParsedSpec(parse_spec(raw, root, path, full_key), "elisp-lint/1", ("static",))
-
-
 def _crap_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str,
     spec_type: Any, version: str,
@@ -184,65 +125,6 @@ def _crap_spec(
         baseline=baseline,
         requires=requires,
     )
-
-
-def _python_crap_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .python_crap import PythonCrapSpec
-
-    return _crap_spec(raw, root, path, full_key, PythonCrapSpec, "python-lines/1")
-
-
-def _elisp_crap_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .elisp_crap import ElispCrapSpec
-    from .elisp_rules import parse_rules
-
-    rules = parse_rules(raw, path, f"{full_key}.decision_rules")
-    return _crap_spec(raw, root, path, full_key,
-                      lambda requires: ElispCrapSpec(requires, rules), "elisp-edebug/1")
-
-
-def _verification_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .verification import VerificationSpec
-
-    requires: str | None = None
-    if "requires" in raw:
-        requires = _string(raw, "requires", path, f"{full_key}.requires")
-    baseline = _baseline(raw, root, path, full_key)
-    return ParsedSpec(
-        VerificationSpec(requires),
-        "verification/1",
-        (),
-        threshold=0,
-        baseline=baseline,
-        requires=requires,
-    )
-
-
-def _owners_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
-) -> ParsedSpec:
-    from .owners import parse_owners
-
-    baseline = _baseline(raw, root, path, full_key)
-    return ParsedSpec(
-        parse_owners(raw, path, full_key),
-        "owners/1",
-        ("static",),
-        threshold=0,
-        baseline=baseline,
-    )
-
-
-def _verification_entry_direction(subject: str, configured: str) -> str:
-    if subject.startswith("tests:") and subject.endswith(":executed"):
-        return "min"
-    return "max"
 
 
 def _spec_budget(spec: Any) -> int:
@@ -274,7 +156,7 @@ def adapter_names() -> tuple[str, ...]:
 register_adapter(AdapterDescriptor(
     "command",
     ("run", "budget_seconds", "must_match", "tests_pattern", "skipped_pattern"),
-    _command_spec,
+    command._command_spec,
     command._run_command,
     no_tests_hint=" (no tests_pattern)",
     argument_fields=("run",),
@@ -283,7 +165,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "clones",
     ("min_tokens", "baseline"),
-    _clones_spec,
+    clones._clones_spec,
     clones._run_clones,
     location_coverage="complete",
     subject_noun="clone",
@@ -293,7 +175,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "python_tests",
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
-    _python_tests_spec,
+    python_tests._python_tests_spec,
     python_tests._run_python_tests,
     argument_fields=("run",),
     budget=_spec_budget,
@@ -301,7 +183,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "elisp_tests",
     ("suite", "load_path", "emacs", "budget_seconds"),
-    _elisp_tests_spec,
+    elisp_tests._elisp_tests_spec,
     elisp_tests.run_tests,
     argument_fields=("emacs", "suite", "load_path"),
     budget=_spec_budget,
@@ -310,7 +192,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "elisp_compile",
     ("load_path", "emacs", "budget_seconds"),
-    _elisp_lint_spec,
+    elisp_lint._elisp_lint_spec,
     elisp_lint.run_lint,
     argument_fields=("emacs", "load_path"),
     budget=_spec_budget,
@@ -319,7 +201,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "elisp_checkdoc",
     ("load_path", "emacs", "budget_seconds"),
-    _elisp_lint_spec,
+    elisp_lint._elisp_lint_spec,
     elisp_lint.run_lint,
     argument_fields=("emacs", "load_path"),
     budget=_spec_budget,
@@ -328,7 +210,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "python_crap",
     ("requires", "threshold", "baseline"),
-    _python_crap_spec,
+    python_crap._python_crap_spec,
     python_crap._run_python_crap,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
@@ -337,7 +219,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "elisp_crap",
     ("requires", "threshold", "baseline", "decision_rules"),
-    _elisp_crap_spec,
+    elisp_crap._elisp_crap_spec,
     elisp_crap.run_crap,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
@@ -346,17 +228,17 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "verification",
     ("requires", "baseline"),
-    _verification_spec,
+    verification._verification_spec,
     verification._run_verification,
     location_coverage="partial",
     default_direction="max",
     requires_tests=True,
-    entry_direction=_verification_entry_direction,
+    entry_direction=verification._verification_entry_direction,
 ))
 register_adapter(AdapterDescriptor(
     "owners",
     ("baseline", "rule"),
-    _owners_spec,
+    owners._owners_spec,
     owners._run_owners,
     location_coverage="complete",
     fixed_header=(1, "enforced", "max"),

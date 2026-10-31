@@ -9,7 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .json_input import load_json
 from .policy import (
@@ -22,6 +22,10 @@ from .policy import (
 from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
 
 
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
+
+
 ELISP_MINIMUM_VERSION = "30.1"
 _VERSION_TEXT_LIMIT = 128
 
@@ -32,6 +36,14 @@ class ElispTestsSpec:
     load_path: tuple[str, ...]
     emacs: str
     budget_seconds: int
+
+
+def _elisp_tests_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec
+
+    return ParsedSpec(parse_spec(raw, root, path, full_key), "test-count/1", ("tests",))
 
 
 def _numeric_version(version: str) -> bool:
@@ -91,11 +103,6 @@ def probe_version(context: Any) -> tuple[str | None, Any]:
     return None, _check_result(context.check, start, "fail" if child.execution == "budget" else "unsupported",
                                execution=child.execution, budget_seconds=budget, reason=reason,
                                diagnostics=child.diagnostics())
-
-
-def version_failure(context: Any) -> Any:
-    """Refuse an unavailable or older Emacs for measurements without a version field."""
-    return probe_version(context)[1]
 
 
 def _validate_report_version(document: Any, version: str) -> None:

@@ -3,14 +3,15 @@
 A reusable, offline code-quality gate any repository can run, built to keep AI-written code high
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
-implementation is the `quality_gate/` package (`policy`, `command`, `files`, `tools`, `runner`, `ratchet`,
-`clones`, `owners`, `output_patterns`,
+implementation is the `quality_gate/` package (`policy`, `adapters`, `command`, `files`, `tools`, `runner`,
+`ratchet`, `clones`, `owners`, `output_patterns`,
 `python_tests`, `python_crap`, `elisp_tests`, `elisp_crap`, `elisp_lint`, `elisp/qg-elisp-child.el`,
 `elisp/qg-elisp-complexity.el`, `elisp/qg-elisp-lint.el`, `verification`, `covrun`,
 `coverage_tool`, `checks`, `gate_result`,
 `trust`, `cli`);
-`qg.py` is only the entry point. Each adapter module owns its specification type and
-adapter-specific parser; `policy` holds shared value readers and policy validation.
+`qg.py` is only the entry point. Each adapter module owns its specification type, parsing and
+adapter-specific rules. `adapters.py` declares descriptors and keeps shared baseline and CRAP
+specification helpers; `policy` holds shared value readers and policy validation.
 Core package modules import only core package modules, with `adapters.py` the sole registry allowed to
 import adapters.
 `check --policy-from REV` takes its policy, baselines, tool lock and protected paths from `REV`;

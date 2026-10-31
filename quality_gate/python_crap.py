@@ -5,7 +5,7 @@ import ast
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .coverage_tool import coverage_config_data, import_coverage
 from .policy import CheckDef, GateError, UnsupportedError
@@ -13,9 +13,21 @@ from .ratchet import Domain, Finding, Location
 from .runner import Diagnostics, StepTimeout, analysis_step
 
 
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
+
+
 @dataclass(frozen=True)
 class PythonCrapSpec:
     requires: str
+
+
+def _python_crap_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import _crap_spec
+
+    return _crap_spec(raw, root, path, full_key, PythonCrapSpec, "python-lines/1")
 
 
 @dataclass(frozen=True)

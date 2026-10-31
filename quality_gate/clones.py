@@ -7,7 +7,7 @@ import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .json_input import load_json
 from .policy import (
@@ -15,6 +15,7 @@ from .policy import (
     CheckDef,
     GateError,
     UnsupportedError,
+    _integer,
 )
 from .ratchet import Domain, Finding, Location, RatchetResult
 from .runner import (
@@ -28,12 +29,39 @@ from .runner import (
 from .tools import tool_binary
 
 
+if TYPE_CHECKING:
+    from .adapters import ParsedSpec
+
+
 DEFAULT_MIN_TOKENS = 50
 
 
 @dataclass(frozen=True)
 class CloneSpec:
     min_tokens: int
+
+
+def _clones_spec(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> ParsedSpec:
+    from .adapters import ParsedSpec, _baseline
+
+    min_tokens = _integer(
+        raw,
+        "min_tokens",
+        path,
+        f"{full_key}.min_tokens",
+        default=DEFAULT_MIN_TOKENS,
+        minimum=1,
+    )
+    baseline = _baseline(raw, root, path, full_key)
+    return ParsedSpec(
+        CloneSpec(min_tokens),
+        "jscpd-clone-occurrences/1",
+        ("duplication",),
+        threshold=0,
+        baseline=baseline,
+    )
 
 
 FORMAT_BY_SUFFIX = {
