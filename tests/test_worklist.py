@@ -163,6 +163,73 @@ def run_worklist(
     )
 
 
+def evidence_runner(
+    case: FixtureCase, *, fail_cleanup: bool = False
+) -> tuple[Path, Path]:
+    paths = case.base / "worklist-evidence-paths.jsonl"
+    runner = case.base / "worklist-evidence-runner.py"
+    failure = ""
+    if fail_cleanup:
+        failure = (
+            "    def cleanup():\n"
+            "        temporary._finalizer.detach()\n"
+            "        raise OSError('cleanup denied')\n"
+            "    temporary.cleanup = cleanup\n"
+        )
+    runner.write_text(
+        "import json, runpy, sys\n"
+        f"sys.path.insert(0, {str(case.gate)!r})\n"
+        "from quality_gate import checks\n"
+        "original = checks._new_evidence_directory\n"
+        "def record(directories, **options):\n"
+        "    temporary = original(directories, **options)\n"
+        f"    with open({str(paths)!r}, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write(json.dumps(temporary.name) + '\\n')\n"
+        + failure
+        + "    return temporary\n"
+        "checks._new_evidence_directory = record\n"
+        f"runpy.run_path({str(case.gate / 'qg.py')!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    return runner, paths
+
+
+def run_worklist_with_evidence(
+    case: FixtureCase, *args: str, fail_cleanup: bool = False
+) -> tuple[subprocess.CompletedProcess[str], list[Path]]:
+    runner, paths = evidence_runner(case, fail_cleanup=fail_cleanup)
+    prefix = case.python_prefix()
+    command = [
+        prefix[0], "-W", "error::ResourceWarning", *prefix[1:], str(runner),
+        "--repo", str(case.repo), "worklist", *args,
+    ]
+    result = subprocess.run(
+        command, cwd=str(case.repo), env=case.env(case.default_tool_env()),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120,
+    )
+    recorded = (
+        [Path(json.loads(line)) for line in paths.read_text(encoding="utf-8").splitlines()]
+        if paths.exists()
+        else []
+    )
+    return result, recorded
+
+
+def assert_evidence_removed(
+    case: FixtureCase,
+    result: subprocess.CompletedProcess[str],
+    directories: list[Path],
+) -> None:
+    case.assertTrue(directories, output(result))
+    case.assertTrue(
+        any(directory.name.startswith("qg-coverage-") for directory in directories),
+        directories,
+    )
+    for directory in directories:
+        case.assertFalse(directory.exists(), str(directory))
+
+
 def snapshot_tree(repo: Path) -> dict[str, bytes]:
     snapshot: dict[str, bytes] = {}
     for path in sorted(repo.rglob("*")):
@@ -230,6 +297,26 @@ class WorklistOrderTests(FixtureCase):
         ])
         self.assertGreater(rows[0]["churn_x_value"], rows[1]["churn_x_value"])
         self.assertEqual(f"{rows[0]['churn_x_value']:.1f}", f"{rows[1]['churn_x_value']:.1f}")
+
+    def test_python_crap_evidence_is_removed_explicitly(self) -> None:
+        result, directories = run_worklist_with_evidence(self, "--json", "crap")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertNotIn("ResourceWarning", result.stderr)
+        self.assertNotIn("Implicitly cleaning up", result.stderr)
+        assert_evidence_removed(self, result, directories)
+
+    def test_cleanup_failure_is_reported_and_exits_one(self) -> None:
+        result, directories = run_worklist_with_evidence(
+            self, "--json", "crap", fail_cleanup=True
+        )
+        self.assertNotEqual(result.returncode, 0, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn("cannot remove evidence directory", result.stderr)
+        self.assertIn("cleanup denied", result.stderr)
+        self.assertTrue(directories, output(result))
+        for directory in directories:
+            self.assertIn(str(directory), result.stderr)
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 class WorklistElispTests(FixtureCase):
@@ -387,6 +474,13 @@ class WorklistUnreliableTests(FixtureCase):
         self.assertIn("got fail", result.stderr)
         self.assertNotIn("CHURN", result.stdout)
         self.assertNotIn("pkg/alpha.py:alpha", result.stdout)
+
+    def test_failing_dependency_still_releases_its_evidence(self) -> None:
+        result, directories = run_worklist_with_evidence(self, "--json", "crap")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("worklist: tests:", result.stderr)
+        self.assertNotIn("ResourceWarning", result.stderr)
+        assert_evidence_removed(self, result, directories)
 
 
 class WorklistGitFailureTests(FixtureCase):

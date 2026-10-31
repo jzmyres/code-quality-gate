@@ -304,8 +304,9 @@ matches more than once (`ambiguous test summary`), `skipped_pattern` matches mor
 installed. On `pass` the adapter combines the registered coverage datasets and keeps the combined data
 as the evidence for checks that require it. The core explicitly removes test evidence directories
 after their last dependent check, including when a check fails or exceeds its budget, and reports
-cleanup failures as diagnostics. Pattern matching runs in an interruptible child bounded by
-the check's remaining budget, together with coverage combination.
+cleanup failures as diagnostics. The `worklist` command follows the same rule for the checks it
+runs, and a cleanup failure makes it exit non-zero. Pattern matching runs in an interruptible child
+bounded by the check's remaining budget, together with coverage combination.
 
 A completed run that executed tests also reports normalized `test_results`. `selected` is the parsed
 run count and `skipped` the parsed skipped count, as above. For a failing run, `failed` is the number

@@ -6,7 +6,7 @@ import json
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -649,7 +649,7 @@ def _run_policy_checks(
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
-    last_users = _evidence_last_users(config)
+    last_users = _evidence_last_users(config.checks.values())
     try:
         for check in config.checks.values():
             if inventory_code != 0:
@@ -679,10 +679,10 @@ def _run_policy_checks(
     return results
 
 
-def _evidence_last_users(config: Config) -> dict[str, str]:
+def _evidence_last_users(checks: Iterable[CheckDef]) -> dict[str, str]:
     last_users: dict[str, str] = {}
     prior: dict[str, CheckDef] = {}
-    for check in config.checks.values():
+    for check in checks:
         last_users[check.id] = check.id
         dependencies = (
             _test_check_dependencies(check, prior)

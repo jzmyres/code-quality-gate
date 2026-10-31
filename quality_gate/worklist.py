@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import adapter_for
-from .checks import CheckResult, _inventory_check, _test_check_dependencies, run_check
+from .checks import (
+    CheckResult,
+    _evidence_last_users,
+    _inventory_check,
+    _release_evidence,
+    _test_check_dependencies,
+    run_check,
+)
 from .files import _type_name, enumerate_files, git_argv
 from .policy import CheckDef, Config, GateError, UsageError
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
@@ -284,26 +291,38 @@ def _copy_config(config: Config, root: Path) -> Config:
 
 def _run_selected(
     root: Path, config: Config, selected: list[CheckDef]
-) -> tuple[CheckResult, dict[str, CheckResult], list[str]]:
+) -> tuple[CheckResult, dict[str, CheckResult], list[str], list[str]]:
     order = _needed_order(config, selected)
     inventory, files, classes, code = _inventory_check(root, config)
     if code != 0:
-        return inventory, {}, order
+        return inventory, {}, order, []
     results: dict[str, CheckResult] = {}
-    for check in config.checks.values():
-        if check.id not in order:
-            continue
-        print(f"check: {check.id} ({check.adapter})", flush=True)
-        results[check.id] = run_check(
-            root,
-            config,
-            check,
-            files,
-            classes,
-            prefix=f"check: {check.id}",
-            prior=results,
+    last_users = _evidence_last_users(
+        [config.checks[identifier] for identifier in order]
+    )
+    cleanup_errors: list[str] = []
+    try:
+        for check in config.checks.values():
+            if check.id not in order:
+                continue
+            print(f"check: {check.id} ({check.adapter})", flush=True)
+            results[check.id] = run_check(
+                root,
+                config,
+                check,
+                files,
+                classes,
+                prefix=f"check: {check.id}",
+                prior=results,
+            )
+            cleanup_errors.extend(
+                _release_evidence(list(results.values()), last_users, check.id)
+            )
+    finally:
+        cleanup_errors.extend(
+            _release_evidence(list(results.values()), last_users)
         )
-    return inventory, results, order
+    return inventory, results, order, cleanup_errors
 
 
 def _passes(result: CheckResult) -> bool:
@@ -517,7 +536,7 @@ def _collect_slack(
 
 def _run_copied(
     root: Path, config: Config, selected: list[CheckDef]
-) -> tuple[CheckResult, dict[str, CheckResult], list[str]]:
+) -> tuple[CheckResult, dict[str, CheckResult], list[str], list[str]]:
     _reject_original_arguments(root, config, selected)
     with tempfile.TemporaryDirectory(prefix="qg-worklist-") as temporary:
         copied_root = Path(temporary) / "repo"
@@ -571,13 +590,15 @@ def _worklist_report(
     if not selected:
         return 0, [], [], []
     try:
-        inventory, results, order = _run_copied(root, config, selected)
+        inventory, results, order, cleanup_errors = _run_copied(root, config, selected)
     except (GateError, OSError) as error:
         print(f"worklist: {error}", file=sys.stderr)
         return 1, [], [], []
     failure = _selected_failure(inventory, results, order)
     if failure is not None:
         print(_failure_message(failure), file=sys.stderr)
+        return 1, [], [], []
+    if cleanup_errors:
         return 1, [], [], []
     try:
         rows, notes = _collect(root, selected, results)
