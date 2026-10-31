@@ -453,5 +453,74 @@ class BaselineFileTests(unittest.TestCase):
         self.assertIn("list of strings", str(raised.exception))
 
 
+class BaselineExtrasTests(unittest.TestCase):
+    def load_extras(self, extra_lines: str):
+        descriptor = dataclasses.replace(
+            adapters.adapter_for("clones"), extras=("tags", "files")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            path.write_text(
+                'check = "metric"\nmetric_version = "metric/1"\n'
+                '[[entry]]\nsubject = "s"\nbound = 1\nreason = ""\n'
+                + extra_lines,
+                encoding="utf-8",
+            )
+            return ratchet.load_baseline(
+                path,
+                check_id="metric",
+                metric_version="metric/1",
+                allowed_extras=descriptor.extras,
+                adapter=descriptor,
+            )
+
+    def empty_reason_errors(self, extra_lines: str) -> str:
+        entries = self.load_extras(extra_lines)
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            result = ratchet.evaluate(
+                [], entries, threshold=0, enforcement="enforced",
+                prefix="check: metric", adapter="metric", domain=ratchet.Domain.all(),
+            )
+        self.assertFalse(result.satisfied)
+        return errors.getvalue()
+
+    def test_non_files_extra_must_be_a_list(self) -> None:
+        with self.assertRaisesRegex(
+            policy.GateError, r"entry\[0\]\.tags: expected a list of strings"
+        ):
+            self.load_extras('files = ["a.py"]\ntags = "not a list"\n')
+
+    def test_non_files_extra_members_must_be_strings(self) -> None:
+        with self.assertRaisesRegex(
+            policy.GateError, r"entry\[0\]\.tags: expected a list of strings"
+        ):
+            self.load_extras('files = ["a.py"]\ntags = ["review", 1]\n')
+
+    def test_empty_reason_lists_extras_in_declaration_order(self) -> None:
+        errors = self.empty_reason_errors(
+            'files = ["a.py", "b.py"]\ntags = ["review", "legacy"]\n'
+        )
+        self.assertEqual(
+            errors,
+            "check: metric: baseline entry s: empty reason "
+            "(expected a non-empty reason)"
+            " (tags: review, legacy) (files: a.py, b.py)\n",
+        )
+
+    def test_empty_reason_omits_empty_extra_lists(self) -> None:
+        for extra_lines, detail in (
+            ('files = ["a.py"]\ntags = []\n', " (files: a.py)"),
+            ('files = []\ntags = ["review"]\n', " (tags: review)"),
+            ('files = []\ntags = []\n', ""),
+        ):
+            with self.subTest(extra_lines=extra_lines):
+                self.assertEqual(
+                    self.empty_reason_errors(extra_lines),
+                    "check: metric: baseline entry s: empty reason "
+                    f"(expected a non-empty reason){detail}\n",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
