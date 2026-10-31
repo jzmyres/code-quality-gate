@@ -3,7 +3,7 @@
 Every adapter's identity lives here exactly once: the configuration keys it
 accepts, its parser, its runner, its argument fields, location coverage, number display, subject
 noun, failure wording and direction rule, whether it produces normalized test results, the baseline
-extras it trusts, and its baseline and budget handling.
+extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from . import (
-    clones, command, elisp_crap, elisp_lint, elisp_tests, owners, python_crap, python_tests,
+    clones, command, coverage_tool, elisp_crap, elisp_lint, elisp_tests, owners, python_crap, python_tests,
     ratchet, verification,
 )
 from .policy import (
@@ -76,6 +76,7 @@ class AdapterDescriptor:
     parse_candidate_inputs: bool = False
     argument_fields: tuple[str, ...] = ()
     no_tests_hint: str = ""
+    process_setup: Callable[[], None] | None = None
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
@@ -153,6 +154,13 @@ def adapter_names() -> tuple[str, ...]:
     return tuple(ADAPTERS)
 
 
+def setup_process() -> None:
+    """Run the per-process setup declared by each registered adapter."""
+    for descriptor in ADAPTERS.values():
+        if descriptor.process_setup is not None:
+            descriptor.process_setup()
+
+
 register_adapter(AdapterDescriptor(
     "command",
     ("run", "budget_seconds", "must_match", "tests_pattern", "skipped_pattern"),
@@ -177,6 +185,7 @@ register_adapter(AdapterDescriptor(
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     python_tests._python_tests_spec,
     python_tests._run_python_tests,
+    process_setup=coverage_tool.install_worker_measurement,
     argument_fields=("run",),
     budget=_spec_budget,
 ))

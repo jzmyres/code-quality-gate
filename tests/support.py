@@ -22,7 +22,7 @@ if str(GATE) not in sys.path:
     sys.path.insert(0, str(GATE))
 
 # The test process can itself run under covrun, just like the gate entry point.
-importlib.import_module("quality_gate.coverage_tool").install_worker_measurement()
+importlib.import_module("quality_gate.adapters").setup_process()
 
 BASE_CONFIG = """\
 schema = 2

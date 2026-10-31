@@ -180,15 +180,15 @@ class ArchitectureTests(unittest.TestCase):
             "json_input", "output_patterns", "payload", "policy", "ratchet", "regexrun",
             "runner", "tools", "trust", "worklist",
         }
-        for module in sorted(core):
-            path = GATE / "quality_gate" / f"{module}.py"
+        for module in sorted(core | {"qg"}):
+            path = GATE / "qg.py" if module == "qg" else GATE / "quality_gate" / f"{module}.py"
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for imported in _package_imports(tree):
                 if module != "adapters":
                     with self.subTest(module=module, imported=imported):
                         self.assertIn(
                             imported, core,
-                            f"quality_gate.{module} imports quality_gate.{imported} outside the core",
+                            f"{path.relative_to(GATE)} imports quality_gate.{imported} outside the core",
                         )
 
 
