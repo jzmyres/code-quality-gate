@@ -57,6 +57,7 @@ jobs:
         if: matrix.name == 'ubuntu2604' && steps.emacs-cache.outputs.cache-hit != 'true'
         # Measured 99 s (cold cache, ubuntu2604) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
         # GitHub run 41173761182, b6ce8f6, 2026-10-31 skipped this build (cache hit); keep 99 s.
+        # GitHub runs 41184599603 (8fe0d95) and 41191759600 (8d56150), 2026-10-31, also skipped it (cache hit).
         # Rule: smallest multiple of 5 minutes at least 3 x largest recorded measurement / 60.
         # 3 x 99 s = 297 s; round up to a multiple of 5 minutes: 5 minutes.
         timeout-minutes: 5
@@ -123,6 +124,10 @@ jobs:
         # Measured 576 s (ubuntu2604) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
         # Measured 592 s (debian13) on GitHub run 41173761182, b6ce8f6, 2026-10-31.
         # Measured 641 s (ubuntu2604) on GitHub run 41173761182, b6ce8f6, 2026-10-31.
+        # Measured 578 s (debian13) on GitHub run 41184599603, 8fe0d95, 2026-10-31.
+        # Measured 482 s (ubuntu2604) on GitHub run 41184599603, 8fe0d95, 2026-10-31.
+        # Measured 617 s (debian13) on GitHub run 41191759600, 8d56150, 2026-10-31.
+        # Measured 474 s (ubuntu2604) on GitHub run 41191759600, 8d56150, 2026-10-31.
         # Rule: smallest multiple of 5 minutes at least 3 x largest recorded measurement / 60.
         # 3 x 641 s = 1923 s; round up to a multiple of 5 minutes: 35 minutes.
         timeout-minutes: 35
@@ -131,9 +136,9 @@ jobs:
   mutation:
     runs-on: ubuntu-latest
     container: debian:13
-    # Mutation step 270 + setup allowance 10 minutes for packages, checkout, cache and tool fetching.
-    # The 280-minute job is within GitHub's 360-minute maximum for a hosted job.
-    timeout-minutes: 280
+    # Mutation step 65 + setup allowance 10 minutes for packages, checkout, cache and tool fetching.
+    # The 75-minute job is within GitHub's 360-minute maximum for a hosted job.
+    timeout-minutes: 75
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
     steps:
@@ -156,10 +161,10 @@ jobs:
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Mutation-test gate decisions
-        # Mutations run the complete suite for each decision, with four isolated copies at a time.
-        # Measured 3809 s on GitHub run 41136060160, bd3b0b9, 2026-10-30.
-        # Measured 5308 s on GitHub run 41173761182, b6ce8f6, 2026-10-31.
+        # Each mutant first runs the tests that reach its target; the full suite confirms survivors and unattributed or unreached cases.
+        # Measured 1269 s on GitHub run 41191759600, 8d56150, 2026-10-31.
+        # Commit 563d187 replaced the complete-suite runner, retiring the earlier measurements (3809 s and 5308 s).
         # Rule: smallest multiple of 5 minutes at least 3 x largest recorded measurement / 60.
-        # 3 x 5308 s = 15924 s; round up to a multiple of 5 minutes: 270 minutes.
-        timeout-minutes: 270
+        # 3 x 1269 s = 3807 s; round up to a multiple of 5 minutes: 65 minutes.
+        timeout-minutes: 65
         run: make mutation
