@@ -88,6 +88,112 @@ class MutationRunnerTests(unittest.TestCase):
         self.assertTrue(report.passed, str(report))
         self.assertEqual(report.outcomes[0].status, "killed")
 
+    def run_targeted_fixture(self, name: str) -> mutation.Report:
+        report = self.run_fixture(
+            self.decision(name, "decision", "return True", operator="opposite_return")
+        )
+        self.assertTrue(report.passed, str(report))
+        self.assertEqual(report.outcomes[0].status, "killed")
+        self.assertIn("1 selected test", report.outcomes[0].detail)
+        self.assertNotIn("full suite", report.outcomes[0].detail)
+        return report
+
+    def test_probe_attributes_a_child_process_hit_to_the_parent_test(self) -> None:
+        self.source("def decision():\n    return True\n")
+        self.write_child_unittest(
+            "self.assertTrue(decision())", "self.assertEqual(result.returncode, 0)"
+        )
+        self.run_targeted_fixture("child_hit")
+
+    def test_targeted_kill_skips_the_full_suite(self) -> None:
+        counter = self.root / "full-suite-runs"
+        self.source("def decision():\n    return True\n")
+        self.write_tests(
+            "import pathlib, unittest\nfrom sample.decision import decision\n"
+            "class TestDecision(unittest.TestCase):\n"
+            "    def test_reach(self):\n        self.assertTrue(decision())\n"
+            "    def test_other(self):\n"
+            f"        path = pathlib.Path({str(counter)!r})\n"
+            "        count = int(path.read_text()) if path.exists() else 0\n"
+            "        path.write_text(str(count + 1))\n"
+        )
+        self.run_targeted_fixture("targeted")
+        self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+
+    def test_selected_tests_passing_sends_the_mutant_to_the_full_suite(self) -> None:
+        self.source(
+            "VALUE = None\n"
+            "def decision():\n"
+            "    global VALUE\n"
+            "    VALUE = 1 >= 1\n"
+            "    return VALUE\n"
+        )
+        self.write_tests(
+            "import unittest\nimport sample.decision as sample\n"
+            "class TestSelection(unittest.TestCase):\n"
+            "    def test_call(self):\n        sample.decision()\n"
+            "    def test_other(self):\n        self.assertIs(sample.VALUE, True)\n"
+        )
+        report = self.run_fixture(self.decision("selection", "decision", "1 >= 1"))
+        self.assertTrue(report.passed, str(report))
+        self.assertEqual(report.outcomes[0].status, "killed")
+        self.assertIn("full suite: selected tests passed", report.outcomes[0].detail)
+        self.assertIn("test_other", report.outcomes[0].detail)
+
+    def test_selected_tests_passing_can_still_survive_the_full_suite(self) -> None:
+        self.source(
+            "VALUE = None\n"
+            "def decision():\n"
+            "    global VALUE\n"
+            "    VALUE = 1 >= 1\n"
+            "    return VALUE\n"
+        )
+        self.write_tests(
+            "import unittest\nimport sample.decision as sample\n"
+            "class TestSelection(unittest.TestCase):\n"
+            "    def test_call(self):\n        sample.decision()\n"
+        )
+        report = self.run_fixture(self.decision("selection", "decision", "1 >= 1"))
+        self.assertFalse(report.passed)
+        self.assertEqual(report.outcomes[0].status, "survived")
+        self.assertIn("full suite: selected tests passed", report.outcomes[0].detail)
+        self.assertIn("the suite passed with the mutation", report.outcomes[0].detail)
+
+    def test_unreached_mutant_goes_straight_to_the_full_suite(self) -> None:
+        self.source("def decision():\n    return True\n")
+        self.write_tests(
+            "import unittest\nfrom sample.decision import decision\n"
+            "class TestImport(unittest.TestCase):\n"
+            "    def test_import(self):\n        self.assertIsNotNone(decision)\n"
+        )
+        report = self.run_fixture(
+            self.decision("unreached", "decision", "return True", operator="opposite_return")
+        )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.outcomes[0].status, "survived")
+        self.assertIn("full suite: no test reached", report.outcomes[0].detail)
+
+    def test_order_dependent_selection_is_not_a_kill(self) -> None:
+        self.source("def decision():\n    return True\n")
+        self.write_tests(
+            "import unittest\nfrom sample.decision import decision\n"
+            "STATE = False\n"
+            "class TestOrder(unittest.TestCase):\n"
+            "    def test_first(self):\n"
+            "        global STATE\n"
+            "        STATE = True\n"
+            "    def test_second(self):\n"
+            "        self.assertTrue(STATE)\n"
+            "        self.assertTrue(decision())\n"
+        )
+        report = self.run_fixture(
+            self.decision("order", "decision", "return True", operator="opposite_return")
+        )
+        self.assertTrue(report.passed, str(report))
+        self.assertEqual(report.outcomes[0].status, "killed")
+        self.assertIn("full suite: selection failed unmutated", report.outcomes[0].detail)
+        self.assertNotIn("1 selected test", report.outcomes[0].detail)
+
     def test_tested_decision_is_killed_and_untested_decision_survives(self) -> None:
         source = "def tested(x):\n    return x >= 1\n\ndef untested(x):\n    return x >= 1\n"
         self.source(source)

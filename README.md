@@ -1200,8 +1200,11 @@ baseline, policy, protected-path, prune and identity rules.
 ## Mutation-testing the gate
 
 `make mutation` runs the gate's own complete unittest suite against isolated copies of its code.
-It freezes the source and tests once, requires a passing unmodified suite, then runs one targeted
-mutation per copy. The declared
+It freezes the source and tests once and requires a passing unmodified suite. It then runs the
+complete suite once more on an unmutated copy as a probe: in that copy, each declared target records
+a "reached" event naming its decision and the current test. The runner exposes the current test ID
+through the environment, so hits from child processes are attributed to the test that started them;
+a hit that cannot be attributed is recorded as unattributed. The declared
 decisions in `tests/mutate_gate.py` cover baseline bounds, threshold and expiry comparisons,
 verification floors, prune refusal and exit status, gate decisions, trust-root identity and protection,
 single-owner checks, and the rule that an ERT run must execute a test. They use comparison flips, boolean negation, an opposite boolean return,
@@ -1210,14 +1213,24 @@ possible change.
 
 Each copied module records its own run in a marker file: a line when the import starts, one when
 the import completes, and a traceback for any uncaught exception or `unittest` error, including errors
-in subtests and in child processes that import the module. A mutant is killed only when the same
-complete test suite runs, loads and imports that mutant, and fails an assertion while the marker file
-records no import or execution failure; assertion text is never inspected. Any recorded error makes
-the mutant an error even if the parent suite passes. Survivors, timeouts, a missing or incomplete
-marker, a recorded import or execution failure, skipped tests, suite errors, invalid decisions and a
-failing unmodified suite all fail the command. Each suite has a 900-second limit; independent mutant
-copies run concurrently and their results are printed in declaration order. The slow mutation run is
-separate from `make check` and uses the same pinned tools cache as the ordinary tests.
+in subtests and in child processes that import the module. A mutant first runs only the tests the
+probe recorded as reaching its target, in their original order, stopping at the first assertion
+failure. That failure is a kill only when the mutant's module was loaded and imported, the marker
+records no import or execution error or fixture failure, and the same selection passes on an
+unmutated copy; each distinct selection is checked once unmutated and reused. A mutant whose selected
+tests all pass, one that no test reached, one with unattributed hits, or one whose selection fails
+unmutated gets the complete-suite run: it is killed only when the same complete suite runs, loads and imports that
+mutant, and fails an assertion while the marker file records no import or execution failure;
+assertion text is never inspected. Any recorded error makes the mutant an error even if the parent
+suite passes. Survivors are therefore mutants that survived the complete suite, so the kill and
+survival guarantees are unchanged. Survivors, timeouts, a missing or incomplete marker, a recorded
+import or execution failure, skipped tests, suite errors, invalid decisions and a failing unmodified
+suite all fail the command; if the probe run itself does not pass, every mutant uses the complete
+suite. Each mutant's line names the path that decided it: the number of selected tests or "full
+suite" with the reason, and the final summary reports the probe time and the total time. Each suite
+has a 900-second limit; independent mutant copies run concurrently and their results are printed in
+declaration order. The slow mutation run is separate from `make check` and uses the same pinned tools
+cache as the ordinary tests.
 
 To protect another decision, add a named `Decision` to the list with its module, function, operator,
 exact source expression or statement, and a reason. The target must identify exactly one applicable
