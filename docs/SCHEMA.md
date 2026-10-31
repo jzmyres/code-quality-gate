@@ -710,11 +710,14 @@ Check keys:
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
 * `test_results` - normalized test outcomes when available: `selected`, `passed`, `failed`,
-  `skipped`, and `failures` (strings naming unexpected results). The Python tests adapter reads
-  `failed` and `failures` from one `FAILED (failures=N, errors=M)` summary and its matching
-  `FAIL:` and `ERROR:` test headings, naming each test by its id; a failing run without that
-  consistent result data has no `test_results`. The Emacs Lisp adapter reads them from its child
-  result document. Passed counts expected results; selected equals passed plus failed plus skipped.
+  `skipped`, and `failures` (strings naming unexpected results). The Python tests adapter takes
+  the failure event count from one `FAILED (failures=N, errors=M)` summary and matches it against
+  the `FAIL:` and `ERROR:` test headings, then names each distinct failing test by the id in its
+  first parenthesized group, in first-seen order; `failed` counts failing tests, so a test with
+  several failing subtests counts once. A failing run without that consistent result data, with a
+  heading that has no test id, or with more distinct test ids than executed tests, has no
+  `test_results`. The Emacs Lisp adapter reads them from its child result document. Passed counts
+  expected results; selected equals passed plus failed plus skipped.
 * `tool` - optional measured tool identity supplied by any adapter: an object with string
   `name` and `version` fields, for example `{"name": "Emacs", "version": "30.1"}` for an
   Emacs Lisp test, compile or checkdoc measurement. It is absent when no identity has been

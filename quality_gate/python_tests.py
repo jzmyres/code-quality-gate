@@ -162,9 +162,22 @@ def _unittest_failure_count(summary: str) -> int | None:
     return failed or None
 
 
-def _unittest_failure_name(heading: str) -> str:
-    match = re.search(r"\(([^()]+)\)", heading)
-    return match.group(1) if match is not None else heading
+def _unittest_failure_name(heading: str) -> str | None:
+    match = re.search(r"\(([^()]*)\)", heading)
+    if match is None or not match.group(1):
+        return None
+    return match.group(1)
+
+
+def _unittest_failure_names(headings: list[str]) -> tuple[str, ...] | None:
+    failures: list[str] = []
+    for heading in headings:
+        name = _unittest_failure_name(heading)
+        if name is None:
+            return None
+        if name not in failures:
+            failures.append(name)
+    return tuple(failures)
 
 
 def _unittest_outcomes(
@@ -177,7 +190,10 @@ def _unittest_outcomes(
     headings = _UNITTEST_FAILURE_HEADING.findall(combined)
     if failed is None or len(headings) != failed:
         return None
-    return failed, tuple(_unittest_failure_name(item) for item in headings)
+    failures = _unittest_failure_names(headings)
+    if failures is None:
+        return None
+    return len(failures), failures
 
 
 def _counted_test_results(
