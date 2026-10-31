@@ -37,6 +37,31 @@ ELISP_SOURCE = """\
 ;;; sample.el ends here
 """
 
+IGNORE_START = "jscpd:ignore-" + "start"
+IGNORE_END = "jscpd:ignore-" + "end"
+
+DUPLICATE_FUNCTION = """\
+def summarize_files(paths):
+    count = 0
+    total = 0
+    for path in paths:
+        if path is None:
+            continue
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8")
+        count = count + 1
+        total = total + len(content)
+    if count == 0:
+        return "0 files, 0 bytes"
+    return f"{count} files, {total} bytes"
+"""
+
+
+def wrapped_in_directives(body: str) -> str:
+    return f"# {IGNORE_START}\n{body}# {IGNORE_END}\n"
+
+
 SHELL_SOURCE = """\
 #!/bin/bash
 set -euo pipefail
@@ -268,6 +293,67 @@ class CloneGateTests(FixtureCase):
         env = self.clone_env([])
         result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("clones: 0 clones", result.stdout)
+
+    def test_ignore_directives_fail_before_clone_evidence(self) -> None:
+        self.write_config(with_clones())
+        self.add_file(
+            "first.py",
+            "UNIQUE_FIRST = 1\n\n\n" + wrapped_in_directives(DUPLICATE_FUNCTION),
+        )
+        self.add_file(
+            "second.py",
+            "UNIQUE_SECOND = 2\n\n\n" + wrapped_in_directives(DUPLICATE_FUNCTION),
+        )
+        self.commit_all()
+        for arguments in ((), ("--changed-from", "HEAD")):
+            with self.subTest(arguments=arguments):
+                result, document = self.run_json(
+                    *arguments, env=self.default_tool_env()
+                )
+                text = output(result)
+                self.assertEqual(result.returncode, 1, text)
+                self.assertIn("first.py:4", text)
+                self.assertIn(IGNORE_START, text)
+                self.assertIn("found 4 ignore directives", text)
+                self.assertIn("baseline entry with a reason", text)
+                check = self.check_by_id(document, "clones")
+                self.assertEqual(check["outcome"], "error")
+                self.assertIn("first.py:4", check["reason"])
+
+    def test_one_ignore_directive_fails_without_clones(self) -> None:
+        env = self.clone_env([])
+        self.add_file("a.py", "VALUE = 1\n# " + IGNORE_END + "\n")
+        self.clone_failure(
+            env,
+            "a.py:2",
+            IGNORE_END,
+            "found 1 ignore directive",
+            "baseline entry with a reason",
+        )
+
+    def test_clean_pair_of_real_sources_passes(self) -> None:
+        self.write_config(with_clones())
+        (self.repo / "a.py").unlink()
+        self.add_file("first.py", DUPLICATE_FUNCTION)
+        self.add_file(
+            "second.py",
+            "def count_bytes(entries):\n"
+            "    counts = {}\n"
+            "    for entry in entries:\n"
+            "        if entry is None:\n"
+            "            continue\n"
+            "        name = entry.get(\"name\")\n"
+            "        if name not in counts:\n"
+            "            counts[name] = 0\n"
+            "        counts[name] = counts[name] + len(entry.get(\"data\", \"\"))\n"
+            "    if not counts:\n"
+            "        return 0\n"
+            "    return max(counts.values())\n",
+        )
+        result = self.run_qg("check", env=self.default_tool_env())
+        text = output(result)
+        self.assertEqual(result.returncode, 0, text)
         self.assertIn("clones: 0 clones", result.stdout)
 
     def test_absent_baseline_with_clone_fails(self) -> None:

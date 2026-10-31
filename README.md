@@ -210,7 +210,9 @@ in a temporary directory, groups the SARIF clone fingerprints into subjects, and
 occurrence count through the generic ratchet. The adapter owns the detection configuration: an empty
 `--config`, the configured `--min-tokens`, `--min-lines 5`, `--max-size` at the hygiene limit, an ignore
 pattern that matches nothing, `--no-gitignore` and a format list covering the selected extensions when
-they are all known.
+they are all known. Inline jscpd ignore directives are refused: the check reads every selected file with
+the bounded regular-file reader and fails on any line containing either directive, naming the first file,
+line and directive and the total count. A clone is accepted only through a baseline entry with a reason.
 The JSON report's `statistics.total.sources` must equal the number of selected files; a mismatch is
 `unsupported` and names the files jscpd did not analyse. The SARIF report must contain exactly one run
 produced by jscpd with a `results` list; absent, malformed or foreign evidence is `unsupported`

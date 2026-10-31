@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .json_input import load_json
+from .owners import _read_regular
 from .policy import (
     DEFAULT_MAX_BYTES,
     CheckDef,
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
 
 DEFAULT_MIN_TOKENS = 50
+_IGNORE_PREFIX = "jscpd:" + "ignore"
+_IGNORE_DIRECTIVES = (_IGNORE_PREFIX + "-start", _IGNORE_PREFIX + "-end")
 
 
 @dataclass(frozen=True)
@@ -576,16 +579,62 @@ def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
     ]
 
 
+def _directive_lines(
+    relative: str, data: bytes
+) -> list[tuple[str, int, str]]:
+    text = data.decode("utf-8", "replace")
+    return [
+        (relative, number, directive)
+        for number, line in enumerate(text.splitlines(), 1)
+        for directive in _IGNORE_DIRECTIVES
+        if directive in line
+    ]
+
+
+def _directive_matches(root: Path, files: list[str]) -> list[tuple[str, int, str]]:
+    matches: list[tuple[str, int, str]] = []
+    for relative in files:
+        data = _read_regular(root, relative)
+        if data is not None:
+            matches.extend(_directive_lines(relative, data))
+    return matches
+
+
+def _refuse_directives(root: Path, files: list[str]) -> None:
+    matches = _directive_matches(root, files)
+    if not matches:
+        return
+    relative, line, directive = matches[0]
+    count = len(matches)
+    noun = "directive" if count == 1 else "directives"
+    raise GateError(
+        f"{relative}:{line}: {directive} is not allowed; a clone is accepted only "
+        f"through a baseline entry with a reason (found {count} ignore {noun})"
+    )
+
+
+def _prepare_clones(
+    root: Path, files: list[str]
+) -> tuple[Path | None, CloneMeasurement | None]:
+    try:
+        binary = analysis_step("clone tool preparation", _jscpd_binary)
+        analysis_step("clone source scan", _refuse_directives, root, files)
+    except UnsupportedError as error:
+        return None, CloneMeasurement([], Diagnostics(), "error", str(error), True)
+    except GateError as error:
+        return None, CloneMeasurement([], Diagnostics(), "error", str(error), False)
+    return binary, None
+
+
 def measure_clones(
     root: Path,
     files: list[str],
     min_tokens: int,
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> CloneMeasurement:
-    try:
-        binary = analysis_step("clone tool preparation", _jscpd_binary)
-    except UnsupportedError as error:
-        return CloneMeasurement([], Diagnostics(), "error", str(error), True)
+    binary, failure = _prepare_clones(root, files)
+    if failure is not None:
+        return failure
     try:
         clones, diagnostics, execution = _run_jscpd(
             root, binary, files, min_tokens, max_bytes
