@@ -1223,9 +1223,9 @@ Each copied module records its own run in a marker file: a line when the import 
 the import completes, and a traceback for any uncaught exception or `unittest` error, including errors
 in subtests and in child processes that import the module. A failed fixture assertion in `setUp`,
 `tearDown` or a cleanup is recorded as a fixture failure in the parent run and in a child process
-that imports the module. A mutant first runs only the tests the
-probe recorded as reaching its target, in their original order, stopping at the first assertion
-failure. That failure is a kill only when the mutant's module was loaded and imported, the marker
+that imports the module, including an assertion reported through a subtest. A mutant first runs
+only the tests the probe recorded as reaching its target, in their original order, stopping at the
+first assertion failure. That failure is a kill only when the mutant's module was loaded and imported, the marker
 records no import or execution error or fixture failure, and the same selection passes on an
 unmutated copy; each distinct selection is checked once unmutated and reused. A mutant whose selected
 tests all pass, one that no test reached, one with unattributed hits, or one whose selection fails
