@@ -1069,6 +1069,46 @@ class IdentityDecisionTests(unittest.TestCase):
 
 
 class IdentityTrustTests(TrustCase):
+    def gate_identity_with_files(
+        self, paths: tuple[str, ...], content: bytes
+    ) -> dict[str, object]:
+        for relative in paths:
+            path = self.gate / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        revision = self.commit_revision()
+        self.fixture_runner = lambda: self.gate / "qg.py"
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        return document["trust"]
+
+    def test_gate_new_extension_files_appear_in_identity_with_digests(self) -> None:
+        content = b"echo helper\n"
+        paths = (
+            "quality_gate/helpers/helper.sh",
+            "quality_gate/helpers/data",
+            "quality_gate/helpers/.settings",
+            "quality_gate/helpers/__pycache__",
+        )
+        identity = self.gate_identity_with_files(paths, content)
+        for snapshot in ("identity_before", "identity_after"):
+            files = identity[snapshot]["gate"]["files"]
+            for relative in paths:
+                with self.subTest(snapshot=snapshot, path=relative):
+                    self.assertIn(relative, files)
+                    self.assertEqual(files[relative], hashlib.sha256(content).hexdigest())
+
+    def test_gate_identity_excludes_bytecode_cache_directories(self) -> None:
+        before = trust._gate_identity(self.gate)
+        identity = self.gate_identity_with_files((
+            "quality_gate/__pycache__/cached.pyc",
+            "quality_gate/elisp/__pycache__/nested/cached.py",
+            "quality_gate/elisp/__pycache__/helper.sh",
+        ), b"interpreter cache\n")
+        for snapshot in ("identity_before", "identity_after"):
+            with self.subTest(snapshot=snapshot):
+                self.assertEqual(identity[snapshot]["gate"], before)
+
     def test_gate_elisp_helper_changed_during_check_is_an_identity_error(self) -> None:
         helper = self.gate / "quality_gate/elisp/qg-elisp-child.el"
         writer = ("import pathlib; "

@@ -182,7 +182,8 @@ Before any check runs, the gate records in `trust.identity_before`:
   tool pins, and a digest of each effective baseline held in memory;
 * each pinned tool's actual install-tree payload digest (the M2a encoding); and
 * a digest and per-file SHA-256 of the gate program's own files
-  (`qg.py`, every Python module and every Emacs Lisp helper under `quality_gate/`).
+  (`qg.py` and every file under `quality_gate/`, regardless of extension or
+  tracking status, except the running interpreter's `__pycache__` directories).
 
 It enumerates the protected scope again after the checks, including ignored
 untracked files, and compares those facts before any prune write. Any protected

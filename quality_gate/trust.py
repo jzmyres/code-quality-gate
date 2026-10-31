@@ -972,7 +972,10 @@ def _effective_lock(
 
 def _gate_files(root: Path) -> list[Path]:
     package = root / "quality_gate"
-    return [root / "qg.py", *sorted(package.rglob("*.py")), *sorted(package.rglob("*.el"))]
+    return [root / "qg.py", *sorted(
+        path for path in package.rglob("*")
+        if "__pycache__" not in path.relative_to(package).parent.parts
+    )]
 
 
 def _gate_identity(root: Path) -> dict[str, Any]:
