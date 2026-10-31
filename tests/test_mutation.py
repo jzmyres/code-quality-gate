@@ -65,21 +65,24 @@ class MutationRunnerTests(unittest.TestCase):
         self.write_parent_child(child, assertion)
 
     def write_child_fixture(
-        self, methods: str, assertion: str = "self.assertEqual(result.returncode, 0)"
+        self, methods: str, assertion: str = "self.assertEqual(result.returncode, 0)",
+        *, import_decision: bool = True,
     ) -> None:
         child = (
             "import sys, unittest\nsys.path.insert(0, sys.argv[1])\n"
-            "from sample.decision import decision\n"
-            "class ChildTests(unittest.TestCase):\n"
+            + ("from sample.decision import decision\n" if import_decision else "")
+            + "class ChildTests(unittest.TestCase):\n"
             + "".join(f"    {line}\n" for line in methods.splitlines())
             + "unittest.main(argv=[sys.argv[0]])\n"
         )
         self.write_parent_child(child, assertion)
 
-    def write_parent_fixture(self, methods: str) -> None:
+    def write_parent_fixture(
+        self, methods: str, base: str = "unittest.TestCase"
+    ) -> None:
         self.write_tests(
             "import unittest\nfrom sample.decision import decision\n"
-            "class ParentTests(unittest.TestCase):\n"
+            f"class ParentTests({base}):\n"
             + "".join(f"    {line}\n" for line in methods.splitlines())
         )
 
@@ -422,16 +425,20 @@ class MutationRunnerTests(unittest.TestCase):
                 "selected run recorded a test setup or cleanup failure", report.outcomes[0].detail
             )
 
-    def assert_child_fixture_is_not_a_kill(self, name: str, methods: str) -> None:
+    def assert_child_fixture_is_not_a_kill(
+        self, name: str, methods: str, *, import_decision: bool = True
+    ) -> None:
         self.source("def decision():\n    return True\n")
-        self.write_child_fixture(methods)
+        self.write_child_fixture(methods, import_decision=import_decision)
         for full in (False, True):
             with self.subTest(path="full suite" if full else "selected"):
                 self.assert_fixture_is_not_a_kill(name, "ChildTests.test_value", full=full)
 
-    def assert_parent_fixture_is_not_a_kill(self, name: str, methods: str) -> None:
+    def assert_parent_fixture_is_not_a_kill(
+        self, name: str, methods: str, *, base: str = "unittest.TestCase"
+    ) -> None:
         self.source("def decision():\n    return True\n")
-        self.write_parent_fixture(methods)
+        self.write_parent_fixture(methods, base)
         for full in (False, True):
             with self.subTest(path="full suite" if full else "selected"):
                 self.assert_fixture_is_not_a_kill(name, "ParentTests.test_value", full=full)
@@ -485,6 +492,39 @@ class MutationRunnerTests(unittest.TestCase):
             "def test_value(self):\n    pass",
         )
 
+    def test_parent_asyncSetUp_subtest_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_parent_fixture_is_not_a_kill(
+            "parent_async_setup_subtest",
+            "async def asyncSetUp(self):\n    with self.subTest():\n"
+            "        self.assertTrue(decision())\nasync def test_value(self):\n    pass",
+            base="unittest.IsolatedAsyncioTestCase",
+        )
+
+    def test_parent_asyncSetUp_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_parent_fixture_is_not_a_kill(
+            "parent_async_setup",
+            "async def asyncSetUp(self):\n    self.assertTrue(decision())\n"
+            "async def test_value(self):\n    pass",
+            base="unittest.IsolatedAsyncioTestCase",
+        )
+
+    def test_child_lazy_setUp_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_child_fixture_is_not_a_kill(
+            "child_lazy_setup",
+            "def setUp(self):\n    from sample.decision import decision\n"
+            "    self.assertTrue(decision())\ndef test_value(self):\n    pass",
+            import_decision=False,
+        )
+
+    def test_child_lazy_setUp_subtest_fixture_failure_is_not_a_kill(self) -> None:
+        self.assert_child_fixture_is_not_a_kill(
+            "child_lazy_setup_subtest",
+            "def setUp(self):\n    from sample.decision import decision\n"
+            "    with self.subTest():\n        self.assertTrue(decision())\n"
+            "def test_value(self):\n    pass",
+            import_decision=False,
+        )
+
     def test_child_test_body_assertion_is_still_a_kill(self) -> None:
         self.source("def decision():\n    return True\n")
         self.assert_child_assertion_kills("child_body", "self.assertTrue(decision())")
@@ -495,6 +535,15 @@ class MutationRunnerTests(unittest.TestCase):
             "def test_value(self):\n    with self.subTest():\n        self.assertTrue(decision())"
         )
         self.run_targeted_fixture("parent_body_subtest")
+
+    def test_parent_test_body_assertion_after_doCleanups_is_still_a_kill(self) -> None:
+        self.source("def decision():\n    return True\n")
+        self.write_parent_fixture(
+            "def setUp(self):\n    self.addCleanup(self.cleanup)\n"
+            "def cleanup(self):\n    pass\n"
+            "def test_value(self):\n    self.doCleanups()\n    self.assertTrue(decision())"
+        )
+        self.run_targeted_fixture("parent_doCleanups")
 
     def test_child_unittest_custom_results_distinguish_errors_and_assertions(self) -> None:
         self.source(

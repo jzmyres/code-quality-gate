@@ -452,37 +452,49 @@ def _insert_reached(source: str, decisions: tuple[Decision, ...]) -> str:
     return source
 
 
-_PHASE_ATTRIBUTE = "_qg_mutation_phase"
-_PHASE_INSTALLED = _PHASE_ATTRIBUTE + "_hooks"
-_PHASE_HOOKS = (
-    ("_callSetUp", "setUp"),
-    ("_callTestMethod", "test"),
-    ("_callTearDown", "tearDown"),
-    ("_callCleanup", "cleanup"),
+_FIXTURE_FRAMES = (
+    "setUp",
+    "tearDown",
+    "asyncSetUp",
+    "asyncTearDown",
+    "_callSetUp",
+    "_callTearDown",
+    "_callCleanup",
+    "doCleanups",
+    "setUpClass",
+    "tearDownClass",
+    "setUpModule",
+    "tearDownModule",
+    "doClassCleanups",
 )
-_FIXTURE_PHASES = ("setUp", "tearDown", "cleanup")
 
 
-def _fixture_phase(result) -> bool:
-    return getattr(result, _PHASE_ATTRIBUTE, None) in _FIXTURE_PHASES
+# unittest reports a subtest from its own context manager, so a subtest in a
+# cleanup loses the cleanup callers from its traceback.  That failure is still a
+# cleanup failure, and these are the cleanup frames of the one fixture list.
+_CLEANUP_FRAMES = tuple(name for name in _FIXTURE_FRAMES if "Cleanup" in name)
 
 
-def _phase_wrapper(original, phase):
-    def call(self, *args, **kwargs):
-        outcome = getattr(self, "_outcome", None)
-        result = getattr(outcome, "result", None)
-        if result is not None:
-            setattr(result, _PHASE_ATTRIBUTE, phase)
-        return original(self, *args, **kwargs)
-    return call
+def _fixture_frame(name: str) -> bool:
+    return name in _FIXTURE_FRAMES
 
 
-def _install_phase_hooks(test_case) -> None:
-    if getattr(test_case, _PHASE_INSTALLED, False):
-        return
-    for name, phase in _PHASE_HOOKS:
-        setattr(test_case, name, _phase_wrapper(getattr(test_case, name), phase))
-    setattr(test_case, _PHASE_INSTALLED, True)
+def _cleanup_call() -> bool:
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_code.co_name in _CLEANUP_FRAMES:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _fixture_failure(error, *, subtest: bool = False) -> bool:
+    trace = error[2]
+    while trace is not None:
+        if _fixture_frame(trace.tb_frame.f_code.co_name):
+            return True
+        trace = trace.tb_next
+    return subtest and _cleanup_call()
 
 
 def _instrument(
@@ -513,9 +525,8 @@ def _instrument(
         "traceback as _qg_mutation_traceback, unittest as _qg_mutation_unittest\n"
         f"_qg_mutation_marker = {str(marker)!r}\n"
         f"_qg_mutation_token = {token!r}\n"
-        f"_qg_mutation_phase = {_PHASE_ATTRIBUTE!r}\n"
-        f"_qg_mutation_phase_hooks = {_PHASE_HOOKS!r}\n"
-        f"_qg_mutation_fixture_phases = {_FIXTURE_PHASES!r}\n"
+        f"_qg_mutation_fixture_frames = {_FIXTURE_FRAMES!r}\n"
+        f"_qg_mutation_cleanup_frames = {_CLEANUP_FRAMES!r}\n"
         "def _qg_mutation_record(event, detail=''):\n"
         "    test = _qg_mutation_os.environ.get('QG_MUTATION_TEST') or 'unattributed'\n"
         "    with open(_qg_mutation_marker, 'a', encoding='utf-8') as _qg_mutation_file:\n"
@@ -533,30 +544,27 @@ def _instrument(
         "def _qg_mutation_test_error(error):\n"
         "    detail = ''.join(_qg_mutation_traceback.format_exception(*error))\n"
         "    _qg_mutation_record('error', detail)\n"
-        "def _qg_mutation_fixture_phase(result):\n"
-        "    return getattr(result, _qg_mutation_phase, None) in _qg_mutation_fixture_phases\n"
-        "def _qg_mutation_test_fixture(result, test):\n"
-        "    if _qg_mutation_fixture_phase(result):\n"
+        "def _qg_mutation_fixture_frame(name):\n"
+        "    return name in _qg_mutation_fixture_frames\n"
+        "def _qg_mutation_cleanup_call():\n"
+        "    frame = _qg_mutation_sys._getframe()\n"
+        "    while frame is not None:\n"
+        "        if frame.f_code.co_name in _qg_mutation_cleanup_frames:\n"
+        "            return True\n"
+        "        frame = frame.f_back\n"
+        "    return False\n"
+        "def _qg_mutation_test_fixture(test, error, subtest=False):\n"
+        "    trace = error[2]\n"
+        "    while trace is not None:\n"
+        "        if _qg_mutation_fixture_frame(trace.tb_frame.f_code.co_name):\n"
+        "            _qg_mutation_record('fixture', test.id())\n"
+        "            return\n"
+        "        trace = trace.tb_next\n"
+        "    if subtest and _qg_mutation_cleanup_call():\n"
         "        _qg_mutation_record('fixture', test.id())\n"
-        "def _qg_mutation_phase_wrapper(original, phase):\n"
-        "    def call(self, *args, **kwargs):\n"
-        "        outcome = getattr(self, '_outcome', None)\n"
-        "        result = getattr(outcome, 'result', None)\n"
-        "        if result is not None:\n"
-        "            setattr(result, _qg_mutation_phase, phase)\n"
-        "        return original(self, *args, **kwargs)\n"
-        "    return call\n"
-        "def _qg_mutation_install_phase_hooks(test_case):\n"
-        "    installed = _qg_mutation_phase + '_hooks'\n"
-        "    if getattr(test_case, installed, False):\n"
-        "        return\n"
-        "    for name, phase in _qg_mutation_phase_hooks:\n"
-        "        setattr(test_case, name, _qg_mutation_phase_wrapper(getattr(test_case, name), phase))\n"
-        "    setattr(test_case, installed, True)\n"
-        "_qg_mutation_install_phase_hooks(_qg_mutation_unittest.TestCase)\n"
         "def _qg_mutation_wrap_failure(original):\n"
         "    def add_failure(self, test, error):\n"
-        "        _qg_mutation_test_fixture(self, test)\n"
+        "        _qg_mutation_test_fixture(test, error)\n"
         "        return original(self, test, error)\n"
         "    return add_failure\n"
         "def _qg_mutation_wrap_error(original):\n"
@@ -567,7 +575,7 @@ def _instrument(
         "def _qg_mutation_wrap_subtest(original):\n"
         "    def add_subtest(self, test, subtest, error):\n"
         "        if error is not None:\n"
-        "            _qg_mutation_test_fixture(self, test)\n"
+        "            _qg_mutation_test_fixture(test, error, True)\n"
         "            if not issubclass(error[0], test.failureException):\n"
         "                _qg_mutation_test_error(error)\n"
         "        return original(self, test, subtest, error)\n"
@@ -629,7 +637,6 @@ class _TestResult(unittest.TextTestResult):
 
     def startTest(self, test):
         self.ids.append(test.id())
-        setattr(self, _PHASE_ATTRIBUTE, None)
         self.previous_tests.append(os.environ.get(_CURRENT_TEST_ENV))
         os.environ[_CURRENT_TEST_ENV] = test.id()
         super().startTest(test)
@@ -642,17 +649,17 @@ class _TestResult(unittest.TextTestResult):
         else:
             os.environ[_CURRENT_TEST_ENV] = previous
 
-    def _record_fixture(self, test) -> None:
-        if _fixture_phase(self):
+    def _record_fixture(self, test, error, *, subtest: bool = False) -> None:
+        if _fixture_failure(error, subtest=subtest):
             self.fixture_failures.append(test.id())
 
     def addFailure(self, test, error):
-        self._record_fixture(test)
+        self._record_fixture(test, error)
         super().addFailure(test, error)
 
     def addSubTest(self, test, subtest, error):
         if error is not None:
-            self._record_fixture(test)
+            self._record_fixture(test, error, subtest=True)
         super().addSubTest(test, subtest, error)
 
 
@@ -676,7 +683,6 @@ def _suite(
     failfast: bool = False,
 ) -> int:
     sys.dont_write_bytecode = True
-    _install_phase_hooks(unittest.TestCase)
     sys.path.insert(0, str(root))
     sys.path.insert(0, str(root / tests))
     suite = unittest.defaultTestLoader.discover(str(root / tests))
