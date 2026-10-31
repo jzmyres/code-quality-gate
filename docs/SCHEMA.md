@@ -716,6 +716,7 @@ Check keys:
   first parenthesized group, in first-seen order; `failed` counts failing tests, so a test with
   several failing subtests counts once. A failing run without that consistent result data, with a
   heading that has no test id, or with more distinct test ids than executed tests, has no
+  `test_results`. A run with failure evidence but no executed test also has no
   `test_results`. The Emacs Lisp adapter reads them from its child result document. Passed counts
   expected results; selected equals passed plus failed plus skipped.
 * `tool` - optional measured tool identity supplied by any adapter: an object with string

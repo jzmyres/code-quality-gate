@@ -196,6 +196,19 @@ def _unittest_outcomes(
     return len(failures), failures
 
 
+def _unittest_failure_evidence(combined: str) -> bool:
+    if _UNITTEST_FAILURE_HEADING.search(combined):
+        return True
+    for summary in _UNITTEST_FAILED_SUMMARY.findall(combined):
+        if _unittest_failure_count(summary) is not None:
+            return True
+    return False
+
+
+def _zero_executed_without_failure(executed: int, combined: str) -> bool:
+    return executed == 0 and not _unittest_failure_evidence(combined)
+
+
 def _counted_test_results(
     ran: int, skipped: int, failed: int, failures: tuple[str, ...]
 ) -> Any | None:
@@ -217,7 +230,7 @@ def _failed_test_results(
 
     if ran is None or skipped is None or executed is None:
         return None
-    if executed == 0:
+    if _zero_executed_without_failure(executed, combined):
         return TestResults(ran, 0, 0)
     outcomes = _unittest_outcomes(combined)
     if outcomes is None:

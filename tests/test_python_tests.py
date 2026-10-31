@@ -263,6 +263,25 @@ class PythonTestsTests(FixtureCase):
             "test_mixed_failures.Sample.test_subtests",
         ])
 
+    def test_a_failing_and_skipped_subtest_has_no_test_results(self) -> None:
+        self.write_config(
+            tests_config(skipped_pattern=r"skipped=(\d+)")
+        )
+        self.add_test(
+            "test_subtests",
+            "    def test_subtests(self):\n"
+            "        with self.subTest(kind='failure'):\n"
+            "            self.fail('deliberate failure')\n"
+            "        with self.subTest(kind='skipped'):\n"
+            "            self.skipTest('deliberate skip')\n",
+        )
+        _result, check = self.failed_tests(
+            "command exited 1 and no test executed: 1 ran, 1 skipped",
+            "deliberate failure",
+        )
+        self.assertEqual(check["measurement"], {"tests": 0})
+        self.assertNotIn("test_results", check)
+
     def test_a_failure_heading_without_a_test_id_has_no_test_results(
         self,
     ) -> None:
@@ -324,10 +343,14 @@ class PythonTestsTests(FixtureCase):
             "    def test_skipped(self):\n"
             "        self.assertTrue(True)\n",
         )
-        self.failed_tests(
+        _result, check = self.failed_tests(
             "no test executed: 1 ran, 1 skipped",
             "zero tests is not a pass",
         )
+        self.assertEqual(check["test_results"], {
+            "selected": 1, "passed": 0, "failed": 0, "skipped": 1,
+            "failures": [],
+        })
 
     def test_ambiguous_test_summary_is_unsupported(self) -> None:
         self.add_file(
