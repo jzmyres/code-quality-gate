@@ -57,13 +57,25 @@ untracked paths, so a new candidate path under a protected glob is a protected
 input too. The protected list always comes from `REV`; a candidate policy
 cannot unprotect a path.
 
-`REV`'s file contents are read from Git objects (`git cat-file blob`), and its
-gitlink commits from its tree, never from the working tree. Every Git command
-the trust root runs ignores replacement refs (`--no-replace-objects`) and
-candidate-configured fsmonitors, and a candidate repository with a graft file
-(`info/grafts` under its Git directory) is refused. Candidate versions are
-read from the working tree only to compare them with `REV`, to apply an
-allowed tightening, or after the caller authorizes the path.
+`REV`'s file contents are read from Git objects and its gitlink commits
+from its tree, never from the working tree. The gate authenticates every
+object it reads from `REV`: it reads the commit, each tree it walks and each
+file's blob by id, hashes the raw content as Git does (type, size and content
+in the repository's object format) and refuses (exit 2) an object whose
+content does not hash to the id its parent names, naming the object id, its
+path in `REV` and "object content does not match its ID". Listing `REV`'s
+tree walks the same authenticated trees, so a forged tree on the path to a
+read file is refused too. A candidate that replaces an object's contents in
+the candidate's object store while keeping its id therefore cannot change what
+the gate reads. This guarantee covers the objects the gate reads and nothing
+else: it does not run a whole-repository `git fsck`, and an object the gate
+never reads, or a hash collision in the repository's object format, is outside
+the check. Every Git command the trust root runs ignores replacement refs
+(`--no-replace-objects`) and candidate-configured fsmonitors, and a candidate
+repository with a graft file (`info/grafts` under its Git directory) is
+refused. Candidate versions are read from the working tree only to compare
+them with `REV`, to apply an allowed tightening, or after the caller
+authorizes the path.
 
 For a protected gitlink, the candidate's value is the commit in its index. If
 the submodule is checked out, its HEAD must also match that index commit. A

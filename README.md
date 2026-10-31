@@ -897,7 +897,9 @@ and exit 2. An argument containing NUL is a configuration error.
 `check --policy-from REV` evaluates the working tree against `REV`'s policy, baselines and tools lock,
 and `REV`'s `[protect] paths`, instead of the candidate's copies. Trusted Git reads ignore
 replacement refs and candidate-configured fsmonitors, and a repository with an `info/grafts` file is
-refused. An unauthorized candidate baseline edit can only tighten: a removed `max` entry takes effect,
+refused. Every object read from `REV` — the commit, the trees it walks and each file's blob — is hashed
+against the id naming it, and a mismatch exits 2 naming the object and its path. An unauthorized
+candidate baseline edit can only tighten: a removed `max` entry takes effect,
 a removed `min` floor keeps `REV`'s entry, added or loosened entries are ignored, and a malformed
 candidate baseline keeps every `REV` entry. Protected candidate files must be reached without following
 a symlink. A protected gitlink is compared by commit: the candidate's index must match `REV`, and a
@@ -926,8 +928,9 @@ mitigations.
 * `2` - missing or invalid configuration (including a baseline header that does not match the policy or
   two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
   git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
-  `--policy-from` or `--changed-from` revision, a gate program inside the candidate, or a protected input, tool payload or
-  gate file that changed during the run.
+  `--policy-from` or `--changed-from` revision, a gate program inside the candidate, an object read from the
+  trusted revision whose content does not match its ID, or a protected input, tool payload or gate file
+  that changed during the run.
 
 ## Configuration
 

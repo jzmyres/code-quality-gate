@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import unittest
+import zlib
 from dataclasses import replace
 from unittest import mock
 
@@ -1328,6 +1329,120 @@ class IdentityTrustTests(TrustCase):
         result = self.run_qg("check", "--allow-protected", "ruff.toml")
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("--policy-from", result.stderr)
+
+
+class TrustedObjectTests(TrustCase):
+    """Every object read from the trusted revision is authenticated against its ID."""
+
+    def raw_git(self, *args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            env=self.env(),
+            capture_output=True,
+            check=True,
+        ).stdout
+
+    def forge(self, oid: str, kind: str, content: bytes) -> None:
+        """Replace the loose object at oid, keeping its file name."""
+        path = self.repo / ".git" / "objects" / oid[:2] / oid[2:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.chmod(0o644)
+        header = f"{kind} {len(content)}".encode("ascii") + b"\0"
+        path.write_bytes(zlib.compress(header + content))
+
+    def assert_refused(
+        self, result: subprocess.CompletedProcess[str],
+        document: dict[str, object], oid: str, location: str,
+    ) -> None:
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertEqual(document["checks"], [])
+        message = document["error"]
+        for value in (oid, location, "object content does not match its ID"):
+            self.assertIn(value, message)
+            self.assertIn(value, result.stderr)
+
+    def failing_revision(self) -> str:
+        self.write_config(BASE_CONFIG.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            'run = ["python3", "-c", "import sys; sys.exit(1)"]',
+        ))
+        revision = self.commit_revision()
+        self.write_config(BASE_CONFIG)
+        return revision
+
+    def forge_policy(self, revision: str) -> str:
+        oid = self.git(
+            "rev-parse", f"{revision}:quality-gate.toml"
+        ).stdout.strip()
+        self.forge(oid, "blob", BASE_CONFIG.encode("utf-8"))
+        return oid
+
+    def forge_tree(self, revision: str, path: str = "") -> str:
+        spec = f"{revision}:{path}" if path else f"{revision}^{{tree}}"
+        oid = self.git("rev-parse", spec).stdout.strip()
+        raw = bytearray(self.raw_git("cat-file", "tree", oid))
+        raw[-1] ^= 1
+        self.forge(oid, "tree", bytes(raw))
+        return oid
+
+    def test_forged_policy_blob_is_refused(self) -> None:
+        revision = self.failing_revision()
+        oid = self.forge_policy(revision)
+        result, document = self.trust_json(revision)
+        self.assert_refused(result, document, oid, "quality-gate.toml")
+
+    def test_forged_policy_blob_is_refused_with_changed_from(self) -> None:
+        revision = self.failing_revision()
+        oid = self.forge_policy(revision)
+        result, document = self.trust_json(
+            revision, "--changed-from", revision
+        )
+        self.assert_refused(result, document, oid, "quality-gate.toml")
+
+    def test_forged_tree_on_the_policy_path_is_refused(self) -> None:
+        revision = self.failing_revision()
+        oid = self.forge_tree(revision)
+        result, document = self.trust_json(revision)
+        self.assert_refused(result, document, oid, ".")
+
+    def test_forged_nested_tree_is_refused(self) -> None:
+        self.write_config(with_clones(baseline="cfg/clones.toml"))
+        self.add_file("cfg/clones.toml", CLONES_HEADER)
+        revision = self.commit_revision()
+        oid = self.forge_tree(revision, "cfg")
+        result, document = self.trust_json(revision)
+        self.assert_refused(result, document, oid, "cfg")
+
+    def test_forged_baseline_blob_is_refused(self) -> None:
+        self.write_config(with_clones())
+        self.add_file("quality-gate-clones.toml", CLONES_HEADER)
+        revision = self.commit_revision()
+        oid = self.git(
+            "rev-parse", f"{revision}:quality-gate-clones.toml"
+        ).stdout.strip()
+        forged = CLONES_HEADER + (
+            '\n[[entry]]\nsubject = "fp1"\nbound = 5\n'
+            'reason = "forged"\n'
+        )
+        self.forge(oid, "blob", forged.encode("utf-8"))
+        result, document = self.trust_json(revision)
+        self.assert_refused(
+            result, document, oid, "quality-gate-clones.toml"
+        )
+
+    def test_packed_revision_objects_are_read(self) -> None:
+        revision = self.commit_revision()
+        self.git("repack", "-a", "-d", "-q")
+        self.assertRegex(
+            self.git("count-objects", "-v").stdout, r"(?m)^count: 0$"
+        )
+        result, document = self.trust_json(revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted")
+        self.assertEqual(document["trust"]["policy_from"], revision)
 
 
 class GitInvocationTests(TrustCase):
