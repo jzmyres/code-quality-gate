@@ -2,36 +2,39 @@
 name: trust-root-change
 description: Checklist for changing the gate's trust root, protected inputs, baseline merge, prune or run identity.
 verified: 2026-10-31
-commit: 373d1a9
+commit: 67a8929
 paths: docs/TRUST.md, quality-gate.toml, quality_gate/trust.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/changes.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py, tests/test_changed.py
 ---
 
 # Changing the trust root
 
-`--policy-from` treats the candidate working tree as untrusted. A green `make -k check` does not prove trust
-closure: the suite covers the probes below, but a new trust path needs its own adversarial test. Use this for
-`quality_gate/trust.py`, `covrun.py`, `[protect]` or identity/prune changes.
+Trusted-revision reads (`--policy-from` and `--changed-from`) treat the candidate working tree as untrusted. A
+green `make -k check` does not prove trust closure: the suite covers the probes below, but a new trust path
+needs its own adversarial test. Use this for `quality_gate/trust.py`, `changes.py`, `covrun.py`,
+`[protect]` or identity/prune changes.
 
 1. **Read the contract.** `docs/TRUST.md` defines protected inputs, statuses, the baseline merge and identity;
-   `docs/SCHEMA.md` has the `trust` result and exit codes. `tests/test_trust.py` builds fixture repositories with
-   `git init`; follow its helpers. With `--policy-from`, `trust._refuse_inside` refuses a gate program inside the
+   `docs/SCHEMA.md` has the `trust` result and exit codes. `tests/test_trust.py` builds fixture repositories
+   with `git init` for the `--policy-from` path; `tests/test_changed.py` does the same for `--changed-from`.
+   Follow their helpers. With `--policy-from`, `trust._refuse_inside` refuses a gate program inside the
    candidate root, so run a trusted copy outside it. A protected path may be a gitlink; the candidate's index
    commit and checked-out HEAD must agree with the trusted tree, while a missing uninitialized checkout is
    allowed. If a check depends on a configuration file, add that file to `[protect] paths` and pass it explicitly
    (Ruff uses `--config ruff.toml`); otherwise a candidate changes tool behavior without touching a protected
    input.
 2. **One Git invocation policy, one trusted-object reader.** `files.git_argv` builds every command the gate
-   runs on a candidate repository: `git --no-replace-objects -c safe.directory=ROOT -c core.fsmonitor=false -C ROOT`;
-   `trust._git`, `files._git` and `gate_result._git` call it, and `checks`, `changes` and `worklist`
-   use it directly for inventory/hygiene argv, worktree diffs, pack/clone and churn. Trusted-revision content
-   for `--policy-from` is read through `trust._TrustedRevision` (held as `Trust.reader`, QF106): it reads
-   the resolved commit, walks each tree and reads each blob by id, hashes type, size and content in the
-   repository's object format and refuses a mismatch (exit 2, naming the object and its path). Two paths still
-   bypass it: at 373d1a9, `changes._base_files`/`_compare_files`/`_collect_link` read `--changed-from`
-   trees and blobs that way (a forged source blob changed exit 1 to 0), and `_commit` resolves with
-   `git rev-parse --verify` before the reader, so a forged commit reports Git's "hash mismatch" text
-   instead of the specified diagnostic. `_refuse_graft` runs before the revision is read. A new bare
-   `git` call or a hand-built argument list loses replacement-ref and fsmonitor isolation.
+   runs on a candidate repository: `git --no-replace-objects -c safe.directory=ROOT -c core.fsmonitor=false
+   -C ROOT`; `trust._git`, `files._git` and `gate_result._git` call it, and `checks`, `changes` and
+   `worklist` use it directly for inventory/hygiene argv, worktree diffs, pack/clone and churn. Both trusted
+   revisions go through `trust._TrustedRevision`: `prepare_trust` reads `--policy-from` (resolved by `_commit`)
+   and `changes.changed_lines` reads `--changed-from`. The reader reads the resolved commit, walks each tree
+   and reads each blob by id, hashes type, size and content in the repository's object format and refuses a
+   mismatch (exit 2, naming the object, its path and the flag). `_commit` turns a `--policy-from` commit whose
+   git resolution reports "hash mismatch" into the shared "object content does not match its ID" diagnostic;
+   `changes.resolve_revision` still resolves `--changed-from` with `git rev-parse --verify` and does not
+   normalize that text (deferred after QF110), so a forged `--changed-from` commit is refused with Git's own
+   wording. `_refuse_graft` runs before the revision is read. A new bare `git` call or a hand-built argument
+   list loses replacement-ref and fsmonitor isolation.
 3. **Candidate reads are regular files.** `_open_candidate` opens with `O_NOFOLLOW|O_NONBLOCK`, and
    `_read_regular` requires `fstat` to report a regular file; `_candidate_parent` rejects a symlinked parent.
    `Path.read_text()` follows symlinks and can block on a FIFO; do not use it for a protected input.
@@ -63,10 +66,12 @@ closure: the suite covers the probes below, but a new trust path needs its own a
    returns `error.exit_code`.
 7. **Probe the cases.** Cover a replacement ref (`git replace A B`, checked with `git --no-replace-objects
    show A:FILE`), an `info/grafts` file, a forged trusted object (a loose policy blob, a tree and a baseline
-   blob are refused with exit 2 naming the object and path; the commit and the `--changed-from` reads still
-   bypass the reader), an unmodified repository with packed objects, a candidate that omits a `min` floor, a
-   malformed candidate baseline, a protected symlink, FIFO and symlinked parent, a prune through a symlinked
-   parent, a protected file created during a check, a check that rewrites an authorized baseline then requests
-   a prune, a gate program inside the candidate, a moved or inconsistent protected gitlink, a candidate
-   `ruff.toml` that weakens lint, and a candidate repository with `core.fsmonitor` set (record it with a
-   marker file). Run `python3 -I -m unittest discover -s tests -p 'test_trust.py'`, then `make -k check`.
+   blob are refused with exit 2 naming the object and path; `--changed-from` base blobs and trees go through
+   the same reader, but a forged `--changed-from` commit still shows Git's "hash mismatch" text), an
+   unmodified repository with packed objects, a candidate that omits a `min` floor, a malformed candidate
+   baseline, a protected symlink, FIFO and symlinked parent, a prune through a symlinked parent, a protected
+   file created during a check, a check that rewrites an authorized baseline then requests a prune, a gate
+   program inside the candidate, a moved or inconsistent protected gitlink, a candidate `ruff.toml` that
+   weakens lint, and a candidate repository with `core.fsmonitor` set (record it with a marker file). Run
+   `python3 -I -m unittest discover -s tests -p 'test_trust.py'`, `python3 -I -m unittest discover -s tests -p
+   'test_changed.py'`, then `make -k check`.
