@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import stat
 import sys
 import tempfile
@@ -285,10 +286,17 @@ def _commit(root: Path, revision: str) -> str:
             f"{root}: --policy-from {revision!r}: expected a commit, got "
             f"git {result.execution}"
         )
+    detail = _git_detail(result)
     if result.returncode != 0:
+        mismatch = re.search(r"hash mismatch ([0-9a-fA-F]+)", detail)
+        if mismatch is not None:
+            raise UsageError(
+                f"{root}: --policy-from: object {mismatch.group(1)} at the "
+                "commit: object content does not match its ID"
+            )
         raise UsageError(
             f"{root}: --policy-from {revision!r}: expected a commit, got "
-            f"{_git_detail(result)}"
+            f"{detail}"
         )
     return result.stdout_text.strip()
 
@@ -334,9 +342,12 @@ class _TrustedRevision:
     compared with the id naming it before its content is used.
     """
 
-    def __init__(self, root: Path, commit: str) -> None:
+    def __init__(
+        self, root: Path, commit: str, flag: str = "--policy-from"
+    ) -> None:
         self.root = root
         self.commit = commit
+        self.flag = flag
         self._hasher = _OBJECT_HASHES[self._object_format()]
         self._hash_size = self._hasher().digest_size
         self._trees: dict[str, dict[str, tuple[str, str]]] = {}
@@ -345,7 +356,7 @@ class _TrustedRevision:
         tree = _commit_tree_id(self._object("commit", commit, "the commit"))
         if tree is None:
             raise UsageError(
-                f"{root}: --policy-from {commit}: expected a commit object "
+                f"{root}: {flag} {commit}: expected a commit object "
                 "naming a tree, got none"
             )
         self._root_tree = tree
@@ -354,7 +365,7 @@ class _TrustedRevision:
         result = _git(self.root, ["rev-parse", "--show-object-format"])
         if result.execution != "completed" or result.returncode != 0:
             raise UsageError(
-                f"{self.root}: --policy-from: cannot read the object format: "
+                f"{self.root}: {self.flag}: cannot read the object format: "
                 f"{_git_detail(result)}"
             )
         return result.stdout_text.strip()
@@ -363,14 +374,14 @@ class _TrustedRevision:
         result = _git(self.root, ["cat-file", kind, oid])
         if result.execution != "completed" or result.returncode != 0:
             raise UsageError(
-                f"{self.root}: --policy-from: cannot read object {oid} at "
+                f"{self.root}: {self.flag}: cannot read object {oid} at "
                 f"{location}: {_git_detail(result)}"
             )
         content = result.stdout
         header = f"{kind} {len(content)}".encode("ascii") + b"\0"
         if self._hasher(header + content).hexdigest() != oid:
             raise UsageError(
-                f"{self.root}: --policy-from: object {oid} at {location}: "
+                f"{self.root}: {self.flag}: object {oid} at {location}: "
                 "object content does not match its ID"
             )
         return content

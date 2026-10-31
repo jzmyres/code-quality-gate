@@ -77,6 +77,13 @@ refused. Candidate versions are read from the working tree only to compare
 them with `REV`, to apply an allowed tightening, or after the caller
 authorizes the path.
 
+`--changed-from` reads its base revision through the same reader. The gate
+resolves the named revision, lists its tree and reads each base blob by id,
+and refuses a forged base object with the same usage error (exit 2) naming the
+object and its path. A run whose `--policy-from` and `--changed-from` name one
+commit therefore cannot substitute a base source blob with the candidate's
+contents, and a forged tree on the path to a changed file is refused too.
+
 For a protected gitlink, the candidate's value is the commit in its index. If
 the submodule is checked out, its HEAD must also match that index commit. A
 missing or empty uninitialized checkout is allowed. A directory containing

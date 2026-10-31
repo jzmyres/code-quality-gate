@@ -13,6 +13,7 @@ from .files import _git, git_argv
 from .policy import GateError, UsageError
 from .ratchet import Location
 from .runner import run
+from .trust import _TrustedRevision
 
 
 HUNK = re.compile(rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -38,15 +39,11 @@ def resolve_revision(root: Path, revision: str) -> str:
     return raw.decode("ascii").strip()
 
 
-def _base_files(root: Path, revision: str) -> dict[str, tuple[str, str]]:
-    data = _read_git(root, ["ls-tree", "-r", "-z", "--full-tree", revision], revision)
-    files: dict[str, tuple[str, str]] = {}
-    for record in data.split(b"\0"):
-        if record:
-            metadata, name = record.split(b"\t", 1)
-            mode, _kind, oid = metadata.decode("ascii").split()
-            files[name.decode("utf-8", "surrogateescape")] = (mode, oid)
-    return files
+def _base_files(reader: _TrustedRevision) -> dict[str, tuple[str, str]]:
+    return {
+        path: entry for path, entry in reader.entries().items()
+        if entry[0] != "040000"
+    }
 
 
 def _hunks(patch: bytes) -> list[tuple[int, int]]:
@@ -147,7 +144,7 @@ def _link_destination(path: Path, root: Path) -> str | None:
 
 
 def _collect_link(
-    root: Path, name: str, revision: str, base: tuple[str, str] | None,
+    root: Path, name: str, reader: _TrustedRevision, base: tuple[str, str] | None,
     changes: Changes, links: dict[str, str | None],
 ) -> None:
     path = root / name
@@ -155,7 +152,7 @@ def _collect_link(
         return
     if base is None or base[0] != "120000":
         changes[name] = [(1, sys.maxsize)]
-    elif _read_git(root, ["cat-file", "blob", base[1]], revision) != _link_bytes(path):
+    elif reader.blob(name) != _link_bytes(path):
         changes[name] = [(1, sys.maxsize)]
     else:
         links[name] = _link_destination(path, root)
@@ -168,7 +165,7 @@ def _add_link_targets(changes: Changes, links: dict[str, str | None], files: lis
 
 
 def _compare_files(
-    root: Path, revision: str, files: list[str], directory: Path,
+    root: Path, reader: _TrustedRevision, files: list[str], directory: Path,
     base_files: dict[str, tuple[str, str]],
 ) -> Changes:
     changes: Changes = {}
@@ -176,14 +173,14 @@ def _compare_files(
     for name in files:
         current = _candidate_bytes(root / name)
         if current is None:
-            _collect_link(root, name, revision, base_files.get(name), changes, links)
+            _collect_link(root, name, reader, base_files.get(name), changes, links)
             continue
         base = base_files.get(name)
         if not _regular_base(base):
             changes[name] = [(1, sys.maxsize)]
             continue
         assert base is not None
-        old = _read_git(root, ["cat-file", "blob", base[1]], revision)
+        old = reader.blob(name)
         if old != current:
             changes[name] = _comparison_hunks(root, directory, old, current, name)
     _add_link_targets(changes, links, files)
@@ -193,10 +190,11 @@ def _compare_files(
 def changed_lines(
     root: Path, revision: str, files: list[str]
 ) -> Changes:
-    base_files = _base_files(root, revision)
+    reader = _TrustedRevision(root, revision, "--changed-from")
+    base_files = _base_files(reader)
     try:
         with tempfile.TemporaryDirectory(prefix="qg-changes-") as directory:
-            return _compare_files(root, revision, files, Path(directory), base_files)
+            return _compare_files(root, reader, files, Path(directory), base_files)
     except OSError as error:
         raise UsageError(f"check: --changed-from {revision!r}: cannot prepare diff: {error}") from error
 

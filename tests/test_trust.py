@@ -1433,6 +1433,63 @@ class TrustedObjectTests(TrustCase):
             result, document, oid, "quality-gate-clones.toml"
         )
 
+    def changed_source_revision(self) -> str:
+        """A base whose file-level suppression the candidate replaces."""
+        from test_verification import (
+            executed_entry,
+            exclusion_entry,
+            verification_baseline,
+            verification_config,
+        )
+
+        (self.repo / "a.py").unlink()
+        self.add_file("pkg/__init__.py", "")
+        self.add_file("pkg/mod.py", "# ruff: noqa: E501\nA = 1\n")
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_ok(self):\n        self.assertTrue(True)\n",
+        )
+        self.write_config(verification_config())
+        self.add_file(
+            "quality-gate-verification.toml",
+            verification_baseline([
+                executed_entry(1),
+                exclusion_entry("pkg/mod.py", "file-suppression", 1),
+            ]),
+        )
+        return self.commit_revision()
+
+    def test_forged_base_blob_on_changed_from_is_refused(self) -> None:
+        revision = self.changed_source_revision()
+        self.add_file("pkg/mod.py", "# ruff: noqa\nA = 1\n")
+        honest, _document = self.trust_json(
+            revision, "--changed-from", revision, env=self.default_tool_env()
+        )
+        self.assertEqual(honest.returncode, 1, output(honest))
+        oid = self.git("rev-parse", f"{revision}:pkg/mod.py").stdout.strip()
+        self.forge(oid, "blob", self.read_file("pkg/mod.py").encode("utf-8"))
+        result, document = self.trust_json(
+            revision, "--changed-from", revision, env=self.default_tool_env()
+        )
+        self.assert_refused(result, document, oid, "pkg/mod.py")
+
+    def test_forged_base_tree_on_changed_from_is_refused(self) -> None:
+        revision = self.changed_source_revision()
+        self.add_file("pkg/mod.py", "# ruff: noqa\nA = 1\n")
+        oid = self.forge_tree(revision, "pkg")
+        result, document = self.run_json(
+            "--changed-from", revision, env=self.default_tool_env()
+        )
+        self.assert_refused(result, document, oid, "pkg")
+
+    def test_forged_trusted_commit_is_refused(self) -> None:
+        revision = self.failing_revision()
+        raw = self.raw_git("cat-file", "commit", revision) + b"forged\n"
+        self.forge(revision, "commit", raw)
+        result, document = self.trust_json(revision)
+        self.assert_refused(result, document, revision, "the commit")
+
     def test_packed_revision_objects_are_read(self) -> None:
         revision = self.commit_revision()
         self.git("repack", "-a", "-d", "-q")
