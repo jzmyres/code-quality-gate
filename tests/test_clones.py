@@ -62,6 +62,12 @@ def wrapped_in_directives(body: str) -> str:
     return f"# {IGNORE_START}\n{body}# {IGNORE_END}\n"
 
 
+def unique_assignments(prefix: str) -> str:
+    return "".join(
+        f"{prefix}_{index} = {index + 1}\n" for index in range(30)
+    )
+
+
 SHELL_SOURCE = """\
 #!/bin/bash
 set -euo pipefail
@@ -297,13 +303,18 @@ class CloneGateTests(FixtureCase):
 
     def test_ignore_directives_fail_before_clone_evidence(self) -> None:
         self.write_config(with_clones())
+        (self.repo / "a.py").unlink()
         self.add_file(
             "first.py",
-            "UNIQUE_FIRST = 1\n\n\n" + wrapped_in_directives(DUPLICATE_FUNCTION),
+            "UNIQUE_FIRST = 1\n\n\n"
+            + wrapped_in_directives(DUPLICATE_FUNCTION)
+            + unique_assignments("FIRST"),
         )
         self.add_file(
             "second.py",
-            "UNIQUE_SECOND = 2\n\n\n" + wrapped_in_directives(DUPLICATE_FUNCTION),
+            "UNIQUE_SECOND = 2\n\n\n"
+            + wrapped_in_directives(DUPLICATE_FUNCTION)
+            + unique_assignments("SECOND"),
         )
         self.commit_all()
         for arguments in ((), ("--changed-from", "HEAD")):
