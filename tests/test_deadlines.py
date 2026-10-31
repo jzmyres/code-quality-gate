@@ -172,12 +172,12 @@ class AnalysisDeadlineTests(unittest.TestCase):
                 self.assertIn("Ran 1 test", result.diagnostics.output_tail)
 
     def test_crap_analysis_is_stopped_while_running(self) -> None:
-        with mock.patch.object(checks, "measure_crap", side_effect=self.stall):
+        with mock.patch.object(python_crap, "measure_crap", side_effect=self.stall):
             result, elapsed = self.run_adapter("crap")
         self.assert_timeout(result, "CRAP analysis", elapsed)
 
     def test_verification_analysis_is_stopped_while_running(self) -> None:
-        with mock.patch.object(checks, "measure_verification", side_effect=self.stall):
+        with mock.patch.object(verification, "measure_verification", side_effect=self.stall):
             result, elapsed = self.run_adapter("verification")
         self.assert_timeout(result, "verification analysis", elapsed)
 
@@ -332,14 +332,14 @@ class AnalysisDeadlineTests(unittest.TestCase):
 
     def test_baseline_loading_is_stopped_while_running(self) -> None:
         findings = [ratchet.Finding("tests:tests:executed", 1, "test summary")]
-        with mock.patch.object(checks, "measure_verification", return_value=findings):
+        with mock.patch.object(verification, "measure_verification", return_value=findings):
             with mock.patch.object(checks, "_baseline_entries", side_effect=self.stall):
                 result, elapsed = self.run_adapter("verification")
         self.assert_timeout(result, "baseline loading", elapsed)
 
     def test_ratchet_evaluation_is_stopped_while_running(self) -> None:
         findings = [ratchet.Finding("tests:tests:executed", 1, "test summary")]
-        with mock.patch.object(checks, "measure_verification", return_value=findings):
+        with mock.patch.object(verification, "measure_verification", return_value=findings):
             with mock.patch.object(checks, "_baseline_entries", return_value=[]):
                 with mock.patch.object(checks, "evaluate", side_effect=self.stall):
                     result, elapsed = self.run_adapter("verification")

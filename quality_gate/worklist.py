@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import adapter_for
-from .checks import CheckResult, _inventory_check, _verification_test_checks, run_check
+from .checks import CheckResult, _inventory_check, _test_check_dependencies, run_check
 from .files import _type_name, enumerate_files, git_argv
 from .policy import CheckDef, Config, GateError, UsageError
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
@@ -141,7 +141,7 @@ def _required(config: Config, check: CheckDef) -> list[str]:
             if candidate.id == check.id:
                 break
             prior[candidate.id] = candidate
-        return _verification_test_checks(check, prior)
+        return _test_check_dependencies(check, prior)
     required = getattr(check.spec, "requires", None)
     return [required] if required is not None else []
 

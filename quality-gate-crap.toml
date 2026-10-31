@@ -12,9 +12,9 @@ bound = 8
 reason = "above 6 after QF1 (2026-10-25); worklist"
 
 [[entry]]
-subject = "quality_gate/checks.py:_run_python_crap"
+subject = "quality_gate/python_crap.py:_run_python_crap"
 bound = 11.003367003367003
-reason = "above 6 after QF1 (2026-10-25); worklist"
+reason = "above 6 after QF1 (2026-10-25); worklist; moved from checks.py in QF85"
 
 [[entry]]
 subject = "quality_gate/clones.py:_sarif_path"

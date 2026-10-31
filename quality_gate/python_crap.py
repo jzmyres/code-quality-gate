@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .coverage_tool import coverage_config_data, import_coverage
-from .policy import GateError
-from .ratchet import Finding, Location
-from .runner import Diagnostics
+from .policy import CheckDef, GateError, UnsupportedError
+from .ratchet import Domain, Finding, Location
+from .runner import Diagnostics, StepTimeout, analysis_step
 
 
 @dataclass(frozen=True)
@@ -659,3 +659,142 @@ def _crap_required(
         )
     print(f"{prefix}: {message}", file=sys.stderr)
     return None, None, Diagnostics(error=message), message
+
+
+def _crap_measure(
+    root: Path,
+    selected: list[str],
+    evidence_path: Path | None,
+    settings: str | None,
+    check: CheckDef,
+    start: float,
+    prefix: str,
+) -> tuple[Any | None, Any | None]:
+    from .checks import CLONE_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
+
+    try:
+        measurement = analysis_step(
+            "CRAP analysis", measure_crap,
+            root,
+            selected,
+            evidence_path,
+            settings,
+            deadline=start + CLONE_BUDGET_SECONDS,
+        )
+    except StepTimeout:
+        reason = _budget_detail(
+            "CRAP analysis exceeded the remaining budget", start, CLONE_BUDGET_SECONDS
+        )
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        return None, _ratchet_result(
+            check, start, "fail", execution="budget", reason=reason
+        )
+    except UnsupportedError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return None, _ratchet_result(
+            check,
+            start,
+            "unsupported",
+            diagnostics=Diagnostics(error=str(error)),
+            reason=str(error),
+        )
+    except GateError as error:
+        return None, _ratchet_error(check, start, prefix, error)
+    return measurement, None
+
+
+def _run_python_crap(context: Any) -> Any:
+    from .checks import (
+        _adapter_selection,
+        _baseline_entries,
+        _class_text,
+        _evaluate_ratchet,
+        _ratchet_result,
+        _tail_diagnostics,
+    )
+
+    root, check = context.root, context.check
+    prefix, prior = context.prefix, context.prior
+    spec, start, selected, names = _adapter_selection(context)
+    if not selected:
+        class_text = _class_text(names)
+        reason = (
+            f"no files selected (classes: {class_text}); "
+            "zero inputs is not a pass"
+        )
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        return _ratchet_result(check, start, "fail", reason=reason)
+
+    evidence_path, settings, failure_diagnostics, message = analysis_step(
+        "coverage evidence validation", _crap_required, prior, spec, prefix
+    )
+    if message is not None:
+        return _ratchet_result(
+            check,
+            start,
+            "unsupported",
+            diagnostics=failure_diagnostics,
+            reason=message,
+        )
+
+    measurement, failure = _crap_measure(
+        root,
+        selected,
+        evidence_path,
+        settings,
+        check,
+        start,
+        prefix,
+    )
+    if failure is not None:
+        return failure
+    assert measurement is not None
+    if measurement.failures:
+        for failure in measurement.failures:
+            print(f"{prefix}: {failure}", file=sys.stderr)
+        diagnostics = _tail_diagnostics(
+            measurement.failures, argv=None, exit_code=1
+        )
+        return _ratchet_result(
+            check,
+            start,
+            "fail",
+            diagnostics=diagnostics,
+            reason=diagnostics.output_tail,
+        )
+
+    try:
+        entries = analysis_step("baseline loading", _baseline_entries, check)
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return _ratchet_result(
+            check,
+            start,
+            "error",
+            execution="error",
+            diagnostics=Diagnostics(error=str(error)),
+            reason=str(error),
+        )
+    ratchet, failure = _evaluate_ratchet(
+        measurement.findings,
+        entries,
+        check,
+        prefix,
+        Domain.of_files(selected),
+    )
+    if ratchet is None:
+        return _ratchet_result(check, start, failure or "error", reason=failure)
+    outcome = _ratchet_result(
+        check,
+        start,
+        ratchet.outcome,
+        ratchet=ratchet,
+        measurement={"functions": len(measurement.findings)},
+    )
+    if ratchet.satisfied:
+        noun = "function" if len(measurement.findings) == 1 else "functions"
+        print(
+            f"{prefix}: {len(measurement.findings)} {noun} within threshold",
+            flush=True,
+        )
+    return outcome

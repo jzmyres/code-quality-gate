@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import elisp_crap, elisp_lint, elisp_tests, python_tests, ratchet
+from . import elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests, ratchet, verification
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -335,7 +335,7 @@ register_adapter(AdapterDescriptor(
     "python_crap",
     ("requires", "threshold", "baseline"),
     _python_crap_spec,
-    _runner("_run_python_crap"),
+    python_crap._run_python_crap,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",
@@ -353,7 +353,7 @@ register_adapter(AdapterDescriptor(
     "verification",
     ("requires", "baseline"),
     _verification_spec,
-    _runner("_run_verification"),
+    verification._run_verification,
     location_coverage="partial",
     default_direction="max",
     requires_tests=True,
