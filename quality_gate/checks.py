@@ -408,6 +408,7 @@ def _adapter_runner(
     classes: dict[str, str],
     prefix: str,
     prior: dict[str, CheckResult],
+    cleanup_errors: list[str],
 ) -> CheckResult:
     temporaries: list[Any] = []
     context = AdapterContext(
@@ -421,7 +422,9 @@ def _adapter_runner(
     finally:
         for temporary in temporaries:
             if result is None or temporary is not result.temporary:
-                _cleanup_evidence(temporary, check.id, result)
+                message = _cleanup_evidence(temporary, check.id, result)
+                if message is not None:
+                    cleanup_errors.append(message)
 
 
 def _new_evidence_directory(temporaries: list[Any], **options: Any) -> Any:
@@ -430,7 +433,7 @@ def _new_evidence_directory(temporaries: list[Any], **options: Any) -> Any:
     return temporary
 
 
-def _cleanup_evidence(temporary: Any, identifier: str, result: CheckResult | None) -> None:
+def _cleanup_evidence(temporary: Any, identifier: str, result: CheckResult | None) -> str | None:
     try:
         temporary.cleanup()
     except Exception as error:
@@ -439,6 +442,8 @@ def _cleanup_evidence(temporary: Any, identifier: str, result: CheckResult | Non
         if result is not None:
             previous = result.diagnostics.error
             result.diagnostics.error = f"{previous}; {message}" if previous else message
+        return message
+    return None
 
 
 def run_check(
@@ -473,10 +478,11 @@ def _run_check_with_deadline(
     budget = _check_budget(check)
     start = time.monotonic()
     result = None
+    cleanup_errors: list[str] = []
     with check_deadline(start, budget) as scope:
         try:
             result = _adapter_runner(
-                root, config, check, files, classes, prefix, prior
+                root, config, check, files, classes, prefix, prior, cleanup_errors
             )
             check_time()
         except (StepTimeout, WorkerError) as error:
@@ -486,8 +492,17 @@ def _run_check_with_deadline(
     if failure is None:
         return result
     if result is not None:
-        _release_evidence([result], {})
-    return _deadline_failure(check, prefix, start, budget, scope.diagnostics, failure)
+        cleanup_errors.extend(_release_evidence([result], {}))
+    result = _deadline_failure(check, prefix, start, budget, scope.diagnostics, failure)
+    _carry_cleanup_errors(result, cleanup_errors)
+    return result
+
+
+def _carry_cleanup_errors(result: CheckResult, messages: list[str]) -> None:
+    for message in messages:
+        previous = result.diagnostics.error
+        if previous is None or message not in previous:
+            result.diagnostics.error = f"{previous}; {message}" if previous else message
 
 
 def _deadline_failure(
@@ -683,11 +698,15 @@ def _evidence_last_users(config: Config) -> dict[str, str]:
 
 def _release_evidence(
     results: list[CheckResult], last_users: dict[str, str], finished: str | None = None,
-) -> None:
+) -> list[str]:
+    cleanup_errors: list[str] = []
     for result in results:
         if result.temporary is not None and (finished is None or last_users[result.id] == finished):
             temporary, result.temporary = result.temporary, None
-            _cleanup_evidence(temporary, result.id, result)
+            message = _cleanup_evidence(temporary, result.id, result)
+            if message is not None:
+                cleanup_errors.append(message)
+    return cleanup_errors
 
 
 def _record_prune(

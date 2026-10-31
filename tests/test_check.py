@@ -269,6 +269,78 @@ class EvidenceCleanupTests(FixtureCase):
         self.assertEqual(results[0].execution, "budget")
         self.assert_removed()
 
+    def assert_cleanup_failure_survives(self, ending, *, recorded_diagnostics=False,
+                                       retain_evidence=True):
+        def adapter(context):
+            result = self.produce(context)
+            self.addCleanup(result.temporary.cleanup)
+            result.temporary.cleanup = mock.Mock(side_effect=PermissionError("cleanup denied"))
+            if not retain_evidence:
+                result.temporary = None
+            result.diagnostics = runner.Diagnostics(
+                argv=["fixture"], exit_code=1, output_bytes=15,
+                output_tail="fixture output", error="original diagnostic",
+            )
+            if recorded_diagnostics:
+                runner.record_diagnostics(result.diagnostics)
+            if ending == "timeout before return":
+                raise runner.StepTimeout("fixture work")
+            if ending == "worker error":
+                raise runner.WorkerError("fixture worker failed")
+            if ending == "failure":
+                result.outcome = "fail"
+            return result
+
+        # Fail check_time only after the adapter has returned its evidence.
+        check_time = runner.StepTimeout("adapter return") if ending == "timeout after return" else None
+        with mock.patch.object(checks, "check_time", side_effect=check_time), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            results = self.run_checks([self.definition("producer")], adapter)
+        document = results[0].to_json()
+        diagnostic = document["diagnostics"]["error"]
+        message = f"cannot remove evidence directory {self.evidence.parent}: cleanup denied"
+        self.assertIn(message, diagnostic)
+        self.assertEqual(diagnostic.count(message), 1)
+        self.assertIn(message, stderr.getvalue())
+        self.assertTrue(self.evidence.parent.is_dir())
+        expected = {
+            "timeout before return": ("fail", "budget"),
+            "timeout after return": ("fail", "budget"),
+            "worker error": ("error", "error"),
+            "success": ("pass", "completed"),
+            "failure": ("fail", "completed"),
+        }
+        self.assertEqual((document["outcome"], document["execution"]), expected[ending])
+        if recorded_diagnostics or ending in ("success", "failure"):
+            self.assertIn("original diagnostic", diagnostic)
+            self.assertEqual(document["diagnostics"]["argv"], ["fixture"])
+            self.assertEqual(document["diagnostics"]["exit_code"], 1)
+            self.assertEqual(document["diagnostics"]["output_tail"], "fixture output")
+        else:
+            self.assertIn(document["reason"], diagnostic)
+
+    def test_cleanup_failure_survives_a_timeout_before_adapter_return(self):
+        self.assert_cleanup_failure_survives("timeout before return")
+
+    def test_cleanup_failure_survives_a_timeout_after_adapter_return(self):
+        self.assert_cleanup_failure_survives("timeout after return")
+
+    def test_cleanup_failure_survives_a_worker_error(self):
+        self.assert_cleanup_failure_survives("worker error")
+
+    def test_cleanup_failure_preserves_recorded_diagnostics(self):
+        for ending in ("timeout before return", "timeout after return", "worker error"):
+            for retained in (False, True):
+                with self.subTest(ending=ending, retained=retained):
+                    self.assert_cleanup_failure_survives(
+                        ending, recorded_diagnostics=True, retain_evidence=retained,
+                    )
+
+    def test_cleanup_failure_preserves_completed_outcomes_and_diagnostics(self):
+        for ending in ("success", "failure"):
+            with self.subTest(ending=ending):
+                self.assert_cleanup_failure_survives(ending)
+
     def test_cleanup_failure_is_reported_and_other_directories_are_still_removed(self):
         paths = []
 
