@@ -104,6 +104,21 @@ class PythonTestsTests(FixtureCase):
             PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n" + body,
         )
 
+    def add_class_fixture_error(self, name: str) -> None:
+        self.add_file(
+            "tests/test_fixture.py",
+            PYTHON_TEST_HEADER
+            + "\nclass Passing(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            "        self.assertTrue(True)\n\n"
+            "class Broken(unittest.TestCase):\n"
+            "    @classmethod\n"
+            f"    def {name}(cls):\n"
+            "        raise RuntimeError('fixture boom')\n\n"
+            "    def test_never(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+
     def failing_summary(
         self, *lines: str
     ) -> tuple[object, dict[str, object]]:
@@ -303,6 +318,39 @@ class PythonTestsTests(FixtureCase):
             "print('FAIL: only (failing_summary.Sample.only)')",
             "print('FAIL: other (failing_summary.Sample.other)')",
         )
+        self.assertEqual(check["measurement"], {"tests": 1})
+        self.assertNotIn("test_results", check)
+        self.assertEqual(check["reason"], "command exited 1")
+
+    def test_a_set_up_class_error_has_no_test_results(self) -> None:
+        self.add_class_fixture_error("setUpClass")
+        _result, check = self.failed_tests("command exited 1", "fixture boom")
+        self.assertEqual(check["measurement"], {"tests": 1})
+        self.assertNotIn("test_results", check)
+        self.assertEqual(check["reason"], "command exited 1")
+
+    def test_a_tear_down_class_error_has_no_test_results(self) -> None:
+        self.add_class_fixture_error("tearDownClass")
+        _result, check = self.failed_tests("command exited 1", "fixture boom")
+        self.assertEqual(check["measurement"], {"tests": 2})
+        self.assertNotIn("test_results", check)
+        self.assertEqual(check["reason"], "command exited 1")
+
+    def test_a_set_up_module_error_has_no_test_results(self) -> None:
+        self.add_test(
+            "test_ok",
+            "    def test_one(self):\n        self.assertTrue(True)\n",
+        )
+        self.add_file(
+            "tests/test_broken.py",
+            PYTHON_TEST_HEADER
+            + "\ndef setUpModule():\n"
+            "    raise RuntimeError('fixture boom')\n\n"
+            "class Broken(unittest.TestCase):\n"
+            "    def test_never(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+        _result, check = self.failed_tests("command exited 1", "fixture boom")
         self.assertEqual(check["measurement"], {"tests": 1})
         self.assertNotIn("test_results", check)
         self.assertEqual(check["reason"], "command exited 1")

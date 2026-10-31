@@ -314,9 +314,10 @@ of distinct failing tests and `failures` names them in first-seen order, from th
 result data: one `FAILED (failures=N, errors=M)` summary matched against its `FAIL:` and `ERROR:` test
 headings. A test with several failing subtests counts once, and its test id comes from the heading's
 first parenthesized group. `passed` is `selected - skipped - failed`. A run that crashes, or whose
-failing summary is missing, repeated or inconsistent with its headings, that has a heading without a
-test id, or that names more distinct tests than `selected - skipped`, reports no `test_results`; the
-reason remains `command exited N`.
+failing summary is missing, repeated or inconsistent with its headings, that has a class or module
+fixture error (a `setUpClass`, `tearDownClass`, `setUpModule` or `tearDownModule` heading), that has a
+heading without a test id, or that names more distinct tests than `selected - skipped`, reports no
+`test_results`; the reason remains `command exited N`.
 
 ### Emacs Lisp tests
 

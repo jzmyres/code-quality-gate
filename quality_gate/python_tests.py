@@ -143,6 +143,9 @@ def _executed_tests(
 _UNITTEST_FAILED_SUMMARY = re.compile(r"^FAILED \((.*)\)$", re.MULTILINE)
 _UNITTEST_OK_SUMMARY = re.compile(r"^OK(?: \(.*\))?$", re.MULTILINE)
 _UNITTEST_FAILURE_HEADING = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
+_UNITTEST_FIXTURE_HEADING = re.compile(
+    r"^(?:setUpClass|tearDownClass|setUpModule|tearDownModule)(?:\s|$)"
+)
 _UNITTEST_FAILURE_COUNT = re.compile(r"^(failures|errors)=([0-9]+)$")
 
 
@@ -172,6 +175,8 @@ def _unittest_failure_name(heading: str) -> str | None:
 def _unittest_failure_names(headings: list[str]) -> tuple[str, ...] | None:
     failures: list[str] = []
     for heading in headings:
+        if _UNITTEST_FIXTURE_HEADING.match(heading):
+            return None
         name = _unittest_failure_name(heading)
         if name is None:
             return None
