@@ -1251,16 +1251,21 @@ The check matrix restores the pinned tools cache keyed on the environment name, 
 Ruff, clones, the test suite under coverage, Python CRAP and the Emacs Lisp checks. The separate
 Debian 13 job restores the same Debian tools cache and runs `make mutation`.
 
-Step timeouts use the smallest multiple of five minutes at least three times the measured duration.
+Step timeouts use the smallest multiple of five minutes at least three times the largest recorded
+GitHub measurement for that step, across all runs and matrix entries. Each measured step's workflow
+comments retain every measurement with its run, commit and date; a newer run that skips a step
+keeps its last measurement. This prevents runner variance from shrinking limits from run to run.
 GitHub run `41136060160` on `bd3b0b9` (2026-10-30) measured the gate at 581 seconds on Debian
-and 576 seconds on Ubuntu,
-the cold-cache Ubuntu Emacs build at 99 seconds, and mutation testing at 3809 seconds. Using the
-slower gate measurement gives these bounds: gate 30 minutes (3 × 581 = 1743 seconds), Emacs build
-5 minutes (3 × 99 = 297 seconds), and mutation step 195 minutes (3 × 3809 = 11427 seconds).
+and 576 seconds on Ubuntu, the cold-cache Ubuntu Emacs build at 99 seconds, and mutation testing
+at 3809 seconds. Run `41173761182` on `b6ce8f6` (2026-10-31) measured the gate at 592 seconds
+on Debian and 641 seconds on Ubuntu, and mutation testing at 5308 seconds; the cached Emacs build
+did not execute. The largest measurements give these bounds: gate 35 minutes (3 × 641 = 1923 seconds),
+Emacs build 5 minutes (3 × 99 = 297 seconds), and mutation step 270 minutes (3 × 5308 = 15924 seconds).
 Each job adds a 10-minute setup allowance for packages, checkout, cache operations, Python
-installation and fetching tools: Debian has a 40-minute job timeout (30 + 10), Ubuntu 45 minutes
-(30 + 5 + 10), and mutation 205 minutes (195 + 10). `tests/test_workflow.py` checks the step rule
-and each job's sum, including Ubuntu's Emacs build to allow for a cold cache.
+installation and fetching tools: Debian has a 45-minute job timeout (35 + 10), Ubuntu 50 minutes
+(35 + 5 + 10), and mutation 280 minutes (270 + 10), within GitHub's 360-minute maximum for a hosted
+job. `tests/test_workflow.py` checks the largest-measurement rule and each job's sum, including
+Ubuntu's Emacs build to allow for a cold cache.
 
 Reproduce it locally with the same tools cache:
 

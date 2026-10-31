@@ -36,10 +36,10 @@ class WorkflowTimeoutTests(unittest.TestCase):
             for name, step, actual in self.step_bounds(job):
                 with self.subTest(job=job_name, step=name):
                     comments = "\n".join(re.findall(r"^        #.*$", step, re.MULTILINE))
-                    measured = re.search(r"\bMeasured (\d+) s\b", comments)
-                    self.assertIsNotNone(
+                    measured = re.findall(r"\bMeasured (\d+) s\b", comments)
+                    self.assertTrue(
                         measured, f"{name}: expected measurement in seconds, actual missing")
-                    expected = ((3 * int(measured[1]) + 299) // 300) * 5
+                    expected = ((3 * max(map(int, measured)) + 299) // 300) * 5
                     self.assertEqual(actual, expected,
                                      f"{name}: expected {expected} minutes, actual {actual}")
 
@@ -106,6 +106,23 @@ class WorkflowBoundaryTests(unittest.TestCase):
         self.assertIn("job='example'", failure)
         self.assertIn("step='step 3'", failure)
         self.assertIn("expected measurement in seconds, actual missing", failure)
+
+    def test_timeout_uses_largest_measurement_in_any_order(self) -> None:
+        for earlier, later in ((592, 641), (641, 592)):
+            for actual in (30, 35):
+                with self.subTest(earlier=earlier, later=later, actual=actual):
+                    result = self.check_workflow(
+                        "      - name: Run the gate\n"
+                        f"        # Measured {earlier} s\n"
+                        f"        # Measured {later} s\n"
+                        f"        timeout-minutes: {actual}\n",
+                        actual + 15, "test_step_timeouts_follow_measurements")
+                    if actual == 30:
+                        self.assertEqual(len(result.failures), 1)
+                        self.assertIn("Run the gate: expected 35 minutes, actual 30",
+                                      result.failures[0][1])
+                    else:
+                        self.assertEqual(result.failures, [])
 
     def test_unnamed_measured_timeout_counts_in_job_sum(self) -> None:
         for first in ("run: sleep 60", "id: unnamed", "uses: example/action@v1",
