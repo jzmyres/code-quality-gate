@@ -18,7 +18,6 @@ from support import (
 )
 
 sys.path.insert(0, str(GATE))
-checks = importlib.import_module("quality_gate.checks")
 clones = importlib.import_module("quality_gate.clones")
 policy = importlib.import_module("quality_gate.policy")
 runner = importlib.import_module("quality_gate.runner")
@@ -758,7 +757,7 @@ class CloneOutcomeTests(unittest.TestCase):
         for execution in ("budget", "signal"):
             with self.subTest(execution=execution):
                 self.assertEqual(
-                    checks._clone_outcome(
+                    clones._clone_outcome(
                         self.measurement(
                             execution=execution, unsupported=True
                         )
@@ -766,13 +765,13 @@ class CloneOutcomeTests(unittest.TestCase):
                     "fail",
                 )
         self.assertEqual(
-            checks._clone_outcome(
+            clones._clone_outcome(
                 self.measurement(execution="error", unsupported=True)
             ),
             "unsupported",
         )
         self.assertEqual(
-            checks._clone_outcome(
+            clones._clone_outcome(
                 self.measurement(execution="error", unsupported=False)
             ),
             "error",

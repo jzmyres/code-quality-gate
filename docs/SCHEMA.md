@@ -457,7 +457,9 @@ expires = 2026-12-31
   within the bound.
 * `expires` is an optional TOML date. A date equal to today still covers
   today; only a date before today expires.
-* Adapter metadata (for example clone `files`) is preserved by `--prune`.
+* Each extra metadata key declared by the adapter descriptor (for example clone
+  `files`) is a list of strings and is preserved by `--prune`. Empty-reason
+  diagnostics list present, nonempty extras in the descriptor's declared order.
 * An absent baseline means no exception is accepted. An existing file with
   only the header is allowed. A `max` metric without an entry passes at or
   below its threshold. A `min` metric needs an entry: without one it is

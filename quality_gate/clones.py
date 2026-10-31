@@ -1,6 +1,7 @@
 """jscpd invocation, SARIF parsing and clone measurement."""
 from __future__ import annotations
 
+import sys
 import tempfile
 import urllib.parse
 from collections import Counter
@@ -11,10 +12,11 @@ from typing import Any
 from .json_input import load_json
 from .policy import (
     DEFAULT_MAX_BYTES,
+    CheckDef,
     GateError,
     UnsupportedError,
 )
-from .ratchet import Finding, Location
+from .ratchet import Domain, Finding, Location, RatchetResult
 from .runner import (
     Diagnostics,
     analysis_step,
@@ -23,7 +25,7 @@ from .runner import (
     remaining_budget,
     run,
 )
-from .tools import _jscpd_binary
+from .tools import tool_binary
 
 
 DEFAULT_MIN_TOKENS = 50
@@ -572,4 +574,183 @@ def measure_clones(
         return CloneMeasurement([], Diagnostics(), "error", str(error), False)
     return CloneMeasurement(
         analysis_step("clone findings", _clone_findings, clones, files), diagnostics, execution
+    )
+
+
+def _jscpd_binary() -> Path:
+    return tool_binary("jscpd")
+
+
+def _clone_outcome(measurement: Any) -> str:
+    if measurement.execution in ("budget", "signal"):
+        return "fail"
+    return "unsupported" if measurement.unsupported else "error"
+
+
+def _clone_result(
+    check: CheckDef,
+    start: float,
+    *,
+    outcome: str,
+    execution: str = "completed",
+    ratchet: RatchetResult | None = None,
+    diagnostics: Diagnostics | None = None,
+    reason: str | None = None,
+) -> Any:
+    from .checks import _ratchet_result
+
+    return _ratchet_result(
+        check,
+        start,
+        outcome,
+        execution=execution,
+        ratchet=ratchet,
+        diagnostics=diagnostics,
+        reason=reason,
+    )
+
+
+def _print_clone_summary(prefix: str, findings: list[Any]) -> None:
+    if findings:
+        noun = "clone" if len(findings) == 1 else "clones"
+        print(
+            f"{prefix}: {len(findings)} {noun} within baseline",
+            flush=True,
+        )
+    else:
+        print(f"{prefix}: 0 clones", flush=True)
+
+
+def _scope_resolves(
+    entry: Any, selected: set[str], present: set[str]
+) -> bool:
+    scope = entry.extras.get("files")
+    if not scope:
+        return True
+    return all(name in selected for name in scope) or any(
+        name not in present for name in scope
+    )
+
+
+def _clone_domain(
+    entries: list[Any], selected: list[str], files: list[str]
+) -> Domain:
+    chosen = set(selected)
+    present = set(files)
+    subjects = [
+        entry.subject
+        for entry in entries
+        if _scope_resolves(entry, chosen, present)
+    ]
+    return Domain.of_subjects(subjects, "the selected files")
+
+
+def _run_clones(context: Any) -> Any:
+    from .checks import _adapter_selection, _class_text
+
+    root, config = context.root, context.config
+    check, files, prefix = context.check, context.files, context.prefix
+    spec, start, selected, names = _adapter_selection(context)
+    if not selected:
+        class_text = _class_text(names)
+        print(
+            f"{prefix}: no files selected (classes: {class_text}); "
+            "zero inputs is not a pass",
+            file=sys.stderr,
+        )
+        return _clone_result(
+            check,
+            start,
+            outcome="fail",
+            reason=f"no files selected (classes: {class_text}); "
+            "zero inputs is not a pass",
+        )
+    measurement = measure_clones(
+        root,
+        selected,
+        spec.min_tokens,
+        config.max_bytes,
+    )
+    return _finish_clones(check, start, prefix, measurement, selected, files)
+
+
+def _finish_clones(
+    check: CheckDef,
+    start: float,
+    prefix: str,
+    measurement: Any,
+    selected: list[str],
+    files: list[str],
+) -> Any:
+    from .checks import _baseline_entries
+
+    diagnostics = measurement.diagnostics
+    record_diagnostics(diagnostics)
+    if measurement.error is not None:
+        return _clone_failure(check, start, prefix, measurement)
+    try:
+        entries = analysis_step("baseline loading", _baseline_entries, check)
+    except GateError as error:
+        print(f"{prefix}: {error}", file=sys.stderr)
+        return _clone_result(
+            check,
+            start,
+            outcome="error",
+            execution="error",
+            diagnostics=diagnostics,
+            reason=str(error),
+        )
+    return _clone_ratchet(check, start, prefix, measurement, entries, selected, files)
+
+
+def _clone_ratchet(
+    check: CheckDef,
+    start: float,
+    prefix: str,
+    measurement: Any,
+    entries: list[Any],
+    selected: list[str],
+    files: list[str],
+) -> Any:
+    from .checks import _evaluate_ratchet
+
+    diagnostics = measurement.diagnostics
+    ratchet, failure = _evaluate_ratchet(
+        measurement.findings,
+        entries,
+        check,
+        prefix,
+        analysis_step("clone domain analysis", _clone_domain, entries, selected, files),
+    )
+    if ratchet is None:
+        return _clone_result(
+            check,
+            start,
+            outcome=failure or "error",
+            execution="completed",
+            diagnostics=diagnostics,
+            reason=failure,
+        )
+    result = _clone_result(
+        check,
+        start,
+        outcome=ratchet.outcome,
+        ratchet=ratchet,
+        diagnostics=diagnostics,
+    )
+    if ratchet.satisfied:
+        _print_clone_summary(prefix, measurement.findings)
+    return result
+
+
+def _clone_failure(check: CheckDef, start: float, prefix: str, measurement: Any) -> Any:
+    from .checks import CLONE_BUDGET_SECONDS, _budget_detail
+
+    reason = measurement.error
+    if measurement.execution == "budget":
+        reason = _budget_detail(reason, start, CLONE_BUDGET_SECONDS)
+    print(f"{prefix}: {reason}", file=sys.stderr)
+    return _clone_result(
+        check, start, outcome=_clone_outcome(measurement), execution=measurement.execution,
+        diagnostics=measurement.diagnostics, reason=reason,
     )

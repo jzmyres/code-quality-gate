@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests, ratchet, verification
+from . import clones, elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests, ratchet, verification
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -290,7 +290,7 @@ register_adapter(AdapterDescriptor(
     "clones",
     ("min_tokens", "baseline"),
     _clones_spec,
-    _runner("_run_clones"),
+    clones._run_clones,
     location_coverage="complete",
     subject_noun="clone",
     failure_wording="occurrences",

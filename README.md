@@ -1110,7 +1110,9 @@ identity and then holds `[[entry]]` tables:
 * `reason` must be non-empty. An empty or missing reason fails the check even if the value is covered.
 * `expires` is optional. A TOML date before today no longer covers its subject and is reported as
   expired. An entry expiring today still covers today.
-* Adapter-specific informational keys are preserved by prune, for example clone `files`.
+* Extra informational keys declared by the adapter descriptor are lists of strings and are
+  preserved by prune, for example clone `files`. Empty-reason diagnostics list present,
+  nonempty extras in the descriptor's declared order.
 
 Thresholds, baseline bounds and measured values must be finite: a non-finite threshold or bound is a
 configuration error, and a non-finite measured value makes the check `unsupported`. JSON output is

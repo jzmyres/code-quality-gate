@@ -643,7 +643,3 @@ def installed_tool_dir(name: str) -> Path:
     """The verified install directory of a pinned tool."""
     _tool, directory = installed_tool(name)
     return directory
-
-
-def _jscpd_binary() -> Path:
-    return tool_binary("jscpd")

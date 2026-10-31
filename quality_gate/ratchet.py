@@ -217,20 +217,19 @@ def _check_header(
             raise _baseline_error(path, key, where, f"{value!r}")
 
 
-def _validate_files_extra(
-    path: Path, where: str, extras: dict[str, Any]
+def _validate_extra(
+    path: Path, where: str, name: str, value: Any
 ) -> None:
-    files = extras.get("files")
-    if files is None or (
-        isinstance(files, list)
-        and all(isinstance(item, str) for item in files)
+    if (
+        isinstance(value, list)
+        and all(isinstance(item, str) for item in value)
     ):
         return
     raise _baseline_error(
         path,
-        f"{where}.files",
+        f"{where}.{name}",
         "a list of strings",
-        _describe(files),
+        _describe(value),
     )
 
 
@@ -241,7 +240,8 @@ def _extras(
     allowed_extras: tuple[str, ...],
 ) -> dict[str, Any]:
     extras = {key: raw[key] for key in allowed_extras if key in raw}
-    _validate_files_extra(path, where, extras)
+    for name, value in extras.items():
+        _validate_extra(path, where, name, value)
     return extras
 
 
@@ -602,10 +602,11 @@ def _finite_inputs(
 
 
 def _empty_reason_detail(entry: BaselineEntry) -> str:
-    files = entry.extras.get("files")
-    if isinstance(files, list) and files:
-        return f" (files: {', '.join(files)})"
-    return ""
+    return "".join(
+        f" ({name}: {', '.join(value)})"
+        for name, value in entry.extras.items()
+        if isinstance(value, list) and value
+    )
 
 
 def _scan_entries(
