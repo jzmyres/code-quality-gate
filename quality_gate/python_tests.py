@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import policy
+from . import output_patterns, policy
 from .coverage_tool import (
     combine_coverage,
     coverage_config_path,
@@ -27,7 +27,6 @@ from .policy import (
     UsageError,
     _config_error,
     _integer,
-    _test_patterns,
 )
 from .runner import (
     Diagnostics,
@@ -59,7 +58,7 @@ def _parse_python_tests(
         raise _config_error(
             path, f"{full_key}.run", "a non-empty argument list", "an empty list"
         )
-    pattern_text, pattern, skipped_pattern_text, skipped_pattern = _test_patterns(
+    pattern_text, pattern, skipped_pattern_text, skipped_pattern = output_patterns._test_patterns(
         raw, path, full_key
     )
     if pattern_text is None or pattern is None:
@@ -119,74 +118,6 @@ def expand_run(run: tuple[str, ...], prefix: list[str]) -> list[str]:
         else:
             expanded.append(argument)
     return expanded
-
-
-def _capture_count(
-    text: str | None, pattern: str, label: str
-) -> tuple[int | None, str | None]:
-    if text is None:
-        return 0, None
-    if re.fullmatch(r"[0-9]+", text) is None:
-        return (
-            None,
-            f"{label}_pattern {pattern!r} captured "
-            f"{text!r}, which is not a test count "
-            "(expected a non-negative integer)",
-        )
-    return int(text), None
-
-
-def _skipped_from_matches(
-    spec: PythonTestsSpec, matches: list[list[str | None]]
-) -> tuple[int | None, str | None]:
-    if spec.skipped_pattern_re is None or not matches:
-        return 0, None
-    if len(matches) > 1:
-        return (
-            None,
-            f"ambiguous skipped summary: skipped_pattern "
-            f"{spec.skipped_pattern!r} matched {len(matches)} times",
-        )
-    assert spec.skipped_pattern is not None
-    return _capture_count(
-        matches[0][0], spec.skipped_pattern, "skipped"
-    )
-
-
-def summarize_matches(
-    spec: PythonTestsSpec,
-    tests_matches: list[list[str | None]],
-    skipped_matches: list[list[str | None]],
-) -> tuple[int | None, int | None, str | None]:
-    if not tests_matches:
-        return (
-            None,
-            None,
-            f"tests_pattern {spec.tests_pattern!r} did not match the "
-            "command output",
-        )
-    if len(tests_matches) > 1:
-        return (
-            None,
-            None,
-            f"ambiguous test summary: tests_pattern {spec.tests_pattern!r} "
-            f"matched {len(tests_matches)} times",
-        )
-    ran, error = _capture_count(
-        tests_matches[0][0], spec.tests_pattern, "tests"
-    )
-    if error is not None:
-        return None, None, error
-    skipped, error = _skipped_from_matches(spec, skipped_matches)
-    if error is not None:
-        return None, None, error
-    if skipped > ran:
-        return (
-            None,
-            None,
-            f"skipped {skipped} tests but only {ran} ran",
-        )
-    return ran, skipped, None
 
 
 def _executed_tests(
@@ -277,10 +208,10 @@ def _tests_summary(
 ) -> tuple[
     int | None, int | None, str | None, Any | None
 ]:
-    from .checks import _command_patterns, _pattern_matches, _tests_result
+    from .checks import _tests_result
 
-    matches, evaluation = _pattern_matches(
-        _command_patterns(spec),
+    matches, evaluation = output_patterns._pattern_matches(
+        output_patterns._command_patterns(spec),
         combined,
         max(0.0, deadline - time.monotonic()),
     )
@@ -316,7 +247,7 @@ def _tests_summary(
             ),
         )
     ran, skipped, error = analysis_step(
-        "test count analysis", summarize_matches,
+        "test count analysis", output_patterns.summarize_matches,
         spec, matches.get("tests", []), matches.get("skipped", []),
     )
     return ran, skipped, error, None

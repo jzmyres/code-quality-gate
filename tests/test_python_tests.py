@@ -33,6 +33,7 @@ covrun = importlib.import_module("quality_gate.covrun")
 gate_tools = importlib.import_module("quality_gate.tools")
 policy = importlib.import_module("quality_gate.policy")
 python_tests = importlib.import_module("quality_gate.python_tests")
+output_patterns = importlib.import_module("quality_gate.output_patterns")
 regexrun = importlib.import_module("quality_gate.regexrun")
 runner = importlib.import_module("quality_gate.runner")
 
@@ -1090,7 +1091,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
 
     def test_counts_returns_a_matching_failure(self) -> None:
         with mock.patch.object(
-            checks, "_pattern_matches", return_value=(None, None)
+            output_patterns, "_pattern_matches", return_value=(None, None)
         ), contextlib.redirect_stderr(io.StringIO()):
             counts, failure = self.counts("ignored")
         self.assertIsNone(counts)
@@ -1218,7 +1219,7 @@ class TestSummaryTests(unittest.TestCase):
         if spec.skipped_pattern is not None:
             patterns["skipped"] = spec.skipped_pattern
         matches = regexrun.evaluate({"text": output, "patterns": patterns})
-        return python_tests.summarize_matches(
+        return output_patterns.summarize_matches(
             spec, matches["tests"], matches.get("skipped", [])
         )
 

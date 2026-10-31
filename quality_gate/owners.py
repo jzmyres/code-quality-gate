@@ -21,9 +21,9 @@ from .json_input import load_json
 from .owners_match import Occurrence, covered
 from .owners_python import python_code, python_events
 from .owners_shell import shell_events
-from .policy import ConfigError, GateError, _check_keys, _config_error, _string, _string_list
-from .ratchet import Finding, Location
-from .runner import run
+from .policy import CheckDef, ConfigError, GateError, _check_keys, _config_error, _string, _string_list
+from .ratchet import Domain, Finding, Location
+from .runner import analysis_step, run
 
 
 KINDS = (
@@ -536,3 +536,54 @@ def measure_owners(
     findings = [finding for rule in spec.rules for finding in _rule_findings(rule, events, regular)]
     findings.extend(_analysis_findings(events))
     return sorted(findings, key=lambda finding: finding.subject)
+
+
+def _owners_message(path: str, line: int, details: dict[str, Any]) -> str:
+    if details.get("kind") == "unanalysable":
+        return f"owners: {path}:{line}: unanalysable {details['word']!r}: {details['reason']}"
+    owners = ", ".join(details["owners"])
+    return f"owners: {details['rule']}: {path}:{line}: {details['pattern']} outside its owners ({owners})"
+
+
+def _owners_report(findings: list[Any]) -> None:
+    for finding in findings:
+        details = finding.measurement
+        assert details is not None
+        path = finding.location.rsplit(":", 1)[0]
+        for line in details["lines"]:
+            print(_owners_message(path, line, details), file=sys.stderr)
+
+
+def _owners_baseline(findings: list[Any], entries: list[Any]) -> list[Any]:
+    uncertain = {finding.subject for finding in findings if finding.kind == "unanalysable"}
+    return [entry for entry in entries if entry.subject not in uncertain]
+
+
+def _owners_error(check: CheckDef, start: float, prefix: str, error: GateError) -> Any:
+    from .checks import _ratchet_error
+
+    result = _ratchet_error(check, start, prefix, error)
+    result.configuration_error = isinstance(error, ConfigError)
+    return result
+
+
+def _run_owners(context: Any) -> Any:
+    from .checks import _baseline_entries, _evaluate_ratchet, _ratchet_result
+
+    root, check = context.root, context.check
+    files, prefix = context.files, context.prefix
+    start = time.monotonic()
+    try:
+        findings = analysis_step("owners analysis", measure_owners, root, files, check.spec)
+        entries = analysis_step("baseline loading", _baseline_entries, check)
+    except GateError as error:
+        return _owners_error(check, start, prefix, error)
+    _owners_report(findings)
+    ratchet, failure = _evaluate_ratchet(
+        findings, _owners_baseline(findings, entries), check, prefix, Domain.all("the full inventory")
+    )
+    if ratchet is None:
+        return _ratchet_result(check, start, failure or "error", reason=failure)
+    if ratchet.satisfied:
+        print(f"{prefix}: {len(findings)} subjects within baseline", flush=True)
+    return _ratchet_result(check, start, ratchet.outcome, ratchet=ratchet)

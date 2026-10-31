@@ -1,11 +1,9 @@
-"""Check adapters, the check runner and the combined check command."""
+"""Shared check machinery, the check runner and the combined check command."""
 from __future__ import annotations
 
 import contextlib
 import json
-import re
 import sys
-import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -17,17 +15,13 @@ from . import gate_result
 from .adapters import AdapterContext, adapter_for
 from .changes import apply_changes, changed_lines, location_coverage, resolve_revision
 from .files import git_argv, hygiene_result, validate_inventory
-from .json_input import load_json
-from .owners import measure_owners
 from .policy import (
     CheckDef,
     Config,
-    ConfigError,
     GateError,
     UnsupportedError,
     UsageError,
 )
-from .python_tests import summarize_matches
 from .ratchet import (
     BaselineEntry,
     Domain,
@@ -39,22 +33,16 @@ from .ratchet import (
 )
 from .runner import (
     Diagnostics,
-    RunResult,
     StepTimeout,
     WorkerError,
     analysis_step,
     check_deadline,
     check_time,
-    mark_step,
-    record_diagnostics,
-    run,
 )
-from .tools import current_tools, tool_binary
 from .trust import checked_prune_path
 
 
-CLONE_BUDGET_SECONDS = 600
-REGEX_RUNNER = Path(__file__).with_name("regexrun.py")
+RATCHET_BUDGET_SECONDS = 600
 
 
 def _budget_detail(reason: str, start: float, budget: float) -> str:
@@ -213,41 +201,6 @@ def _baseline_entries(check: CheckDef) -> list[BaselineEntry]:
     )
 
 
-def _file_argument(name: str) -> str:
-    return f"./{name}" if name.startswith("-") else name
-
-
-def _expand_run(
-    check: CheckDef, files: list[str]
-) -> tuple[list[str], str | None]:
-    spec = check.spec
-    expanded: list[str] = []
-    tools = None
-    for argument in spec.run:
-        if argument == "{files}":
-            expanded.extend(map(_file_argument, files))
-            continue
-        match = re.fullmatch(r"\{tool:([^{}]+)\}", argument)
-        if match is None:
-            expanded.append(argument)
-            continue
-        name = match.group(1)
-        if tools is None:
-            _lock, tools = current_tools()
-        if name not in tools:
-            known = ", ".join(sorted(tools)) or "none"
-            return (
-                [],
-                f"unknown tool {name!r} (pinned tools: {known}); "
-                "run 'python3 -I qg.py tools fetch'",
-            )
-        try:
-            expanded.append(str(tool_binary(name)))
-        except UnsupportedError as error:
-            return [], str(error)
-    return expanded, None
-
-
 def _check_result(
     check: CheckDef,
     start: float,
@@ -311,274 +264,6 @@ def _evaluate_ratchet(
         return None, "error"
 
 
-def _command_failure(
-    check: CheckDef,
-    spec: Any,
-    start: float,
-    prefix: str,
-    reason: str,
-    **fields: Any,
-) -> CheckResult:
-    return _tests_result(check, spec, start, prefix, reason, **fields)
-
-
-def _expanded_or_failure(
-    check: CheckDef,
-    spec: Any,
-    selected: list[str],
-    prefix: str,
-    start: float,
-) -> tuple[list[str] | None, CheckResult | None]:
-    try:
-        expanded, unsupported = analysis_step(
-            "command preparation", _expand_run, check, selected
-        )
-    except UsageError as error:
-        return None, _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            str(error),
-            outcome="error",
-            execution="error",
-            diagnostics=Diagnostics(error=str(error)),
-        )
-    if unsupported is not None:
-        return None, _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            unsupported,
-            outcome="unsupported",
-            execution="error",
-            diagnostics=Diagnostics(error=unsupported),
-        )
-    return expanded, None
-
-
-def _termination_failure(
-    check: CheckDef,
-    spec: Any,
-    start: float,
-    prefix: str,
-    result: RunResult,
-    diagnostics: Diagnostics,
-) -> CheckResult | None:
-    combined = result.combined_text
-    if result.execution == "error":
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            result.error or "cannot run command",
-            outcome="error",
-            execution="error",
-            diagnostics=diagnostics,
-        )
-    if result.execution == "budget":
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            f"command exceeded its {spec.budget_seconds} second budget",
-            execution="budget",
-            diagnostics=diagnostics,
-            combined=combined,
-        )
-    if result.execution == "signal":
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            f"command terminated by signal {-result.returncode}",
-            execution="signal",
-            diagnostics=diagnostics,
-            combined=combined,
-        )
-    if result.returncode != 0:
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            f"command exited {result.returncode}",
-            diagnostics=diagnostics,
-            combined=combined,
-        )
-    return None
-
-
-def _command_patterns(spec: Any) -> dict[str, str]:
-    patterns: dict[str, str] = {}
-    for name in ("tests", "skipped"):
-        value = getattr(spec, f"{name}_pattern", None)
-        if value is not None:
-            patterns[name] = value
-    must_match = getattr(spec, "must_match", None)
-    if must_match is not None:
-        patterns["must_match"] = must_match
-    return patterns
-
-
-def _pattern_matches(
-    patterns: dict[str, str], text: str, budget_seconds: float
-) -> tuple[dict[str, Any] | None, RunResult | None]:
-    deadline = time.monotonic() + max(0.0, budget_seconds)
-    with tempfile.TemporaryDirectory(prefix="qg-regex-") as temporary:
-        job = Path(temporary) / "job.json"
-        analysis_step("output matching preparation", _write_pattern_job, job, patterns, text)
-        mark_step("output matching")
-        result = run(
-            [sys.executable, "-I", str(REGEX_RUNNER), str(job)],
-            budget_seconds=max(0.0, deadline - time.monotonic()),
-        )
-    if result.execution != "completed" or result.returncode != 0:
-        return None, result
-    try:
-        return analysis_step("output matching analysis", load_json, result.stdout_text), result
-    except ValueError:
-        return None, result
-
-
-def _write_pattern_job(job: Path, patterns: dict[str, str], text: str) -> None:
-    job.write_text(json.dumps({"text": text, "patterns": patterns}), encoding="utf-8")
-
-
-def _pattern_failure(
-    check: CheckDef,
-    spec: Any,
-    start: float,
-    prefix: str,
-    diagnostics: Diagnostics,
-    evaluation: RunResult | None,
-) -> CheckResult:
-    if evaluation is not None and evaluation.execution == "budget":
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            "output matching exceeded the remaining budget",
-            execution="budget",
-            diagnostics=diagnostics,
-        )
-    return _command_failure(
-        check,
-        spec,
-        start,
-        prefix,
-        "output matching failed",
-        outcome="error",
-        execution="error",
-        diagnostics=diagnostics,
-    )
-
-
-def _command_test_fields(
-    check: CheckDef,
-    spec: Any,
-    start: float,
-    prefix: str,
-    matches: dict[str, Any],
-    diagnostics: Diagnostics,
-    combined: str,
-) -> tuple[dict[str, Any], CheckResult | None]:
-    if spec.tests_pattern_re is None:
-        return {}, None
-    ran, skipped, count_error = analysis_step(
-        "test count analysis", summarize_matches,
-        spec, matches.get("tests", []), matches.get("skipped", []),
-    )
-    if count_error is not None:
-        return {}, _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            count_error,
-            outcome="unsupported",
-            diagnostics=diagnostics,
-            combined=combined,
-        )
-    assert ran is not None and skipped is not None
-    executed = ran - skipped
-    if executed == 0:
-        return {}, _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            f"no test executed: {ran} ran, {skipped} skipped; "
-            "zero tests is not a pass",
-            diagnostics=diagnostics,
-            measurement={"tests": 0},
-            combined=combined,
-        )
-    return {
-        "measurement": {"tests": executed},
-        "tests_ran": ran,
-        "tests_skipped": skipped,
-    }, None
-
-
-def _command_evidence(
-    check: CheckDef,
-    spec: Any,
-    start: float,
-    prefix: str,
-    result: RunResult,
-    diagnostics: Diagnostics,
-    deadline: float,
-) -> CheckResult:
-    combined = result.combined_text
-    patterns = _command_patterns(spec)
-    matches: dict[str, Any] = {}
-    if patterns:
-        matches, evaluation = _pattern_matches(
-            patterns,
-            combined,
-            max(0.0, deadline - time.monotonic()),
-        )
-        if matches is None:
-            return _pattern_failure(
-                check, spec, start, prefix, diagnostics, evaluation
-            )
-    fields, failure = _command_test_fields(
-        check, spec, start, prefix, matches, diagnostics, combined
-    )
-    if failure is not None:
-        return failure
-    if spec.must_match_pattern is not None and not matches.get("must_match"):
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            f"output did not match must_match {spec.must_match!r}",
-            diagnostics=diagnostics,
-            combined=combined,
-            **fields,
-        )
-    outcome = _check_result(
-        check,
-        start,
-        "pass",
-        budget_seconds=spec.budget_seconds,
-        diagnostics=diagnostics,
-        **fields,
-    )
-    print(
-        f"{prefix}: passed (exit 0, {outcome.duration_seconds:.2f}s)",
-        flush=True,
-    )
-    return outcome
-
-
 def _adapter_selection(
     context: AdapterContext,
 ) -> tuple[Any, float, list[str], list[str]]:
@@ -590,43 +275,6 @@ def _adapter_selection(
         context.files, context.classes,
     )
     return spec, start, selected, names
-
-
-def _run_command(context: AdapterContext) -> CheckResult:
-    root, check, prefix = context.root, context.check, context.prefix
-    spec, start, selected, names = _adapter_selection(context)
-    if "{files}" in spec.run and not selected:
-        return _command_failure(
-            check,
-            spec,
-            start,
-            prefix,
-            f"no files selected (classes: {_class_text(names)}); "
-            "zero inputs is not a pass",
-        )
-    expanded, failure = _expanded_or_failure(
-        check, spec, selected, prefix, start
-    )
-    if failure is not None:
-        return failure
-    assert expanded is not None
-    deadline = start + spec.budget_seconds
-    mark_step("command")
-    result = run(
-        expanded,
-        cwd=root,
-        budget_seconds=max(0.0, deadline - time.monotonic()),
-    )
-    diagnostics = result.diagnostics()
-    record_diagnostics(diagnostics)
-    failure = _termination_failure(
-        check, spec, start, prefix, result, diagnostics
-    )
-    if failure is not None:
-        return failure
-    return _command_evidence(
-        check, spec, start, prefix, result, diagnostics, deadline
-    )
 
 
 def _ratchet_reason(
@@ -655,7 +303,7 @@ def _ratchet_result(
         start,
         outcome,
         execution=execution,
-        budget_seconds=CLONE_BUDGET_SECONDS,
+        budget_seconds=RATCHET_BUDGET_SECONDS,
         findings=ratchet.findings if ratchet is not None else [],
         resolved_baseline_entries=ratchet.resolved if ratchet is not None else [],
         unmeasured_baseline_entries=(
@@ -671,7 +319,7 @@ def _ratchet_result(
 
 def _ratchet_budget_reason(reason: str | None, execution: str, start: float) -> str | None:
     if execution == "budget" and reason is not None and "deadline:" not in reason:
-        return _budget_detail(reason, start, CLONE_BUDGET_SECONDS)
+        return _budget_detail(reason, start, RATCHET_BUDGET_SECONDS)
     return reason
 
 
@@ -741,53 +389,6 @@ def _test_check_dependencies(
         for identifier, result in prior.items()
         if "tests" in result.evidence
     ]
-
-
-def _owners_message(path: str, line: int, details: dict[str, Any]) -> str:
-    if details.get("kind") == "unanalysable":
-        return f"owners: {path}:{line}: unanalysable {details['word']!r}: {details['reason']}"
-    owners = ", ".join(details["owners"])
-    return f"owners: {details['rule']}: {path}:{line}: {details['pattern']} outside its owners ({owners})"
-
-
-def _owners_report(findings: list[Any]) -> None:
-    for finding in findings:
-        details = finding.measurement
-        assert details is not None
-        path = finding.location.rsplit(":", 1)[0]
-        for line in details["lines"]:
-            print(_owners_message(path, line, details), file=sys.stderr)
-
-
-def _owners_baseline(findings: list[Any], entries: list[Any]) -> list[Any]:
-    uncertain = {finding.subject for finding in findings if finding.kind == "unanalysable"}
-    return [entry for entry in entries if entry.subject not in uncertain]
-
-
-def _owners_error(check: CheckDef, start: float, prefix: str, error: GateError) -> CheckResult:
-    result = _ratchet_error(check, start, prefix, error)
-    result.configuration_error = isinstance(error, ConfigError)
-    return result
-
-
-def _run_owners(context: AdapterContext) -> CheckResult:
-    root, check = context.root, context.check
-    files, prefix = context.files, context.prefix
-    start = time.monotonic()
-    try:
-        findings = analysis_step("owners analysis", measure_owners, root, files, check.spec)
-        entries = analysis_step("baseline loading", _baseline_entries, check)
-    except GateError as error:
-        return _owners_error(check, start, prefix, error)
-    _owners_report(findings)
-    ratchet, failure = _evaluate_ratchet(
-        findings, _owners_baseline(findings, entries), check, prefix, Domain.all("the full inventory")
-    )
-    if ratchet is None:
-        return _ratchet_result(check, start, failure or "error", reason=failure)
-    if ratchet.satisfied:
-        print(f"{prefix}: {len(findings)} subjects within baseline", flush=True)
-    return _ratchet_result(check, start, ratchet.outcome, ratchet=ratchet)
 
 
 def _check_descriptor(check: CheckDef) -> Any:

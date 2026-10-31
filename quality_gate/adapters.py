@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import clones, elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests, ratchet, verification
+from . import (
+    clones, command, elisp_crap, elisp_lint, elisp_tests, owners, python_crap, python_tests,
+    ratchet, verification,
+)
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -22,9 +25,9 @@ from .policy import (
 
 
 def _default_budget(_spec: Any) -> int:
-    from .checks import CLONE_BUDGET_SECONDS
+    from .checks import RATCHET_BUDGET_SECONDS
 
-    return CLONE_BUDGET_SECONDS
+    return RATCHET_BUDGET_SECONDS
 
 
 @dataclass(frozen=True)
@@ -242,15 +245,6 @@ def _verification_entry_direction(subject: str, configured: str) -> str:
     return "max"
 
 
-def _runner(attribute: str) -> Callable[[AdapterContext], Any]:
-    def run(context: AdapterContext) -> Any:
-        from . import checks
-
-        return getattr(checks, attribute)(context)
-
-    return run
-
-
 def _spec_budget(spec: Any) -> int:
     return spec.budget_seconds
 
@@ -281,7 +275,7 @@ register_adapter(AdapterDescriptor(
     "command",
     ("run", "budget_seconds", "must_match", "tests_pattern", "skipped_pattern"),
     _command_spec,
-    _runner("_run_command"),
+    command._run_command,
     no_tests_hint=" (no tests_pattern)",
     argument_fields=("run",),
     budget=_spec_budget,
@@ -363,7 +357,7 @@ register_adapter(AdapterDescriptor(
     "owners",
     ("baseline", "rule"),
     _owners_spec,
-    _runner("_run_owners"),
+    owners._run_owners,
     location_coverage="complete",
     fixed_header=(1, "enforced", "max"),
 ))

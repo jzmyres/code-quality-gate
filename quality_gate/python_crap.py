@@ -670,7 +670,7 @@ def _crap_measure(
     start: float,
     prefix: str,
 ) -> tuple[Any | None, Any | None]:
-    from .checks import CLONE_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
+    from .checks import RATCHET_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
 
     try:
         measurement = analysis_step(
@@ -679,11 +679,11 @@ def _crap_measure(
             selected,
             evidence_path,
             settings,
-            deadline=start + CLONE_BUDGET_SECONDS,
+            deadline=start + RATCHET_BUDGET_SECONDS,
         )
     except StepTimeout:
         reason = _budget_detail(
-            "CRAP analysis exceeded the remaining budget", start, CLONE_BUDGET_SECONDS
+            "CRAP analysis exceeded the remaining budget", start, RATCHET_BUDGET_SECONDS
         )
         print(f"{prefix}: {reason}", file=sys.stderr)
         return None, _ratchet_result(

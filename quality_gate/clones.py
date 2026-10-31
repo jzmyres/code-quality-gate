@@ -744,11 +744,11 @@ def _clone_ratchet(
 
 
 def _clone_failure(check: CheckDef, start: float, prefix: str, measurement: Any) -> Any:
-    from .checks import CLONE_BUDGET_SECONDS, _budget_detail
+    from .checks import RATCHET_BUDGET_SECONDS, _budget_detail
 
     reason = measurement.error
     if measurement.execution == "budget":
-        reason = _budget_detail(reason, start, CLONE_BUDGET_SECONDS)
+        reason = _budget_detail(reason, start, RATCHET_BUDGET_SECONDS)
     print(f"{prefix}: {reason}", file=sys.stderr)
     return _clone_result(
         check, start, outcome=_clone_outcome(measurement), execution=measurement.execution,

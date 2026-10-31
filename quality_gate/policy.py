@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -333,55 +332,6 @@ def _argv_list(
                 "embedded NUL",
             )
     return values
-
-
-def _one_group_pattern(
-    raw: dict[str, Any], key: str, path: Path, full_key: str
-) -> tuple[str | None, re.Pattern[str] | None]:
-    if key not in raw:
-        return None, None
-    text = _string(raw, key, path, full_key)
-    try:
-        pattern = re.compile(text, re.MULTILINE)
-    except re.error as error:
-        raise _config_error(
-            path,
-            full_key,
-            "a valid regular expression",
-            str(error),
-        ) from error
-    if pattern.groups != 1:
-        raise _config_error(
-            path,
-            full_key,
-            "a regular expression with one capture group",
-            f"{pattern.groups} capture groups",
-        )
-    return text, pattern
-
-
-def _test_patterns(
-    raw: dict[str, Any], path: Path, full_key: str
-) -> tuple[
-    str | None,
-    re.Pattern[str] | None,
-    str | None,
-    re.Pattern[str] | None,
-]:
-    if "skipped_pattern" in raw and "tests_pattern" not in raw:
-        raise _config_error(
-            path,
-            f"{full_key}.skipped_pattern",
-            "tests_pattern in the same check",
-            "skipped_pattern without tests_pattern",
-        )
-    tests_text, tests_re = _one_group_pattern(
-        raw, "tests_pattern", path, f"{full_key}.tests_pattern"
-    )
-    skipped_text, skipped_re = _one_group_pattern(
-        raw, "skipped_pattern", path, f"{full_key}.skipped_pattern"
-    )
-    return tests_text, tests_re, skipped_text, skipped_re
 
 
 def _parse_direction(

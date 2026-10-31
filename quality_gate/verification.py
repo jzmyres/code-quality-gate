@@ -248,7 +248,7 @@ def _verification_findings(
     start: float,
     prefix: str,
 ) -> Any:
-    from .checks import CLONE_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
+    from .checks import RATCHET_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
 
     counts, problem = analysis_step("verification test counts", _verification_counts, check, prior)
     if problem is not None:
@@ -264,11 +264,11 @@ def _verification_findings(
     try:
         return analysis_step(
             "verification analysis", measure_verification, root, files, counts,
-            deadline=start + CLONE_BUDGET_SECONDS,
+            deadline=start + RATCHET_BUDGET_SECONDS,
         )
     except StepTimeout:
         reason = _budget_detail(
-            "verification analysis exceeded the remaining budget", start, CLONE_BUDGET_SECONDS
+            "verification analysis exceeded the remaining budget", start, RATCHET_BUDGET_SECONDS
         )
         print(f"{prefix}: {reason}", file=sys.stderr)
         return _ratchet_result(check, start, "fail", execution="budget", reason=reason)

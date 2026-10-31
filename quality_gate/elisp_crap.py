@@ -217,7 +217,7 @@ def _complexity_document(context: Any, selected: list[str], start: float, child:
 
 
 def _complexity(context: Any, selected: list[str], start: float) -> tuple[Any, Any]:
-    from .checks import CLONE_BUDGET_SECONDS
+    from .checks import RATCHET_BUDGET_SECONDS
 
     required = context.config.checks[context.check.spec.requires]
     with _temporary() as temporary:
@@ -225,7 +225,7 @@ def _complexity(context: Any, selected: list[str], start: float) -> tuple[Any, A
         mark_step("Emacs complexity command")
         child = run(_command(required.spec.emacs, context.root, selected, result,
                              context.check.spec.decision_rules),
-                    cwd=context.root, budget_seconds=CLONE_BUDGET_SECONDS)
+                    cwd=context.root, budget_seconds=RATCHET_BUDGET_SECONDS)
         record_diagnostics(child.diagnostics())
         if child.execution != "completed":
             return None, _child_failure(context, start, child)

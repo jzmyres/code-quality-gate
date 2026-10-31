@@ -7,9 +7,9 @@ metric_version = "python-lines/1"
 # resolved entries.
 
 [[entry]]
-subject = "quality_gate/checks.py:_expand_run"
+subject = "quality_gate/command.py:_expand_run"
 bound = 8
-reason = "above 6 after QF1 (2026-10-25); worklist"
+reason = "above 6 after QF1 (2026-10-25); worklist; moved from checks.py in QF87"
 
 [[entry]]
 subject = "quality_gate/python_crap.py:_run_python_crap"

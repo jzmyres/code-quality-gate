@@ -134,7 +134,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
 
     def run_adapter(self, adapter: str) -> tuple[object, float]:
         start = time.monotonic()
-        with mock.patch.object(checks, "CLONE_BUDGET_SECONDS", self.budget):
+        with mock.patch.object(checks, "RATCHET_BUDGET_SECONDS", self.budget):
             with contextlib.redirect_stderr(io.StringIO()):
                 result = checks.run_check(
                     self.root, self.config, self.check_def(adapter),
@@ -182,7 +182,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
         self.assert_timeout(result, "verification analysis", elapsed)
 
     def test_owners_analysis_is_stopped_while_running(self) -> None:
-        with mock.patch.object(checks, "measure_owners", side_effect=self.stall):
+        with mock.patch.object(owners, "measure_owners", side_effect=self.stall):
             result, elapsed = self.run_adapter("owners")
         self.assert_timeout(result, "owners analysis", elapsed)
 
@@ -274,7 +274,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
             return process, failure
 
         with mock.patch.object(runner, "_spawn", side_effect=record_spawn):
-            with mock.patch.object(checks, "CLONE_BUDGET_SECONDS", 0.06):
+            with mock.patch.object(checks, "RATCHET_BUDGET_SECONDS", 0.06):
                 with contextlib.redirect_stderr(io.StringIO()):
                     result = checks.run_check(
                         self.root, self.config, check, ["owner.txt", "source.txt"], {},
@@ -299,7 +299,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
             runner.run(command, budget_seconds=20)
 
         try:
-            with mock.patch.object(checks, "measure_owners", side_effect=work):
+            with mock.patch.object(owners, "measure_owners", side_effect=work):
                 with mock.patch.object(runner.os, "killpg", side_effect=deny_child):
                     result, _elapsed = self.run_adapter("owners")
             pid, child_pid = (int(value) for value in self.started.read_text(encoding="utf-8").split())
@@ -317,7 +317,7 @@ class AnalysisDeadlineTests(unittest.TestCase):
                     original_killpg(pid, signal.SIGKILL)
 
     def test_owners_baseline_loading_is_stopped_while_running(self) -> None:
-        with mock.patch.object(checks, "measure_owners", return_value=[]):
+        with mock.patch.object(owners, "measure_owners", return_value=[]):
             with mock.patch.object(checks, "_baseline_entries", side_effect=self.stall):
                 result, elapsed = self.run_adapter("owners")
         self.assert_timeout(result, "baseline loading", elapsed)

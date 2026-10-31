@@ -19,7 +19,7 @@ from support import (
 
 sys.path.insert(0, str(GATE))
 regexrun = importlib.import_module("quality_gate.regexrun")
-checks = importlib.import_module("quality_gate.checks")
+output_patterns = importlib.import_module("quality_gate.output_patterns")
 runner = importlib.import_module("quality_gate.runner")
 
 
@@ -446,8 +446,8 @@ class RegexRunnerTests(unittest.TestCase):
             with self.subTest(text=text):
                 child = runner.RunResult(argv=(), execution="completed", returncode=0,
                                          stdout=text.encode())
-                with mock.patch.object(checks, "run", return_value=child):
-                    matches, result = checks._pattern_matches({"tests": "pattern"}, "text", 60)
+                with mock.patch.object(output_patterns, "run", return_value=child):
+                    matches, result = output_patterns._pattern_matches({"tests": "pattern"}, "text", 60)
                 self.assertIsNone(matches)
                 self.assertIs(result, child)
 
