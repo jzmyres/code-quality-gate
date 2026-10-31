@@ -40,16 +40,8 @@ def parse_stub(
     )
 
 
-def run_stub(
-    root: Path,
-    config: object,
-    check: policy.CheckDef,
-    files: list[str],
-    classes: dict[str, str],
-    *,
-    prefix: str,
-    prior: dict[str, object],
-) -> checks.CheckResult:
+def run_stub(context: adapters.AdapterContext) -> checks.CheckResult:
+    check = context.check
     count = check.spec.count
     return checks.CheckResult(
         id=check.id,
@@ -266,7 +258,9 @@ class StubAdapterTests(unittest.TestCase):
 
     def test_any_adapter_can_report_its_tool_identity(self) -> None:
         config = self.config(STUB_CONFIG)
-        result = run_stub(self.root, config, config.checks["stub"], [], {}, prefix="stub", prior={})
+        result = run_stub(adapters.AdapterContext(
+            self.root, config, config.checks["stub"], [], {}, "stub", {}
+        ))
         self.assertNotIn("tool", result.to_json())
         result.tool = {"name": "fixture compiler", "version": "2.3"}
         document = result.to_json()

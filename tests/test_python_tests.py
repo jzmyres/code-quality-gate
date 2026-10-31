@@ -914,7 +914,7 @@ class CoverageDeadlineTests(unittest.TestCase):
             threshold=None,
             baseline=None,
         )
-        result = checks._combine_tests_evidence(
+        result = python_tests._combine_tests_evidence(
             check,
             spec,
             0.0,
@@ -956,7 +956,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         )
 
     def counts(self, combined: str) -> tuple[object, object]:
-        return checks._tests_counts(
+        return python_tests._tests_counts(
             self.check,
             self.spec,
             0.0,
@@ -970,20 +970,20 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary)
             settings = coverage_tool.coverage_config_text(data_dir)
-            missing = checks._coverage_config_problem(data_dir, settings)
+            missing = coverage_tool._coverage_config_problem(data_dir, settings)
             self.assertIn("coverage.ini", missing)
             self.assertIn("cannot be read", missing)
             coverage_tool.write_coverage_config(data_dir, data_dir)
-            with mock.patch.object(checks.os, "open", side_effect=PermissionError("denied")):
-                unreadable = checks._coverage_config_problem(data_dir, settings)
+            with mock.patch.object(coverage_tool.os, "open", side_effect=PermissionError("denied")):
+                unreadable = coverage_tool._coverage_config_problem(data_dir, settings)
             self.assertIn("coverage.ini", unreadable)
             self.assertIn("denied", unreadable)
 
     def test_setup_returns_the_data_directory_and_prefix(self) -> None:
         with mock.patch.object(
-            checks, "coverage_prefix", return_value=["prefix"]
+            python_tests, "coverage_prefix", return_value=["prefix"]
         ) as prefix:
-            setup = checks._tests_setup(
+            setup = python_tests._tests_setup(
                 Path("/repo"), self.check, self.spec, 0.0, "check: tests"
             )
         assert not isinstance(setup, checks.CheckResult)
@@ -995,9 +995,9 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
 
     def setup_failure(self, error: Exception) -> checks.CheckResult:
         with mock.patch.object(
-            checks, "coverage_prefix", side_effect=error
+            python_tests, "coverage_prefix", side_effect=error
         ), contextlib.redirect_stderr(io.StringIO()):
-            setup = checks._tests_setup(
+            setup = python_tests._tests_setup(
                 Path("/repo"), self.check, self.spec, 0.0, "check: tests"
             )
         assert isinstance(setup, checks.CheckResult)
@@ -1055,7 +1055,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         for run_result, outcome, execution, reason in cases:
             with self.subTest(execution=run_result.execution):
                 with contextlib.redirect_stderr(io.StringIO()):
-                    result = checks._tests_execution_failure(
+                    result = python_tests._tests_execution_failure(
                         self.check,
                         self.spec,
                         run_result,
@@ -1077,7 +1077,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             argv=(), execution="completed", returncode=1
         )
         self.assertIsNone(
-            checks._tests_execution_failure(
+            python_tests._tests_execution_failure(
                 self.check,
                 self.spec,
                 run_result,
@@ -1160,7 +1160,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         data_dir.mkdir()
         coverage_tool.write_coverage_config(data_dir, data_dir)
         with mock.patch.object(
-            checks, "_combine_tests_evidence", return_value=None
+            python_tests, "_combine_tests_evidence", return_value=None
         ), contextlib.redirect_stdout(io.StringIO()) as stdout:
             result = python_tests._tests_evidence(
                 self.check,

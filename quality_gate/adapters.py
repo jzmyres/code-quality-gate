@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import ratchet
+from . import elisp_crap, elisp_lint, elisp_tests, python_tests, ratchet
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -59,7 +59,7 @@ class AdapterDescriptor:
     name: str
     keys: tuple[str, ...]
     parse: Callable[[dict[str, Any], Path, Path, str], ParsedSpec]
-    run: Callable[..., Any]
+    run: Callable[[AdapterContext], Any]
     location_coverage: str = "none"
     display: Callable[[float], str] = ratchet._number
     subject_noun: str = ""
@@ -242,22 +242,10 @@ def _verification_entry_direction(subject: str, configured: str) -> str:
     return "max"
 
 
-def _runner(attribute: str) -> Callable[..., Any]:
-    def run(
-        root: Path,
-        config: Any,
-        check: Any,
-        files: list[str],
-        classes: dict[str, str],
-        *,
-        prefix: str,
-        prior: dict[str, Any],
-    ) -> Any:
+def _runner(attribute: str) -> Callable[[AdapterContext], Any]:
+    def run(context: AdapterContext) -> Any:
         from . import checks
 
-        context = AdapterContext(
-            root, config, check, files, classes, prefix, prior
-        )
         return getattr(checks, attribute)(context)
 
     return run
@@ -312,7 +300,7 @@ register_adapter(AdapterDescriptor(
     "python_tests",
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     _python_tests_spec,
-    _runner("_run_python_tests"),
+    python_tests._run_python_tests,
     argument_fields=("run",),
     budget=_spec_budget,
 ))
@@ -320,7 +308,7 @@ register_adapter(AdapterDescriptor(
     "elisp_tests",
     ("suite", "load_path", "emacs", "budget_seconds"),
     _elisp_tests_spec,
-    _runner("_run_elisp_tests"),
+    elisp_tests.run_tests,
     argument_fields=("emacs", "suite", "load_path"),
     budget=_spec_budget,
     parse_candidate_inputs=True,
@@ -329,7 +317,7 @@ register_adapter(AdapterDescriptor(
     "elisp_compile",
     ("load_path", "emacs", "budget_seconds"),
     _elisp_lint_spec,
-    _runner("_run_elisp_lint"),
+    elisp_lint.run_lint,
     argument_fields=("emacs", "load_path"),
     budget=_spec_budget,
     parse_candidate_inputs=True,
@@ -338,7 +326,7 @@ register_adapter(AdapterDescriptor(
     "elisp_checkdoc",
     ("load_path", "emacs", "budget_seconds"),
     _elisp_lint_spec,
-    _runner("_run_elisp_lint"),
+    elisp_lint.run_lint,
     argument_fields=("emacs", "load_path"),
     budget=_spec_budget,
     parse_candidate_inputs=True,
@@ -356,7 +344,7 @@ register_adapter(AdapterDescriptor(
     "elisp_crap",
     ("requires", "threshold", "baseline", "decision_rules"),
     _elisp_crap_spec,
-    _runner("_run_elisp_crap"),
+    elisp_crap.run_crap,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="elisp_tests",

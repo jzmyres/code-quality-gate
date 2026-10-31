@@ -636,7 +636,8 @@ def _bridge_parse(raw, root, path, full_key):
     return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "bridge/1", ("tests",),
                       requires=raw["requires"])
 
-def _bridge_run(root, config, check, files, classes, *, prefix, prior):
+def _bridge_run(context):
+    check, prior = context.check, context.prior
     import time
     from .checks import _check_result
     required = prior[check.spec.requires]
@@ -908,7 +909,8 @@ import time
 def _fixture_parse(raw, root, path, key):
     return ParsedSpec(SimpleNamespace(launch=tuple(raw["launch"])), "fixture/1", ("tests",))
 
-def _fixture_run(root, config, check, files, classes, *, prefix, prior):
+def _fixture_run(context):
+    root, check = context.root, context.check
     start = time.monotonic()
     child = run(check.spec.launch, cwd=root, budget_seconds=10)
     return _check_result(check, start, "pass" if child.returncode == 0 else "fail",

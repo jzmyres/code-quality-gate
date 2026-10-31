@@ -160,7 +160,8 @@ def _fixture_parse(raw, root, path, full_key):
     from types import SimpleNamespace
     return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "fixture/1", (), requires=raw["requires"])
 
-def _fixture_run(root, config, check, files, classes, *, prefix, prior):
+def _fixture_run(context):
+    check, prior = context.check, context.prior
     import json, time
     from .checks import _check_result
     evidence = prior[check.spec.requires].evidence_path

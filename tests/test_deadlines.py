@@ -28,6 +28,7 @@ clones = importlib.import_module("quality_gate.clones")
 owners = importlib.import_module("quality_gate.owners")
 python_crap = importlib.import_module("quality_gate.python_crap")
 python_tests = importlib.import_module("quality_gate.python_tests")
+coverage_tool = importlib.import_module("quality_gate.coverage_tool")
 verification = importlib.import_module("quality_gate.verification")
 
 
@@ -157,11 +158,11 @@ class AnalysisDeadlineTests(unittest.TestCase):
                 self.started.unlink(missing_ok=True)
                 validation = self.stall if step == "coverage configuration validation" else None
                 start = time.monotonic()
-                with mock.patch.object(checks, "coverage_prefix", return_value=[]):
+                with mock.patch.object(python_tests, "coverage_prefix", return_value=[]):
                     with mock.patch.object(
-                        checks, "_coverage_config_problem", side_effect=validation, return_value=None
+                        coverage_tool, "_coverage_config_problem", side_effect=validation, return_value=None
                     ):
-                        with mock.patch.object(checks, "combine_coverage", side_effect=self.stall):
+                        with mock.patch.object(python_tests, "combine_coverage", side_effect=self.stall):
                             with contextlib.redirect_stderr(io.StringIO()):
                                 result = checks.run_check(
                                     self.root, self.config, check, [], {}, prefix="check"

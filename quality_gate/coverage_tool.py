@@ -6,6 +6,9 @@ adapters, and they put the tools cache's coverage install on sys.path first.
 from __future__ import annotations
 
 import configparser
+import errno
+import os
+import stat
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -71,6 +74,56 @@ def coverage_config_data(settings: str, data_file: Path) -> str:
 
 def coverage_config_path(data_dir: Path) -> Path:
     return data_dir / COVERAGE_CONFIG_NAME
+
+
+def _coverage_file_kind(mode: int) -> str:
+    return {
+        "d": "directory", "p": "FIFO", "l": "symlink", "s": "socket",
+        "c": "character device", "b": "block device",
+    }.get(stat.filemode(mode)[0], "non-regular file")
+
+
+def _open_coverage_config(path: Path) -> int:
+    try:
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise GateError("expected a regular file, got symlink") from error
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            raise error from None
+        if not stat.S_ISREG(mode):
+            raise GateError(f"expected a regular file, got {_coverage_file_kind(mode)}") from error
+        raise
+
+
+def _read_coverage_config(path: Path) -> str:
+    descriptor = _open_coverage_config(path)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            raise GateError(f"expected a regular file, got {_coverage_file_kind(mode)}")
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(descriptor)
+
+
+def _coverage_config_problem(data_dir: Path, settings: str) -> str | None:
+    path = coverage_config_path(data_dir)
+    try:
+        actual = _read_coverage_config(path)
+    except GateError as error:
+        return f"coverage configuration {path}: {error}"
+    except (OSError, UnicodeDecodeError) as error:
+        return f"coverage configuration {path} cannot be read: {error}"
+    if actual != settings:
+        return (
+            f"coverage configuration {path} differs from the "
+            "gate-owned configuration after the test run"
+        )
+    return None
 
 
 def write_coverage_config(data_dir: Path, root: Path) -> Path:

@@ -1010,8 +1010,8 @@ class CoverageConfigurationAttackTests(FixtureCase):
         shadow = self.base / "shadow"
         shadow.mkdir()
         (shadow / "risky.py").write_text(RISKY_SOURCE, encoding="utf-8")
-        checks_file = self.gate / "quality_gate" / "checks.py"
-        with checks_file.open("a", encoding="utf-8") as stream:
+        coverage_file = self.gate / "quality_gate" / "coverage_tool.py"
+        with coverage_file.open("a", encoding="utf-8") as stream:
             stream.write(
                 "\n_original_coverage_config_problem = _coverage_config_problem\n"
                 "def _change_config_after_validation(data_dir, settings):\n"
