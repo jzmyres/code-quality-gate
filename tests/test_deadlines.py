@@ -89,8 +89,8 @@ class AnalysisDeadlineTests(unittest.TestCase):
             adapter="python_tests", evidence=("tests",), metric_version="test-count/1",
             outcome="pass", execution="completed", duration_seconds=0,
             budget_seconds=1, tests_ran=1, tests_skipped=0,
-            evidence_path=self.evidence, coverage_config=self.config_file,
-            coverage_settings="canonical settings",
+            evidence_path=self.evidence,
+            adapter_data={"coverage_config": self.config_file, "coverage_settings": "canonical settings"},
         )
 
     def assert_timeout(self, result: object, step: str, elapsed: float) -> None:

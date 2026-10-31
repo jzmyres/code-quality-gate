@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,10 +11,12 @@ from typing import Any
 from . import policy
 from .coverage_tool import (
     coverage_config_path,
+    coverage_config_text,
     registry_dir,
     write_coverage_config,
 )
-from .policy import DEFAULT_TESTS_BUDGET_SECONDS, _config_error, _integer, _test_patterns
+from .policy import CheckDef, DEFAULT_TESTS_BUDGET_SECONDS, _config_error, _integer, _test_patterns
+from .runner import Diagnostics, analysis_step
 from .tools import installed_tool
 
 
@@ -163,3 +166,79 @@ def summarize_matches(
             f"skipped {skipped} tests but only {ran} ran",
         )
     return ran, skipped, None
+
+
+def _tests_evidence(
+    check: CheckDef,
+    spec: Any,
+    start: float,
+    prefix: str,
+    temporary: tempfile.TemporaryDirectory,
+    root: Path,
+    data_dir: Path,
+    ran: int,
+    skipped: int,
+    executed: int,
+    diagnostics: Diagnostics,
+    deadline: float,
+) -> Any:
+    from .checks import (
+        TestResults,
+        _check_result,
+        _combine_tests_evidence,
+        _coverage_config_problem,
+        _tests_result,
+    )
+
+    settings = coverage_config_text(root)
+    problem = analysis_step(
+        "coverage configuration validation", _coverage_config_problem,
+        data_dir, settings, deadline=deadline,
+    )
+    if problem is not None:
+        return _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            problem,
+            outcome="error",
+            execution="error",
+            diagnostics=Diagnostics(error=problem),
+            configuration_error=True,
+        )
+    combined_file = Path(temporary.name) / "combined" / ".coverage"
+    config_file = coverage_config_path(data_dir)
+    failure = _combine_tests_evidence(
+        check,
+        spec,
+        start,
+        prefix,
+        settings,
+        data_dir,
+        combined_file,
+        diagnostics,
+        deadline,
+    )
+    if failure is not None:
+        return failure
+    outcome = _check_result(
+        check,
+        start,
+        "pass",
+        budget_seconds=spec.budget_seconds,
+        diagnostics=diagnostics,
+        measurement={"tests": executed},
+        test_results=TestResults(ran, executed, 0),
+        tests_ran=ran,
+        tests_skipped=skipped,
+        evidence_path=combined_file,
+        adapter_data={"coverage_config": config_file, "coverage_settings": settings},
+        temporary=temporary,
+    )
+    print(
+        f"{prefix}: passed ({executed} tests, "
+        f"{outcome.duration_seconds:.2f}s)",
+        flush=True,
+    )
+    return outcome

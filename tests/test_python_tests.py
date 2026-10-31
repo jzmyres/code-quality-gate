@@ -1138,7 +1138,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         data_dir.mkdir()
         coverage_tool.write_coverage_config(data_dir, data_dir)
         with self.assertRaisesRegex(runner.StepTimeout, "coverage configuration validation"):
-            checks._tests_evidence(
+            python_tests._tests_evidence(
                 self.check,
                 self.spec,
                 0.0,
@@ -1162,7 +1162,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         with mock.patch.object(
             checks, "_combine_tests_evidence", return_value=None
         ), contextlib.redirect_stdout(io.StringIO()) as stdout:
-            result = checks._tests_evidence(
+            result = python_tests._tests_evidence(
                 self.check,
                 self.spec,
                 0.0,
@@ -1184,8 +1184,10 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             result.evidence_path,
             Path(temporary.name) / "combined" / ".coverage",
         )
-        self.assertEqual(result.coverage_config, data_dir / "coverage.ini")
-        self.assertEqual(result.coverage_settings, coverage_tool.coverage_config_text(data_dir))
+        self.assertEqual(result.adapter_data["coverage_config"], data_dir / "coverage.ini")
+        self.assertEqual(
+            result.adapter_data["coverage_settings"], coverage_tool.coverage_config_text(data_dir)
+        )
         self.assertIs(result.temporary, temporary)
         self.assertIn("passed (2 tests", stdout.getvalue())
 

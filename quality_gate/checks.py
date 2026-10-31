@@ -23,7 +23,6 @@ from .clones import measure_clones
 from .coverage_tool import (
     combine_coverage,
     coverage_config_path,
-    coverage_config_text,
 )
 from .files import git_argv, hygiene_result, validate_inventory
 from .json_input import load_json
@@ -118,14 +117,13 @@ class CheckResult:
     reason: str | None = None
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     evidence_path: Path | None = None
-    coverage_config: Path | None = None
-    coverage_settings: str | None = None
+    adapter_data: Any = None
     temporary: Any = field(default=None, repr=False, compare=False)
     configuration_error: bool = False
     change_scoped_failure: bool = False
     incomplete_locations: bool = False
     tool: dict[str, str] | None = None
-    definitions: list[dict[str, Any]] | None = None
+    report_fields: dict[str, Any] = field(default_factory=dict)
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:
@@ -159,6 +157,7 @@ class CheckResult:
             "location_coverage": self._location_coverage(),
         }
         document.update(self._json_test_fields())
+        document.update(self.report_fields)
         if self.measurement is not None:
             document["measurement"] = self.measurement
         return document
@@ -175,8 +174,6 @@ class CheckResult:
             }
         if self.tool is not None:
             fields["tool"] = self.tool
-        if self.definitions is not None:
-            fields["definitions"] = self.definitions
         return fields
 
     def _location_coverage(self) -> str:
@@ -1324,76 +1321,9 @@ def _coverage_config_problem(data_dir: Path, settings: str) -> str | None:
     return None
 
 
-def _tests_evidence(
-    check: CheckDef,
-    spec: Any,
-    start: float,
-    prefix: str,
-    temporary: tempfile.TemporaryDirectory,
-    root: Path,
-    data_dir: Path,
-    ran: int,
-    skipped: int,
-    executed: int,
-    diagnostics: Diagnostics,
-    deadline: float,
-) -> CheckResult:
-    settings = coverage_config_text(root)
-    problem = analysis_step(
-        "coverage configuration validation", _coverage_config_problem,
-        data_dir, settings, deadline=deadline,
-    )
-    if problem is not None:
-        return _tests_result(
-            check,
-            spec,
-            start,
-            prefix,
-            problem,
-            outcome="error",
-            execution="error",
-            diagnostics=Diagnostics(error=problem),
-            configuration_error=True,
-        )
-    combined_file = Path(temporary.name) / "combined" / ".coverage"
-    config_file = coverage_config_path(data_dir)
-    failure = _combine_tests_evidence(
-        check,
-        spec,
-        start,
-        prefix,
-        settings,
-        data_dir,
-        combined_file,
-        diagnostics,
-        deadline,
-    )
-    if failure is not None:
-        return failure
-    outcome = _check_result(
-        check,
-        start,
-        "pass",
-        budget_seconds=spec.budget_seconds,
-        diagnostics=diagnostics,
-        measurement={"tests": executed},
-        test_results=TestResults(ran, executed, 0),
-        tests_ran=ran,
-        tests_skipped=skipped,
-        evidence_path=combined_file,
-        coverage_config=config_file,
-        coverage_settings=settings,
-        temporary=temporary,
-    )
-    print(
-        f"{prefix}: passed ({executed} tests, "
-        f"{outcome.duration_seconds:.2f}s)",
-        flush=True,
-    )
-    return outcome
-
-
 def _run_python_tests(context: AdapterContext) -> CheckResult:
+    from .python_tests import _tests_evidence
+
     root, check, prefix = context.root, context.check, context.prefix
     spec = check.spec
     start = time.monotonic()
@@ -1473,37 +1403,6 @@ def _run_elisp_crap(context: AdapterContext) -> CheckResult:
     return run_crap(context)
 
 
-def _file_present(path: Path | None) -> bool:
-    return path is not None and path.is_file()
-
-
-def _crap_missing_evidence(required: CheckResult) -> str | None:
-    if not _file_present(required.evidence_path):
-        return "combined coverage data"
-    if not _file_present(required.coverage_config) or required.coverage_settings is None:
-        return "gate coverage configuration"
-    return None
-
-
-def _crap_required(
-    prior: dict[str, CheckResult],
-    spec: Any,
-    prefix: str,
-) -> tuple[Path | None, str | None, Diagnostics | None, str | None]:
-    required = prior.get(spec.requires)
-    if required is None or required.outcome != "pass":
-        message = f"coverage unreliable: {spec.requires} did not pass"
-    else:
-        missing = _crap_missing_evidence(required)
-        if missing is None:
-            return required.evidence_path, required.coverage_settings, None, None
-        message = (
-            f"coverage unreliable: {spec.requires} produced no {missing}"
-        )
-    print(f"{prefix}: {message}", file=sys.stderr)
-    return None, None, Diagnostics(error=message), message
-
-
 def _crap_measure(
     root: Path,
     selected: list[str],
@@ -1545,6 +1444,8 @@ def _crap_measure(
 
 
 def _run_python_crap(context: AdapterContext) -> CheckResult:
+    from .python_crap import _crap_required
+
     root, check = context.root, context.check
     prefix, prior = context.prefix, context.prior
     spec, start, selected, names = _adapter_selection(context)

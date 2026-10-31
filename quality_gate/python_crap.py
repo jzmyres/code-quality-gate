@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -9,6 +10,7 @@ from typing import Any, Callable
 from .coverage_tool import coverage_config_data, import_coverage
 from .policy import GateError
 from .ratchet import Finding, Location
+from .runner import Diagnostics
 
 
 @dataclass(frozen=True)
@@ -625,3 +627,35 @@ def measure_crap(
         return CrapMeasurement([], failures)
     findings.sort(key=lambda item: item.subject)
     return CrapMeasurement(findings, [])
+
+
+def _file_present(path: Path | None) -> bool:
+    return path is not None and path.is_file()
+
+
+def _crap_missing_evidence(required: Any) -> str | None:
+    if not _file_present(required.evidence_path):
+        return "combined coverage data"
+    data = required.adapter_data or {}
+    if not _file_present(data.get("coverage_config")) or data.get("coverage_settings") is None:
+        return "gate coverage configuration"
+    return None
+
+
+def _crap_required(
+    prior: dict[str, Any],
+    spec: Any,
+    prefix: str,
+) -> tuple[Path | None, str | None, Diagnostics | None, str | None]:
+    required = prior.get(spec.requires)
+    if required is None or required.outcome != "pass":
+        message = f"coverage unreliable: {spec.requires} did not pass"
+    else:
+        missing = _crap_missing_evidence(required)
+        if missing is None:
+            return required.evidence_path, required.adapter_data["coverage_settings"], None, None
+        message = (
+            f"coverage unreliable: {spec.requires} produced no {missing}"
+        )
+    print(f"{prefix}: {message}", file=sys.stderr)
+    return None, None, Diagnostics(error=message), message

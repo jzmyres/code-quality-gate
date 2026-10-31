@@ -274,7 +274,8 @@ def apply_document(result: Any, document: dict[str, Any]) -> None:
     result.tests_skipped = document["skipped"]
     result.measurement = {"tests": document["selected"] - document["skipped"]}
     result.tool = {"name": "Emacs", "version": document["emacs_version"]}
-    result.definitions = document["definitions"]
+    result.adapter_data = document["definitions"]
+    result.report_fields = {"definitions": document["definitions"]}
 
 
 def _verdict(document: dict[str, Any]) -> str | None:

@@ -239,10 +239,10 @@ def _required(context: Any, start: float) -> tuple[Any, Any]:
     required = context.prior.get(name)
     if required is None or required.outcome != "pass":
         reason = f"coverage unreliable: {name} did not pass"
-    elif required.definitions is None:
+    elif required.adapter_data is None:
         reason = f"coverage unreliable: {name} produced no Edebug evidence"
     else:
-        return required.definitions, None
+        return required.adapter_data, None
     print(f"{context.prefix}: {reason}", file=sys.stderr)
     return None, _ratchet_result(context.check, start, "unsupported", reason=reason)
 

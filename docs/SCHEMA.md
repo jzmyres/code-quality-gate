@@ -715,7 +715,8 @@ Check keys:
   `name` and `version` fields, for example `{"name": "Emacs", "version": "30.1"}` for an
   Emacs Lisp test, compile or checkdoc measurement. It is absent when no identity has been
   reported, such as when Emacs is missing. This replaces `emacs_version`.
-* `definitions` - the Elisp measurement's array of objects with `symbol`, repository-relative `file`,
+* `definitions` - an optional report entry supplied by the Emacs Lisp test adapter: an array of objects
+  with `symbol`, repository-relative `file`,
   one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
   These counts are also retained as evidence for later checks.
 
