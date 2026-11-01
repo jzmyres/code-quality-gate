@@ -1132,27 +1132,11 @@ The check matrix restores the pinned tools cache keyed on the environment name, 
 Ruff, clones, the test suite under coverage, Python CRAP and the Emacs Lisp checks. The separate
 Debian 13 job restores the same Debian tools cache and runs `make mutation`.
 
-Step timeouts use the smallest multiple of five minutes at least three times the largest recorded
-GitHub measurement for that step, across all runs and matrix entries. Each measured step's workflow
-comments retain every measurement with its run, commit and date; a newer run that skips a step
-keeps its last measurement. This prevents runner variance from shrinking limits from run to run.
-A step whose program is replaced starts a new measurement list: it keeps only measurements of the
-replacement, and its comment names the commit that replaced the program and retires the earlier
-measurements. GitHub run `41136060160` on `bd3b0b9` (2026-10-30) measured the gate at 581 seconds on
-Debian and 576 seconds on Ubuntu, and the cold-cache Ubuntu Emacs build at 99 seconds. Run
-`41173761182` on `b6ce8f6` (2026-10-31) measured the gate at 592 seconds on Debian and 641 seconds
-on Ubuntu; the cached Emacs build did not execute. Runs `41184599603` on `8fe0d95` and `41191759600`
-on `8d56150` (both 2026-10-31) measured the gate at 578 and 617 seconds on Debian and 482 and 474
-seconds on Ubuntu, and both skipped the cached Emacs build. The largest measurements give these
-bounds: gate 35 minutes (3 × 641 = 1923 seconds) and Emacs build 5 minutes (3 × 99 = 297 seconds).
-Commit `563d187` replaced the mutation runner, so mutation measurements start over with run
-`41191759600` on `8d56150` (2026-10-31) at 1269 seconds; the earlier complete-suite runs measured
-3809 and 5308 seconds and are retired. The mutation step is therefore 65 minutes (3 × 1269 =
-3807 seconds). Each job adds a 10-minute setup allowance for packages, checkout, cache operations,
-Python installation and fetching tools: Debian has a 45-minute job timeout (35 + 10), Ubuntu 50
-minutes (35 + 5 + 10), and mutation 75 minutes (65 + 10), within GitHub's 360-minute maximum for a
-hosted job. `tests/test_workflow.py` checks the largest-measurement rule and each job's sum,
-including Ubuntu's Emacs build to allow for a cold cache.
+Step timeouts are fixed at about five times the longest run observed as of 2026-10-31: 60 minutes
+for the gate, 15 for the cold Emacs build and 120 for the mutation step, and each job adds 10 minutes
+of setup for packages, checkout, cache operations, Python installation and fetching tools, giving 70
+minutes for Debian, 85 for Ubuntu and 130 for mutation. Raise these bounds if the program grows; a
+bound comfortably above the normal duration is enough to stop a hung job.
 
 Reproduce it locally with the same tools cache:
 

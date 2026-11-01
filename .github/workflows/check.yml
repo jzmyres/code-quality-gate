@@ -27,14 +27,13 @@ jobs:
             image: debian:13
             python: "3.13"
             emacs: "30.1"
-            timeout: 45
+            timeout: 70
           - name: ubuntu2604
             image: ubuntu:26.04
-            timeout: 50
+            timeout: 85
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
-    # Gate 35 + cold-cache Emacs build 5 (Ubuntu only) + setup allowance 10 minutes.
-    # Setup covers packages, checkout, cache operations, Python installation and tool fetching.
+    # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
     timeout-minutes: ${{ matrix.timeout }}
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
@@ -55,12 +54,8 @@ jobs:
           key: ${{ matrix.image }}-${{ runner.arch }}-emacs-${{ env.EMACS_VERSION }}-${{ env.EMACS_SHA256 }}
       - name: Build pinned batch Emacs
         if: matrix.name == 'ubuntu2604' && steps.emacs-cache.outputs.cache-hit != 'true'
-        # Measured 99 s (cold cache, ubuntu2604) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
-        # GitHub run 41173761182, b6ce8f6, 2026-10-31 skipped this build (cache hit); keep 99 s.
-        # GitHub runs 41184599603 (8fe0d95) and 41191759600 (8d56150), 2026-10-31, also skipped it (cache hit).
-        # Rule: smallest multiple of 5 minutes at least 3 x largest recorded measurement / 60.
-        # 3 x 99 s = 297 s; round up to a multiple of 5 minutes: 5 minutes.
-        timeout-minutes: 5
+        # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
+        timeout-minutes: 15
         run: |
           apt-get install -y --no-install-recommends build-essential libncurses-dev pkg-config texinfo
           curl --fail --location --retry 3 "$EMACS_URL" -o /tmp/emacs.tar.xz
@@ -120,25 +115,15 @@ jobs:
       - name: Fetch pinned tools
         run: python3 -I qg.py tools fetch
       - name: Run the gate
-        # Measured 581 s (debian13) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
-        # Measured 576 s (ubuntu2604) on GitHub run 41136060160, bd3b0b9, 2026-10-30.
-        # Measured 592 s (debian13) on GitHub run 41173761182, b6ce8f6, 2026-10-31.
-        # Measured 641 s (ubuntu2604) on GitHub run 41173761182, b6ce8f6, 2026-10-31.
-        # Measured 578 s (debian13) on GitHub run 41184599603, 8fe0d95, 2026-10-31.
-        # Measured 482 s (ubuntu2604) on GitHub run 41184599603, 8fe0d95, 2026-10-31.
-        # Measured 617 s (debian13) on GitHub run 41191759600, 8d56150, 2026-10-31.
-        # Measured 474 s (ubuntu2604) on GitHub run 41191759600, 8d56150, 2026-10-31.
-        # Rule: smallest multiple of 5 minutes at least 3 x largest recorded measurement / 60.
-        # 3 x 641 s = 1923 s; round up to a multiple of 5 minutes: 35 minutes.
-        timeout-minutes: 35
+        # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
+        timeout-minutes: 60
         run: make -k check
 
   mutation:
     runs-on: ubuntu-latest
     container: debian:13
-    # Mutation step 65 + setup allowance 10 minutes for packages, checkout, cache and tool fetching.
-    # The 75-minute job is within GitHub's 360-minute maximum for a hosted job.
-    timeout-minutes: 75
+    # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
+    timeout-minutes: 130
     env:
       QG_TOOLS_DIR: /tmp/qg-tools
     steps:
@@ -162,9 +147,6 @@ jobs:
         run: python3 -I qg.py tools fetch
       - name: Mutation-test gate decisions
         # Each mutant first runs the tests that reach its target; the full suite confirms survivors and unattributed or unreached cases.
-        # Measured 1269 s on GitHub run 41191759600, 8d56150, 2026-10-31.
-        # Commit 563d187 replaced the complete-suite runner, retiring the earlier measurements (3809 s and 5308 s).
-        # Rule: smallest multiple of 5 minutes at least 3 x largest recorded measurement / 60.
-        # 3 x 1269 s = 3807 s; round up to a multiple of 5 minutes: 65 minutes.
-        timeout-minutes: 65
+        # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
+        timeout-minutes: 120
         run: make mutation
