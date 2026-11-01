@@ -124,9 +124,7 @@ class ElispTests(FixtureCase):
 
     def test_pass_definitions_and_version(self) -> None:
         result, check = self.assert_outcome("pass")
-        self.assertEqual(check["test_results"], {
-            "selected": 2, "passed": 2, "failed": 0, "skipped": 0, "failures": [],
-        })
+        self.assertEqual(check["measurement"], {"tests": 2})
         definitions = check["definitions"]
         functions = {item["symbol"]: item for item in definitions}
         used, unused = functions["sample-used"], functions["sample-unused"]
@@ -197,10 +195,9 @@ register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_
         self.add_file("tests/suite.el", "(require 'ert)\n(ert-deftest broken () (should (= 1 2)))\n"
                       "(ert-run-tests-batch-and-exit t)\n")
         _result, check = self.assert_outcome("fail", "broken", "ert-test-failed", "(= 1 2)")
-        self.assertEqual(check["test_results"]["failed"], 1)
-        failure = check["test_results"]["failures"][0]
-        self.assertIn("broken", failure)
-        self.assertIn(failure.removeprefix("broken: "), check["diagnostics"]["output_tail"])
+        tail = check["diagnostics"]["output_tail"]
+        self.assertIn("broken", tail)
+        self.assertIn("(= 1 2)", tail)
 
     def test_no_tests_and_all_skipped_fail(self) -> None:
         suites = [
@@ -220,14 +217,11 @@ register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_
                       "(ert-deftest skipped () (ert-skip \"fixture\"))\n"
                       "(ert-run-tests-batch-and-exit t)\n")
         _result, check = self.assert_outcome("pass")
-        self.assertEqual(check["test_results"], {
-            "selected": 3, "passed": 2, "failed": 0, "skipped": 1, "failures": [],
-        })
+        self.assertEqual(check["measurement"], {"tests": 2})
         self.add_file("tests/suite.el", "(require 'ert)\n"
                       "(ert-deftest surprising () :expected-result :failed (should t))\n"
                       "(ert-run-tests-batch-and-exit t)\n")
-        _result, check = self.assert_outcome("fail", "surprising", "passed")
-        self.assertEqual(check["test_results"]["failed"], 1)
+        self.assert_outcome("fail", "surprising", "passed")
 
     def test_suite_contract_is_exactly_one_batch_call(self) -> None:
         for suite, message in (("(message \"no tests\")", "called 0 times"),
@@ -285,7 +279,6 @@ baseline = "crap.toml"
                 check = self.check_by_id(document, name)
                 self.assertEqual(check["outcome"], "unsupported", output(result))
                 self.assertEqual(check["reason"], "found Emacs 29.3; minimum required is Emacs 30.1")
-                self.assertNotIn("test_results", check)
         self.assertEqual(log.read_text().splitlines(),
                          ["-Q --batch --eval (princ emacs-version)"] * 4)
 
@@ -306,7 +299,6 @@ baseline = "crap.toml"
                         shown = version[:128] + ("..." if len(version) > 128 else "")
                         self.assertIn(repr(shown), reason)
                         self.assertLess(len(reason), len(str(wrapper)) + 256)
-                        self.assertNotIn("test_results", check)
                 self.assertEqual(log.read_text().splitlines(),
                                  ["-Q --batch --eval (princ emacs-version)"] * 4)
 
@@ -326,7 +318,6 @@ baseline = "crap.toml"
                 self.assertLess(len(reason), len(str(wrapper)) + 256)
                 self.assertEqual(check["diagnostics"]["output_truncated"], truncated)
                 self.assertEqual(check["diagnostics"]["exit_code"], exit_code)
-                self.assertNotIn("test_results", check)
 
     def test_truncated_emacs_version_is_unsupported_before_any_measurement(self) -> None:
         version = "30.1" + " " * (1024 * 1024) + "suffix"
@@ -408,7 +399,6 @@ baseline = "crap.toml"
                     assert_report_version_mismatch(self, check, version)
                     self.assertLess(len(result.stderr), 4096)
                     self.assertNotIn("tool", check)
-                    self.assertNotIn("test_results", check)
 
     def test_report_matching_preflight_is_accepted(self) -> None:
         self.report_version("30.1")
@@ -460,7 +450,6 @@ baseline = "crap.toml"
         self.report_version("30.1")
         self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {json.dumps(report)})\n")
         _result, check = self.assert_outcome("unsupported", "JSON result document", "duplicate name 'failed'")
-        self.assertNotIn("test_results", check)
 
     def test_budget_kills_emacs_and_its_process_group(self) -> None:
         marker = self.base / "emacs-pid"
@@ -505,7 +494,7 @@ baseline = "crap.toml"
         self.add_file("tests/suite.el", "(require 'ert)\n(ert-deftest only () (should t))\n"
                       "(ert-run-tests-batch-and-exit t)\n")
         _result, check = self.assert_outcome("pass")
-        self.assertEqual(check["test_results"]["selected"], 1)
+        self.assertEqual(check["measurement"], {"tests": 1})
         self.assertEqual(check["definitions"], [])
 
     def test_load_path_and_load_file_context(self) -> None:

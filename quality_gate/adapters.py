@@ -2,7 +2,7 @@
 
 Every adapter's identity lives here exactly once: the configuration keys it
 accepts, its parser, its runner, its argument fields, location coverage, number display, subject
-noun, failure wording and direction rule, whether it produces normalized test results, the baseline
+noun, failure wording and direction rule, whether it produces test counts, the baseline
 extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations

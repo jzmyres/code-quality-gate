@@ -996,7 +996,7 @@ class WorklistOriginalArgumentTests(FixtureCase):
         self.patch_runner('''
 from types import SimpleNamespace
 from quality_gate.adapters import AdapterDescriptor, ParsedSpec, register_adapter
-from quality_gate.checks import TestResults, _check_result
+from quality_gate.checks import _check_result
 from quality_gate.runner import run
 import time
 
@@ -1008,7 +1008,7 @@ def _fixture_run(context):
     start = time.monotonic()
     child = run(check.spec.launch, cwd=root, budget_seconds=10)
     return _check_result(check, start, "pass" if child.returncode == 0 else "fail",
-                         test_results=TestResults(1, 1, 0))
+                         tests_ran=1, tests_skipped=0)
 
 register_adapter(AdapterDescriptor("fixture-command", ("launch", "tests_pattern", "skipped_pattern"),
                                    _fixture_parse, _fixture_run, argument_fields=("launch",)))

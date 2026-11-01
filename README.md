@@ -63,8 +63,8 @@ An adapter is a descriptor, not a branch in the core. It declares its name, conf
 parser, run function, argument fields, location coverage, number display, subject noun, failure wording,
 direction rule, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
 configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
-The registry is the only list of supported adapters. A test adapter returns normalized test results:
-selected, passed and failed, with any named failures. A metric adapter returns findings. Verification's
+The registry is the only list of supported adapters. A test adapter reports how many tests ran and
+were skipped, and its outcome. A metric adapter returns findings. Verification's
 prerequisite is every earlier check with `tests` evidence: `python_tests`, `elisp_tests`, and
 `command` checks with `tests_pattern`.
 
@@ -308,16 +308,11 @@ cleanup failures as diagnostics. The `worklist` command follows the same rule fo
 runs, and a cleanup failure makes it exit non-zero. Pattern matching runs in an interruptible child
 bounded by the check's remaining budget, together with coverage combination.
 
-A completed run that executed tests also reports normalized `test_results`. `selected` is the parsed
-run count and `skipped` the parsed skipped count, as above. For a failing run, `failed` is the number
-of distinct failing tests and `failures` names them in first-seen order, from the run's own unittest
-result data: one `FAILED (failures=N, errors=M)` summary matched against its `FAIL:` and `ERROR:` test
-headings. A test with several failing subtests counts once, and its test id comes from the heading's
-first parenthesized group. `passed` is `selected - skipped - failed`. A run that crashes, or whose
-failing summary is missing, repeated or inconsistent with its headings, that has a class or module
-fixture error (a `setUpClass`, `tearDownClass`, `setUpModule` or `tearDownModule` heading), that has a
-heading without a test id, or that names more distinct tests than `selected - skipped`, reports no
-`test_results`; the reason remains `command exited N`.
+A completed run records the parsed run and skipped counts for verification, which reports them as
+its `tests:ID:executed` and `tests:ID:skipped` findings. It does not reconstruct individual test
+outcomes. A failing run has `outcome = "fail"`; its reason is `command exited N`, extended with the
+zero-test detail when no test executed. Unittest's own failure details, when the command printed any,
+are in `diagnostics.output_tail`.
 
 ### Emacs Lisp tests
 
@@ -357,11 +352,11 @@ a timeout reports `execution = "budget"`. A missing Emacs command or a child tha
 writes an invalid result without completing a valid measurement is `unsupported`. Errors identify the
 input, and invalid-result messages state what was expected and found.
 
-The check reports `tool` (`{"name": "Emacs", "version": "30.1"}`), normalized `test_results`,
-and `definitions` in JSON; the human report includes the Emacs version. Each definition entry,
-including generated lambda symbols, gives its
-repository-relative file, character position, total stop points and reached stop points. This evidence
-is retained for a later check that requires it.
+The check reports `tool` (`{"name": "Emacs", "version": "30.1"}`), its executed and skipped counts
+for verification, and `definitions` in JSON; the human report includes the Emacs version. Each
+definition entry, including generated lambda symbols, gives its repository-relative file, character
+position, total stop points and reached stop points. This evidence is retained for a later check that
+requires it.
 
 ### Emacs Lisp compile and checkdoc
 

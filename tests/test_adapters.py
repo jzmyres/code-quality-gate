@@ -58,7 +58,8 @@ def run_stub(context: adapters.AdapterContext) -> checks.CheckResult:
         budget_seconds=600,
         threshold=check.threshold,
         baseline_path=check.baseline,
-        test_results=checks.TestResults(count, count, 0),
+        tests_ran=count,
+        tests_skipped=0,
     )
 
 
@@ -263,7 +264,7 @@ class StubAdapterTests(unittest.TestCase):
             prefix="check: stub",
         )
         self.assertEqual(result.outcome, "pass")
-        self.assertEqual(result.test_results, checks.TestResults(4, 4, 0))
+        self.assertEqual((result.tests_ran, result.tests_skipped), (4, 0))
         self.assertEqual(ratchet._display_number(2.5, "stub"), "2.50")
 
     def test_verification_uses_every_adapter_that_produces_tests(self) -> None:

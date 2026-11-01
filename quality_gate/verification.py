@@ -214,11 +214,9 @@ def measure_verification(
 def _recorded_test_counts(
     result: Any,
 ) -> tuple[int, int] | None:
-    if result.test_results is not None:
-        return result.test_results.selected, result.test_results.skipped
-    if result.tests_ran is not None and result.tests_skipped is not None:
-        return result.tests_ran, result.tests_skipped
-    return None
+    if result.tests_ran is None or result.tests_skipped is None:
+        return None
+    return result.tests_ran, result.tests_skipped
 
 
 def _missing_test_count(

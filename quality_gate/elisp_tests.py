@@ -272,11 +272,7 @@ def _read_document(path: Path, selected: list[str], version: str) -> dict[str, A
 
 
 def apply_document(result: Any, document: dict[str, Any]) -> None:
-    """Attach normalized results and definition evidence to a check result."""
-    from .checks import TestResults
-
-    failures = tuple(f"{item['name']}: {item['condition']}" for item in document["failures"])
-    result.test_results = TestResults(document["selected"], document["passed"], document["failed"], failures)
+    """Attach test counts and definition evidence to a check result."""
     result.tests_ran = document["selected"]
     result.tests_skipped = document["skipped"]
     result.measurement = {"tests": document["selected"] - document["skipped"]}

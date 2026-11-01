@@ -709,17 +709,6 @@ Check keys:
 * `reason` - a structured explanation of a non-passing adapter verdict
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
-* `test_results` - normalized test outcomes when available: `selected`, `passed`, `failed`,
-  `skipped`, and `failures` (strings naming unexpected results). The Python tests adapter takes
-  the failure event count from one `FAILED (failures=N, errors=M)` summary and matches it against
-  the `FAIL:` and `ERROR:` test headings, then names each distinct failing test by the id in its
-  first parenthesized group, in first-seen order; `failed` counts failing tests, so a test with
-  several failing subtests counts once. A failing run without that consistent result data, with a
-  class or module fixture error (a `setUpClass`, `tearDownClass`, `setUpModule` or `tearDownModule`
-  heading), with a heading that has no test id, or with more distinct test ids than executed tests, has
-  no `test_results`. A run with failure evidence but no executed test also has no
-  `test_results`. The Emacs Lisp adapter reads them from its child result document. Passed counts
-  expected results; selected equals passed plus failed plus skipped.
 * `tool` - optional measured tool identity supplied by any adapter: an object with string
   `name` and `version` fields, for example `{"name": "Emacs", "version": "30.1"}` for an
   Emacs Lisp test, compile or checkdoc measurement. It is absent when no identity has been
@@ -728,6 +717,11 @@ Check keys:
   with `symbol`, repository-relative `file`,
   one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
   These counts are also retained as evidence for later checks.
+
+A test check reports its `outcome` and `reason` and keeps the command's output tail in
+`diagnostics`; the executed count is in `measurement`. It records the executed and skipped counts
+for verification, which reports them as `tests:ID:executed` and `tests:ID:skipped`. Per-test
+outcomes are not reconstructed.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`,

@@ -104,35 +104,6 @@ class PythonTestsTests(FixtureCase):
             PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n" + body,
         )
 
-    def add_class_fixture_error(self, name: str) -> None:
-        self.add_file(
-            "tests/test_fixture.py",
-            PYTHON_TEST_HEADER
-            + "\nclass Passing(unittest.TestCase):\n"
-            "    def test_one(self):\n"
-            "        self.assertTrue(True)\n\n"
-            "class Broken(unittest.TestCase):\n"
-            "    @classmethod\n"
-            f"    def {name}(cls):\n"
-            "        raise RuntimeError('fixture boom')\n\n"
-            "    def test_never(self):\n"
-            "        self.assertTrue(True)\n",
-        )
-
-    def failing_summary(
-        self, *lines: str
-    ) -> tuple[object, dict[str, object]]:
-        self.add_file(
-            "tests/failing_summary.py",
-            "import sys\n"
-            + "".join(f"{line}\n" for line in lines)
-            + "sys.exit(1)\n",
-        )
-        self.write_config(
-            tests_config(run='["{python}", "tests/failing_summary.py"]')
-        )
-        return self.failed_tests("command exited 1")
-
     def run_tests(
         self, *, env: dict[str, str] | None = None
     ) -> tuple[object, dict[str, object]]:
@@ -176,203 +147,15 @@ class PythonTestsTests(FixtureCase):
         self.assertEqual(check["execution"], "completed")
         self.assertEqual(check["measurement"], {"tests": 2})
         self.assertEqual(check["metric_version"], "test-count/1")
-        self.assertEqual(check["test_results"], {
-            "selected": 2, "passed": 2, "failed": 0, "skipped": 0,
-            "failures": [],
-        })
         self.assertIn("passed (2 tests", result.stderr)
 
-    def test_a_mixed_suite_reports_real_outcomes_and_failure_names(self) -> None:
-        self.add_test(
-            "test_mixed",
-            "    def test_passes(self):\n        self.assertTrue(True)\n\n"
-            "    def test_fails(self):\n        self.fail('deliberate failure')\n\n"
-            "    def test_errors(self):\n        raise RuntimeError('deliberate error')\n",
-        )
-        result, check = self.failed_tests(
-            "command exited 1", "deliberate failure", "deliberate error"
-        )
-        self.assertEqual(check["measurement"], {"tests": 3})
-        results = check["test_results"]
-        self.assertEqual(results["selected"], 3)
-        self.assertEqual(results["passed"], 1)
-        self.assertEqual(results["failed"], 2)
-        self.assertEqual(results["skipped"], 0)
-        self.assertCountEqual(results["failures"], [
-            "test_mixed.Sample.test_errors",
-            "test_mixed.Sample.test_fails",
-        ])
-        for failure in results["failures"]:
-            self.assertIn(failure, result.stderr)
-
-    def test_a_test_with_two_failing_subtests_counts_once(self) -> None:
-        self.add_test(
-            "test_subtests",
-            "    def test_one(self):\n        self.assertTrue(True)\n\n"
-            "    def test_two(self):\n        self.assertTrue(True)\n\n"
-            "    def test_subtests(self):\n"
-            "        for value in (1, 2):\n"
-            "            with self.subTest(value=value):\n"
-            "                self.fail(f'deliberate {value}')\n",
-        )
-        _result, check = self.failed_tests(
-            "command exited 1", "deliberate 1", "deliberate 2"
-        )
-        self.assertEqual(check["measurement"], {"tests": 3})
-        self.assertEqual(check["test_results"], {
-            "selected": 3, "passed": 2, "failed": 1, "skipped": 0,
-            "failures": ["test_subtests.Sample.test_subtests"],
-        })
-
-    def test_a_test_with_failing_and_erroring_subtests_counts_once(
-        self,
-    ) -> None:
-        self.add_test(
-            "test_subtests",
-            "    def test_subtests(self):\n"
-            "        with self.subTest(kind='failure'):\n"
-            "            self.fail('deliberate failure')\n"
-            "        with self.subTest(kind='error'):\n"
-            "            raise RuntimeError('deliberate error')\n",
-        )
-        _result, check = self.failed_tests(
-            "command exited 1", "deliberate failure", "deliberate error"
-        )
-        self.assertEqual(check["measurement"], {"tests": 1})
-        self.assertEqual(check["test_results"], {
-            "selected": 1, "passed": 0, "failed": 1, "skipped": 0,
-            "failures": ["test_subtests.Sample.test_subtests"],
-        })
-
-    def test_plain_errors_and_subtest_failures_count_each_test_once(
-        self,
-    ) -> None:
-        self.add_test(
-            "test_mixed_failures",
-            "    def test_passes(self):\n        self.assertTrue(True)\n\n"
-            "    def test_fails(self):\n"
-            "        self.fail('deliberate failure')\n\n"
-            "    def test_errors(self):\n"
-            "        raise RuntimeError('deliberate error')\n\n"
-            "    def test_subtests(self):\n"
-            "        for value in (1, 2):\n"
-            "            with self.subTest(value=value):\n"
-            "                self.fail(f'deliberate subtest {value}')\n",
-        )
-        _result, check = self.failed_tests(
-            "command exited 1",
-            "deliberate failure",
-            "deliberate error",
-            "deliberate subtest 1",
-            "deliberate subtest 2",
-        )
-        self.assertEqual(check["measurement"], {"tests": 4})
-        results = check["test_results"]
-        self.assertEqual(results["selected"], 4)
-        self.assertEqual(results["passed"], 1)
-        self.assertEqual(results["failed"], 3)
-        self.assertEqual(results["skipped"], 0)
-        self.assertCountEqual(results["failures"], [
-            "test_mixed_failures.Sample.test_errors",
-            "test_mixed_failures.Sample.test_fails",
-            "test_mixed_failures.Sample.test_subtests",
-        ])
-
-    def test_a_failing_and_skipped_subtest_has_no_test_results(self) -> None:
-        self.write_config(
-            tests_config(skipped_pattern=r"skipped=(\d+)")
-        )
-        self.add_test(
-            "test_subtests",
-            "    def test_subtests(self):\n"
-            "        with self.subTest(kind='failure'):\n"
-            "            self.fail('deliberate failure')\n"
-            "        with self.subTest(kind='skipped'):\n"
-            "            self.skipTest('deliberate skip')\n",
-        )
-        _result, check = self.failed_tests(
-            "command exited 1 and no test executed: 1 ran, 1 skipped",
-            "deliberate failure",
-        )
-        self.assertEqual(check["measurement"], {"tests": 0})
-        self.assertNotIn("test_results", check)
-
-    def test_a_failure_heading_without_a_test_id_has_no_test_results(
-        self,
-    ) -> None:
-        _result, check = self.failing_summary(
-            "print('Ran 1 test in 0.1s')",
-            "print('FAILED (failures=1)')",
-            "print('FAIL: without_an_id')",
-        )
-        self.assertEqual(check["measurement"], {"tests": 1})
-        self.assertNotIn("test_results", check)
-        self.assertEqual(check["reason"], "command exited 1")
-
-    def test_more_distinct_failures_than_executed_tests_has_no_test_results(
-        self,
-    ) -> None:
-        _result, check = self.failing_summary(
-            "print('Ran 1 test in 0.1s')",
-            "print('FAILED (failures=2)')",
-            "print('FAIL: only (failing_summary.Sample.only)')",
-            "print('FAIL: other (failing_summary.Sample.other)')",
-        )
-        self.assertEqual(check["measurement"], {"tests": 1})
-        self.assertNotIn("test_results", check)
-        self.assertEqual(check["reason"], "command exited 1")
-
-    def test_a_set_up_class_error_has_no_test_results(self) -> None:
-        self.add_class_fixture_error("setUpClass")
-        _result, check = self.failed_tests("command exited 1", "fixture boom")
-        self.assertEqual(check["measurement"], {"tests": 1})
-        self.assertNotIn("test_results", check)
-        self.assertEqual(check["reason"], "command exited 1")
-
-    def test_a_tear_down_class_error_has_no_test_results(self) -> None:
-        self.add_class_fixture_error("tearDownClass")
-        _result, check = self.failed_tests("command exited 1", "fixture boom")
-        self.assertEqual(check["measurement"], {"tests": 2})
-        self.assertNotIn("test_results", check)
-        self.assertEqual(check["reason"], "command exited 1")
-
-    def test_a_set_up_module_error_has_no_test_results(self) -> None:
-        self.add_test(
-            "test_ok",
-            "    def test_one(self):\n        self.assertTrue(True)\n",
-        )
-        self.add_file(
-            "tests/test_broken.py",
-            PYTHON_TEST_HEADER
-            + "\ndef setUpModule():\n"
-            "    raise RuntimeError('fixture boom')\n\n"
-            "class Broken(unittest.TestCase):\n"
-            "    def test_never(self):\n"
-            "        self.assertTrue(True)\n",
-        )
-        _result, check = self.failed_tests("command exited 1", "fixture boom")
-        self.assertEqual(check["measurement"], {"tests": 1})
-        self.assertNotIn("test_results", check)
-        self.assertEqual(check["reason"], "command exited 1")
-
-    def test_a_crashing_suite_has_no_test_results(self) -> None:
+    def test_a_crashing_suite_fails_with_its_exit_status(self) -> None:
         self.add_test(
             "test_crash",
             "    def test_crash(self):\n        import os\n        os._exit(3)\n",
         )
         _result, check = self.failed_tests("command exited 3")
-        self.assertNotIn("test_results", check)
         self.assertEqual(check["reason"], "command exited 3")
-
-    def test_ambiguous_failure_summary_has_no_test_results(self) -> None:
-        _result, check = self.failing_summary(
-            "print('Ran 1 test in 0.1s')",
-            "print('FAILED (failures=1)')",
-            "print('FAIL: only (failing_summary.Sample.only)')",
-            "print('FAILED (failures=1)')",
-        )
-        self.assertNotIn("test_results", check)
-        self.assertEqual(check["reason"], "command exited 1")
 
     def test_zero_tests_fails(self) -> None:
         self.add_file("tests/helper.py", "VALUE = 1\n")
@@ -395,10 +178,7 @@ class PythonTestsTests(FixtureCase):
             "no test executed: 1 ran, 1 skipped",
             "zero tests is not a pass",
         )
-        self.assertEqual(check["test_results"], {
-            "selected": 1, "passed": 0, "failed": 0, "skipped": 1,
-            "failures": [],
-        })
+        self.assertEqual(check["measurement"], {"tests": 0})
 
     def test_ambiguous_test_summary_is_unsupported(self) -> None:
         self.add_file(
@@ -441,7 +221,6 @@ class PythonTestsTests(FixtureCase):
         )
         _result, check = self.failed_tests("command exited 1", "no summary")
         self.assertNotIn("measurement", check)
-        self.assertNotIn("test_results", check)
 
     def test_failed_command_with_zero_executed_tests_reports_counts(self) -> None:
         self.add_file(

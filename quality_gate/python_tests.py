@@ -140,109 +140,6 @@ def _executed_tests(
     return ran - skipped
 
 
-_UNITTEST_FAILED_SUMMARY = re.compile(r"^FAILED \((.*)\)$", re.MULTILINE)
-_UNITTEST_OK_SUMMARY = re.compile(r"^OK(?: \(.*\))?$", re.MULTILINE)
-_UNITTEST_FAILURE_HEADING = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
-_UNITTEST_FIXTURE_HEADING = re.compile(
-    r"^(?:setUpClass|tearDownClass|setUpModule|tearDownModule)(?:\s|$)"
-)
-_UNITTEST_FAILURE_COUNT = re.compile(r"^(failures|errors)=([0-9]+)$")
-
-
-def _unittest_summary(combined: str) -> str | None:
-    summaries = _UNITTEST_FAILED_SUMMARY.findall(combined)
-    if len(summaries) != 1 or _UNITTEST_OK_SUMMARY.search(combined):
-        return None
-    return summaries[0]
-
-
-def _unittest_failure_count(summary: str) -> int | None:
-    failed = 0
-    for part in summary.split(","):
-        match = _UNITTEST_FAILURE_COUNT.match(part.strip())
-        if match is not None:
-            failed += int(match.group(2))
-    return failed or None
-
-
-def _unittest_failure_name(heading: str) -> str | None:
-    match = re.search(r"\(([^()]*)\)", heading)
-    if match is None or not match.group(1):
-        return None
-    return match.group(1)
-
-
-def _unittest_failure_names(headings: list[str]) -> tuple[str, ...] | None:
-    failures: list[str] = []
-    for heading in headings:
-        if _UNITTEST_FIXTURE_HEADING.match(heading):
-            return None
-        name = _unittest_failure_name(heading)
-        if name is None:
-            return None
-        if name not in failures:
-            failures.append(name)
-    return tuple(failures)
-
-
-def _unittest_outcomes(
-    combined: str,
-) -> tuple[int, tuple[str, ...]] | None:
-    summary = _unittest_summary(combined)
-    if summary is None:
-        return None
-    failed = _unittest_failure_count(summary)
-    headings = _UNITTEST_FAILURE_HEADING.findall(combined)
-    if failed is None or len(headings) != failed:
-        return None
-    failures = _unittest_failure_names(headings)
-    if failures is None:
-        return None
-    return len(failures), failures
-
-
-def _unittest_failure_evidence(combined: str) -> bool:
-    if _UNITTEST_FAILURE_HEADING.search(combined):
-        return True
-    for summary in _UNITTEST_FAILED_SUMMARY.findall(combined):
-        if _unittest_failure_count(summary) is not None:
-            return True
-    return False
-
-
-def _zero_executed_without_failure(executed: int, combined: str) -> bool:
-    return executed == 0 and not _unittest_failure_evidence(combined)
-
-
-def _counted_test_results(
-    ran: int, skipped: int, failed: int, failures: tuple[str, ...]
-) -> Any | None:
-    from .checks import TestResults
-
-    passed = ran - skipped - failed
-    if passed < 0:
-        return None
-    return TestResults(ran, passed, failed, failures)
-
-
-def _failed_test_results(
-    ran: int | None,
-    skipped: int | None,
-    executed: int | None,
-    combined: str,
-) -> Any | None:
-    from .checks import TestResults
-
-    if ran is None or skipped is None or executed is None:
-        return None
-    if _zero_executed_without_failure(executed, combined):
-        return TestResults(ran, 0, 0)
-    outcomes = _unittest_outcomes(combined)
-    if outcomes is None:
-        return None
-    return _counted_test_results(ran, skipped, *outcomes)
-
-
 def _tests_summary(
     check: CheckDef,
     spec: Any,
@@ -342,7 +239,6 @@ def _tests_failed(
             combined=combined,
         )
     executed = _executed_tests(ran, skipped)
-    test_results = _failed_test_results(ran, skipped, executed, combined)
     return _tests_result(
         check,
         spec,
@@ -351,7 +247,8 @@ def _tests_failed(
         _tests_failure_reason(run_result, ran, skipped, executed),
         diagnostics=diagnostics,
         measurement={"tests": executed} if executed is not None else None,
-        test_results=test_results,
+        tests_ran=ran,
+        tests_skipped=skipped,
         combined=combined,
     )
 
@@ -508,7 +405,7 @@ def _tests_counts(
     diagnostics: Diagnostics,
     deadline: float,
 ) -> tuple[tuple[int, int, int] | None, Any | None]:
-    from .checks import TestResults, _tests_result
+    from .checks import _tests_result
 
     ran, skipped, count_error, failure = _tests_summary(
         check, spec, start, prefix, combined, diagnostics, deadline
@@ -538,7 +435,8 @@ def _tests_counts(
             "zero tests is not a pass",
             diagnostics=diagnostics,
             measurement={"tests": 0},
-            test_results=TestResults(ran, 0, 0),
+            tests_ran=ran,
+            tests_skipped=skipped,
             combined=combined,
         )
     return (ran, skipped, executed), None
@@ -558,11 +456,7 @@ def _tests_evidence(
     diagnostics: Diagnostics,
     deadline: float,
 ) -> Any:
-    from .checks import (
-        TestResults,
-        _check_result,
-        _tests_result,
-    )
+    from .checks import _check_result, _tests_result
 
     from .coverage_tool import _coverage_config_problem
 
@@ -605,7 +499,6 @@ def _tests_evidence(
         budget_seconds=spec.budget_seconds,
         diagnostics=diagnostics,
         measurement={"tests": executed},
-        test_results=TestResults(ran, executed, 0),
         tests_ran=ran,
         tests_skipped=skipped,
         evidence_path=combined_file,

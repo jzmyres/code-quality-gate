@@ -51,20 +51,6 @@ def _budget_detail(reason: str, start: float, budget: float) -> str:
     return f"{reason} (timeout; deadline: {budget:g} seconds; elapsed: {elapsed:.3f} seconds)"
 
 
-@dataclass(frozen=True)
-class TestResults:
-    """One test adapter's normalized result, whatever the language."""
-
-    selected: int
-    passed: int
-    failed: int
-    failures: tuple[str, ...] = ()
-
-    @property
-    def skipped(self) -> int:
-        return max(0, self.selected - self.passed - self.failed)
-
-
 @dataclass
 class CheckResult:
     id: str
@@ -85,7 +71,6 @@ class CheckResult:
     baseline_path: Path | None = None
     ratchet: RatchetResult | None = None
     measurement: dict[str, Any] | None = None
-    test_results: TestResults | None = None
     tests_ran: int | None = None
     tests_skipped: int | None = None
     satisfied: bool | None = None
@@ -132,25 +117,12 @@ class CheckResult:
             "reason": self.reason,
             "location_coverage": self._location_coverage(),
         }
-        document.update(self._json_test_fields())
+        if self.tool is not None:
+            document["tool"] = self.tool
         document.update(self.report_fields)
         if self.measurement is not None:
             document["measurement"] = self.measurement
         return document
-
-    def _json_test_fields(self) -> dict[str, Any]:
-        fields: dict[str, Any] = {}
-        if self.test_results is not None:
-            fields["test_results"] = {
-                "selected": self.test_results.selected,
-                "passed": self.test_results.passed,
-                "failed": self.test_results.failed,
-                "skipped": self.test_results.skipped,
-                "failures": list(self.test_results.failures),
-            }
-        if self.tool is not None:
-            fields["tool"] = self.tool
-        return fields
 
     def _location_coverage(self) -> str:
         coverage = location_coverage(self.adapter)
