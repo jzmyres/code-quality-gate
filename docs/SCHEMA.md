@@ -462,8 +462,8 @@ Top-level keys:
 * `gate_version` - the gate's own revision, or `unknown: ...`.
 * `revision`, `dirty` - the consumer's HEAD (or null) and worktree state.
 * `policy_sha256` - the effective policy file's SHA-256, or null. With
-  `--policy-from` and an unauthorized candidate policy, this is `REV`'s
-  policy; an authorized replacement is the candidate's.
+  `--policy-from` and an unauthorized candidate policy, this is the trusted
+  source's policy; an authorized replacement is the candidate's.
 * `decision` - `accepted`, `accepted_with_exceptions`, `rejected`,
   `blocked` or `error`.
 * `checks` - inventory, hygiene and every configured check, in that order.
@@ -520,7 +520,9 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
 }
 ```
 
-* `policy_from` is the full commit id `REV` resolved to.
+* `policy_from` is the full commit id `REV` resolved to. In directory mode
+  `path` (the trusted directory) and `digest` (a SHA-256 over the trusted
+  files the gate read, in sorted path order) replace `policy_from`.
 * `protected` has one entry per protected input. `path` is
   repository-relative; `rev_sha256` and `candidate_sha256` are lowercase
   SHA-256 hex or null when the file is absent (in `identity_after`, `refused`
@@ -533,7 +535,8 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
   `candidate_index_commit` records the staged commit. `status` is `unchanged`,
   `tightened`, `ignored`, `authorized` or `blocked`. A baseline entry also
   carries `ignored_entries`, the subjects whose candidate entry was ignored.
-* `identity_before` and `identity_after` record `REV`'s commit id, each
+* `identity_before` and `identity_after` record `REV`'s commit id or
+  `DIR`'s path, each
   protected input's file SHA-256 values or gitlink kinds and commits, the
   effective policy, tool lock, tool
   pins and each in-memory baseline under `effective_inputs`, every pinned tool's

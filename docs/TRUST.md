@@ -1,19 +1,23 @@
-# The trust root: `qg check --policy-from REV`
+# The trust root: `qg check --policy-from REV|DIR`
 
 A gate that reads its policy, baselines and tool lock from the tree it is
 checking cannot measure that tree honestly: the same working tree can weaken
 the policy, add a baseline exception, raise a threshold, remove a check, change
 a tool pin, narrow test discovery or edit a script a check executes. The trust
 root makes the enforcement inputs come from a revision the candidate cannot
-change.
+change, or from a directory the caller extracted from that revision.
 
 ```
 python3 -I qg.py check --policy-from REV
 python3 -I qg.py check --policy-from REV --allow-protected PATH
+python3 -I qg.py check --policy-from DIR
+python3 -I qg.py check --policy-from DIR --allow-protected PATH
 ```
 
-`REV` is any Git revision that resolves to a commit. `--allow-protected` is
-repeatable and requires `--policy-from`.
+`REV` is any Git revision that resolves to a commit. An absolute path to an
+existing directory selects `DIR` mode; anything else is a revision. The
+directory must lie outside the candidate. `--allow-protected` is repeatable
+and requires `--policy-from`.
 
 ## Parties
 
@@ -22,6 +26,10 @@ repeatable and requires `--policy-from`.
   candidate: a runner passes the batch's base commit, and a person passes the
   commit they reviewed. The gate resolves it to a commit id and reports that id
   as `trust.policy_from`.
+* The **trusted directory** `DIR` is an extracted tree of that revision,
+  outside the candidate and made read-only by the caller. The gate reports its
+  path as `trust.path` and a digest of the trusted files it read as
+  `trust.digest`.
 * The **gate program** is trusted only when it runs from a copy the candidate
   cannot modify. With `--policy-from`, the gate refuses to run (exit 2) when
   its own program files lie inside the candidate root, naming both paths. Run a
@@ -31,14 +39,40 @@ repeatable and requires `--policy-from`.
 Without `--policy-from`, nothing changes. A developer checking their own tree
 trusts that tree.
 
+## Directory mode
+
+`--policy-from DIR` reads the policy, baselines, tools lock and protected
+files from `DIR` with plain file reads. It reads nothing from the candidate's
+`.git` for these inputs. A symlink inside `DIR` is never followed: a
+protected path that is not a regular file reads as missing. The policy and
+baselines get the same tighten-only merge with the candidate's entries as in
+`REV` mode, and protected files are compared by SHA-256 against the
+candidate's non-following read. Directory mode compares files and globs only;
+it does not compare a protected gitlink's commit, so the caller checks a
+submodule pin.
+
+Make the copy from the trusted repository, outside the candidate, then make it
+read-only:
+
+```
+git -C TRUSTED_REPO archive REV | tar -x -C DEST
+chmod -R a-w DEST
+```
+
+A missing directory, or one inside the candidate root, is a usage error (exit
+2) naming it. Directory mode refuses `--changed-from` as a usage error,
+because the harness uses no changed-line blocking and a later item replaces
+that option.
+
 ## Protected inputs
 
-For every `--policy-from` run, the protected inputs are, in `REV`:
+For every `--policy-from` run, the protected inputs are, in the trusted source
+(`REV` or `DIR`):
 
 * the policy file, `quality-gate.toml`;
 * every baseline file the policy names;
 * the tools lock, `tools.lock.toml` at the candidate root; and
-* every path or glob listed in `REV`'s policy under `[protect] paths`, for
+* every path or glob listed in the trusted policy under `[protect] paths`, for
   example the pinned gate submodule, `ruff.toml`, `Makefile`, CI workflows,
   or a test runner such as `tests/run_tests.py`:
 
@@ -52,13 +86,13 @@ that file with `--config ruff.toml`, so a discovered configuration file
 elsewhere cannot change lint policy.
 
 A literal path is protected whether or not it exists. A glob is matched against
-the union of `REV`'s files and gitlinks and the candidate's tracked and
-untracked paths, so a new candidate path under a protected glob is a protected
-input too. The protected list always comes from `REV`; a candidate policy
-cannot unprotect a path.
+the union of the trusted source's files and gitlinks and the candidate's
+tracked and untracked paths, so a new candidate path under a protected glob is
+a protected input too. The protected list always comes from the trusted source;
+a candidate policy cannot unprotect a path.
 
-`REV`'s file contents are read from Git objects and its gitlink commits
-from its tree, never from the working tree. The gate authenticates every
+In `REV` mode, `REV`'s file contents are read from Git objects and its
+gitlink commits from its tree, never from the working tree. The gate authenticates every
 object it reads from `REV`: it reads the commit, each tree it walks and each
 file's blob by id, hashes the raw content as Git does (type, size and content
 in the repository's object format) and refuses (exit 2) an object whose
@@ -77,14 +111,16 @@ refused. Candidate versions are read from the working tree only to compare
 them with `REV`, to apply an allowed tightening, or after the caller
 authorizes the path.
 
-`--changed-from` reads its base revision through the same reader. The gate
+`--changed-from` reads its base revision through the same reader. Directory
+mode refuses `--changed-from` as a usage error. In `REV` mode the gate
 resolves the named revision, lists its tree and reads each base blob by id,
 and refuses a forged base object with the same usage error (exit 2) naming the
 object and its path. A run whose `--policy-from` and `--changed-from` name one
 commit therefore cannot substitute a base source blob with the candidate's
 contents, and a forged tree on the path to a changed file is refused too.
 
-For a protected gitlink, the candidate's value is the commit in its index. If
+In `REV` mode, for a protected gitlink, the candidate's value is the commit
+in its index. If
 the submodule is checked out, its HEAD must also match that index commit. A
 missing or empty uninitialized checkout is allowed. A directory containing
 other files without a submodule checkout is a directory, and an unreadable
@@ -118,27 +154,28 @@ bounded by the check's remaining deadline. A difference or non-regular file is a
 configuration error. Coverage combination and CRAP analysis use the canonical
 settings passed as data, even if the file changes after that comparison.
 
-For each protected input whose candidate content differs from `REV`:
+For each protected input whose candidate content differs from the trusted
+source:
 
 ### Baseline files
 
 Baselines tighten only:
 
 * a candidate removal takes effect for a `max` entry, and is ignored for a
-  `min` floor: the removed entry keeps `REV`'s bound;
+  `min` floor: the removed entry keeps the trusted bound;
 * an entry whose bound the candidate tightens takes effect (a lower `max`
   bound or a higher `min` bound, with an earlier expiry);
 * an entry the candidate adds, a bound it loosens, an expiry it later removes,
-  reasons it changes and metadata it changes are ignored, and `REV`'s entry is
-  used;
+  reasons it changes and metadata it changes are ignored, and the trusted entry
+  is used;
 * a candidate baseline that cannot be parsed is ignored in full, and every
-  `REV` entry is used unchanged.
+  trusted entry is used unchanged.
 
 Each entry and finding use the same `max` or `min` direction for their
 subject. The adapter's per-subject rule, descriptor default or check's
 configured `direction` decides it, including before any finding exists.
 
-The entry set used for the run is therefore `REV`'s entries with candidate
+The entry set used for the run is therefore the trusted entries with candidate
 removals of `max` entries and tightened bounds applied. The entries whose
 candidate form was ignored, including a removed `min` floor, are listed in the
 protected input's `ignored_entries`. A baseline that only tightens is
@@ -156,8 +193,8 @@ as written; the candidate is then the reviewed replacement.
 ### The policy file and the tools lock
 
 Unauthorized changes to the policy file and the tools lock are ignored:
-`REV`'s version is used. The checks therefore run `REV`'s checks, thresholds,
-classes, exemptions and pinned tool set, not the candidate's. The protected
+the trusted version is used. The checks therefore run the trusted checks,
+thresholds, classes, exemptions and pinned tool set, not the candidate's. The protected
 entry is reported as `ignored`.
 
 An authorized lock is the effective lock for the whole run. The coverage
@@ -170,15 +207,15 @@ does not fall back to the bundled pin.
 
 An unauthorized change to any other protected path makes the decision
 `blocked` (exit 1), naming the path in the result and on stderr. The gate
-cannot substitute `REV`'s version of a file another program reads or executes
+cannot substitute the trusted version of a file another program reads or executes
 (for example Ruff's configuration or a test runner), so it refuses to accept
 the run. The checks still run against the candidate and are reported in full.
 
 ## Prune under `--policy-from`
 
-`check --prune ID --policy-from REV` writes the effective baseline, which is
-`REV`'s baseline tightened by the measurement: a `max` bound is lowered, a
-`min` floor is raised. It never adds an entry, loosens a bound, or keeps an
+`check --prune ID --policy-from REV|DIR` writes the effective baseline, which
+is the trusted baseline tightened by the measurement: a `max` bound is
+lowered, a `min` floor is raised. It never adds an entry, loosens a bound, or keeps an
 entry that exists only in the candidate. A baseline path whose parent is a
 symlink inside the candidate is refused before the write.
 
@@ -188,15 +225,17 @@ nothing is pruned, so a check cannot weaken a baseline and have pruning keep
 the weakened value. After the write, the pruned path may differ from its
 pre-prune content only by exactly the bytes the gate generated; any other
 difference fails the run naming the path. The written content is derived from
-`REV` and the measurement, never from the candidate's loosened entries.
+the trusted baseline and the measurement, never from the candidate's loosened
+entries.
 
 ## Identity
 
 Before any check runs, the gate records in `trust.identity_before`:
 
-* `REV`'s commit id;
-* each protected file's `REV` and candidate SHA-256, or a protected gitlink's
-  kinds, `REV` commit, candidate index commit and checked-out HEAD (stored per path);
+* `REV`'s commit id, or `DIR`'s path;
+* each protected file's trusted and candidate SHA-256, or in `REV` mode a
+  protected gitlink's kinds, `REV` commit, candidate index commit and
+  checked-out HEAD (stored per path);
 * the effective policy and tool lock file SHA-256, a digest of the captured
   tool pins, and a digest of each effective baseline held in memory;
 * each pinned tool's actual install-tree payload digest (the M2a encoding); and
@@ -262,9 +301,15 @@ A trust run writes result `schema = 3` and adds:
 }
 ```
 
+In directory mode the source keys are `{"path": DIR, "digest": SHA256}`
+instead of `policy_from`. The digest hashes, in sorted path order, each
+trusted file's repository-relative path, a NUL byte and the SHA-256 of its
+bytes, each followed by a newline.
+
 `status` is one of `unchanged`, `tightened`, `ignored`, `authorized` or
-`blocked`. Only baseline entries carry `ignored_entries`. For a comparison
-involving a gitlink, the entry and both identity snapshots use `rev_kind` and
+`blocked`. Only baseline entries carry `ignored_entries`. In `REV` mode, for
+a comparison involving a gitlink, the entry and both identity snapshots use
+`rev_kind` and
 `candidate_kind` (`gitlink`, `file`, `directory`, `missing`, or `refused` in
 an identity snapshot), `rev_commit`, `candidate_commit` and `candidate_head`.
 The commit values are full Git object IDs; a value is `null` when that side
@@ -303,9 +348,10 @@ schema 2 and has no `trust` key.
   assess the tests. These mitigations do not make in-process evidence
   tamper-proof.
 * **A consumer's pinned gate commit.** The submodule pin is a candidate input
-  unless its path is listed or matched by a glob in `REV`'s `[protect] paths`.
-  An unprotected pin can change and become the trusted gate in a later run
-  whose trusted base contains that change.
+  unless its path is listed or matched by a glob in the trusted policy's
+  `[protect] paths`. In directory mode the gate compares files only, so the
+  caller checks the pin. An unprotected pin can change and become the trusted
+  gate in a later run whose trusted base contains that change.
 * **CI trust.** The workflow file is part of the candidate; branch protection
   and review cover it. A `[protect]` glob can still block an unreviewed change
   to it.

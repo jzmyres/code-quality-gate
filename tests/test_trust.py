@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,35 @@ class TrustCase(FixtureCase):
     def commit_revision(self) -> str:
         self.commit_all()
         return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def trusted_directory(
+        self, revision: str, name: str = "trusted"
+    ) -> Path:
+        directory = self.base / name
+        directory.mkdir()
+        archive = subprocess.run(
+            ["git", "archive", revision],
+            cwd=self.repo,
+            env=self.env(),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["tar", "-x", "-C", str(directory)],
+            input=archive.stdout,
+            capture_output=True,
+            check=True,
+        )
+        return directory
+
+    def forge(self, oid: str, kind: str, content: bytes) -> None:
+        """Replace the loose object at oid, keeping its file name."""
+        path = self.repo / ".git" / "objects" / oid[:2] / oid[2:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.chmod(0o644)
+        header = f"{kind} {len(content)}".encode("ascii") + b"\0"
+        path.write_bytes(zlib.compress(header + content))
 
     def trust_json(
         self, revision: str, *args: str, env: dict[str, str] | None = None
@@ -715,6 +745,147 @@ class PolicyTrustTests(TrustCase):
         self.assert_blocked(result, document)
 
 
+class DirectoryTrustTests(TrustCase):
+    def test_directory_matches_revision_for_a_loosened_baseline(self) -> None:
+        self.write_config(with_clones())
+        self.add_file("b.py", "print('b')\n")
+        self.write_clones_baseline(bound=5)
+        revision = self.commit_revision()
+        directory = self.trusted_directory(revision)
+        self.write_clones_baseline(bound=1)
+        env = self.clone_env(count=2)
+        by_revision, revision_document = self.trust_json(revision, env=env)
+        by_directory, directory_document = self.trust_json(
+            str(directory), env=env
+        )
+        self.assertEqual(
+            by_directory.returncode, by_revision.returncode, output(by_directory)
+        )
+        self.assertEqual(
+            directory_document["decision"], revision_document["decision"]
+        )
+        self.assertEqual(directory_document["decision"], "rejected")
+        self.assertEqual(directory_document["trust"]["path"], str(directory))
+        self.assertRegex(
+            directory_document["trust"]["digest"], r"^[0-9a-f]{64}$"
+        )
+        repeat, repeat_document = self.trust_json(str(directory), env=env)
+        self.assertEqual(
+            repeat_document["trust"]["digest"],
+            directory_document["trust"]["digest"],
+            output(repeat),
+        )
+
+    def test_directory_matches_revision_for_a_protected_file(self) -> None:
+        revision = self.commit_ruff_revision()
+        directory = self.trusted_directory(revision)
+        self.change_ruff()
+        by_revision, revision_document = self.trust_json(revision)
+        by_directory, directory_document = self.trust_json(str(directory))
+        self.assertEqual(
+            by_directory.returncode, by_revision.returncode, output(by_directory)
+        )
+        self.assertEqual(
+            directory_document["decision"], revision_document["decision"]
+        )
+        self.assertEqual(directory_document["decision"], "blocked")
+        authorized, authorized_document = self.trust_json(
+            str(directory), "--allow-protected", "ruff.toml"
+        )
+        self.assertEqual(authorized.returncode, 0, output(authorized))
+        self.assertEqual(authorized_document["decision"], "accepted")
+        self.assertEqual(
+            self.protected(authorized_document, "ruff.toml")["status"],
+            "authorized",
+        )
+
+    def test_directory_glob_skips_symlinks_inside_the_copy(self) -> None:
+        self.write_config(with_protect(BASE_CONFIG, "*.md"))
+        revision = self.commit_revision()
+        directory = self.trusted_directory(revision)
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "linked.md").write_text("# outside\n", encoding="utf-8")
+        (directory / "linked.md").symlink_to(outside / "linked.md")
+        (directory / "linked").symlink_to(outside, target_is_directory=True)
+        self.add_file("README.md", "# changed\n")
+        result, document = self.trust_json(str(directory))
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        self.assertEqual(
+            self.protected(document, "README.md")["status"], "blocked"
+        )
+
+    def test_directory_ignores_replaced_objects_in_the_candidate_store(self) -> None:
+        revision = self.commit_revision()
+        directory = self.trusted_directory(revision)
+        failing = BASE_CONFIG.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            'run = ["python3", "-c", "import sys; sys.exit(1)"]',
+        )
+        oid = self.git(
+            "rev-parse", f"{revision}:quality-gate.toml"
+        ).stdout.strip()
+        self.forge(oid, "blob", failing.encode("utf-8"))
+        result, document = self.trust_json(str(directory))
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted")
+        self.assertEqual(self.check_by_id(document, "smoke")["outcome"], "pass")
+
+    def test_inventory_reads_the_directory(self) -> None:
+        revision = self.commit_revision()
+        directory = self.trusted_directory(revision)
+        result = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", str(directory)
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("a.py", result.stdout.splitlines())
+
+    def test_directory_inside_candidate_is_refused(self) -> None:
+        inside = self.repo / "trusted"
+        inside.mkdir()
+        (inside / "quality-gate.toml").write_text(
+            BASE_CONFIG, encoding="utf-8"
+        )
+        result = self.run_qg("check", "--policy-from", str(inside))
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(str(inside), result.stderr)
+        self.assertIn("candidate root", result.stderr)
+
+    def test_missing_directory_is_refused(self) -> None:
+        missing = self.base / "missing-trusted"
+        result = self.run_qg("check", "--policy-from", str(missing))
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(str(missing), result.stderr)
+        self.assertIn("expected an existing directory", result.stderr)
+
+    def test_changed_from_with_directory_is_refused(self) -> None:
+        revision = self.commit_revision()
+        directory = self.trusted_directory(revision)
+        result = self.run_qg(
+            "check",
+            "--policy-from",
+            str(directory),
+            "--changed-from",
+            revision,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("--changed-from", result.stderr)
+        self.assertIn(str(directory), result.stderr)
+
+    def test_symlink_inside_directory_is_not_followed(self) -> None:
+        revision = self.commit_revision()
+        directory = self.trusted_directory(revision)
+        target = self.base / "outside-policy.toml"
+        target.write_text(BASE_CONFIG, encoding="utf-8")
+        (directory / "quality-gate.toml").unlink()
+        (directory / "quality-gate.toml").symlink_to(target)
+        result = self.run_qg("check", "--policy-from", str(directory))
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("quality-gate.toml", result.stderr)
+        self.assertIn("missing", result.stderr)
+
+
 class GitlinkTrustTests(TrustCase):
     path = "vendor/code-quality-gate"
 
@@ -1342,15 +1513,6 @@ class TrustedObjectTests(TrustCase):
             capture_output=True,
             check=True,
         ).stdout
-
-    def forge(self, oid: str, kind: str, content: bytes) -> None:
-        """Replace the loose object at oid, keeping its file name."""
-        path = self.repo / ".git" / "objects" / oid[:2] / oid[2:]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            path.chmod(0o644)
-        header = f"{kind} {len(content)}".encode("ascii") + b"\0"
-        path.write_bytes(zlib.compress(header + content))
 
     def assert_refused(
         self, result: subprocess.CompletedProcess[str],

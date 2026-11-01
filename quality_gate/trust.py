@@ -146,7 +146,8 @@ class Trust:
     protected: list[ProtectedInput]
     lock_path: Path
     lock_tools: dict[str, Tool]
-    reader: _TrustedRevision
+    reader: _TrustedRevision | _TrustedTree
+    trusted: Path | None = None
     temporary: list[tempfile.TemporaryDirectory[str]] = field(
         default_factory=list
     )
@@ -169,8 +170,16 @@ class Trust:
             directory.cleanup()
 
     def to_json(self) -> dict[str, Any]:
+        if self.trusted is None:
+            source: dict[str, Any] = {"policy_from": self.revision}
+        else:
+            assert isinstance(self.reader, _TrustedTree)
+            source = {
+                "path": str(self.trusted),
+                "digest": self.reader.digest(),
+            }
         return {
-            "policy_from": self.revision,
+            **source,
             "protected": [item.to_json() for item in self.protected],
             "identity_before": self.identity_before,
             "identity_after": self.identity_after,
@@ -347,6 +356,7 @@ class _TrustedRevision:
     ) -> None:
         self.root = root
         self.commit = commit
+        self.location = commit
         self.flag = flag
         self._hasher = _OBJECT_HASHES[self._object_format()]
         self._hash_size = self._hasher().digest_size
@@ -417,11 +427,14 @@ class _TrustedRevision:
             if mode != "040000"
         ]
 
-    def blob(self, relative: str) -> bytes | None:
+    def read(self, relative: str) -> bytes | None:
         entry = self.entries().get(relative)
         if entry is None or entry[0] not in _BLOB_MODES:
             return None
         return self._blob(entry[1], relative)
+
+    def blob(self, relative: str) -> bytes | None:
+        return self.read(relative)
 
     def _blob(self, oid: str, location: str) -> bytes:
         cached = self._blobs.get(oid)
@@ -429,6 +442,66 @@ class _TrustedRevision:
             cached = self._object("blob", oid, location)
             self._blobs[oid] = cached
         return cached
+
+
+class _TrustedTree:
+    """Plain reads of a caller-supplied extracted tree; symlinks are not followed."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.location = str(root)
+        self._reads: dict[str, bytes] = {}
+
+    def _regular(self, path: Path) -> bool:
+        try:
+            return stat.S_ISREG(path.lstat().st_mode)
+        except OSError:
+            return False
+
+    def files(self) -> list[str]:
+        names: list[str] = []
+        for directory, _directories, files in os.walk(self.root):
+            for name in files:
+                path = Path(directory) / name
+                if self._regular(path):
+                    names.append(path.relative_to(self.root).as_posix())
+        return names
+
+    def _read_file(self, path: Path) -> bytes | None:
+        try:
+            handle = os.open(
+                path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            )
+        except OSError:
+            return None
+        try:
+            with os.fdopen(handle, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    return None
+                return stream.read()
+        except OSError as error:
+            raise UsageError(
+                f"{path}: --policy-from: expected a readable trusted "
+                f"file, got {error}"
+            ) from error
+
+    def read(self, relative: str) -> bytes | None:
+        if relative in self._reads:
+            return self._reads[relative]
+        path = _safe_join(self.root, relative)
+        if path is None or not self._regular(path):
+            return None
+        data = self._read_file(path)
+        if data is not None:
+            self._reads[relative] = data
+        return data
+
+    def digest(self) -> str:
+        encoded = "".join(
+            f"{relative}\0{_sha256(data)}\n"
+            for relative, data in sorted(self._reads.items())
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _candidate_files(root: Path) -> list[str]:
@@ -625,7 +698,7 @@ def _revision_value(
         return _PathValue("gitlink", commit=oid)
     if mode == "040000":
         return _PathValue("directory")
-    return _PathValue("file", sha256=_sha256(revision.blob(path)))
+    return _PathValue("file", sha256=_sha256(revision.read(path)))
 
 
 def _submodule_git(path: Path, args: list[str], what: str) -> str:
@@ -710,34 +783,53 @@ def _gitlink_changed(comparison: _GitlinkComparison) -> bool:
     )
 
 
+def _input_kind(path: str, baselines: set[str]) -> str:
+    if path == POLICY_NAME:
+        return "policy"
+    if path == LOCK_NAME:
+        return "lock"
+    return "baseline" if path in baselines else "other"
+
+
+def _protected_input(
+    root: Path,
+    source: _TrustedRevision | _TrustedTree,
+    revision: _TrustedRevision | None,
+    tree: dict[str, tuple[str, str]],
+    index: dict[str, list[tuple[str, str, str]]],
+    path: str,
+    kind: str,
+) -> _Input:
+    comparison = (
+        _comparison(root, revision, path, tree, index)
+        if revision is not None
+        else None
+    )
+    if comparison is None:
+        return _Input(
+            path, kind, _sha256(source.read(path)),
+            _sha256(_candidate_bytes(root, path)),
+        )
+    return _Input(
+        path, kind, comparison.revision.sha256,
+        comparison.candidate.sha256, comparison,
+    )
+
+
 def _protected_inputs(
-    root: Path, revision: _TrustedRevision, config: Config
+    root: Path, source: _TrustedRevision | _TrustedTree, config: Config
 ) -> dict[str, _Input]:
     baselines = _baseline_names(config)
-    tree = revision.entries()
-    index = _index_entries(root)
-    inputs: dict[str, _Input] = {}
-    for path in sorted(_protected_scope(root, revision, config)):
-        if path == POLICY_NAME:
-            kind = "policy"
-        elif path == LOCK_NAME:
-            kind = "lock"
-        elif path in baselines:
-            kind = "baseline"
-        else:
-            kind = "other"
-        comparison = _comparison(root, revision, path, tree, index)
-        if comparison is None:
-            inputs[path] = _Input(
-                path, kind, _sha256(revision.blob(path)),
-                _sha256(_candidate_bytes(root, path)),
-            )
-        else:
-            inputs[path] = _Input(
-                path, kind, comparison.revision.sha256,
-                comparison.candidate.sha256, comparison,
-            )
-    return inputs
+    revision = source if isinstance(source, _TrustedRevision) else None
+    tree = revision.entries() if revision is not None else {}
+    index = _index_entries(root) if revision is not None else {}
+    return {
+        path: _protected_input(
+            root, source, revision, tree, index, path,
+            _input_kind(path, baselines),
+        )
+        for path in sorted(_protected_scope(root, source, config))
+    }
 
 
 def _input_changed(item: _Input) -> bool:
@@ -776,18 +868,21 @@ def _safe_join(root: Path, relative: str) -> Path | None:
 
 
 def _materialize(
-    policy_root: Path, root: Path, revision: _TrustedRevision, policy: bytes
+    policy_root: Path,
+    root: Path,
+    source: _TrustedRevision | _TrustedTree,
+    policy: bytes,
 ) -> None:
     (policy_root / POLICY_NAME).write_bytes(policy)
     try:
         data = tomllib.loads(policy.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise ConfigError(
-            f"{root / POLICY_NAME} at {revision.commit}: expected valid TOML, got "
+            f"{root / POLICY_NAME} at {source.location}: expected valid TOML, got "
             f"{error}"
         ) from error
     for name in _policy_baseline_names(data):
-        raw = revision.blob(name)
+        raw = source.read(name)
         target = _safe_join(policy_root, name)
         if raw is None or target is None:
             continue
@@ -833,16 +928,19 @@ def _entries_from_bytes(
 
 
 def _rev_entries(
-    temporary: Path, revision: _TrustedRevision, relative: str, check: Any
+    temporary: Path,
+    source: _TrustedRevision | _TrustedTree,
+    relative: str,
+    check: Any,
 ) -> list[BaselineEntry]:
-    raw = revision.blob(relative)
+    raw = source.read(relative)
     if raw is None:
         return []
     try:
         return _entries_from_bytes(temporary, "rev", raw, check)
     except GateError as error:
         raise UsageError(
-            f"{relative} at {revision.commit}: expected a valid baseline, "
+            f"{relative} at {source.location}: expected a valid baseline, "
             f"got {error}"
         ) from error
 
@@ -1061,7 +1159,7 @@ def _candidate_lock_authorized(
 
 def _effective_lock(
     root: Path,
-    revision: _TrustedRevision,
+    source: _TrustedRevision | _TrustedTree,
     inputs: dict[str, _Input],
     allowed: set[str],
     temporary: Path,
@@ -1071,7 +1169,7 @@ def _effective_lock(
         path = root / LOCK_NAME
         load_tools(path)
         return path, "authorized"
-    revision_raw = revision.blob(LOCK_NAME)
+    revision_raw = source.read(LOCK_NAME)
     if revision_raw is None:
         return _default_lock_path(), _declared_status(item, allowed)
     path = temporary / "rev-tools.lock.toml"
@@ -1176,9 +1274,23 @@ def _effective_identity(trust: Trust) -> dict[str, str | None]:
     return inputs
 
 
-def _capture_identity(trust: Trust) -> dict[str, Any]:
-    scope = _protected_scope(trust.root, trust.reader, trust.rev_config)
-    scope |= _baseline_names(trust.config)
+def _tree_protected_identity(
+    trust: Trust, scope: set[str]
+) -> dict[str, dict[str, str | None]]:
+    assert isinstance(trust.reader, _TrustedTree)
+    return {
+        path: {
+            "rev_sha256": _sha256(trust.reader.read(path)),
+            "candidate_sha256": _candidate_identity_sha256(trust.root, path),
+        }
+        for path in sorted(scope)
+    }
+
+
+def _revision_protected_identity(
+    trust: Trust, scope: set[str]
+) -> dict[str, dict[str, Any]]:
+    assert isinstance(trust.reader, _TrustedRevision)
     tree = trust.reader.entries()
     index = _index_entries(trust.root)
     protected = {}
@@ -1188,10 +1300,20 @@ def _capture_identity(trust: Trust) -> dict[str, Any]:
         )
         protected[path] = (
             comparison.to_json() if comparison is not None else {
-                "rev_sha256": _sha256(trust.reader.blob(path)),
+                "rev_sha256": _sha256(trust.reader.read(path)),
                 "candidate_sha256": _candidate_identity_sha256(trust.root, path),
             }
         )
+    return protected
+
+
+def _capture_identity(trust: Trust) -> dict[str, Any]:
+    scope = _protected_scope(trust.root, trust.reader, trust.rev_config)
+    scope |= _baseline_names(trust.config)
+    if trust.trusted is None:
+        protected = _revision_protected_identity(trust, scope)
+    else:
+        protected = _tree_protected_identity(trust, scope)
     return {
         "revision": trust.revision,
         "protected": protected,
@@ -1318,12 +1440,14 @@ def _refuse_inside(root: Path) -> None:
         )
 
 
-def _rev_policy_bytes(root: Path, revision: _TrustedRevision) -> bytes:
-    policy = revision.blob(POLICY_NAME)
+def _rev_policy_bytes(
+    root: Path, source: _TrustedRevision | _TrustedTree
+) -> bytes:
+    policy = source.read(POLICY_NAME)
     if policy is None:
         raise UsageError(
-            f"{root}: --policy-from {revision.commit!r}: expected {POLICY_NAME} "
-            "in the trusted revision, got missing"
+            f"{root}: --policy-from {source.location!r}: expected {POLICY_NAME} "
+            "in the trusted source, got missing"
         )
     return policy
 
@@ -1350,37 +1474,55 @@ def _check_initial_gitlinks(inputs: dict[str, _Input], identity: dict[str, Any])
             raise UsageError(f"protected input {path} changed while preparing the run")
 
 
-def prepare_trust(
-    root: Path, revision_text: str, allowed: list[str]
+def is_directory_argument(value: str) -> bool:
+    return Path(value).is_absolute()
+
+
+def _directory_source(root: Path, value: str) -> _TrustedTree | None:
+    if not is_directory_argument(value):
+        return None
+    path = Path(value)
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        detail = "missing" if not resolved.exists() else "not a directory"
+        raise UsageError(
+            f"{path}: --policy-from: expected an existing directory, "
+            f"got {detail}"
+        )
+    if resolved.is_relative_to(root):
+        raise UsageError(
+            f"{path}: --policy-from: the trusted directory lies inside "
+            f"the candidate root {root}"
+        )
+    return _TrustedTree(resolved)
+
+
+def _prepare_source(
+    root: Path,
+    source: _TrustedRevision | _TrustedTree,
+    temporary: list[tempfile.TemporaryDirectory[str]],
+    allowed: list[str],
+    trusted: Path | None = None,
 ) -> Trust:
-    root = root.resolve()
-    _refuse_inside(root)
-    _refuse_graft(root)
-    revision = _TrustedRevision(root, _commit(root, revision_text))
-    revision_dir = tempfile.TemporaryDirectory(prefix="qg-rev-")
-    merge_dir = tempfile.TemporaryDirectory(prefix="qg-merge-")
-    temporary = [revision_dir, merge_dir]
-    policy_root = Path(revision_dir.name)
-    _materialize(
-        policy_root, root, revision, _rev_policy_bytes(root, revision)
-    )
+    policy_root = Path(temporary[0].name)
+    _materialize(policy_root, root, source, _rev_policy_bytes(root, source))
     rev_config = load_config(policy_root, candidate_root=root)
-    inputs = _protected_inputs(root, revision, rev_config)
+    inputs = _protected_inputs(root, source, rev_config)
     allowed_paths = {_normalise(path) for path in allowed}
     config, policy_status = _policy_config(
         root, rev_config, inputs, allowed_paths
     )
     config, baseline_statuses, ignored = _apply_baselines(
         root,
-        revision,
+        source,
         rev_config,
         config,
         inputs,
         allowed_paths,
-        Path(merge_dir.name),
+        Path(temporary[1].name),
     )
     lock_path, lock_status = _effective_lock(
-        root, revision, inputs, allowed_paths, Path(merge_dir.name)
+        root, source, inputs, allowed_paths, Path(temporary[1].name)
     )
     lock_tools = load_tools(lock_path)
     statuses = dict(baseline_statuses)
@@ -1400,13 +1542,14 @@ def prepare_trust(
     ]
     trust = Trust(
         root=root,
-        revision=revision.commit,
+        revision=source.location,
         config=config,
         rev_config=rev_config,
         protected=protected,
         lock_path=lock_path,
         lock_tools=lock_tools,
-        reader=revision,
+        reader=source,
+        trusted=trusted,
         temporary=temporary,
     )
     trust.identity_before = _capture_identity(trust)
@@ -1416,3 +1559,26 @@ def prepare_trust(
         trust.close()
         raise
     return trust
+
+
+def prepare_trust(
+    root: Path, revision_text: str, allowed: list[str]
+) -> Trust:
+    root = root.resolve()
+    _refuse_inside(root)
+    trusted = _directory_source(root, revision_text)
+    if trusted is not None:
+        temporary = [
+            tempfile.TemporaryDirectory(prefix="qg-tree-"),
+            tempfile.TemporaryDirectory(prefix="qg-merge-"),
+        ]
+        return _prepare_source(
+            root, trusted, temporary, allowed, trusted.root
+        )
+    _refuse_graft(root)
+    revision = _TrustedRevision(root, _commit(root, revision_text))
+    temporary = [
+        tempfile.TemporaryDirectory(prefix="qg-rev-"),
+        tempfile.TemporaryDirectory(prefix="qg-merge-"),
+    ]
+    return _prepare_source(root, revision, temporary, allowed)

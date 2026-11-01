@@ -131,10 +131,12 @@ Protect the pin in the policy used with `--policy-from`:
     [protect]
     paths = ["code-quality-gate"]
 
-The trusted run compares that gitlink's commit with the candidate index and,
-when checked out, its HEAD. A changed pin or a different checked-out HEAD is
-blocked unless the path is explicitly authorized with `--allow-protected`.
-Run the gate from a trusted copy outside the candidate, as described below.
+With `--policy-from REV`, the trusted run compares that gitlink's commit with
+the candidate index and, when checked out, its HEAD. A changed pin or a
+different checked-out HEAD is blocked unless the path is explicitly authorized
+with `--allow-protected`. Directory mode compares files only, so the caller
+checks the pin. Run the gate from a trusted copy outside the candidate, as
+described below.
 
 `check` never downloads a tool. If a configured check needs a pinned tool and it is missing, the check's
 outcome is `unsupported` and the message names `python3 -I code-quality-gate/qg.py tools fetch`.
@@ -166,6 +168,7 @@ regular file.
     python3 -I qg.py inventory --list python
     python3 -I /path/to/trusted-gate/qg.py --repo /path/to/repo inventory --list python --policy-from REV
     python3 -I /path/to/trusted-gate/qg.py --repo /path/to/repo inventory --policy-from REV --allow-protected quality-gate.toml
+    python3 -I /path/to/trusted-gate/qg.py --repo /path/to/repo inventory --list python --policy-from /path/to/trusted-copy
 
 The first form prints a summary such as `inventory: 42 files match 7 rules`. `--list CLASS` prints the
 files of one class, one per line, and prints nothing for a known but empty class. It exits 2 for an
@@ -174,7 +177,8 @@ unknown class, so a Makefile can use it as the single source of file lists:
     python_files=$(python3 -I qg.py inventory --list python)
 
 `--policy-from REV` classifies the working tree using the effective policy from `REV`, with the same
-protected-input validation as `check`. An unapproved policy edit is ignored; an unapproved change to
+protected-input validation as `check`. `--policy-from DIR` does the same with an absolute path to a
+trusted directory outside the candidate. An unapproved policy edit is ignored; an unapproved change to
 another protected path blocks inventory before it prints a summary or file list. It uses the same
 blocked report as `check`, naming the path, both kinds, and the trusted and candidate file hashes or
 gitlink commits. To use a reviewed replacement, pass `--allow-protected PATH`; repeat the option for
@@ -576,6 +580,8 @@ The default tools directory is shared by every repository using the gate on this
     python3 -I qg.py check --prune all
     python3 -I qg.py check --policy-from REV
     python3 -I qg.py check --policy-from REV --allow-protected ruff.toml
+    python3 -I qg.py check --policy-from DIR
+    python3 -I qg.py check --policy-from DIR --allow-protected ruff.toml
     python3 -I qg.py check --changed-from REV
 
 `check` runs inventory and hygiene (built in, always), then every configured check in policy order. It
@@ -753,27 +759,37 @@ and exit 2. An argument containing NUL is a configuration error.
 
 ### Trust root
 
-`check --policy-from REV` evaluates the working tree against `REV`'s policy, baselines and tools lock,
-and `REV`'s `[protect] paths`, instead of the candidate's copies. Trusted Git reads ignore
-replacement refs and candidate-configured fsmonitors, and a repository with an `info/grafts` file is
-refused. Every object read from `REV` — the commit, the trees it walks and each file's blob — is hashed
-against the id naming it, and a mismatch exits 2 naming the object and its path. An unauthorized
-candidate baseline edit can only tighten: a removed `max` entry takes effect,
-a removed `min` floor keeps `REV`'s entry, added or loosened entries are ignored, and a malformed
-candidate baseline keeps every `REV` entry. Protected candidate files must be reached without following
-a symlink. A protected gitlink is compared by commit: the candidate's index must match `REV`, and a
-checked-out submodule's HEAD must match the index. An uninitialized submodule is allowed. A gitlink
-replaced by a file or directory, or the reverse, is a protected change. An unauthorized change to
-another protected path makes the decision
-`blocked` (exit 1), while `--allow-protected PATH` accepts a reviewed replacement and reports it as
-authorized. Gitlink results show the commits and kinds, including a checked-out HEAD; file results
-continue to show SHA-256 values. The gate records protected-input, tool-payload and gate-program
-identities before the checks, again after them before a prune write, and once more after a prune write,
-re-enumerating the
-protected scope (including ignored untracked files); an added, removed or changed protected path makes
-the decision `error` (exit 2). A performed prune may change its baseline path only by exactly the bytes
-the gate generated. It refuses to run from a gate program inside the candidate root. The full contract
-is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in [`docs/SCHEMA.md`](docs/SCHEMA.md).
+`check --policy-from` evaluates the working tree against the policy, baselines, tools lock and
+`[protect] paths` of a trusted source instead of the candidate's copies. The source is either `REV`, a
+Git revision, or an absolute path to a trusted `DIR`, an extracted tree outside the candidate. Anything
+that is not an absolute path is a revision; a missing directory or one inside the candidate root is a
+usage error. In directory mode the gate reads the trusted files with plain file reads, never follows a
+symlink inside `DIR`, reads nothing from the candidate's `.git` for them, and refuses
+`--changed-from`. Make the copy outside the candidate and make it read-only:
+
+    git -C TRUSTED_REPO archive REV | tar -x -C DEST
+    chmod -R a-w DEST
+
+In `REV` mode, trusted Git reads ignore replacement refs and candidate-configured fsmonitors, and a
+repository with an `info/grafts` file is refused. Every object read from `REV` — the commit, the trees
+it walks and each file's blob — is hashed against the id naming it, and a mismatch exits 2 naming the
+object and its path. An unauthorized candidate baseline edit can only tighten: a removed `max` entry
+takes effect, a removed `min` floor keeps the trusted entry, added or loosened entries are ignored, and
+a malformed candidate baseline keeps every trusted entry. Protected candidate files must be reached
+without following a symlink. In `REV` mode, a protected gitlink is compared by commit: the candidate's
+index must match `REV`, and a checked-out submodule's HEAD must match the index. An uninitialized
+submodule is allowed. A gitlink replaced by a file or directory, or the reverse, is a protected change.
+Directory mode compares files and globs only, so its caller checks a submodule pin. An unauthorized
+change to another protected path makes the decision `blocked` (exit 1), while `--allow-protected
+PATH` accepts a reviewed replacement and reports it as authorized. Gitlink results show the commits and
+kinds, including a checked-out HEAD; file results continue to show SHA-256 values. The gate records
+protected-input, tool-payload and gate-program identities before the checks, again after them before a
+prune write, and once more after a prune write, re-enumerating the protected scope (including ignored
+untracked files); an added, removed or changed protected path makes the decision `error` (exit 2). A
+performed prune may change its baseline path only by exactly the bytes the gate generated. It refuses
+to run from a gate program inside the candidate root. A directory-mode result reports `trust.path` and
+`trust.digest` instead of `trust.policy_from`. The full contract is
+[`docs/TRUST.md`](docs/TRUST.md); the result fields are in [`docs/SCHEMA.md`](docs/SCHEMA.md).
 Test-process measurements are trusted, and a consumer's pinned gate commit is a candidate input until
 its submodule path is protected. See the [out-of-scope limits](docs/TRUST.md#out-of-scope) and their
 mitigations.
@@ -787,9 +803,10 @@ mitigations.
 * `2` - missing or invalid configuration (including a baseline header that does not match the policy or
   two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
   git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
-  `--policy-from` or `--changed-from` revision, a gate program inside the candidate, an object read from the
-  trusted revision whose content does not match its ID, or a protected input, tool payload or gate file
-  that changed during the run.
+  `--policy-from` revision or trusted directory, a trusted directory inside the candidate,
+  `--changed-from` with a trusted directory, a gate program inside the candidate, an object read from
+  the trusted revision whose content does not match its ID, or a protected input, tool payload or gate
+  file that changed during the run.
 
 ## Configuration
 
@@ -939,9 +956,10 @@ Notes:
 * A check's optional `direction` is `max` (the default: the value must not exceed its bound and
   tightening lowers it) or `min` (the value must not fall below its bound and tightening raises it).
 * `[protect] paths` is a list of repository-relative paths or `fnmatch` globs that `--policy-from`
-  treats as protected inputs. The list always comes from `REV`, so a candidate cannot unprotect a path;
-  without `--policy-from` it is parsed and ignored. Include a pinned gate's submodule path to protect
-  its gitlink commit. The example protects `ruff.toml` and its Ruff check
+  treats as protected inputs. The list always comes from the trusted source (`REV` or `DIR`), so a
+  candidate cannot unprotect a path; without `--policy-from` it is parsed and ignored. Include a pinned
+  gate's submodule path to protect its gitlink commit in `REV` mode; directory mode compares files
+  only. The example protects `ruff.toml` and its Ruff check
   passes `--config ruff.toml`: a candidate cannot weaken lint policy, and Ruff cannot discover a
   different configuration file elsewhere.
 

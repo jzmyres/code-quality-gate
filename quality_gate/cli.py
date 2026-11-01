@@ -19,7 +19,7 @@ from .tools import (
     command_tools_path,
     load_tools,
 )
-from .trust import prepare_trust
+from .trust import is_directory_argument, prepare_trust
 from .worklist import command_worklist
 
 
@@ -33,8 +33,9 @@ class _Parser(argparse.ArgumentParser):
 def _add_policy_from_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--policy-from",
-        metavar="REV",
-        help="evaluate the working tree against REV's policy and inputs",
+        metavar="REV|DIR",
+        help="evaluate the working tree against REV's or a trusted directory's "
+        "policy and inputs",
     )
 
 
@@ -176,6 +177,14 @@ def _run_tools(args: Any) -> int:
 
 
 def _run_trusted_check(root: Path, args: Any) -> int:
+    if (
+        args.changed_from is not None
+        and is_directory_argument(args.policy_from)
+    ):
+        raise UsageError(
+            f"qg.py: --policy-from {args.policy_from}: --changed-from: "
+            "expected no --changed-from with a trusted directory"
+        )
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
     return command_check(
         root,
