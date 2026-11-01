@@ -2,7 +2,7 @@
 name: retire-adapter
 description: Checklist for removing an adapter with its registration, tests, mutation decisions and docs.
 verified: 2026-11-01
-commit: e4f98b7
+commit: af07f0e
 paths: quality_gate/adapters.py, quality_gate/policy.py, quality_gate/clones.py, quality_gate/runner.py, tests/mutate_gate.py, tests/test_adapters.py, tests/test_policy.py, tests/test_runner.py, docs/SCHEMA.md, README.md, CLAUDE.md
 ---
 

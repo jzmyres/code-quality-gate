@@ -13,7 +13,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   `command_tools_fetch` returns `error.exit_code` (2 for this `UsageError`), so no traceback escapes.
   When moving or adding a payload read, grep every `payload_digest`/`_content_sha256` call, add its catch and a
   test that injects a read failure with `mock.patch("quality_gate.payload.os.scandir", ...)`.
-  [verified 2026-10-31 @ 67a8929; paths: quality_gate/tools.py, quality_gate/payload.py, quality_gate/trust.py, quality_gate/covrun.py, tests/test_tools.py]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/tools.py, quality_gate/payload.py, quality_gate/trust.py, quality_gate/covrun.py, tests/test_tools.py]
 
 - **Tests counted by the verification ratchet must not depend on the user running them.** CI runs as root, where
   `chmod 000` denies nothing; QF8 replaced that test with an in-process patch of
@@ -46,36 +46,51 @@ each batch and reviewed before landing. Context for those agents, never rules: C
 
 - **The trust root protects only named inputs, and a green gate does not prove closure.** Protected inputs are
   the policy, baselines, lock and `[protect] paths`; `trust._refuse_inside` also refuses a gate program that
-  lies inside the candidate root, so a trusted copy must run outside it. `quality-gate.toml` protects
+  lies inside the candidate root, so a trusted copy must run outside it. `--policy-from` selects either a Git
+  `REV` (authenticated by `trust._TrustedRevision`) or an absolute `DIR` (plain reads by `trust._TrustedTree`);
+  `Trust.reader` holds either, and directory mode has its own entry below. `quality-gate.toml` protects
   `ruff.toml` and the Ruff check passes it explicitly, but an unlisted configuration file remains
   candidate-controlled: add each tool config to `[protect] paths` and pass it. QF10 replaced the path-wide
   prune exemption with an after-checks snapshot and an exact-bytes allowance (`Trust.before_prune`,
   `record_prune_write`, `_allowed_change`), and the gate validates the effective policy, tool pins and every
   baseline before the checks, exposes baselines as `CheckDef.effective_baseline` and digests them in
-  `identity_before.effective_inputs`. QF106 added the authenticated reader `trust._TrustedRevision`
-  (held as `Trust.reader`): it reads the commit, walks trees and reads each blob by id, hashes type, size and
-  content in the repository's object format and refuses a mismatch (exit 2, "object content does not match its
-  ID"). QF110 routes `--changed-from`'s base tree and blobs through it too (`changes.changed_lines`), so two
-  flags naming one commit cannot substitute the candidate's contents for the base. `_commit` still resolves
-  with `git rev-parse --verify`, but it turns a `--policy-from` hash mismatch into the specified diagnostic;
+  `identity_before.effective_inputs`. QF106 added the authenticated revision reader
+  `trust._TrustedRevision` (one of `Trust.reader`'s two kinds): it reads the commit, walks trees and reads
+  each blob by id, hashes type, size and content in the repository's object format and refuses a mismatch
+  (exit 2, "object content does not match its ID"). QF110 routes `--changed-from`'s base tree and blobs
+  through it too (`changes.changed_lines`), so two flags naming one commit cannot substitute the candidate's
+  contents for the base. `_commit` still resolves with `git rev-parse --verify`, but it turns a
+  `--policy-from` hash mismatch into the specified diagnostic;
   `changes.resolve_revision` does not, so a forged `--changed-from` commit still reports Git's raw "hash
-  mismatch" text (deferred after QF110). Route every new trusted-revision read through the reader; the
-  checklist is `.agents/skills/trust-root-change/SKILL.md`.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/trust.py, quality_gate/changes.py, quality_gate/checks.py, quality_gate/policy.py, quality-gate.toml, docs/TRUST.md, tests/test_trust.py, tests/test_changed.py]
+  mismatch" text (deferred after QF110). Route every new trusted read through `source.read`, never through
+  the candidate; the checklist is `.agents/skills/trust-root-change/SKILL.md`.
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/trust.py, quality_gate/changes.py, quality_gate/checks.py, quality_gate/policy.py, quality-gate.toml, docs/TRUST.md, tests/test_trust.py, tests/test_changed.py]
+
+- **Directory mode is a plain-tree trust source; no trust input comes from the candidate's `.git`.** Any
+  absolute `--policy-from` value selects it, even one that is missing; `_directory_source` resolves the path,
+  refuses a missing directory or one inside the candidate, and `cli._run_trusted_check` refuses
+  `--changed-from` with it. `trust._TrustedTree` uses `_safe_join` and `O_NOFOLLOW|O_NONBLOCK`, follows no
+  symlink inside it (a symlink reads as missing), caches only files it read, and `to_json` reports
+  `{"path", "digest"}` (sorted path, NUL, file SHA-256) instead of `policy_from`. `_capture_identity`
+  dispatches on `Trust.trusted` to `_tree_protected_identity`, which compares files and globs only, so
+  directory mode cannot compare a gitlink pin and the caller must. `prepare_trust` skips `_commit` and
+  `_refuse_graft` in this mode; candidate inventory still uses `git ls-files`, and the same tighten-only
+  merge and `--allow-protected` rules apply.
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/trust.py, quality_gate/cli.py, docs/TRUST.md, docs/SCHEMA.md, tests/test_trust.py]
 
 - **Every git command on a candidate repository goes through `files.git_argv`.** It adds
   `--no-replace-objects`, `safe.directory=ROOT` and `core.fsmonitor=false`; `trust._git`, `files._git` and
   `gate_result._git` call it, and `checks`, `changes` and `worklist` use it directly for inventory/hygiene
   argv, worktree diffs, pack/clone and churn. A bare `git` call lets a candidate-configured fsmonitor or
   replacement ref change what the gate reads.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/files.py, quality_gate/trust.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/changes.py, quality_gate/worklist.py]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/files.py, quality_gate/trust.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/changes.py, quality_gate/worklist.py]
 
 - **An unmeasured entry resolves by domain, not direction.** `ratchet._record_unmeasured` resolves every entry
   absent from the findings when its subject lies in the adapter's complete `Domain`, whatever its direction, and
   `pruned_entries` then drops it. A measured `min` entry never resolves by itself; `_min_verdict` only handles a
   measured minimum. QF14 corrected `docs/SCHEMA.md` and README to say this. When changing resolution, docs or
   tests, probe a complete domain with an absent entry, not only measured findings.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
 
 - **Pruning a verification baseline tightens every measured entry in that check.** `ratchet._prune_entry`
   raises a `min` bound to the measurement, and verification makes `tests:*:executed` a `min` floor, so a prune
@@ -128,7 +143,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   `Decision`, and cover a return-code-only subprocess assertion, an order-dependent selection, a child
   setUp/tearDown/addCleanup failure, an async fixture, a lazy import and the helper-from-setUp subtest in
   `tests/test_mutation.py`.
-  [verified 2026-11-01 @ e4f98b7; paths: tests/mutate_gate.py, tests/test_mutation.py, README.md]
+  [verified 2026-11-01 @ af07f0e; paths: tests/mutate_gate.py, tests/test_mutation.py, README.md]
 
 - **One subject-direction rule feeds loading, evaluation, pruning and the trusted merge.**
   `ratchet.subject_direction` delegates to the adapter descriptor's `direction_for_subject`, which asks
@@ -140,7 +155,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   `min` floor vanished). When adding a descriptor kind or a per-subject rule, test loading/evaluation, prune
   and the trusted merge with a stub adapter in `tests/test_ratchet.py`, `tests/test_trust.py` and
   `tests/test_adapters.py`.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/ratchet.py, quality_gate/adapters.py, quality_gate/trust.py, quality_gate/checks.py, tests/test_ratchet.py, tests/test_trust.py, tests/test_adapters.py]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/ratchet.py, quality_gate/adapters.py, quality_gate/trust.py, quality_gate/checks.py, tests/test_ratchet.py, tests/test_trust.py, tests/test_adapters.py]
 
 - **A test check reports the counts it parses, never a reconstruction of per-test outcomes.** The Python and
   Emacs adapters set `tests_ran` and `tests_skipped`; `verification._recorded_test_counts` reads only those,
@@ -151,7 +166,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   reports `outcome = "fail"` with reason "command exited N" and the output tail in diagnostics; zero executed
   tests is not a pass. Do not re-add parsing of `FAILED (...)`, `FAIL:`/`ERROR:` headings or fixture names;
   add the count to both adapters and a verification test instead.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/python_tests.py, quality_gate/elisp_tests.py, quality_gate/verification.py, quality_gate/checks.py, tests/test_python_tests.py, tests/test_verification.py, docs/SCHEMA.md, README.md]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/python_tests.py, quality_gate/elisp_tests.py, quality_gate/verification.py, quality_gate/checks.py, tests/test_python_tests.py, tests/test_verification.py, docs/SCHEMA.md, README.md]
 
 - **The clone check refuses inline jscpd ignore directives before it runs the tool, and its regression must
   show the bypass.** `clones._refuse_directives` is the "clone source scan" `analysis_step` inside
@@ -163,7 +178,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   run `unsupported` ("jscpd ... analyzed no files"), and the review reproduced `accepted` only after giving
   each file ~30 unique assignments. Before landing a refusal, remove it in a disposable copy and confirm the
   bypass really passes.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/clones.py, tests/test_clones.py, README.md]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/clones.py, tests/test_clones.py, README.md]
 
 - **Test evidence is released through one helper by both the check command and the worklist.**
   `checks._evidence_last_users` maps each result to its last dependent check; `_release_evidence` clears
@@ -173,7 +188,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   its selected order, releases after each last user and again in a `finally`, and passes the messages out as
   a fourth list so `_worklist_report` exits 1. Leaving cleanup to the `TemporaryDirectory` finalizer only
   emits an implicit `ResourceWarning` and loses the failure.
-  [verified 2026-11-01 @ e4f98b7; paths: quality_gate/checks.py, quality_gate/worklist.py, tests/test_worklist.py, README.md]
+  [verified 2026-11-01 @ af07f0e; paths: quality_gate/checks.py, quality_gate/worklist.py, tests/test_worklist.py, README.md]
 
 - **Copy only the working files for a disposable demo.** `cp -a` of this clone fails on `.git/objects` with
   `preserving permissions ... Invalid argument` and leaves a partial copy. Copy the files the command needs
