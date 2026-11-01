@@ -25,7 +25,6 @@ policy = importlib.import_module("quality_gate.policy")
 runner = importlib.import_module("quality_gate.runner")
 ratchet = importlib.import_module("quality_gate.ratchet")
 clones = importlib.import_module("quality_gate.clones")
-owners = importlib.import_module("quality_gate.owners")
 python_crap = importlib.import_module("quality_gate.python_crap")
 python_tests = importlib.import_module("quality_gate.python_tests")
 coverage_tool = importlib.import_module("quality_gate.coverage_tool")
@@ -59,21 +58,12 @@ class AnalysisDeadlineTests(unittest.TestCase):
         time.sleep(20)
         self.finished.touch()
 
-    def owners_spec(self) -> object:
-        rule = owners.OwnerRule(
-            "single-owner", "one implementation", ("source.py",),
-            (owners.Pattern("python-call", "peak"),), (),
-        )
-        return owners.OwnersSpec((rule,))
-
     def adapter_spec(self, adapter: str) -> object:
         if adapter == "clones":
             return clones.CloneSpec(50)
         if adapter == "crap":
             return python_crap.PythonCrapSpec("tests")
-        if adapter == "verification":
-            return verification.VerificationSpec("tests")
-        return self.owners_spec()
+        return verification.VerificationSpec("tests")
 
     def check_def(self, adapter: str) -> object:
         return policy.CheckDef(
@@ -181,11 +171,6 @@ class AnalysisDeadlineTests(unittest.TestCase):
             result, elapsed = self.run_adapter("verification")
         self.assert_timeout(result, "verification analysis", elapsed)
 
-    def test_owners_analysis_is_stopped_while_running(self) -> None:
-        with mock.patch.object(owners, "measure_owners", side_effect=self.stall):
-            result, elapsed = self.run_adapter("owners")
-        self.assert_timeout(result, "owners analysis", elapsed)
-
     def test_cancelled_worker_stops_its_subprocess_and_group(self) -> None:
         command = self.long_running_command(self.started)
         def work() -> None:
@@ -213,6 +198,38 @@ class AnalysisDeadlineTests(unittest.TestCase):
                 runner.analysis_step("analysis", work)
         self.assert_marker_processes_stopped(thread_marker)
         self.assert_marker_processes_stopped(nested_marker)
+
+    def test_surviving_group_member_is_reported_with_pid_and_command(self) -> None:
+        command = self.long_running_command(self.started)
+        original_killpg = os.killpg
+
+        def deny_child(pid: int, number: int) -> None:
+            if self.started.exists() and pid == int(self.started.read_text().split()[0]):
+                if number in (signal.SIGTERM, signal.SIGKILL):
+                    raise PermissionError("signal denied")
+            original_killpg(pid, number)
+
+        def work() -> None:
+            runner.run(command, budget_seconds=20)
+
+        try:
+            with mock.patch.object(runner.os, "killpg", side_effect=deny_child):
+                with runner.check_deadline(time.monotonic(), self.budget):
+                    with self.assertRaises(runner.WorkerError) as caught:
+                        runner.analysis_step("analysis", work)
+            reason = str(caught.exception)
+            pid, child_pid = (int(value) for value in self.started.read_text(encoding="utf-8").split())
+            self.assertIn(str(pid), reason)
+            self.assertIn(str(child_pid), reason)
+            self.assertIn(sys.executable, reason)
+            self.assertIn("import time; time.sleep(20)", reason)
+            self.assertIn("signal denied", reason)
+            self.assertIn("still running", reason)
+        finally:
+            if self.started.exists():
+                pid = int(self.started.read_text(encoding="utf-8").split()[0])
+                with contextlib.suppress(ProcessLookupError):
+                    original_killpg(pid, signal.SIGKILL)
 
     def test_cancellation_during_subprocess_launch_stops_the_process(self) -> None:
         register = runner._register_session
@@ -256,79 +273,6 @@ class AnalysisDeadlineTests(unittest.TestCase):
         self.assertEqual(completed.execution, "completed")
         self.assertEqual(missing.execution, "error")
         self.assertIn("missing-command", missing.error)
-
-    def test_owners_regex_is_stopped_at_a_60ms_deadline(self) -> None:
-        (self.root / "owner.txt").write_text("owner", encoding="utf-8")
-        (self.root / "source.txt").write_text("a" * 2000 + "!", encoding="utf-8")
-        rule = owners.OwnerRule(
-            "single-owner", "one implementation", ("owner.txt",),
-            (owners.Pattern("text-regex", r"(a+)+$"),), (),
-        )
-        check = replace(self.check_def("owners"), spec=owners.OwnersSpec((rule,)))
-        spawn = runner._spawn
-
-        def record_spawn(*args: object, **kwargs: object) -> object:
-            process, failure = spawn(*args, **kwargs)
-            if process is not None and str(owners.REGEX_RUNNER) in process.args:
-                self.started.write_text(str(process.pid), encoding="utf-8")
-            return process, failure
-
-        with mock.patch.object(runner, "_spawn", side_effect=record_spawn):
-            with mock.patch.object(checks, "RATCHET_BUDGET_SECONDS", 0.06):
-                with contextlib.redirect_stderr(io.StringIO()):
-                    result = checks.run_check(
-                        self.root, self.config, check, ["owner.txt", "source.txt"], {},
-                        prefix="check",
-                    )
-        self.assertEqual(result.execution, "budget")
-        self.assertIn("owners analysis", result.reason)
-        self.assertTrue(self.started.exists(), "the regex process did not start before the deadline")
-        self.assert_process_stopped(int(self.started.read_text(encoding="utf-8")))
-
-    def test_unstoppable_subprocess_is_reported_with_pid_and_command(self) -> None:
-        command = self.long_running_command(self.started)
-        original_killpg = os.killpg
-
-        def deny_child(pid: int, number: int) -> None:
-            if self.started.exists() and pid == int(self.started.read_text().split()[0]):
-                if number in (signal.SIGTERM, signal.SIGKILL):
-                    raise PermissionError("signal denied")
-            original_killpg(pid, number)
-
-        def work(*args: object) -> None:
-            runner.run(command, budget_seconds=20)
-
-        try:
-            with mock.patch.object(owners, "measure_owners", side_effect=work):
-                with mock.patch.object(runner.os, "killpg", side_effect=deny_child):
-                    result, _elapsed = self.run_adapter("owners")
-            pid, child_pid = (int(value) for value in self.started.read_text(encoding="utf-8").split())
-            self.assertEqual(result.execution, "error")
-            self.assertEqual(result.outcome, "error")
-            self.assertIn(str(pid), result.reason)
-            self.assertIn(str(child_pid), result.reason)
-            self.assertIn(sys.executable, result.reason)
-            self.assertIn("import time; time.sleep(20)", result.reason)
-            self.assertIn("signal denied", result.reason)
-        finally:
-            if self.started.exists():
-                pid = int(self.started.read_text(encoding="utf-8").split()[0])
-                with contextlib.suppress(ProcessLookupError):
-                    original_killpg(pid, signal.SIGKILL)
-
-    def test_owners_baseline_loading_is_stopped_while_running(self) -> None:
-        with mock.patch.object(owners, "measure_owners", return_value=[]):
-            with mock.patch.object(checks, "_baseline_entries", side_effect=self.stall):
-                result, elapsed = self.run_adapter("owners")
-        self.assert_timeout(result, "baseline loading", elapsed)
-
-    def test_normal_owners_run_passes(self) -> None:
-        (self.root / "source.py").write_text("peak()\n", encoding="utf-8")
-        result, _elapsed = self.run_adapter("owners")
-        self.assertEqual(result.outcome, "pass")
-        self.assertEqual(result.execution, "completed")
-        self.assertTrue(result.is_satisfied())
-        self.assertEqual(result.findings, [])
 
     def test_baseline_loading_is_stopped_while_running(self) -> None:
         findings = [ratchet.Finding("tests:tests:executed", 1, "test summary")]

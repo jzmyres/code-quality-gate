@@ -431,26 +431,6 @@ def _check_header(
     return descriptor, tier, enforcement
 
 
-def _validate_fixed_header(
-    descriptor: Any, tier: int, enforcement: str, direction: str,
-    path: Path, full_key: str,
-) -> None:
-    fixed = descriptor.fixed_header
-    if fixed is None:
-        return
-    fixed_tier, fixed_enforcement, fixed_direction = fixed
-    if tier != fixed_tier or enforcement != fixed_enforcement:
-        raise _config_error(
-            path, full_key,
-            f"an {fixed_enforcement} tier {fixed_tier} {descriptor.name} check",
-            f"tier {tier}, {enforcement}",
-        )
-    if direction != fixed_direction:
-        raise _config_error(
-            path, f"{full_key}.direction", fixed_direction, direction
-        )
-
-
 def _parse_check(
     name: str,
     raw: Any,
@@ -468,9 +448,6 @@ def _parse_check(
     parse_root = candidate_root if descriptor.parse_candidate_inputs else root
     parts = descriptor.parse(raw, parse_root, path, full_key)
     direction = _parse_direction(raw, path, full_key)
-    _validate_fixed_header(
-        descriptor, tier, enforcement, direction, path, full_key
-    )
     check = CheckDef(
         id=name,
         adapter=descriptor.name,

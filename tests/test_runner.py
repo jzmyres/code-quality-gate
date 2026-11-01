@@ -156,6 +156,18 @@ class AnalysisWorkerTests(unittest.TestCase):
             self.assertTrue(runner._proc_group_member("/proc/123/stat", 123))
         self.assertFalse(runner._proc_group_member("/proc/no-such-pid/stat", 123))
 
+    def test_unreadable_process_details_fall_back_to_the_registered_entry(self) -> None:
+        fallback = ["registered", "command"]
+        self.assertEqual(runner._proc_member_command(-1, fallback), fallback)
+        with mock.patch("builtins.open", mock.mock_open(read_data=b"")):
+            self.assertEqual(runner._proc_member_command(123, fallback), fallback)
+        self.assertIsNone(runner._live_member("/proc/no-such-pid/stat", 123, 123, fallback))
+        self.assertIsNone(
+            runner._live_member(f"/proc/{os.getpid()}/stat", os.getpid(), -1, fallback)
+        )
+        with mock.patch.object(runner.os, "scandir", side_effect=OSError("denied")):
+            self.assertEqual(runner._live_group_members(123, {"command": fallback}), {})
+
     def test_large_result_and_output_are_returned(self) -> None:
         def work() -> bytes:
             print("worker output")

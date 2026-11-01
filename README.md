@@ -28,6 +28,8 @@ the Edebug coverage collected by the test adapter.
 
 The archived implementation can be inspected with
 `git show archive/result-reuse-2026-10-30:PATH`, or by checking out that tag.
+The archived owners adapter can be inspected with
+`git show archive/owners-2026-10-31:PATH`.
 
 ## Requirements
 
@@ -56,8 +58,7 @@ exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
 `--policy-from` protected inputs, effective inputs and run identity, and `cli.py` holds the
-argument parser and dispatch. `owners.py` and its matchers enforce declared single-owner rules.
-`qg.py` is only the entry point.
+argument parser and dispatch. `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
 parser, run function, argument fields, location coverage, number display, subject noun, failure wording,
@@ -522,144 +523,6 @@ report rounds to one decimal. Each finding's `measurement` contains `cc`, `point
 metric version is `elisp-edebug/1`. The measured domain is the selected files, so resolved baseline
 entries and `--prune` follow the same ratchet rules as Python CRAP.
 
-### Single-owner rules
-
-The `owners` adapter checks a declared concern across the **entire inventory**, including tracked and
-stageable untracked files, whether or not the file's class lists the check. It is an enforced tier 1
-static check; a separate test check is still needed for the tier 1 tests obligation. Each rule names
-its implementation files, explains why, and specifies forbidden patterns. A matching occurrence
-outside an owner is a violation unless an `allow` pattern covers that occurrence. The rules are in the
-protected policy; the named baseline is protected just like other baselines under `--policy-from`.
-The owners check has one absolute 600-second deadline covering its inventory scan, baseline loading and
-ratchet evaluation; each synchronous phase runs in a supervised worker, so an overrun is stopped at the
-deadline and reported as a timeout naming the phase that was running.
-
-Patterns are inline tables with `kind`, `value`, and optional `paths`, a non-empty array of
-repository-relative `fnmatch` globs. `paths` limits where that pattern can match. Use it when a broad
-pattern, such as `python3`, would otherwise include unrelated callers. All files still go through the
-inventory; a pattern applies only to its configured paths. An owner must be an enumerated regular file.
-Gitlinks and symlinks are not read, and symlinked parents are refused.
-
-| `kind` | Matches |
-|---|---|
-| `python-call` | An AST call's exact name or dotted attribute, such as `subprocess.run`. |
-| `python-import` | An imported module, including `from MODULE import ...`. |
-| `python-argv` | A Python list or tuple whose first element is the literal string `value`, when passed as the first argument of a call or returned from a builder. |
-| `python-script` | The literal script argument of a Python or shell interpreter in such a literal argv list. |
-| `shell-command` | An unquoted command word, including after `|`, `&&` and `;`; a command substitution's commands are scanned apart from the enclosing command. A path also matches its basename. |
-| `shell-script` | An unquoted script argument after an interpreter and its options, such as `python3 -I peak-window.py`; a shell's short `-c` (alone or in a cluster such as `-ec`) starts a command string instead. |
-| `text-regex` | A Python regular expression over code with comments and quoted strings masked; a last resort, identified as `text-regex` in findings. |
-
-Python matching parses the AST and never matches text inside a comment or ordinary string. An argv
-pattern deliberately inspects literal **elements** of a list or tuple passed directly to a call or
-returned by a builder, not a data list assigned to a variable or text that merely looks like a list.
-Shell matching skips comments and here-document bodies; literal quoted words are recognised, and commands in
-`$(...)` are scanned separately, including inside double quotes, while the substitution stays an
-argument of the enclosing command. Arithmetic expansions stay in their enclosing word, including in
-assignment prefixes. Interpreter patterns require literal words. A shell's short `-c`
-(alone or in a cluster such as `-ec`) and Python's `-c` and `-m` name a command string or module, not
-a script; interpreter-specific option tables also recognise shell `+` forms and options that consume
-operands, such as `--rcfile FILE` and `--check-hash-based-pycs never`.
-
-When a command or script pattern applies, an unknown interpreter option, an option whose meaning
-depends on the interpreter version or implementation, or a shell expansion that prevents the scanner
-from determining the command head, an option, or the script produces an `unanalysable` finding.
-An extended-glob word, `?(...)`, `*(...)`, `+(...)`, `@(...)` or `!(...)` with balanced
-parentheses, is nonliteral and produces one too, whether or not the script enables `extglob`.
-A nonliteral Python argv element in the option or script position is also
-reported. The finding names the file, line, word and reason, and fails the check even in an owner file
-or with a baseline entry. Rewrite the invocation so its command and script can be determined. An
-unanalysable invocation also prevents a missing pattern match from being reported as a stale rule.
-
-Text patterns mask Python and shell comments and strings with their
-language tokenizers. For other text they mask quoted strings, `#` and `//` line comments, `/* ... */`
-block comments, and, in `.el` files, `;` comments. Use a more specific pattern when those conventions do
-not describe the file. Regular expressions run in a bounded child process; only non-empty matches
-count.
-
-An allowance covers a forbidden Python event in the same call or import, or an allowed call nested in
-the first argument of that call; for shell, both must be in the same simple command. A text allowance
-must contain the forbidden text match. An allowance elsewhere on the same line does not cover it.
-These are syntactic rules: they do not resolve aliases, infer computed argv or prove that two
-algorithms are equivalent. Choose patterns and path scopes that describe the actual bypasses and
-reimplementations in the repository.
-
-For example, this peak-window policy allows the shell runner and Python `agent-usage.py` to launch
-the helper, but flags a different script in those call sites and a matching window computation in
-any Python or shell file. The hour expression is an illustrative repository-specific signature:
-
-```toml
-[checks.architecture]
-adapter = "owners"
-tier = 1
-enforcement = "enforced"
-baseline = "owners-baseline.toml"
-
-[[checks.architecture.rule]]
-name = "peak-window"
-reason = "the helper owns the peak-window decision"
-owners = ["peak-window.py"]
-forbid = [
-  { kind = "shell-command", value = "python3", paths = ["dsh-implement.sh", "opencode.sh"] },
-  { kind = "python-argv", value = "python3", paths = ["agent-usage.py", "opencode.py"] },
-  { kind = "text-regex", value = 'hour\s*>=\s*17', paths = ["*.py", "*.sh"] },
-]
-allow = [
-  { kind = "shell-script", value = "peak-window.py" },
-  { kind = "python-script", value = "peak-window.py" },
-]
-```
-
-For instance, `python3 -I peak-window.py` and
-`subprocess.run(["python3", "-I", "peak-window.py"])` are covered by the respective allowances.
-`python3 -I copied-window.py` in a listed shell file and either `now.hour >= 17` or
-`(( hour >= 17 ))` outside the owner are findings. Scope the interpreter patterns to files where every
-such launch is relevant to this concern.
-
-The gate's Git invocation policy illustrates an argv builder rather than a subprocess owner:
-
-```toml
-[checks.architecture]
-adapter = "owners"
-tier = 1
-enforcement = "enforced"
-baseline = "owners-baseline.toml"
-
-[[checks.architecture.rule]]
-name = "git"
-reason = "files.git_argv owns candidate Git invocation options"
-owners = ["quality_gate/files.py"]
-forbid = [{ kind = "python-argv", value = "git" }]
-```
-
-`files.git_argv` returns a list starting with `"git"`, which is the rule's owner witness. A call using
-`run(git_argv(root, "status"))` has no literal `"git"` argv and passes. A call such as
-`subprocess.run(["git", "status"])` elsewhere is a violation; no `allow` is needed for the builder
-call. Every forbid and allow pattern must match at least once somewhere in its scope, including
-owners. A missing owner, a never-matching forbid, or a never-matching allow is a configuration error
-(exit 2), naming the rule and offending item.
-
-Violations have a stable subject: a compact JSON array of rule name, repository path, pattern kind,
-and pattern value, with no line number; non-ASCII characters use JSON ASCII escapes. The finding's
-location and `measurement.lines` report the
-current lines, and its value is the count of occurrences for that subject. The usual max ratchet
-applies: a new or increased count fails; a reviewed exception needs a reason, and prune lowers bounds
-or removes resolved entries. For the Git example, an exception might be:
-
-```toml
-check = "architecture"
-metric_version = "owners/1"
-
-[[entry]]
-subject = '["git","bypass.py","python-argv","git"]'
-bound = 1
-reason = "legacy invocation pending migration"
-```
-
-Adopt this check only in a later batch whose trusted base already contains the adapter. The runner
-uses the gate from the batch base; adding this adapter and naming it in that same batch's policy would
-make the older trusted gate reject the unknown adapter before acceptance.
-
 ### tools
 
     python3 -I qg.py tools fetch
@@ -743,7 +606,7 @@ do not block the whole-tree judgement. With `--changed-from`, a located threshol
 lines blocks even in an advisory check. Missing evidence is `unsupported`, never `pass`. Each check has one
 absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
 baseline loading and ratchet evaluation. Command, Python test and Emacs Lisp checks use their configured budgets;
-clone, CRAP, verification and owners checks each have 600 seconds. Synchronous analysis runs in supervised workers.
+clone, CRAP and verification checks each have 600 seconds. Synchronous analysis runs in supervised workers.
 Cancelling a worker stops it, every subprocess it started through the runner, and those subprocesses' process
 groups before cancellation returns. If a process cannot be stopped, the check reports an error naming its pid and
 command. An overrun reports `outcome = "fail"` and `execution = "budget"`, names the step, deadline and elapsed
@@ -836,9 +699,9 @@ inventory cannot be compared and its finding is reported as not change-scoped.
 Git's line matching decides which lines count as additions, and a deletion alone adds no lines. Ignored
 untracked files and deleted files are outside inventory. A bad revision or failed diff exits 2.
 
-The `python_crap`, `elisp_crap`, `owners` and `clones` adapters provide complete locations: respectively the entire
-function range (including Python decorators), every occurrence line, and both ranges of every clone in a
-fingerprint group. CRAP's module subject uses the span from its first to last outside-function node;
+The `python_crap`, `elisp_crap` and `clones` adapters provide complete locations: respectively the entire
+function range (including Python decorators) and both ranges of every clone in a fingerprint group.
+CRAP's module subject uses the span from its first to last outside-function node;
 that conservative span can include intervening functions. Verification supplies every inline and
 file-wide suppression line, one location per directive, but its test-count metrics have no source
 location. Command checks, Python test results, inventory
@@ -1073,8 +936,6 @@ Notes:
   not count. An added file-wide suppression fails unless a baseline entry with a non-empty reason covers
   its count; removing all such suppressions from the file resolves that entry. Replacing inline
   suppressions with a file-wide directive cannot use the inline baseline entry.
-* An `owners` check needs a `baseline` and declared rules. Its full-inventory scope, pattern forms,
-  allowances and examples are described under [Single-owner rules](#single-owner-rules).
 * A check's optional `direction` is `max` (the default: the value must not exceed its bound and
   tightening lowers it) or `min` (the value must not fall below its bound and tightening raises it).
 * `[protect] paths` is a list of repository-relative paths or `fnmatch` globs that `--policy-from`
@@ -1211,7 +1072,7 @@ through the environment, so hits from child processes are attributed to the test
 a hit that cannot be attributed is recorded as unattributed. The declared
 decisions in `tests/mutate_gate.py` cover baseline bounds, threshold and expiry comparisons,
 verification floors, prune refusal and exit status, gate decisions, trust-root identity and protection,
-single-owner checks, and the rule that an ERT run must execute a test. They use comparison flips, boolean negation, an opposite boolean return,
+and the rule that an ERT run must execute a test. They use comparison flips, boolean negation, an opposite boolean return,
 and removal of a raise. This is a selected set of faults, not an exhaustive measurement of every
 possible change.
 

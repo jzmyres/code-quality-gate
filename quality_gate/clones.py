@@ -1,16 +1,17 @@
 """jscpd invocation, SARIF parsing and clone measurement."""
 from __future__ import annotations
 
+import os
+import stat
 import sys
 import tempfile
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from .json_input import load_json
-from .owners import _read_regular
 from .policy import (
     DEFAULT_MAX_BYTES,
     CheckDef,
@@ -577,6 +578,40 @@ def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
         _clone_finding(fingerprint, occurrences[fingerprint], selected)
         for fingerprint in sorted(occurrences)
     ]
+
+
+def _parent_fd(root: Path, relative: str) -> int:
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in PurePosixPath(relative).parts[:-1]:
+            following = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = following
+        return descriptor
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
+def _read_regular(root: Path, relative: str) -> bytes | None:
+    parent = -1
+    try:
+        parent = _parent_fd(root, relative)
+        name = PurePosixPath(relative).name
+        if not stat.S_ISREG(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+            return None
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise GateError(f"cannot scan {relative}: expected a regular file")
+            return stream.read()
+    except OSError as error:
+        raise GateError(f"cannot scan {relative}: {error}") from error
+    finally:
+        if parent >= 0:
+            os.close(parent)
 
 
 def _directive_lines(

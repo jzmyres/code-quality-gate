@@ -13,7 +13,7 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Iterator
 
 from . import (
-    clones, command, coverage_tool, elisp_crap, elisp_lint, elisp_tests, owners, python_crap, python_tests,
+    clones, command, coverage_tool, elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests,
     ratchet, verification,
 )
 from .policy import (
@@ -72,7 +72,6 @@ class AdapterDescriptor:
     extras: tuple[str, ...] = ()
     requires_adapter: str | None = None
     requires_tests: bool = False
-    fixed_header: tuple[int, str, str] | None = None
     budget: Callable[[Any], int] = _default_budget
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
@@ -245,12 +244,4 @@ register_adapter(AdapterDescriptor(
     default_direction="max",
     requires_tests=True,
     entry_direction=verification._verification_entry_direction,
-))
-register_adapter(AdapterDescriptor(
-    "owners",
-    ("baseline", "rule"),
-    owners._owners_spec,
-    owners._run_owners,
-    location_coverage="complete",
-    fixed_header=(1, "enforced", "max"),
 ))

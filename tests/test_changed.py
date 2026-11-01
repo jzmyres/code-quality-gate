@@ -5,9 +5,8 @@ import unittest
 from unittest import mock
 
 from support import (
-    BASE_CONFIG, GATE, PYTHON_TEST_HEADER, FixtureCase, baseline_text, output, sarif_report, with_clones,
+    BASE_CONFIG, PYTHON_TEST_HEADER, FixtureCase, baseline_text, output, sarif_report, with_clones,
 )
-from test_owners import baseline as owners_baseline, owner_config, pattern, rule, subject
 from test_python_crap import crap_config
 from test_verification import executed_entry, exclusion_entry, verification_baseline, verification_config
 from quality_gate.changes import changed_lines, resolve_revision
@@ -353,56 +352,6 @@ class ChangedVerificationTests(FixtureCase):
                 self.assertEqual(finding["locations"], [
                     {"path": "pkg/mod.py", "start_line": 3, "end_line": 3},
                 ])
-
-
-class ChangedOwnersTests(FixtureCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.add_file("a.py", "sensitive()\n")
-        self.add_file("other.py", "sensitive()\nsensitive()\n")
-        self.write_config(owner_config([rule([pattern("python-call", "sensitive")])]))
-        key = subject("single-owner", "other.py", "python-call", "sensitive")
-        self.add_file("owners-baseline.toml", owners_baseline([(key, 2, "old")]))
-        self.commit_all()
-
-    def test_later_owner_occurrence_is_change_scoped(self) -> None:
-        self.add_file("other.py", "sensitive()\nsensitive(42)\n")
-        result, document = self.run_json("--changed-from", "HEAD")
-        self.assertEqual(result.returncode, 1, output(result))
-        check = self.check_by_id(document, "arch")
-        self.assertEqual(check["location_coverage"], "complete")
-        self.assertEqual([span["start_line"] for span in check["findings"][0]["locations"]], [1, 2])
-        self.assertTrue(check["findings"][0]["blocking"])
-
-    def test_trusted_policy_and_change_scope_can_use_same_base(self) -> None:
-        self.add_file("tools.lock.toml", (GATE / "tools.lock.toml").read_text())
-        self.commit_all("trusted base")
-        self.add_file("other.py", "sensitive()\nsensitive(42)\n")
-        result, document = self.run_json("--policy-from", "HEAD", "--changed-from", "HEAD")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["schema"], 3)
-        self.assertEqual(document["changed_from"], document["trust"]["policy_from"])
-        self.assertTrue(self.check_by_id(document, "arch")["findings"][0]["blocking"])
-
-    def test_replace_refs_do_not_change_the_diff_base(self) -> None:
-        base = self.git("rev-parse", "HEAD").stdout.strip()
-        self.add_file("other.py", "sensitive()\nsensitive(42)\n")
-        self.commit_all("candidate")
-        candidate = self.git("rev-parse", "HEAD").stdout.strip()
-        self.git("replace", base, candidate)
-        result, document = self.run_json("--changed-from", base)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertTrue(self.check_by_id(document, "arch")["findings"][0]["on_changed_lines"])
-
-    def test_candidate_clean_filter_cannot_hide_a_changed_occurrence(self) -> None:
-        self.git("config", "filter.hide.clean", "cat >/dev/null; printf 'sensitive()\\nsensitive()\\n'")
-        attributes = self.repo / ".git" / "info" / "attributes"
-        attributes.write_text("other.py filter=hide\n", encoding="utf-8")
-        self.add_file("other.py", "sensitive()\nsensitive(42)\n")
-        self.assertEqual(self.git("diff", "HEAD", "--", "other.py").stdout, "")
-        result, document = self.run_json("--changed-from", "HEAD")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertTrue(self.check_by_id(document, "arch")["findings"][0]["on_changed_lines"])
 
 
 class ChangedCloneTests(FixtureCase):

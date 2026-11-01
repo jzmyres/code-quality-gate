@@ -186,6 +186,14 @@ class PolicyTests(FixtureCase):
             "one of command, clones",
         )
 
+    def test_owners_adapter_is_unknown(self) -> None:
+        self.config_error(
+            BASE_CONFIG.replace('adapter = "command"', 'adapter = "owners"'),
+            "checks.smoke.adapter",
+            "one of command, clones",
+            "got str 'owners'",
+        )
+
     def test_check_enforcement_must_be_enforced_or_advisory(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(

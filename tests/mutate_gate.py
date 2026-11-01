@@ -253,49 +253,6 @@ DECISIONS = (
         "old.get(name) != new.get(name)",
         "Changes to a gate file or tool payload are errors.",
     ),
-    Decision(
-        "owners_owner_boundary",
-        "quality_gate/owners.py",
-        "_file_findings",
-        "comparison",
-        "relative in rule.owners",
-        "Only declared owner files are exempt from violations.",
-    ),
-    Decision(
-        "owners_allow_scope",
-        "quality_gate/owners.py",
-        "_uncovered",
-        "negate",
-        "not any(covered(hit, exemption) for exemption in allowed)",
-        "Only a matching allow covering an occurrence exempts it.",
-    ),
-    Decision(
-        "owners_missing_owner",
-        "quality_gate/owners.py",
-        "_check_stale",
-        "remove_raise",
-        'raise ConfigError(\n'
-        '                f"owners: rule {rule.name}: owner file {owner} '
-        'is missing or not an enumerated regular file"\n'
-        '            )',
-        "A missing or non-regular owner is a configuration error.",
-    ),
-    Decision(
-        "owners_text_allow_boundary",
-        "quality_gate/owners_match.py",
-        "covered",
-        "comparison",
-        "allowed.start <= forbidden.start",
-        "A text allow may start exactly at the forbidden match.",
-    ),
-    Decision(
-        "owner_match_verdict",
-        "quality_gate/owners_match.py",
-        "covered",
-        "opposite_return",
-        "return False",
-        "An occurrence outside the allow scope remains forbidden.",
-    ),
 )
 
 
