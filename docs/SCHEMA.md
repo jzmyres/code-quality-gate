@@ -183,8 +183,8 @@ Rules:
   configuration error.
 * `[protect]` has one optional key, `paths`, a list of repository-relative
   paths or `fnmatch` globs. It is the caller's protected-input list for
-  `check --policy-from REV`; without that option it is parsed and ignored. The
-  list used by a trust run always comes from `REV`.
+  `check --policy-from DIR`; without that option it is parsed and ignored. The
+  list used by a trust run always comes from `DIR`.
 
 ### Evidence and obligations
 
@@ -348,56 +348,6 @@ and is pruned, whatever its direction. An entry outside the domain is reported
 as `unmeasured` and kept; prune never drops it. A clone entry naming a file
 deleted from the repository resolves.
 
-## Change-scoped enforcement
-
-`check --changed-from REV` preserves the full-tree checks and ratchets and adds
-a judgement for threshold violations on added or modified worktree lines. A
-located violation that overlaps those lines blocks regardless of baseline or
-whether the check is advisory. A measurement at or within its threshold does
-not fail this extra judgement. Unchanged violations remain subject to the
-ordinary ratchet; a check with a changed-line violation cannot be pruned.
-
-`REV` must resolve to a commit. Git compares that commit to the current
-worktree, including committed, staged and unstaged changes and stageable
-untracked files. Every line of an inventory file absent from the base is new.
-The gate compares raw base blobs with worktree bytes in an isolated temporary
-directory, so index flags and candidate Git clean filters cannot hide edits.
-Line-ending changes are changes. The gate runs a zero-context textual Git
-diff with rename detection off. Files containing lone carriage returns are
-normalized for line numbering; if only their line endings differ, all lines
-are marked changed.
-For a finding through a symlink, a new or retargeted link marks all its source
-lines new. An unchanged link to an inventoried file uses the target's changed
-lines; a target outside that inventory cannot be compared and the finding is
-reported as not change-scoped.
-Moved code is judged where Git reports added lines; Git's alignment determines
-which lines those are. A deletion alone adds no lines. Ignored untracked files
-and deleted files are not in inventory. A bad revision or failed diff is a
-usage error (exit 2).
-
-CRAP supplies the full function or lambda range including decorators. Its
-outside-function module subject uses the span of its first through last
-outside-function node, which can also include intervening functions. Clones
-supply both ranges of every clone in a fingerprint group. Verification
-supplies every suppression line, while its test-count metrics have no source
-location. Command checks, Python tests, inventory and hygiene have no complete
-source locations. Unlocated checks and metrics retain their ordinary
-whole-tree judgement and are reported as
-`not change-scoped`; clone findings with missing or incomplete ranges are also
-reported this way. Locations are inclusive and repository-relative.
-
-A consumer runner passes its externally selected batch base to both options,
-using a trusted gate program outside the candidate:
-
-```
-python3 -I /path/to/trusted-gate/qg.py --repo "$candidate" check --json \
-    --policy-from "$batch_base" --changed-from "$batch_base"
-```
-
-The harness's trusted gate already knows the batch base. The trusted base must
-contain this option before a runner can use it. `--changed-from` by itself
-does not establish a trusted policy or baseline.
-
 ## Result: `check --json`
 
 ```json
@@ -463,15 +413,13 @@ Top-level keys:
 * `revision`, `dirty` - the consumer's HEAD (or null) and worktree state.
 * `policy_sha256` - the effective policy file's SHA-256, or null. With
   `--policy-from` and an unauthorized candidate policy, this is the trusted
-  source's policy; an authorized replacement is the candidate's.
+  directory's policy; an authorized replacement is the candidate's.
 * `decision` - `accepted`, `accepted_with_exceptions`, `rejected`,
   `blocked` or `error`.
 * `checks` - inventory, hygiene and every configured check, in that order.
 * `obligations` - one entry per code class and required tier.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
-* `changed_from` - the full resolved commit id, present only when
-  `--changed-from` was requested and the comparison succeeded.
 * `trust` - present only on a `--policy-from` result; see below.
 * `error` - present only on a `decision = "error"` document.
 
@@ -483,7 +431,8 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
 {
   "schema": 3,
   "trust": {
-    "policy_from": "8dbb703...",
+    "path": "/trusted/tree",
+    "digest": "9e12...",
     "protected": [
       {
         "path": "quality-gate-clones.toml",
@@ -494,7 +443,7 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
       }
     ],
     "identity_before": {
-      "revision": "8dbb703...",
+      "revision": "/trusted/tree",
       "protected": {
         "quality-gate-clones.toml": {
           "rev_sha256": "c2a2...",
@@ -520,29 +469,20 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
 }
 ```
 
-* `policy_from` is the full commit id `REV` resolved to. In directory mode
-  `path` (the trusted directory) and `digest` (a SHA-256 over the trusted
-  files the gate read, in sorted path order) replace `policy_from`.
+* `path` is the trusted directory and `digest` is a SHA-256 over the trusted
+  files the gate read, in sorted path order.
 * `protected` has one entry per protected input. `path` is
   repository-relative; `rev_sha256` and `candidate_sha256` are lowercase
   SHA-256 hex or null when the file is absent (in `identity_after`, `refused`
-  means the candidate file could not be read safely). For a comparison involving
-  a gitlink, `rev_kind` and `candidate_kind` name the sides; `rev_commit` and
-  `candidate_commit` hold the full gitlink commit IDs, or null for another
-  kind, and `candidate_head` holds the checked-out submodule HEAD or null if
-  it is not checked out. A file side carries its corresponding SHA-256 instead.
-  When a staged gitlink's worktree path is a file or directory,
-  `candidate_index_commit` records the staged commit. `status` is `unchanged`,
+  means the candidate file could not be read safely). `status` is `unchanged`,
   `tightened`, `ignored`, `authorized` or `blocked`. A baseline entry also
   carries `ignored_entries`, the subjects whose candidate entry was ignored.
-* `identity_before` and `identity_after` record `REV`'s commit id or
-  `DIR`'s path, each
-  protected input's file SHA-256 values or gitlink kinds and commits, the
-  effective policy, tool lock, tool
-  pins and each in-memory baseline under `effective_inputs`, every pinned tool's
-  `payload_sha256` (or null when not installed, or `invalid` when the tree has
-  no digest), and the gate program's own per-file SHA-256 values plus one
-  combined `digest`. The protected scope is enumerated again for
+* `identity_before` and `identity_after` record `DIR`'s path as `revision`,
+  each protected input's file SHA-256 values, the effective policy, tool lock,
+  tool pins and each in-memory baseline under `effective_inputs`, every pinned
+  tool's `payload_sha256` (or null when not installed, or `invalid` when the
+  tree has no digest), and the gate program's own per-file SHA-256 values plus
+  one combined `digest`. The protected scope is enumerated again for
   `identity_after`, including ignored untracked files, and an added or removed
   path is a difference; a refused candidate path is recorded as `refused`.
   `identity_after` is captured after the checks and, when a prune was
@@ -550,7 +490,7 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
   input, tool payload or gate file makes the decision `error` (exit 2) naming
   the changed input, and a requested prune writes nothing. The one permitted difference is
   the baseline the gate itself wrote for a performed prune: that path must
-  equal exactly the bytes the gate generated, which is `REV`'s baseline
+  equal exactly the bytes the gate generated, which is the trusted baseline
   tightened by the measurement.
 
 Check keys:
@@ -567,9 +507,8 @@ Check keys:
   `unknown`.
 * `satisfied` - whether the policy obligation is met after baselines and
   enforcement. A baseline-covered violation keeps `outcome = "fail"` and sets
-  `satisfied = true` unless it is on changed lines. An advisory check does not
-  block the whole-tree judgement; a located threshold violation on changed
-  lines blocks even when the check is advisory.
+  `satisfied = true`. An advisory check does not block the whole-tree
+  judgement.
 * `duration_seconds`, `budget_seconds` (null for built-ins).
 * `diagnostics` - `argv` (array or null), `exit_code` (integer or null),
   `signal` (integer or null), `output_bytes`, `output_tail` (at most 4 KiB),
@@ -578,8 +517,7 @@ Check keys:
 * `findings`, `resolved_baseline_entries`, `unmeasured_baseline_entries`.
 * `location_coverage` - `complete`, `partial` or `none` for the check's
   violations. Verification is partial because test counts have no location;
-  a clone finding without complete ranges or a finding through an uncomparable
-  symlink makes its check partial.
+  a clone finding without complete ranges makes its check partial.
 * `reason` - a structured explanation of a non-passing adapter verdict
   (for example `no completed jscpd run`), or null when the adapter passed.
 * `measurement` - optional adapter facts, for example `{"tests": 12}`.
@@ -601,9 +539,7 @@ A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`,
 `locations` and `expired`. `locations` is an array of objects with `path`,
 `start_line` and `end_line`, or null when the source locations are incomplete.
-With `--changed-from`, `on_changed_lines` is a boolean for a finding with
-complete, comparable locations and null otherwise. A baseline-covered finding may have
-`blocking = true` when it violates its threshold on changed lines. Baseline errors carry `error`.
+Baseline errors carry `error`.
 Python CRAP findings carry `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
 Emacs Lisp CRAP findings carry `measurement` with `cc` (cyclomatic complexity), `points` (Edebug
 stop points) and `hits` (reached stop points); their metric version is `elisp-edebug/1`.
@@ -613,13 +549,12 @@ Obligation status is `satisfied`, `exempted` (with `reason`) or
 the checks that counted.
 
 The decision is `rejected` when inventory or hygiene fails, when an enforced
-check is not satisfied, when any obligation is `unsatisfied`, or when a located
-threshold violation is on changed lines under `--changed-from`.
+check is not satisfied, or when any obligation is `unsatisfied`.
 `accepted_with_exceptions` means every obligation and enforced check is
 satisfied, but a baseline exception or a non-passing advisory check exists.
 `blocked` (exit 1, trust runs only) means an unauthorized protected path other
-than the policy, a baseline or the tools lock differs from `REV`; the checks
-still ran and are reported. `error` (exit 2) is invalid policy, usage,
+than the policy, a baseline or the tools lock differs from the trusted
+directory; the checks still ran and are reported. `error` (exit 2) is invalid policy, usage,
 configuration, or a protected input, effective input, tool payload or gate
 file that changed during the run.
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -12,7 +11,6 @@ import time
 import unittest
 import zlib
 from dataclasses import replace
-from unittest import mock
 
 from support import (
     BASE_CONFIG,
@@ -60,25 +58,11 @@ class TrustCase(FixtureCase):
         self.commit_all()
         return self.git("rev-parse", "HEAD").stdout.strip()
 
-    def trusted_directory(
-        self, revision: str, name: str = "trusted"
-    ) -> Path:
-        directory = self.base / name
-        directory.mkdir()
-        archive = subprocess.run(
-            ["git", "archive", revision],
-            cwd=self.repo,
-            env=self.env(),
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["tar", "-x", "-C", str(directory)],
-            input=archive.stdout,
-            capture_output=True,
-            check=True,
-        )
-        return directory
+    def directory_revision(self) -> str:
+        return str(self.trusted_directory(self.commit_revision()))
+
+    def trusted_ruff_directory(self) -> str:
+        return str(self.trusted_directory(self.commit_ruff_revision()))
 
     def forge(self, oid: str, kind: str, content: bytes) -> None:
         """Replace the loose object at oid, keeping its file name."""
@@ -224,7 +208,7 @@ class BaselineTrustTests(TrustCase):
 
     def test_added_baseline_entry_is_ignored(self) -> None:
         self.empty_clones_baseline()
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.add_file(
             "quality-gate-clones.toml",
             CLONES_HEADER
@@ -242,7 +226,7 @@ class BaselineTrustTests(TrustCase):
 
     def test_raised_baseline_bound_is_ignored(self) -> None:
         self.write_clones_baseline()
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.write_clones_baseline(bound=5)
         result, document = self.trust_json(
             revision, env=self.clone_env(count=2)
@@ -255,28 +239,14 @@ class BaselineTrustTests(TrustCase):
 
     def test_removed_baseline_entry_takes_effect(self) -> None:
         self.write_clones_baseline()
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.empty_clones_baseline()
         result, document = self.trust_json(revision, env=self.clone_env())
         self.assert_clone_fails_tightened(result, document)
 
-    def test_gitlink_replacing_a_baseline_keeps_the_trusted_entries(self) -> None:
-        self.write_clones_baseline()
-        revision = self.commit_revision()
-        self.git("update-index", "--force-remove", "quality-gate-clones.toml")
-        (self.repo / "quality-gate-clones.toml").unlink()
-        self.git("update-index", "--add", "--cacheinfo",
-                 f"160000,{revision},quality-gate-clones.toml")
-        result, document = self.trust_json(revision, env=self.clone_env())
-        self.assertEqual(result.returncode, 0, output(result))
-        entry = self.protected(document, "quality-gate-clones.toml")
-        self.assertEqual(entry["status"], "ignored")
-        self.assertEqual((entry["rev_kind"], entry["candidate_kind"]), ("file", "gitlink"))
-        self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
-
     def test_lowered_baseline_bound_takes_effect(self) -> None:
         self.write_clones_baseline(bound=5)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.write_clones_baseline(bound=1)
         result, document = self.trust_json(
             revision, env=self.clone_env(count=2)
@@ -285,7 +255,7 @@ class BaselineTrustTests(TrustCase):
 
     def test_malformed_candidate_baseline_keeps_trusted_entries(self) -> None:
         self.write_clones_baseline(bound=5)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.add_file("quality-gate-clones.toml", "not = [valid\n")
         result, document = self.trust_json(revision, env=self.clone_env())
         self.assertEqual(result.returncode, 0, output(result))
@@ -297,7 +267,7 @@ class BaselineTrustTests(TrustCase):
 
     def test_changed_effective_baseline_fails_identity_before_prune(self) -> None:
         self.write_clones_baseline()
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         trust = prepare_trust(self.repo, revision, [])
         self.addCleanup(trust.close)
         check = trust.config.checks["clones"]
@@ -331,7 +301,7 @@ class BaselineTrustTests(TrustCase):
                 ]
             ),
         )
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         outside = self.base / "outside"
         outside.mkdir()
         target = outside / "clones.toml"
@@ -377,7 +347,7 @@ class BaselineTrustTests(TrustCase):
                 ]
             ),
         )
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(
             revision, "--prune", "clones", env=self.clone_env()
         )
@@ -385,9 +355,9 @@ class BaselineTrustTests(TrustCase):
         self.assertFalse(document["prune"]["performed"])
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel\n")
 
-    def test_prune_writes_revisions_baseline_lowered(self) -> None:
+    def test_prune_writes_trusted_baseline_lowered(self) -> None:
         self.write_clones_baseline(bound=5)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.add_file(
             "quality-gate-clones.toml",
             baseline_text(
@@ -439,7 +409,7 @@ class StubFloorTrustTests(TrustCase):
                 metric_version="stub/1",
             ),
         )
-        self.revision = self.commit_revision()
+        self.directory = self.directory_revision()
         self.add_file(
             "floor.toml",
             baseline_text([], check="floor", metric_version="stub/1"),
@@ -459,7 +429,7 @@ class StubFloorTrustTests(TrustCase):
 
     def test_candidate_omitting_a_floor_keeps_the_trusted_bound(self) -> None:
         self.assertIs(adapters.adapter_for(FLOOR_STUB.name), FLOOR_STUB)
-        prepared = prepare_trust(self.repo, self.revision, [])
+        prepared = prepare_trust(self.repo, self.directory, [])
         self.addCleanup(prepared.close)
         self.assert_floor_retained(prepared)
 
@@ -470,7 +440,7 @@ class StubFloorTrustTests(TrustCase):
             entry_direction=lambda _subject, _configured: "min",
         )
         adapters.register_adapter(descriptor)
-        prepared = prepare_trust(self.repo, self.revision, [])
+        prepared = prepare_trust(self.repo, self.directory, [])
         self.addCleanup(prepared.close)
         check = prepared.config.checks["floor"]
         self.assertEqual(check.direction, "max")
@@ -503,7 +473,7 @@ class PolicyTrustTests(TrustCase):
             'format = "deb"\nbinary = "usr/bin/legacy"\n'
         )
         self.add_file("tools.lock.toml", lock)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.add_file("tools.lock.toml", "")
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 0, output(result))
@@ -529,7 +499,7 @@ class PolicyTrustTests(TrustCase):
             "        self.assertTrue(True)\n",
         )
         self.write_config(crap_config())
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.write_config(crap_config(threshold=100))
         result, document = self.trust_json(
             revision, env=self.default_tool_env()
@@ -573,7 +543,7 @@ class PolicyTrustTests(TrustCase):
             "    def test_attack(self):\n"
             + self.merge_attack("crap", forged),
         )
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         check = self.attacked_check(revision, "crap")
         finding = next(
             item for item in check["findings"]
@@ -584,7 +554,7 @@ class PolicyTrustTests(TrustCase):
         self.assertTrue(finding["blocking"])
 
     def test_authorized_policy_replacement_is_used(self) -> None:
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.write_config(
             BASE_CONFIG.replace(
                 'run = ["python3", "-c", "print(1)"]',
@@ -601,36 +571,8 @@ class PolicyTrustTests(TrustCase):
         entry = self.protected(document, "quality-gate.toml")
         self.assertEqual(entry["status"], "authorized")
 
-    def test_replacement_ref_cannot_change_the_policy(self) -> None:
-        failing = BASE_CONFIG.replace(
-            'run = ["python3", "-c", "print(1)"]',
-            'run = ["python3", "-c", "import sys; sys.exit(1)"]',
-        )
-        self.write_config(failing)
-        revision = self.commit_revision()
-        self.write_config(BASE_CONFIG)
-        self.commit_all()
-        replacement = self.git("rev-parse", "HEAD").stdout.strip()
-        self.git("replace", revision, replacement)
-        result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "rejected")
-        self.assertEqual(
-            self.check_by_id(document, "smoke")["outcome"], "fail"
-        )
-
-    def test_graft_file_is_refused(self) -> None:
-        revision = self.commit_revision()
-        info = self.repo / ".git" / "info"
-        info.mkdir(exist_ok=True)
-        graft = info / "grafts"
-        graft.write_text("", encoding="utf-8")
-        result = self.run_qg("check", "--policy-from", revision)
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn(str(graft), result.stderr)
-
     def test_protected_symlink_is_refused(self) -> None:
-        revision = self.commit_ruff_revision()
+        revision = self.trusted_ruff_directory()
         target = self.base / "outside.toml"
         target.write_text("line-length = 200\n", encoding="utf-8")
         (self.repo / "ruff.toml").unlink()
@@ -640,7 +582,7 @@ class PolicyTrustTests(TrustCase):
         self.assertIn("ruff.toml", result.stderr)
 
     def test_protected_fifo_is_refused_without_blocking(self) -> None:
-        revision = self.commit_ruff_revision()
+        revision = self.trusted_ruff_directory()
         (self.repo / "ruff.toml").unlink()
         os.mkfifo(self.repo / "ruff.toml")
         started = time.monotonic()
@@ -655,7 +597,7 @@ class PolicyTrustTests(TrustCase):
     def test_protected_symlinked_parent_is_refused(self) -> None:
         self.write_config(with_protect(BASE_CONFIG, "cfg/ruff.toml"))
         self.add_file("cfg/ruff.toml", "line-length = 100\n")
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         outside = self.base / "outside"
         outside.mkdir()
         (outside / "ruff.toml").write_text(
@@ -669,7 +611,7 @@ class PolicyTrustTests(TrustCase):
         self.assertIn("cfg/ruff.toml", result.stderr)
 
     def test_removed_check_is_ignored(self) -> None:
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.write_config(
             BASE_CONFIG.replace('checks = ["smoke"]\n', "") + "\n"
         )
@@ -682,14 +624,14 @@ class PolicyTrustTests(TrustCase):
         self.assertEqual(entry["status"], "ignored")
 
     def test_unauthorized_protected_change_is_blocked(self) -> None:
-        revision = self.commit_ruff_revision()
+        revision = self.trusted_ruff_directory()
         self.change_ruff()
         result, document = self.trust_json(revision)
         self.assert_blocked(result, document)
         self.assertIn("ruff.toml", result.stderr)
 
     def test_changed_protected_file_blocks_inventory_with_check_report(self) -> None:
-        revision = self.commit_ruff_revision()
+        revision = self.trusted_ruff_directory()
         self.change_ruff()
         old = hashlib.sha256(b"line-length = 100\n").hexdigest()
         new = hashlib.sha256(b"line-length = 200\n").hexdigest()
@@ -702,7 +644,7 @@ class PolicyTrustTests(TrustCase):
     def test_inventory_reports_missing_protected_file_sides(self) -> None:
         self.write_config(with_protect(BASE_CONFIG, "ruff.toml", "new.toml"))
         self.add_file("ruff.toml", "trusted\n")
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         (self.repo / "ruff.toml").unlink()
         self.add_file("new.toml", "candidate\n")
         old = hashlib.sha256(b"trusted\n").hexdigest()
@@ -714,7 +656,7 @@ class PolicyTrustTests(TrustCase):
         self.assert_inventory_block_report(revision, *details)
 
     def test_authorized_protected_change_passes(self) -> None:
-        revision = self.commit_ruff_revision()
+        revision = self.trusted_ruff_directory()
         self.change_ruff()
         result, document = self.trust_json(
             revision, "--allow-protected", "ruff.toml"
@@ -727,7 +669,7 @@ class PolicyTrustTests(TrustCase):
 
     def test_protected_glob_blocks_a_change(self) -> None:
         self.write_config(with_protect(BASE_CONFIG, "*.md"))
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.add_file("README.md", "# changed\n")
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 1, output(result))
@@ -736,7 +678,7 @@ class PolicyTrustTests(TrustCase):
         self.assertEqual(entry["status"], "blocked")
 
     def test_deleted_protect_entry_still_protects(self) -> None:
-        revision = self.commit_ruff_revision()
+        revision = self.trusted_ruff_directory()
         self.write_config(
             without_protect(with_protect(BASE_CONFIG, "ruff.toml"))
         )
@@ -746,51 +688,32 @@ class PolicyTrustTests(TrustCase):
 
 
 class DirectoryTrustTests(TrustCase):
-    def test_directory_matches_revision_for_a_loosened_baseline(self) -> None:
+    def test_loosened_baseline_is_rejected(self) -> None:
         self.write_config(with_clones())
         self.add_file("b.py", "print('b')\n")
         self.write_clones_baseline(bound=5)
-        revision = self.commit_revision()
-        directory = self.trusted_directory(revision)
+        directory = self.directory_revision()
         self.write_clones_baseline(bound=1)
         env = self.clone_env(count=2)
-        by_revision, revision_document = self.trust_json(revision, env=env)
-        by_directory, directory_document = self.trust_json(
-            str(directory), env=env
-        )
-        self.assertEqual(
-            by_directory.returncode, by_revision.returncode, output(by_directory)
-        )
-        self.assertEqual(
-            directory_document["decision"], revision_document["decision"]
-        )
-        self.assertEqual(directory_document["decision"], "rejected")
-        self.assertEqual(directory_document["trust"]["path"], str(directory))
-        self.assertRegex(
-            directory_document["trust"]["digest"], r"^[0-9a-f]{64}$"
-        )
-        repeat, repeat_document = self.trust_json(str(directory), env=env)
+        result, document = self.trust_json(directory, env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["trust"]["path"], directory)
+        self.assertRegex(document["trust"]["digest"], r"^[0-9a-f]{64}$")
+        repeat, repeat_document = self.trust_json(directory, env=env)
         self.assertEqual(
             repeat_document["trust"]["digest"],
-            directory_document["trust"]["digest"],
+            document["trust"]["digest"],
             output(repeat),
         )
 
-    def test_directory_matches_revision_for_a_protected_file(self) -> None:
-        revision = self.commit_ruff_revision()
-        directory = self.trusted_directory(revision)
+    def test_protected_file_is_blocked_or_authorized(self) -> None:
+        directory = self.trusted_ruff_directory()
         self.change_ruff()
-        by_revision, revision_document = self.trust_json(revision)
-        by_directory, directory_document = self.trust_json(str(directory))
-        self.assertEqual(
-            by_directory.returncode, by_revision.returncode, output(by_directory)
-        )
-        self.assertEqual(
-            directory_document["decision"], revision_document["decision"]
-        )
-        self.assertEqual(directory_document["decision"], "blocked")
+        result, document = self.trust_json(directory)
+        self.assert_blocked(result, document)
         authorized, authorized_document = self.trust_json(
-            str(directory), "--allow-protected", "ruff.toml"
+            directory, "--allow-protected", "ruff.toml"
         )
         self.assertEqual(authorized.returncode, 0, output(authorized))
         self.assertEqual(authorized_document["decision"], "accepted")
@@ -859,19 +782,30 @@ class DirectoryTrustTests(TrustCase):
         self.assertIn(str(missing), result.stderr)
         self.assertIn("expected an existing directory", result.stderr)
 
-    def test_changed_from_with_directory_is_refused(self) -> None:
-        revision = self.commit_revision()
-        directory = self.trusted_directory(revision)
-        result = self.run_qg(
-            "check",
-            "--policy-from",
-            str(directory),
-            "--changed-from",
-            revision,
-        )
+    def test_relative_policy_from_is_refused(self) -> None:
+        result = self.run_qg("check", "--policy-from", "trusted")
         self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("--changed-from", result.stderr)
-        self.assertIn(str(directory), result.stderr)
+        self.assertIn("trusted", result.stderr)
+        self.assertIn("absolute trusted directory", result.stderr)
+
+    def test_head_as_policy_from_is_refused(self) -> None:
+        result = self.run_qg("check", "--policy-from", "HEAD")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("HEAD", result.stderr)
+        self.assertIn("absolute trusted directory", result.stderr)
+
+    def test_commit_id_as_policy_from_is_refused(self) -> None:
+        revision = self.commit_revision()
+        result = self.run_qg("check", "--policy-from", revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(revision, result.stderr)
+        self.assertIn("absolute trusted directory", result.stderr)
+
+    def test_removed_option_is_unknown(self) -> None:
+        option = "--changed" + "-from"
+        result = self.run_qg("check", option, "HEAD")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(option, result.stderr)
 
     def test_symlink_inside_directory_is_not_followed(self) -> None:
         revision = self.commit_revision()
@@ -884,316 +818,6 @@ class DirectoryTrustTests(TrustCase):
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("quality-gate.toml", result.stderr)
         self.assertIn("missing", result.stderr)
-
-
-class GitlinkTrustTests(TrustCase):
-    path = "vendor/code-quality-gate"
-
-    def sub_git(self, root, *args):
-        return subprocess.run(
-            ["git", "-C", str(root), *args],
-            env=self.env(), capture_output=True, text=True, check=True,
-        ).stdout.strip()
-
-    def setUp(self) -> None:
-        super().setUp()
-        source = self.base / "gate-source"
-        source.mkdir()
-        self.sub_git(source, "init", "-q", "-b", "main")
-        (source / "gate.py").write_text("trusted\n", encoding="utf-8")
-        self.sub_git(source, "add", "gate.py")
-        self.sub_git(source, "commit", "-q", "-m", "trusted gate")
-        self.old = self.sub_git(source, "rev-parse", "HEAD")
-        (source / "gate.py").write_text("candidate\n", encoding="utf-8")
-        self.sub_git(source, "commit", "-qam", "candidate gate")
-        self.new = self.sub_git(source, "rev-parse", "HEAD")
-        self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q",
-                 str(source), self.path)
-        self.checkout(self.old)
-        rules = (
-            '\n[[rule]]\npattern = ".gitmodules"\nclass = "config"\n'
-            'reason = "submodule configuration"\n'
-            f'\n[[rule]]\npattern = "{self.path}"\nclass = "config"\n'
-            'reason = "pinned gate"\n'
-        )
-        self.config = with_protect(BASE_CONFIG, self.path) + rules
-        self.write_config(self.config)
-        self.revision = self.commit_revision()
-
-    def checkout(self, commit: str) -> None:
-        self.sub_git(self.repo / self.path, "checkout", "-q", "--detach", commit)
-
-    def moved_gitlink_detail(self) -> str:
-        return (
-            f"check: protected input {self.path}: REV gitlink {self.old}; "
-            f"candidate gitlink {self.new}; index {self.new}; "
-            f"HEAD {self.new}; blocked"
-        )
-
-    def assert_gitlink(self, entry, status, candidate, head) -> None:
-        self.assertEqual(entry["status"], status)
-        self.assertEqual(entry["rev_kind"], "gitlink")
-        self.assertEqual(entry["candidate_kind"], "gitlink")
-        self.assertEqual(entry["rev_commit"], self.old)
-        self.assertEqual(entry["candidate_commit"], candidate)
-        self.assertEqual(entry["candidate_head"], head)
-        self.assertNotIn("rev_sha256", entry)
-        self.assertNotIn("candidate_sha256", entry)
-
-    def kind_change(self, revision: str, rev_kind: str, candidate_kind: str):
-        result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 1, output(result))
-        entry = self.protected(document, self.path)
-        self.assertEqual(
-            (entry["status"], entry["rev_kind"], entry["candidate_kind"]),
-            ("blocked", rev_kind, candidate_kind),
-        )
-        return result, entry
-
-    def file_revision(self) -> str:
-        self.git("rm", "--cached", "-f", self.path)
-        shutil.rmtree(self.repo / self.path)
-        self.add_file(self.path, "ordinary file\n")
-        return self.commit_revision()
-
-    def stage_gitlink(self) -> None:
-        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.new},{self.path}")
-
-    def vendor_glob_revision(self) -> str:
-        self.write_config(self.config.replace(f'paths = ["{self.path}"]',
-                                              'paths = ["vendor/*"]'))
-        return self.commit_revision()
-
-    def identity_changed_by(self, command):
-        script = f"import subprocess; subprocess.run({command!r}, check=True); print(1)"
-        self.write_config(self.config.replace(
-            'run = ["python3", "-c", "print(1)"]',
-            f"run = {json.dumps([sys.executable, '-c', script])}",
-        ))
-        self.commit_all()
-        revision = self.git("rev-parse", "HEAD").stdout.strip()
-        result, document = self.trust_json(revision)
-        self.assertEqual((result.returncode, document["decision"]), (2, "error"), output(result))
-        self.assertIn(self.path, document["error"])
-        snapshots = document["trust"]
-        return tuple(snapshots[name]["protected"][self.path]
-                     for name in ("identity_before", "identity_after"))
-
-    def test_moved_gitlink_is_blocked_or_authorized(self) -> None:
-        self.checkout(self.new)
-        self.git("add", self.path)
-        result, document = self.trust_json(self.revision)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "blocked")
-        self.assert_gitlink(self.protected(document, self.path), "blocked", self.new, self.new)
-        for value in (self.path, self.old, self.new):
-            self.assertIn(value, result.stderr)
-        text = self.run_qg("check", "--policy-from", self.revision)
-        self.assertEqual(text.returncode, 1, output(text))
-        for value in (self.path, self.old, self.new):
-            self.assertIn(value, output(text))
-        allowed, document = self.trust_json(
-            self.revision, "--allow-protected", self.path
-        )
-        self.assertEqual(allowed.returncode, 0, output(allowed))
-        self.assertEqual(document["decision"], "accepted")
-        self.assert_gitlink(self.protected(document, self.path), "authorized", self.new, self.new)
-
-    def test_moved_gitlink_blocks_inventory_with_check_report(self) -> None:
-        self.checkout(self.new)
-        self.git("add", self.path)
-        self.assert_inventory_block_report(self.revision, self.moved_gitlink_detail())
-
-    def test_unchanged_gitlink_passes_checked_out_or_uninitialized(self) -> None:
-        result, document = self.trust_json(self.revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assert_gitlink(self.protected(document, self.path), "unchanged", self.old, self.old)
-        self.git("submodule", "deinit", "-f", "--", self.path)
-        result, document = self.trust_json(self.revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assert_gitlink(self.protected(document, self.path), "unchanged", self.old, None)
-        (self.repo / self.path).rmdir()
-        result, document = self.trust_json(self.revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assert_gitlink(self.protected(document, self.path), "unchanged", self.old, None)
-
-    def test_checked_out_head_different_from_index_is_blocked(self) -> None:
-        self.checkout(self.new)
-        result, document = self.trust_json(self.revision)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "blocked")
-        self.assert_gitlink(self.protected(document, self.path), "blocked", self.old, self.new)
-        self.assertIn(self.old, result.stderr)
-        self.assertIn(self.new, result.stderr)
-        allowed, document = self.trust_json(
-            self.revision, "--allow-protected", self.path
-        )
-        self.assertEqual(allowed.returncode, 0, output(allowed))
-        self.assert_gitlink(self.protected(document, self.path), "authorized", self.old, self.new)
-
-    def test_gitlink_replaced_by_file_is_blocked_with_both_kinds(self) -> None:
-        shutil.rmtree(self.repo / self.path)
-        self.git("rm", "--cached", "-f", self.path)
-        self.add_file(self.path, "replacement\n")
-        self.git("add", self.path)
-        result, entry = self.kind_change(self.revision, "gitlink", "file")
-        self.assertEqual(entry["rev_commit"], self.old)
-        digest = hashlib.sha256(b"replacement\n").hexdigest()
-        self.assertEqual(entry["candidate_sha256"], digest)
-        for value in (self.path, "gitlink", "file", self.old):
-            self.assertIn(value, result.stderr)
-        detail = (
-            f"check: protected input {self.path}: REV gitlink {self.old}; "
-            f"candidate file {digest}; index -; HEAD not checked out; blocked"
-        )
-        self.assert_inventory_block_report(self.revision, detail)
-
-    def test_multiple_blocked_inputs_have_the_same_inventory_report(self) -> None:
-        self.write_config(self.config.replace(
-            f'paths = ["{self.path}"]', f'paths = ["{self.path}", "ruff.toml"]'
-        ))
-        self.add_file("ruff.toml", "trusted\n")
-        revision = self.commit_revision()
-        self.add_file("ruff.toml", "candidate\n")
-        old = hashlib.sha256(b"trusted\n").hexdigest()
-        new = hashlib.sha256(b"candidate\n").hexdigest()
-        detail = (
-            f"check: protected input ruff.toml: REV file {old}; "
-            f"candidate file {new}; blocked"
-        )
-        self.assert_inventory_block_report(revision, detail)
-        self.checkout(self.new)
-        self.git("add", self.path)
-        self.assert_inventory_block_report(revision, detail, self.moved_gitlink_detail())
-
-    def test_gitlink_replaced_by_unstaged_file_is_blocked(self) -> None:
-        shutil.rmtree(self.repo / self.path)
-        self.add_file(self.path, "replacement\n")
-        result, document = self.trust_json(self.revision)
-        self.assertEqual(result.returncode, 1, output(result))
-        entry = self.protected(document, self.path)
-        self.assertEqual((entry["rev_kind"], entry["candidate_kind"]), ("gitlink", "file"))
-        self.assertEqual(entry["candidate_index_commit"], self.old)
-
-    def test_gitlink_replaced_by_directory_is_blocked_with_both_kinds(self) -> None:
-        shutil.rmtree(self.repo / self.path)
-        self.add_file(self.path + "/ordinary.txt", "replacement\n")
-        result, _entry = self.kind_change(self.revision, "gitlink", "directory")
-        self.assertIn("directory", result.stderr)
-        self.assertIn("gitlink", result.stderr)
-
-    def test_file_replaced_by_gitlink_is_blocked_with_both_kinds(self) -> None:
-        revision = self.file_revision()
-        self.git("rm", "--cached", "-f", self.path)
-        (self.repo / self.path).unlink()
-        self.stage_gitlink()
-        result, entry = self.kind_change(revision, "file", "gitlink")
-        self.assertEqual(entry["candidate_commit"], self.new)
-        self.assertIn("file", result.stderr)
-        self.assertIn("gitlink", result.stderr)
-
-    def test_file_cannot_hide_a_staged_gitlink_with_the_same_bytes(self) -> None:
-        revision = self.file_revision()
-        self.git("update-index", "--force-remove", self.path)
-        self.stage_gitlink()
-        _result, entry = self.kind_change(revision, "file", "file")
-        self.assertEqual(entry["candidate_index_commit"], self.new)
-
-    def test_directory_replaced_by_gitlink_is_blocked_with_both_kinds(self) -> None:
-        self.git("rm", "--cached", "-f", self.path)
-        shutil.rmtree(self.repo / self.path)
-        self.add_file(self.path + "/ordinary.txt", "ordinary file\n")
-        self.write_config(self.config.replace(f'pattern = "{self.path}"',
-                                              f'pattern = "{self.path}*"'))
-        revision = self.commit_revision()
-        self.git("rm", "--cached", "-r", "-f", self.path)
-        shutil.rmtree(self.repo / self.path)
-        self.stage_gitlink()
-        result, _entry = self.kind_change(revision, "directory", "gitlink")
-        self.assertIn("directory", result.stderr)
-        self.assertIn("gitlink", result.stderr)
-
-    def test_glob_protects_gitlink(self) -> None:
-        revision = self.vendor_glob_revision()
-        self.checkout(self.new)
-        self.git("add", self.path)
-        result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assert_gitlink(self.protected(document, self.path), "blocked", self.new, self.new)
-
-    def test_unreadable_checked_out_submodule_is_refused(self) -> None:
-        (self.repo / self.path / ".git").write_text("not a git directory\n", encoding="utf-8")
-        result = self.run_qg("check", "--policy-from", self.revision)
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn(self.path, result.stderr)
-        self.assertIn("unreadable submodule", result.stderr)
-
-    def test_submodule_with_unborn_head_is_refused(self) -> None:
-        self.sub_git(self.repo / self.path, "symbolic-ref", "HEAD", "refs/heads/unborn")
-        result = self.run_qg("check", "--policy-from", self.revision)
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("unreadable submodule HEAD", result.stderr)
-
-    def test_submodule_with_a_different_worktree_root_is_refused(self) -> None:
-        other = self.base / "other-worktree"
-        other.mkdir()
-        self.sub_git(self.repo / self.path, "config", "core.worktree", str(other))
-        result = self.run_qg("check", "--policy-from", self.revision)
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("a different worktree root", result.stderr)
-
-    def test_gitlink_symlinked_parent_is_refused(self) -> None:
-        shutil.rmtree(self.repo / "vendor")
-        (self.repo / "vendor").symlink_to(self.base, target_is_directory=True)
-        result = self.run_qg("check", "--policy-from", self.revision)
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("symlinked parent", result.stderr)
-
-    def test_unmerged_gitlink_is_refused(self) -> None:
-        self.git("update-index", "--force-remove", self.path)
-        records = f"160000 {self.old} 1\t{self.path}\n160000 {self.new} 2\t{self.path}\n"
-        subprocess.run(["git", "update-index", "--index-info"], cwd=self.repo,
-                       env=self.env(), input=records, text=True, check=True)
-        result = self.run_qg("check", "--policy-from", self.revision)
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("unresolved index entries", result.stderr)
-
-    def test_gitlink_changed_during_preparation_is_refused(self) -> None:
-        original = trust.load_tools
-
-        def move_head(path):
-            self.checkout(self.new)
-            return original(path)
-
-        with mock.patch.object(trust, "load_tools", side_effect=move_head):
-            with self.assertRaisesRegex(trust.UsageError, "changed while preparing"):
-                prepared = prepare_trust(self.repo, self.revision, [])
-                prepared.close()
-
-    def test_gitlink_added_under_glob_during_preparation_is_refused(self) -> None:
-        revision = self.vendor_glob_revision()
-        original = trust.load_tools
-
-        def add_gitlink(path):
-            self.git("update-index", "--add", "--cacheinfo", f"160000,{self.new},vendor/added")
-            return original(path)
-
-        with mock.patch.object(trust, "load_tools", side_effect=add_gitlink):
-            with self.assertRaisesRegex(trust.UsageError, "vendor/added changed while preparing"):
-                prepared = prepare_trust(self.repo, revision, [])
-                prepared.close()
-
-    def test_gitlink_index_changed_during_check_is_identity_error(self) -> None:
-        command = ["git", "update-index", "--cacheinfo", f"160000,{self.new},{self.path}"]
-        before, after = self.identity_changed_by(command)
-        self.assertEqual(before["candidate_commit"], self.old)
-        self.assertEqual(after["candidate_commit"], self.new)
-
-    def test_gitlink_head_changed_during_check_is_identity_error(self) -> None:
-        command = ["git", "-C", self.path, "checkout", "-q", "--detach", self.new]
-        before, after = self.identity_changed_by(command)
-        self.assertEqual(before["candidate_head"], self.old)
-        self.assertEqual(after["candidate_head"], self.new)
 
 
 class IdentityDecisionTests(unittest.TestCase):
@@ -1230,15 +854,6 @@ class IdentityDecisionTests(unittest.TestCase):
         self.assertFalse(trust._allowed_change(before, other, written))
         self.assertFalse(trust._allowed_change(before, {**after, "rev_sha256": "changed"}, written))
 
-    def test_prune_cannot_hide_a_gitlink_index_change(self) -> None:
-        written = b"trusted, tightened baseline"
-        before = {"rev_sha256": "revision", "candidate_sha256": "old"}
-        after = {"rev_sha256": "revision", "candidate_sha256": trust._sha256(written)}
-        staged = {"rev_kind": "file", "candidate_kind": "file", "candidate_index_commit": "commit"}
-        self.assertFalse(trust._allowed_change(before, {**after, **staged}, written))
-        self.assertFalse(trust._allowed_change({**before, **staged}, after, written))
-        self.assertFalse(trust._allowed_change({**before, **staged}, {**after, **staged}, written))
-
 
 class IdentityTrustTests(TrustCase):
     def gate_identity_with_files(
@@ -1248,7 +863,7 @@ class IdentityTrustTests(TrustCase):
             path = self.gate / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.fixture_runner = lambda: self.gate / "qg.py"
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 0, output(result))
@@ -1290,7 +905,7 @@ class IdentityTrustTests(TrustCase):
             'run = ["python3", "-c", "print(1)"]',
             f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(writer)}]',
         ))
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.fixture_runner = lambda: self.gate / "qg.py"
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 2, output(result))
@@ -1329,7 +944,7 @@ class IdentityTrustTests(TrustCase):
             f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(restore)}]\n'
         )
         self.write_config(config)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision, env=self.attack_env())
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(self.check_by_id(document, "tool")["outcome"], "pass")
@@ -1355,7 +970,7 @@ class IdentityTrustTests(TrustCase):
                 f'run = [{json.dumps(sys.executable)}, "-c", {json.dumps(writer)}]',
             )
         )
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision, env=self.attack_env())
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(document["decision"], "error")
@@ -1381,7 +996,7 @@ class IdentityTrustTests(TrustCase):
             )
         )
         self.add_file("ruff.toml", "line-length = 100\n")
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(document["decision"], "error")
@@ -1412,7 +1027,7 @@ class IdentityTrustTests(TrustCase):
                 f'{json.dumps(writer)}]',
             )
         )
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(document["decision"], "error")
@@ -1425,13 +1040,8 @@ class IdentityTrustTests(TrustCase):
             "generated/new.txt", trust["identity_after"]["protected"]
         )
 
-    def test_missing_revision_exits_two(self) -> None:
-        result = self.run_qg("check", "--policy-from", "deadbeef")
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("deadbeef", result.stderr)
-
     def test_gate_inside_candidate_is_refused(self) -> None:
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         inside = self.repo / "gatecopy"
         shutil.copytree(self.gate, inside)
         result = subprocess.run(
@@ -1457,12 +1067,13 @@ class IdentityTrustTests(TrustCase):
         self.assertIn(str(self.repo), result.stderr)
 
     def test_trust_object_records_identity(self) -> None:
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(document["schema"], 3)
         trust = document["trust"]
-        self.assertEqual(trust["policy_from"], revision)
+        self.assertEqual(trust["path"], revision)
+        self.assertNotIn("policy_from", trust)
         paths = {item["path"] for item in trust["protected"]}
         self.assertIn("quality-gate.toml", paths)
         self.assertIn("tools.lock.toml", paths)
@@ -1483,7 +1094,7 @@ class IdentityTrustTests(TrustCase):
     def test_candidate_tools_lock_change_is_ignored(self) -> None:
         lock = (self.gate / "tools.lock.toml").read_text(encoding="utf-8")
         self.add_file("tools.lock.toml", lock)
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         changed = lock.replace(
             "b44982df629d97a4c8fc703ff27f73437e1bc1e683fb11862b56d486e6857ff8",
             "0" * 64,
@@ -1502,171 +1113,9 @@ class IdentityTrustTests(TrustCase):
         self.assertIn("--policy-from", result.stderr)
 
 
-class TrustedObjectTests(TrustCase):
-    """Every object read from the trusted revision is authenticated against its ID."""
-
-    def raw_git(self, *args: str) -> bytes:
-        return subprocess.run(
-            ["git", *args],
-            cwd=self.repo,
-            env=self.env(),
-            capture_output=True,
-            check=True,
-        ).stdout
-
-    def assert_refused(
-        self, result: subprocess.CompletedProcess[str],
-        document: dict[str, object], oid: str, location: str,
-    ) -> None:
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertEqual(document["decision"], "error")
-        self.assertEqual(document["checks"], [])
-        message = document["error"]
-        for value in (oid, location, "object content does not match its ID"):
-            self.assertIn(value, message)
-            self.assertIn(value, result.stderr)
-
-    def failing_revision(self) -> str:
-        self.write_config(BASE_CONFIG.replace(
-            'run = ["python3", "-c", "print(1)"]',
-            'run = ["python3", "-c", "import sys; sys.exit(1)"]',
-        ))
-        revision = self.commit_revision()
-        self.write_config(BASE_CONFIG)
-        return revision
-
-    def forge_policy(self, revision: str) -> str:
-        oid = self.git(
-            "rev-parse", f"{revision}:quality-gate.toml"
-        ).stdout.strip()
-        self.forge(oid, "blob", BASE_CONFIG.encode("utf-8"))
-        return oid
-
-    def forge_tree(self, revision: str, path: str = "") -> str:
-        spec = f"{revision}:{path}" if path else f"{revision}^{{tree}}"
-        oid = self.git("rev-parse", spec).stdout.strip()
-        raw = bytearray(self.raw_git("cat-file", "tree", oid))
-        raw[-1] ^= 1
-        self.forge(oid, "tree", bytes(raw))
-        return oid
-
-    def test_forged_policy_blob_is_refused(self) -> None:
-        revision = self.failing_revision()
-        oid = self.forge_policy(revision)
-        result, document = self.trust_json(revision)
-        self.assert_refused(result, document, oid, "quality-gate.toml")
-
-    def test_forged_policy_blob_is_refused_with_changed_from(self) -> None:
-        revision = self.failing_revision()
-        oid = self.forge_policy(revision)
-        result, document = self.trust_json(
-            revision, "--changed-from", revision
-        )
-        self.assert_refused(result, document, oid, "quality-gate.toml")
-
-    def test_forged_tree_on_the_policy_path_is_refused(self) -> None:
-        revision = self.failing_revision()
-        oid = self.forge_tree(revision)
-        result, document = self.trust_json(revision)
-        self.assert_refused(result, document, oid, ".")
-
-    def test_forged_nested_tree_is_refused(self) -> None:
-        self.write_config(with_clones(baseline="cfg/clones.toml"))
-        self.add_file("cfg/clones.toml", CLONES_HEADER)
-        revision = self.commit_revision()
-        oid = self.forge_tree(revision, "cfg")
-        result, document = self.trust_json(revision)
-        self.assert_refused(result, document, oid, "cfg")
-
-    def test_forged_baseline_blob_is_refused(self) -> None:
-        self.write_config(with_clones())
-        self.add_file("quality-gate-clones.toml", CLONES_HEADER)
-        revision = self.commit_revision()
-        oid = self.git(
-            "rev-parse", f"{revision}:quality-gate-clones.toml"
-        ).stdout.strip()
-        forged = CLONES_HEADER + (
-            '\n[[entry]]\nsubject = "fp1"\nbound = 5\n'
-            'reason = "forged"\n'
-        )
-        self.forge(oid, "blob", forged.encode("utf-8"))
-        result, document = self.trust_json(revision)
-        self.assert_refused(
-            result, document, oid, "quality-gate-clones.toml"
-        )
-
-    def changed_source_revision(self) -> str:
-        """A base whose file-level suppression the candidate replaces."""
-        from test_verification import (
-            executed_entry,
-            exclusion_entry,
-            verification_baseline,
-            verification_config,
-        )
-
-        (self.repo / "a.py").unlink()
-        self.add_file("pkg/__init__.py", "")
-        self.add_file("pkg/mod.py", "# ruff: noqa: E501\nA = 1\n")
-        self.add_file(
-            "tests/test_sample.py",
-            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
-            "    def test_ok(self):\n        self.assertTrue(True)\n",
-        )
-        self.write_config(verification_config())
-        self.add_file(
-            "quality-gate-verification.toml",
-            verification_baseline([
-                executed_entry(1),
-                exclusion_entry("pkg/mod.py", "file-suppression", 1),
-            ]),
-        )
-        return self.commit_revision()
-
-    def test_forged_base_blob_on_changed_from_is_refused(self) -> None:
-        revision = self.changed_source_revision()
-        self.add_file("pkg/mod.py", "# ruff: noqa\nA = 1\n")
-        honest, _document = self.trust_json(
-            revision, "--changed-from", revision, env=self.default_tool_env()
-        )
-        self.assertEqual(honest.returncode, 1, output(honest))
-        oid = self.git("rev-parse", f"{revision}:pkg/mod.py").stdout.strip()
-        self.forge(oid, "blob", self.read_file("pkg/mod.py").encode("utf-8"))
-        result, document = self.trust_json(
-            revision, "--changed-from", revision, env=self.default_tool_env()
-        )
-        self.assert_refused(result, document, oid, "pkg/mod.py")
-
-    def test_forged_base_tree_on_changed_from_is_refused(self) -> None:
-        revision = self.changed_source_revision()
-        self.add_file("pkg/mod.py", "# ruff: noqa\nA = 1\n")
-        oid = self.forge_tree(revision, "pkg")
-        result, document = self.run_json(
-            "--changed-from", revision, env=self.default_tool_env()
-        )
-        self.assert_refused(result, document, oid, "pkg")
-
-    def test_forged_trusted_commit_is_refused(self) -> None:
-        revision = self.failing_revision()
-        raw = self.raw_git("cat-file", "commit", revision) + b"forged\n"
-        self.forge(revision, "commit", raw)
-        result, document = self.trust_json(revision)
-        self.assert_refused(result, document, revision, "the commit")
-
-    def test_packed_revision_objects_are_read(self) -> None:
-        revision = self.commit_revision()
-        self.git("repack", "-a", "-d", "-q")
-        self.assertRegex(
-            self.git("count-objects", "-v").stdout, r"(?m)^count: 0$"
-        )
-        result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(document["decision"], "accepted")
-        self.assertEqual(document["trust"]["policy_from"], revision)
-
-
 class GitInvocationTests(TrustCase):
     def test_configured_fsmonitor_never_runs(self) -> None:
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         marker = self.base / "fsmonitor-ran"
         program = self.base / "fsmonitor.sh"
         program.write_text(
@@ -1722,7 +1171,7 @@ class RepositoryPolicyTests(TrustCase):
         self.add_file("ruff.toml", ruff_config)
         self.add_file("a.py", "import os\n")
         self.write_config(self.repository_config())
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         self.add_file("ruff.toml", ruff_config + 'ignore = ["F401"]\n')
         result, document = self.trust_json(
             revision, env=self.default_tool_env()

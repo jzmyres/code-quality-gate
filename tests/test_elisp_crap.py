@@ -493,25 +493,6 @@ checks = ["crap"]
         self.assertEqual(check["outcome"], "pass")
         self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["run"])
 
-    def test_changed_lines_cover_the_whole_definition(self) -> None:
-        self.add_file("src/core.el", "(defun never (x)\n  (if x\n      (if x 1 2)\n    3))\n")
-        self.add_file("tests/suite.el", simple_suite())
-        self.add_file("crap.toml", baseline_text([
-            {"subject": "src/core.el:never", "bound": 12, "reason": "legacy"},
-        ], check="crap", metric_version="elisp-edebug/1"))
-        self.commit_all()
-        self.add_file("src/core.el", "(defun never (x)\n  (if x\n      (if x 9 2)\n    3))\n")
-        result, _document, check = self.run_crap("--changed-from", "HEAD")
-        self.assertEqual(result.returncode, 1, output(result))
-        findings = by_subject(check)
-        self.assertIn("src/core.el:never", findings, output(result))
-        finding = findings["src/core.el:never"]
-        self.assertEqual(finding["location"], "src/core.el:1")
-        self.assertEqual(finding["locations"], [{"path": "src/core.el", "start_line": 1, "end_line": 4}])
-        self.assertTrue(finding["on_changed_lines"])
-        self.assertTrue(finding["blocking"])
-
-
 class ElispCrapTrustTests(TrustCase):
     def test_prune_resolves_colon_names_only_in_selected_files(self) -> None:
         (self.repo / "a.py").unlink()
@@ -529,7 +510,7 @@ reason = "unselected file"
             {"subject": "src/core.el:gone:member", "bound": 9, "reason": "removed"},
             {"subject": "src/core.el:outside.el:member", "bound": 9, "reason": "outside domain"},
         ], check="crap", metric_version="elisp-edebug/1"))
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision, "--prune", "crap")
         self.assertEqual(result.returncode, 0, output(result))
         check = self.check_by_id(document, "crap")
@@ -544,7 +525,7 @@ reason = "unselected file"
         self.add_file("src/core.el", MODULE)
         suite = self.add_file("tests/suite.el", SUITE)
         self.write_config(crap_config())
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         outside = self.base / "outside.el"
         outside.write_text(SUITE, encoding="utf-8")
         suite.unlink()

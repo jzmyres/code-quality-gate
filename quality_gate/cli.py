@@ -19,7 +19,7 @@ from .tools import (
     command_tools_path,
     load_tools,
 )
-from .trust import is_directory_argument, prepare_trust
+from .trust import prepare_trust
 from .worklist import command_worklist
 
 
@@ -33,9 +33,9 @@ class _Parser(argparse.ArgumentParser):
 def _add_policy_from_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--policy-from",
-        metavar="REV|DIR",
-        help="evaluate the working tree against REV's or a trusted directory's "
-        "policy and inputs",
+        metavar="DIR",
+        help="evaluate the working tree against an absolute trusted "
+        "directory's policy and inputs",
     )
 
 
@@ -92,11 +92,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="tighten a check's baseline after it passes (repeatable; all selects every baseline)",
     )
     _add_policy_from_argument(check)
-    check.add_argument(
-        "--changed-from",
-        metavar="REV",
-        help="also reject threshold violations on lines changed since REV",
-    )
     _add_allow_protected_argument(check)
     worklist = commands.add_parser(
         "worklist", help="rank baseline debt by churn x current value"
@@ -161,7 +156,6 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         config,
         json_output=args.json,
         prune_ids=args.prune,
-        changed_from=args.changed_from,
     )
 
 
@@ -177,14 +171,6 @@ def _run_tools(args: Any) -> int:
 
 
 def _run_trusted_check(root: Path, args: Any) -> int:
-    if (
-        args.changed_from is not None
-        and is_directory_argument(args.policy_from)
-    ):
-        raise UsageError(
-            f"qg.py: --policy-from {args.policy_from}: --changed-from: "
-            "expected no --changed-from with a trusted directory"
-        )
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
     return command_check(
         root,
@@ -192,7 +178,6 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         json_output=args.json,
         prune_ids=args.prune,
         trust=trust,
-        changed_from=args.changed_from,
     )
 
 
@@ -204,7 +189,7 @@ def _run_trusted_inventory(root: Path, args: Any) -> int:
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream):
             code = command_inventory(root, trust.config, args.list_class)
-        code, _ = trust.finish(code, {}, report_gitlinks=False)
+        code, _ = trust.finish(code, {})
         if code == 0:
             print(stream.getvalue(), end="")
         return code

@@ -29,7 +29,9 @@ class InventoryTrustTests(FixtureCase):
         )
         self.write_config(config)
         self.commit_all()
-        self.revision = self.git("rev-parse", "HEAD").stdout.strip()
+        self.revision = str(self.trusted_directory(
+            self.git("rev-parse", "HEAD").stdout.strip()
+        ))
         self.write_config(
             config.replace(
                 'pattern = "*.py"\nclass = "python"\nreason = "Python source"',
@@ -55,7 +57,7 @@ class InventoryTrustTests(FixtureCase):
         self.assertEqual(inventory.stderr, check.stderr)
         return inventory.stderr
 
-    def test_policy_from_uses_revision_classes_and_summary(self) -> None:
+    def test_policy_from_uses_trusted_classes_and_summary(self) -> None:
         candidate = self.run_qg("inventory", "--list", "python")
         trusted = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision
@@ -190,24 +192,6 @@ class InventoryTrustTests(FixtureCase):
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(result.stdout, "")
         self.assertIn("protected input ruff.toml changed during the run", result.stderr)
-
-    def test_unchanged_protected_gitlink_does_not_change_inventory_output(self) -> None:
-        config = self.git("show", f"{self.revision}:quality-gate.toml").stdout
-        self.write_config(
-            config.replace('paths = ["ruff.toml"]', 'paths = ["ruff.toml", "vendor"]')
-            + '\n[[rule]]\npattern = "vendor"\nclass = "config"\n'
-            'reason = "a pinned submodule"\n'
-        )
-        self.git("add", "quality-gate.toml")
-        self.git(
-            "update-index", "--add", "--cacheinfo",
-            "160000,1111111111111111111111111111111111111111,vendor",
-        )
-        self.git("commit", "-q", "-m", "protect submodule")
-        result = self.run_qg("inventory", "--policy-from", "HEAD")
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(result.stdout, "inventory: 7 files match 5 rules\n")
-        self.assertEqual(self.gate_messages(result), [])
 
 
 class InventoryTests(FixtureCase):

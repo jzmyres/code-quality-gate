@@ -944,9 +944,11 @@ class CoverageConfigurationAttackTests(FixtureCase):
     ) -> tuple[object, dict[str, object]]:
         self.add_covering_test(tamper)
         self.commit_all()
-        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        directory = str(self.trusted_directory(
+            self.git("rev-parse", "HEAD").stdout.strip()
+        ))
         return self.run_json(
-            "--policy-from", revision, env=self.default_tool_env()
+            "--policy-from", directory, env=self.default_tool_env()
         )
 
     def assert_risky_score(self, document: dict[str, object]) -> None:
@@ -1001,10 +1003,13 @@ class CoverageConfigurationAttackTests(FixtureCase):
                     + f"        {replace}\n",
                 )
                 self.commit_all(kind)
-                revision = self.git("rev-parse", "HEAD").stdout.strip()
+                directory = str(self.trusted_directory(
+                    self.git("rev-parse", "HEAD").stdout.strip(),
+                    name=f"trusted-{kind}",
+                ))
                 started = time.monotonic()
                 result = self.run_qg(
-                    "check", "--json", "--policy-from", revision,
+                    "check", "--json", "--policy-from", directory,
                     env=self.default_tool_env(), timeout=8,
                 )
                 elapsed = time.monotonic() - started
@@ -1042,10 +1047,12 @@ class CoverageConfigurationAttackTests(FixtureCase):
                 "_coverage_config_problem = _change_config_after_validation\n"
             )
         self.commit_all()
-        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        directory = str(self.trusted_directory(
+            self.git("rev-parse", "HEAD").stdout.strip()
+        ))
         result = subprocess.run(
             [sys.executable, "-I", str(self.gate / "qg.py"), "--repo", str(self.repo),
-             "check", "--json", "--policy-from", revision],
+             "check", "--json", "--policy-from", directory],
             cwd=self.repo, env=self.default_tool_env(), capture_output=True,
             text=True, timeout=30,
         )

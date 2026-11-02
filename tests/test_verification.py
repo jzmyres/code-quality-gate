@@ -699,7 +699,7 @@ class MultiplePruneTrustTests(TrustCase):
         prepare_multiple_prune(self)
 
     def test_trusted_prune_all_records_each_exact_write(self) -> None:
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         result, document = self.trust_json(revision, "--prune", "all", env=self.default_tool_env())
         self.assertEqual(result.returncode, 0, output(result))
         self.assertTrue(document["prune"]["performed"])
@@ -719,7 +719,7 @@ class MultiplePruneTrustTests(TrustCase):
             "enforcement = \"enforced\"\nrun = " + json.dumps([sys.executable, "-c", writer])
             + "\n\n[checks.tests]", 1,
         ))
-        revision = self.commit_revision()
+        revision = self.directory_revision()
         before = self.read_file(BASELINE)
         result, document = self.trust_json(revision, "--prune", "all", env=self.default_tool_env())
         self.assertEqual(result.returncode, 2, output(result))
@@ -898,7 +898,7 @@ class VerificationTrustTests(FindingMixin, TrustCase):
                 ]
             ),
         )
-        return self.commit_revision()
+        return str(self.trusted_directory(self.commit_revision()))
 
     def candidate(
         self, revision: str, floor: int, ceiling: int

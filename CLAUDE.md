@@ -14,8 +14,8 @@ adapter-specific rules. `adapters.py` declares descriptors and keeps shared base
 specification helpers; `policy` holds shared value readers and policy validation.
 Core package modules and `qg.py` import only core package modules, with `adapters.py` the sole registry
 allowed to import adapters.
-`check --policy-from REV` takes its policy, baselines, tool lock and protected paths from `REV`;
-`docs/TRUST.md` is the contract.
+`check --policy-from DIR` takes its policy, baselines, tool lock and protected paths from an
+absolute trusted directory; `docs/TRUST.md` is the contract.
 
 Policy declares `schema = 2`, code classes with their `checks`, and one `[checks.ID]` table per check
 (`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `elisp_crap`, `elisp_compile`,

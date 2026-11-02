@@ -381,7 +381,9 @@ class AuthorizedCoverageTests(FixtureCase):
         lock = (GATE / "tools.lock.toml").read_text(encoding="utf-8")
         self.add_file("tools.lock.toml", lock)
         self.commit_all()
-        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        directory = str(self.trusted_directory(
+            self.git("rev-parse", "HEAD").stdout.strip()
+        ))
 
         source = coverage_tool.coverage_installation()
         tools = self.base / "tools"
@@ -402,7 +404,7 @@ class AuthorizedCoverageTests(FixtureCase):
 
         result, document = self.run_json(
             "--policy-from",
-            revision,
+            directory,
             "--allow-protected",
             "tools.lock.toml",
             env={"QG_TOOLS_DIR": str(tools)},

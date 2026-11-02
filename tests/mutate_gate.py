@@ -194,14 +194,6 @@ DECISIONS = (
         "Only explicitly authorized protected changes take effect.",
     ),
     Decision(
-        "trust_gitlink_head",
-        "quality_gate/trust.py",
-        "_gitlink_changed",
-        "comparison",
-        "candidate.head != candidate.commit",
-        "A checked-out protected gitlink must match its index commit.",
-    ),
-    Decision(
         "trust_min_baseline_merge",
         "quality_gate/trust.py",
         "_merge_revision_entry",
@@ -216,16 +208,6 @@ DECISIONS = (
         "remove_raise",
         "raise _candidate_error(path, _kind_name(mode))",
         "Protected inputs must be regular files.",
-    ),
-    Decision(
-        "trust_graft",
-        "quality_gate/trust.py",
-        "_refuse_graft",
-        "remove_raise",
-        'raise UsageError(\n            f"{graft}: --policy-from: expected no graft file in the "\n'
-        '            "candidate repository, got a graft that can rewrite the "\n'
-        '            "trusted history"\n        )',
-        "Candidate grafts cannot rewrite trusted history.",
     ),
     Decision(
         "trust_gate_location",

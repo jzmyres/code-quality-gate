@@ -167,7 +167,7 @@ def _enforced_checks_pass(results: list[Any]) -> bool:
         result.is_satisfied()
         for result in results
         if result.kind == "check"
-        and (result.enforcement == "enforced" or getattr(result, "change_scoped_failure", False))
+        and result.enforcement == "enforced"
     )
 
 

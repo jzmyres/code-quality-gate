@@ -177,7 +177,7 @@ def _package_imports(tree: ast.AST):
 class ArchitectureTests(unittest.TestCase):
     def test_core_imports_only_core_modules(self) -> None:
         core = {
-            "__init__", "adapters", "changes", "checks", "cli", "files", "gate_result",
+            "__init__", "adapters", "checks", "cli", "files", "gate_result",
             "json_input", "output_patterns", "payload", "policy", "ratchet", "regexrun",
             "runner", "tools", "trust", "worklist",
         }

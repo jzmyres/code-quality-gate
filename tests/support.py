@@ -306,6 +306,26 @@ class FixtureCase(unittest.TestCase):
     def read_file(self, relative: str) -> str:
         return (self.repo / relative).read_text(encoding="utf-8")
 
+    def trusted_directory(
+        self, revision: str, name: str = "trusted"
+    ) -> Path:
+        directory = self.base / name
+        directory.mkdir()
+        archive = subprocess.run(
+            ["git", "archive", revision],
+            cwd=self.repo,
+            env=self.env(),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["tar", "-x", "-C", str(directory)],
+            input=archive.stdout,
+            capture_output=True,
+            check=True,
+        )
+        return directory
+
     def write_config(self, text: str | None = None) -> None:
         self.config_path.write_text(
             BASE_CONFIG if text is None else text, encoding="utf-8"

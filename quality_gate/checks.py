@@ -14,7 +14,6 @@ from typing import Any
 
 from . import gate_result
 from .adapters import AdapterContext, adapter_for
-from .changes import apply_changes, changed_lines, location_coverage, resolve_revision
 from .files import git_argv, hygiene_result, validate_inventory
 from .policy import (
     CheckDef,
@@ -81,8 +80,6 @@ class CheckResult:
     # Owned by the core until the last dependent check finishes.
     temporary: Any = field(default=None, repr=False, compare=False)
     configuration_error: bool = False
-    change_scoped_failure: bool = False
-    incomplete_locations: bool = False
     tool: dict[str, str] | None = None
     report_fields: dict[str, Any] = field(default_factory=dict)
 
@@ -131,10 +128,16 @@ class CheckResult:
         return coverage
 
 
+def location_coverage(adapter: str) -> str:
+    from .adapters import adapter_for
+
+    descriptor = adapter_for(adapter)
+    return descriptor.location_coverage if descriptor is not None else "none"
+
+
 def _incomplete_locations(result: CheckResult) -> bool:
-    return result.incomplete_locations or (
-        result.ratchet is not None
-        and any(item.locations is None for item in result.ratchet.findings)
+    return result.ratchet is not None and any(
+        item.locations is None for item in result.ratchet.findings
     )
 
 
@@ -839,7 +842,7 @@ def _enforced_failures(results: list[CheckResult]) -> list[str]:
         result.id
         for result in results
         if result.kind == "check"
-        and (result.enforcement == "enforced" or result.change_scoped_failure)
+        and result.enforcement == "enforced"
         and not result.is_satisfied()
     ]
 
@@ -1011,21 +1014,14 @@ def _check_command(
     config: Config,
     prune_ids: list[str],
     trust: Any = None,
-    changed_from: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    revision = resolve_revision(root, changed_from) if changed_from is not None else None
     problem = _prune_request_problem(config, prune_ids)
     if problem is not None:
         return _prune_option_error(root, config, prune_ids, problem)
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
     results.extend(_run_policy_checks(root, config, files, classes, code))
-    if revision is not None:
-        apply_changes(results, changed_lines(root, revision, files))
-    exit_code, document = _finalize_check(root, config, results, prune_ids, trust)
-    if revision is not None:
-        document["changed_from"] = revision
-    return exit_code, document
+    return _finalize_check(root, config, results, prune_ids, trust)
 
 
 def _run_check_document(
@@ -1034,12 +1030,11 @@ def _run_check_document(
     prune_ids: list[str],
     json_output: bool,
     trust: Any = None,
-    changed_from: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     if not json_output:
-        return _check_command(root, config, prune_ids, trust, changed_from)
+        return _check_command(root, config, prune_ids, trust)
     with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_ids, trust, changed_from)
+        return _check_command(root, config, prune_ids, trust)
 
 
 def command_check(
@@ -1049,18 +1044,17 @@ def command_check(
     json_output: bool = False,
     prune_ids: list[str] | None = None,
     trust: Any = None,
-    changed_from: str | None = None,
 ) -> int:
     requested = prune_ids or []
     if trust is None:
         code, document = _run_check_document(
-            root, config, requested, json_output, changed_from=changed_from
+            root, config, requested, json_output
         )
     else:
         try:
             with trust.activate():
                 code, document = _run_check_document(
-                    root, config, requested, json_output, trust, changed_from
+                    root, config, requested, json_output, trust
                 )
             code, document = trust.finish(code, document)
         finally:

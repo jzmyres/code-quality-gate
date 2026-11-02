@@ -317,20 +317,16 @@ class CloneGateTests(FixtureCase):
             + unique_assignments("SECOND"),
         )
         self.commit_all()
-        for arguments in ((), ("--changed-from", "HEAD")):
-            with self.subTest(arguments=arguments):
-                result, document = self.run_json(
-                    *arguments, env=self.default_tool_env()
-                )
-                text = output(result)
-                self.assertEqual(result.returncode, 1, text)
-                self.assertIn("first.py:4", text)
-                self.assertIn(IGNORE_START, text)
-                self.assertIn("found 4 ignore directives", text)
-                self.assertIn("baseline entry with a reason", text)
-                check = self.check_by_id(document, "clones")
-                self.assertEqual(check["outcome"], "error")
-                self.assertIn("first.py:4", check["reason"])
+        result, document = self.run_json(env=self.default_tool_env())
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("first.py:4", text)
+        self.assertIn(IGNORE_START, text)
+        self.assertIn("found 4 ignore directives", text)
+        self.assertIn("baseline entry with a reason", text)
+        check = self.check_by_id(document, "clones")
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("first.py:4", check["reason"])
 
     def test_one_ignore_directive_fails_without_clones(self) -> None:
         env = self.clone_env([])

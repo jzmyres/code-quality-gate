@@ -1,8 +1,8 @@
 """The trust root: protected inputs, effective inputs and run identity.
 
-With --policy-from REV the gate evaluates the candidate working tree against
-the policy, baselines and tool lock stored in REV, refusing to trust a
-candidate's copy of an input another program reads or executes.
+With --policy-from DIR the gate evaluates the candidate working tree against
+the policy, baselines and tool lock in a trusted directory, refusing to trust
+a candidate's copy of an input another program reads or executes.
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import posixpath
-import re
 import stat
 import sys
 import tempfile
@@ -35,37 +34,6 @@ RESULT_SCHEMA = 3
 
 
 @dataclass(frozen=True)
-class _PathValue:
-    kind: str
-    sha256: str | None = None
-    commit: str | None = None
-    head: str | None = None
-    index_commit: str | None = None
-
-
-@dataclass(frozen=True)
-class _GitlinkComparison:
-    revision: _PathValue
-    candidate: _PathValue
-
-    def to_json(self) -> dict[str, Any]:
-        document: dict[str, Any] = {
-            "rev_kind": self.revision.kind,
-            "candidate_kind": self.candidate.kind,
-            "rev_commit": self.revision.commit,
-            "candidate_commit": self.candidate.commit,
-            "candidate_head": self.candidate.head,
-        }
-        if self.revision.kind == "file":
-            document["rev_sha256"] = self.revision.sha256
-        if self.candidate.kind == "file":
-            document["candidate_sha256"] = self.candidate.sha256
-        if self.candidate.index_commit is not None:
-            document["candidate_index_commit"] = self.candidate.index_commit
-        return document
-
-
-@dataclass(frozen=True)
 class ProtectedInput:
     path: str
     kind: str
@@ -73,18 +41,14 @@ class ProtectedInput:
     candidate_sha256: str | None
     status: str
     ignored_entries: tuple[str, ...] = ()
-    gitlink: _GitlinkComparison | None = None
 
     def to_json(self) -> dict[str, Any]:
-        if self.gitlink is None:
-            document: dict[str, Any] = {
-                "path": self.path,
-                "rev_sha256": self.rev_sha256,
-                "candidate_sha256": self.candidate_sha256,
-                "status": self.status,
-            }
-        else:
-            document = {"path": self.path, **self.gitlink.to_json(), "status": self.status}
+        document: dict[str, Any] = {
+            "path": self.path,
+            "rev_sha256": self.rev_sha256,
+            "candidate_sha256": self.candidate_sha256,
+            "status": self.status,
+        }
         if self.kind == "baseline":
             document["ignored_entries"] = list(self.ignored_entries)
         return document
@@ -94,41 +58,11 @@ def _blocked_paths(protected: list[ProtectedInput]) -> list[str]:
     return [item.path for item in protected if item.status == "blocked"]
 
 
-def _display_value(value: _PathValue) -> str:
-    return value.commit or value.sha256 or "-"
-
-
-def _report_gitlink(item: ProtectedInput) -> None:
-    if item.gitlink is None:
-        return
-    revision = item.gitlink.revision
-    candidate = item.gitlink.candidate
-    print(
-        f"check: protected input {item.path}: REV {revision.kind} "
-        f"{_display_value(revision)}; candidate {candidate.kind} "
-        f"{_display_value(candidate)}; "
-        f"index {candidate.index_commit or candidate.commit or '-'}; "
-        f"HEAD {candidate.head or 'not checked out'}; {item.status}",
-        file=sys.stderr,
-    )
-
-
-def _report_gitlinks(
-    protected: list[ProtectedInput], *, include_blocked: bool
-) -> None:
-    for item in protected:
-        if include_blocked or item.status != "blocked":
-            _report_gitlink(item)
-
-
 def _file_description(sha256: str | None) -> str:
     return f"file {sha256}" if sha256 is not None else "missing -"
 
 
 def _report_blocked_detail(item: ProtectedInput) -> None:
-    if item.gitlink is not None:
-        _report_gitlink(item)
-        return
     print(
         f"check: protected input {item.path}: REV "
         f"{_file_description(item.rev_sha256)}; candidate "
@@ -146,8 +80,8 @@ class Trust:
     protected: list[ProtectedInput]
     lock_path: Path
     lock_tools: dict[str, Tool]
-    reader: _TrustedRevision | _TrustedTree
-    trusted: Path | None = None
+    reader: _TrustedTree
+    trusted: Path
     temporary: list[tempfile.TemporaryDirectory[str]] = field(
         default_factory=list
     )
@@ -170,16 +104,9 @@ class Trust:
             directory.cleanup()
 
     def to_json(self) -> dict[str, Any]:
-        if self.trusted is None:
-            source: dict[str, Any] = {"policy_from": self.revision}
-        else:
-            assert isinstance(self.reader, _TrustedTree)
-            source = {
-                "path": str(self.trusted),
-                "digest": self.reader.digest(),
-            }
         return {
-            **source,
+            "path": str(self.trusted),
+            "digest": self.reader.digest(),
             "protected": [item.to_json() for item in self.protected],
             "identity_before": self.identity_before,
             "identity_after": self.identity_after,
@@ -218,7 +145,7 @@ class Trust:
         return True
 
     def finish(
-        self, code: int, document: dict[str, Any], *, report_gitlinks: bool = True
+        self, code: int, document: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         after = _capture_identity(self)
         start = self.identity_after_checks or self.identity_before or {}
@@ -233,9 +160,6 @@ class Trust:
         self.identity_after = after
         document["schema"] = RESULT_SCHEMA
         document["trust"] = self.to_json()
-        if report_gitlinks:
-            # Blocked gitlinks are reported below unless identity changed.
-            _report_gitlinks(self.protected, include_blocked=bool(problems))
         if problems:
             message = "; ".join(problems)
             print(f"check: error: {message}", file=sys.stderr)
@@ -254,7 +178,6 @@ class _Input:
     kind: str
     rev_sha256: str | None
     candidate_sha256: str | None
-    gitlink: _GitlinkComparison | None = None
 
 
 def _git(root: Path, args: list[str]) -> RunResult:
@@ -267,181 +190,6 @@ def _git(root: Path, args: list[str]) -> RunResult:
 
 def _git_detail(result: RunResult) -> str:
     return result.stderr_text.strip() or f"git exited {result.returncode}"
-
-
-def _refuse_graft(root: Path) -> None:
-    result = _git(
-        root,
-        ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"],
-    )
-    if result.execution != "completed" or result.returncode != 0:
-        raise UsageError(
-            f"{root}: --policy-from: cannot locate the git directory: "
-            f"{_git_detail(result)}"
-        )
-    graft = Path(result.stdout_text.strip())
-    if os.path.lexists(graft):
-        raise UsageError(
-            f"{graft}: --policy-from: expected no graft file in the "
-            "candidate repository, got a graft that can rewrite the "
-            "trusted history"
-        )
-
-
-def _commit(root: Path, revision: str) -> str:
-    result = _git(root, ["rev-parse", "--verify", f"{revision}^{{commit}}"])
-    if result.execution != "completed":
-        raise UsageError(
-            f"{root}: --policy-from {revision!r}: expected a commit, got "
-            f"git {result.execution}"
-        )
-    detail = _git_detail(result)
-    if result.returncode != 0:
-        mismatch = re.search(r"hash mismatch ([0-9a-fA-F]+)", detail)
-        if mismatch is not None:
-            raise UsageError(
-                f"{root}: --policy-from: object {mismatch.group(1)} at the "
-                "commit: object content does not match its ID"
-            )
-        raise UsageError(
-            f"{root}: --policy-from {revision!r}: expected a commit, got "
-            f"{detail}"
-        )
-    return result.stdout_text.strip()
-
-
-_OBJECT_HASHES = {
-    "sha1": hashlib.sha1,
-    "sha256": hashlib.sha256,
-}
-_BLOB_MODES = ("100644", "100755", "120000")
-
-
-def _ls_tree_mode(mode: str) -> str:
-    """A tree entry's mode as git ls-tree spells it."""
-    return "040000" if mode == "40000" else mode
-
-
-def _commit_tree_id(raw: bytes) -> str | None:
-    line, _separator, _rest = raw.partition(b"\n")
-    prefix = b"tree "
-    if not line.startswith(prefix):
-        return None
-    return line[len(prefix):].decode("ascii")
-
-
-def _parse_tree(raw: bytes, hash_size: int) -> dict[str, tuple[str, str]]:
-    entries: dict[str, tuple[str, str]] = {}
-    offset = 0
-    while offset < len(raw):
-        space = raw.index(b" ", offset)
-        nul = raw.index(b"\0", space)
-        mode = raw[offset:space].decode("ascii")
-        name = raw[space + 1:nul].decode("utf-8", "surrogateescape")
-        oid = raw[nul + 1:nul + 1 + hash_size].hex()
-        entries[name] = (_ls_tree_mode(mode), oid)
-        offset = nul + 1 + hash_size
-    return entries
-
-
-class _TrustedRevision:
-    """The one reader for the trusted revision's objects.
-
-    Each object is hashed as Git hashes it (type, size and content) and
-    compared with the id naming it before its content is used.
-    """
-
-    def __init__(
-        self, root: Path, commit: str, flag: str = "--policy-from"
-    ) -> None:
-        self.root = root
-        self.commit = commit
-        self.location = commit
-        self.flag = flag
-        self._hasher = _OBJECT_HASHES[self._object_format()]
-        self._hash_size = self._hasher().digest_size
-        self._trees: dict[str, dict[str, tuple[str, str]]] = {}
-        self._blobs: dict[str, bytes] = {}
-        self._entries: dict[str, tuple[str, str]] | None = None
-        tree = _commit_tree_id(self._object("commit", commit, "the commit"))
-        if tree is None:
-            raise UsageError(
-                f"{root}: {flag} {commit}: expected a commit object "
-                "naming a tree, got none"
-            )
-        self._root_tree = tree
-
-    def _object_format(self) -> str:
-        result = _git(self.root, ["rev-parse", "--show-object-format"])
-        if result.execution != "completed" or result.returncode != 0:
-            raise UsageError(
-                f"{self.root}: {self.flag}: cannot read the object format: "
-                f"{_git_detail(result)}"
-            )
-        return result.stdout_text.strip()
-
-    def _object(self, kind: str, oid: str, location: str) -> bytes:
-        result = _git(self.root, ["cat-file", kind, oid])
-        if result.execution != "completed" or result.returncode != 0:
-            raise UsageError(
-                f"{self.root}: {self.flag}: cannot read object {oid} at "
-                f"{location}: {_git_detail(result)}"
-            )
-        content = result.stdout
-        header = f"{kind} {len(content)}".encode("ascii") + b"\0"
-        if self._hasher(header + content).hexdigest() != oid:
-            raise UsageError(
-                f"{self.root}: {self.flag}: object {oid} at {location}: "
-                "object content does not match its ID"
-            )
-        return content
-
-    def _tree(self, oid: str, location: str) -> dict[str, tuple[str, str]]:
-        entries = self._trees.get(oid)
-        if entries is None:
-            entries = _parse_tree(
-                self._object("tree", oid, location), self._hash_size
-            )
-            self._trees[oid] = entries
-        return entries
-
-    def _collect(
-        self, prefix: str, oid: str, entries: dict[str, tuple[str, str]]
-    ) -> None:
-        for name, entry in self._tree(oid, prefix or ".").items():
-            path = f"{prefix}/{name}" if prefix else name
-            entries[path] = entry
-            if entry[0] == "040000":
-                self._collect(path, entry[1], entries)
-
-    def entries(self) -> dict[str, tuple[str, str]]:
-        if self._entries is None:
-            entries: dict[str, tuple[str, str]] = {}
-            self._collect("", self._root_tree, entries)
-            self._entries = entries
-        return self._entries
-
-    def files(self) -> list[str]:
-        return [
-            path for path, (mode, _oid) in self.entries().items()
-            if mode != "040000"
-        ]
-
-    def read(self, relative: str) -> bytes | None:
-        entry = self.entries().get(relative)
-        if entry is None or entry[0] not in _BLOB_MODES:
-            return None
-        return self._blob(entry[1], relative)
-
-    def blob(self, relative: str) -> bytes | None:
-        return self.read(relative)
-
-    def _blob(self, oid: str, location: str) -> bytes:
-        cached = self._blobs.get(oid)
-        if cached is None:
-            cached = self._object("blob", oid, location)
-            self._blobs[oid] = cached
-        return cached
 
 
 class _TrustedTree:
@@ -619,7 +367,7 @@ def _has_magic(pattern: str) -> bool:
 
 
 def _expand_protect(
-    patterns: tuple[str, ...], root: Path, revision: _TrustedRevision
+    patterns: tuple[str, ...], root: Path, source: _TrustedTree
 ) -> set[str]:
     protected: set[str] = set()
     globs: list[str] = []
@@ -630,7 +378,7 @@ def _expand_protect(
             protected.add(_normalise(pattern))
     if not globs:
         return protected
-    names = set(revision.files()) | set(_candidate_files(root))
+    names = set(source.files()) | set(_candidate_files(root))
     for pattern in globs:
         protected.update(fnmatch.filter(names, pattern))
     return protected
@@ -653,134 +401,10 @@ def _baseline_names(config: Config) -> set[str]:
 
 
 def _protected_scope(
-    root: Path, revision: _TrustedRevision, config: Config
+    root: Path, source: _TrustedTree, config: Config
 ) -> set[str]:
     paths = {POLICY_NAME, LOCK_NAME} | _baseline_names(config)
-    return paths | _expand_protect(config.protect_paths, root, revision)
-
-
-def _git_entries(root: Path, args: list[str], what: str) -> list[str]:
-    result = _git(root, args)
-    if result.execution != "completed" or result.returncode != 0:
-        raise UsageError(f"{root}: cannot list {what}: {_git_detail(result)}")
-    return [
-        item for item in result.stdout.decode("utf-8", "surrogateescape").split("\0")
-        if item
-    ]
-
-
-def _index_entries(root: Path) -> dict[str, list[tuple[str, str, str]]]:
-    records = _git_entries(root, ["ls-files", "--stage", "-z"], "candidate index")
-    entries: dict[str, list[tuple[str, str, str]]] = {}
-    for record in records:
-        metadata, _tab, path = record.partition("\t")
-        mode, oid, stage = metadata.split()
-        entries.setdefault(path, []).append((mode, oid, stage))
-    return entries
-
-
-def _index_gitlink(
-    root: Path, path: str, entries: list[tuple[str, str, str]]
-) -> str | None:
-    if any(stage != "0" for _mode, _oid, stage in entries):
-        raise UsageError(f"{root / path}: protected input: unresolved index entries")
-    return next((oid for mode, oid, _stage in entries if mode == "160000"), None)
-
-
-def _revision_value(
-    root: Path, revision: _TrustedRevision, path: str,
-    entry: tuple[str, str] | None,
-) -> _PathValue:
-    if entry is None:
-        return _PathValue("missing")
-    mode, oid = entry
-    if mode == "160000":
-        return _PathValue("gitlink", commit=oid)
-    if mode == "040000":
-        return _PathValue("directory")
-    return _PathValue("file", sha256=_sha256(revision.read(path)))
-
-
-def _submodule_git(path: Path, args: list[str], what: str) -> str:
-    result = _git(path, args)
-    if result.execution != "completed" or result.returncode != 0:
-        raise _candidate_error(path, f"an unreadable {what}: {_git_detail(result)}")
-    return result.stdout_text.strip()
-
-
-def _submodule_head(path: Path) -> str:
-    top = _submodule_git(path, ["rev-parse", "--show-toplevel"], "submodule")
-    if Path(top).resolve() != path:
-        raise _candidate_error(path, "a submodule with a different worktree root")
-    return _submodule_git(path, ["rev-parse", "--verify", "HEAD^{commit}"], "submodule HEAD")
-
-
-def _directory_value(path: Path, index_commit: str | None) -> _PathValue:
-    if index_commit is None:
-        return _PathValue("directory")
-    if os.path.lexists(path / ".git"):
-        return _PathValue("gitlink", commit=index_commit, head=_submodule_head(path))
-    try:
-        with os.scandir(path) as entries:
-            empty = next(entries, None) is None
-    except OSError as error:
-        raise _candidate_error(path, str(error)) from error
-    if empty:
-        return _PathValue("gitlink", commit=index_commit)
-    return _PathValue("directory", index_commit=index_commit)
-
-
-def _candidate_value(root: Path, relative: str, index_commit: str | None) -> _PathValue:
-    path = _candidate_path(root, relative)
-    mode = _parent_mode(path) if path is not None else None
-    if mode is None:
-        if index_commit is not None:
-            return _PathValue("gitlink", commit=index_commit)
-        return _PathValue("missing")
-    if stat.S_ISDIR(mode):
-        return _directory_value(path, index_commit)
-    raw = _read_regular(path)
-    return _PathValue("file", sha256=_sha256(raw), index_commit=index_commit)
-
-
-def _contains_gitlink(
-    entry: tuple[str, str] | None, staged: list[tuple[str, str, str]]
-) -> bool:
-    return (entry is not None and entry[0] == "160000") or any(
-        mode == "160000" for mode, _oid, _stage in staged
-    )
-
-
-def _comparison(
-    root: Path,
-    revision: _TrustedRevision,
-    path: str,
-    tree: dict[str, tuple[str, str]],
-    index: dict[str, list[tuple[str, str, str]]],
-    *,
-    identity: bool = False,
-) -> _GitlinkComparison | None:
-    entry = tree.get(path)
-    staged = index.get(path, [])
-    if not _contains_gitlink(entry, staged):
-        return None
-    rev = _revision_value(root, revision, path, entry)
-    try:
-        candidate = _candidate_value(root, path, _index_gitlink(root, path, staged))
-    except UsageError:
-        if not identity:
-            raise
-        candidate = _PathValue("refused")
-    return _GitlinkComparison(rev, candidate)
-
-
-def _gitlink_changed(comparison: _GitlinkComparison) -> bool:
-    revision, candidate = comparison.revision, comparison.candidate
-    if revision.kind != candidate.kind or candidate.index_commit is not None:
-        return True
-    return revision.commit != candidate.commit or (
-        candidate.head is not None and candidate.head != candidate.commit
-    )
+    return paths | _expand_protect(config.protect_paths, root, source)
 
 
 def _input_kind(path: str, baselines: set[str]) -> str:
@@ -792,51 +416,26 @@ def _input_kind(path: str, baselines: set[str]) -> str:
 
 
 def _protected_input(
-    root: Path,
-    source: _TrustedRevision | _TrustedTree,
-    revision: _TrustedRevision | None,
-    tree: dict[str, tuple[str, str]],
-    index: dict[str, list[tuple[str, str, str]]],
-    path: str,
-    kind: str,
+    root: Path, source: _TrustedTree, path: str, kind: str
 ) -> _Input:
-    comparison = (
-        _comparison(root, revision, path, tree, index)
-        if revision is not None
-        else None
-    )
-    if comparison is None:
-        return _Input(
-            path, kind, _sha256(source.read(path)),
-            _sha256(_candidate_bytes(root, path)),
-        )
     return _Input(
-        path, kind, comparison.revision.sha256,
-        comparison.candidate.sha256, comparison,
+        path, kind, _sha256(source.read(path)),
+        _sha256(_candidate_bytes(root, path)),
     )
 
 
 def _protected_inputs(
-    root: Path, source: _TrustedRevision | _TrustedTree, config: Config
+    root: Path, source: _TrustedTree, config: Config
 ) -> dict[str, _Input]:
     baselines = _baseline_names(config)
-    revision = source if isinstance(source, _TrustedRevision) else None
-    tree = revision.entries() if revision is not None else {}
-    index = _index_entries(root) if revision is not None else {}
     return {
-        path: _protected_input(
-            root, source, revision, tree, index, path,
-            _input_kind(path, baselines),
-        )
+        path: _protected_input(root, source, path, _input_kind(path, baselines))
         for path in sorted(_protected_scope(root, source, config))
     }
 
 
 def _input_changed(item: _Input) -> bool:
-    return (
-        _gitlink_changed(item.gitlink) if item.gitlink is not None
-        else item.rev_sha256 != item.candidate_sha256
-    )
+    return item.rev_sha256 != item.candidate_sha256
 
 
 def _declared_status(item: _Input, allowed: set[str]) -> str:
@@ -870,7 +469,7 @@ def _safe_join(root: Path, relative: str) -> Path | None:
 def _materialize(
     policy_root: Path,
     root: Path,
-    source: _TrustedRevision | _TrustedTree,
+    source: _TrustedTree,
     policy: bytes,
 ) -> None:
     (policy_root / POLICY_NAME).write_bytes(policy)
@@ -929,7 +528,7 @@ def _entries_from_bytes(
 
 def _rev_entries(
     temporary: Path,
-    source: _TrustedRevision | _TrustedTree,
+    source: _TrustedTree,
     relative: str,
     check: Any,
 ) -> list[BaselineEntry]:
@@ -1063,20 +662,15 @@ def _baseline_status(
 def _merged_baseline(
     temporary: Path,
     root: Path,
-    revision: _TrustedRevision,
+    source: _TrustedTree,
     relative: str,
     check: Any,
     item: _Input,
 ) -> tuple[list[BaselineEntry], str, tuple[str, ...]]:
-    revision_entries = _rev_entries(
-        temporary, revision, relative, check
+    revision_entries = _rev_entries(temporary, source, relative, check)
+    candidate_entries, invalid = _candidate_entries(
+        temporary, root, relative, check
     )
-    if item.gitlink is not None and item.gitlink.candidate.kind != "file":
-        candidate_entries, invalid = [], True
-    else:
-        candidate_entries, invalid = _candidate_entries(
-            temporary, root, relative, check
-        )
     if invalid:
         merged, ignored, tightened = revision_entries, (), False
     else:
@@ -1106,7 +700,7 @@ def _required_candidate_entries(
 
 def _apply_baselines(
     root: Path,
-    revision: _TrustedRevision,
+    source: _TrustedTree,
     rev_config: Config,
     config: Config,
     inputs: dict[str, _Input],
@@ -1132,7 +726,7 @@ def _apply_baselines(
                 statuses[relative] = _declared_status(inputs[relative], allowed)
         else:
             entries, status, ignored = _merged_baseline(
-                temporary, root, revision, relative, check, inputs[relative]
+                temporary, root, source, relative, check, inputs[relative]
             )
             statuses[relative] = status
             ignored_entries[relative] = ignored
@@ -1159,7 +753,7 @@ def _candidate_lock_authorized(
 
 def _effective_lock(
     root: Path,
-    source: _TrustedRevision | _TrustedTree,
+    source: _TrustedTree,
     inputs: dict[str, _Input],
     allowed: set[str],
     temporary: Path,
@@ -1287,36 +881,12 @@ def _tree_protected_identity(
     }
 
 
-def _revision_protected_identity(
-    trust: Trust, scope: set[str]
-) -> dict[str, dict[str, Any]]:
-    assert isinstance(trust.reader, _TrustedRevision)
-    tree = trust.reader.entries()
-    index = _index_entries(trust.root)
-    protected = {}
-    for path in sorted(scope):
-        comparison = _comparison(
-            trust.root, trust.reader, path, tree, index, identity=True
-        )
-        protected[path] = (
-            comparison.to_json() if comparison is not None else {
-                "rev_sha256": _sha256(trust.reader.read(path)),
-                "candidate_sha256": _candidate_identity_sha256(trust.root, path),
-            }
-        )
-    return protected
-
-
 def _capture_identity(trust: Trust) -> dict[str, Any]:
     scope = _protected_scope(trust.root, trust.reader, trust.rev_config)
     scope |= _baseline_names(trust.config)
-    if trust.trusted is None:
-        protected = _revision_protected_identity(trust, scope)
-    else:
-        protected = _tree_protected_identity(trust, scope)
     return {
         "revision": trust.revision,
-        "protected": protected,
+        "protected": _tree_protected_identity(trust, scope),
         "effective_inputs": _effective_identity(trust),
         "tools": _tool_identity(trust.lock_tools),
         "gate": _gate_identity(Path(__file__).resolve().parent.parent),
@@ -1349,11 +919,7 @@ _UNWRITTEN = object()
 
 
 def _prune_source_is_file(entry: dict[str, Any]) -> bool:
-    return (
-        "rev_kind" not in entry
-        and "rev_sha256" in entry
-        and "candidate_sha256" in entry
-    )
+    return "rev_sha256" in entry and "candidate_sha256" in entry
 
 
 def _same_revision_files(old: dict[str, Any], new: dict[str, Any]) -> bool:
@@ -1440,9 +1006,7 @@ def _refuse_inside(root: Path) -> None:
         )
 
 
-def _rev_policy_bytes(
-    root: Path, source: _TrustedRevision | _TrustedTree
-) -> bytes:
+def _rev_policy_bytes(root: Path, source: _TrustedTree) -> bytes:
     policy = source.read(POLICY_NAME)
     if policy is None:
         raise UsageError(
@@ -1452,36 +1016,12 @@ def _rev_policy_bytes(
     return policy
 
 
-def _initial_value(item: _Input | None) -> dict[str, Any] | None:
-    if item is None:
-        return None
-    if item.gitlink is not None:
-        return item.gitlink.to_json()
-    return {"rev_sha256": item.rev_sha256, "candidate_sha256": item.candidate_sha256}
-
-
-def _initial_gitlink(item: _Input | None, current: dict[str, Any] | None) -> bool:
-    return (item is not None and item.gitlink is not None) or (
-        current is not None and "rev_kind" in current
-    )
-
-
-def _check_initial_gitlinks(inputs: dict[str, _Input], identity: dict[str, Any]) -> None:
-    protected = identity["protected"]
-    for path in sorted(set(inputs) | set(protected)):
-        item, current = inputs.get(path), protected.get(path)
-        if _initial_gitlink(item, current) and _initial_value(item) != current:
-            raise UsageError(f"protected input {path} changed while preparing the run")
-
-
-def is_directory_argument(value: str) -> bool:
-    return Path(value).is_absolute()
-
-
-def _directory_source(root: Path, value: str) -> _TrustedTree | None:
-    if not is_directory_argument(value):
-        return None
+def _directory_source(root: Path, value: str) -> _TrustedTree:
     path = Path(value)
+    if not path.is_absolute():
+        raise UsageError(
+            f"{value}: --policy-from: expected an absolute trusted directory"
+        )
     resolved = path.resolve()
     if not resolved.is_dir():
         detail = "missing" if not resolved.exists() else "not a directory"
@@ -1499,10 +1039,9 @@ def _directory_source(root: Path, value: str) -> _TrustedTree | None:
 
 def _prepare_source(
     root: Path,
-    source: _TrustedRevision | _TrustedTree,
+    source: _TrustedTree,
     temporary: list[tempfile.TemporaryDirectory[str]],
     allowed: list[str],
-    trusted: Path | None = None,
 ) -> Trust:
     policy_root = Path(temporary[0].name)
     _materialize(policy_root, root, source, _rev_policy_bytes(root, source))
@@ -1536,7 +1075,6 @@ def _prepare_source(
             item.candidate_sha256,
             statuses.get(item.path, _declared_status(item, allowed_paths)),
             ignored.get(item.path, ()),
-            item.gitlink,
         )
         for item in inputs.values()
     ]
@@ -1549,36 +1087,19 @@ def _prepare_source(
         lock_path=lock_path,
         lock_tools=lock_tools,
         reader=source,
-        trusted=trusted,
+        trusted=source.root,
         temporary=temporary,
     )
     trust.identity_before = _capture_identity(trust)
-    try:
-        _check_initial_gitlinks(inputs, trust.identity_before)
-    except UsageError:
-        trust.close()
-        raise
     return trust
 
 
-def prepare_trust(
-    root: Path, revision_text: str, allowed: list[str]
-) -> Trust:
+def prepare_trust(root: Path, value: str, allowed: list[str]) -> Trust:
     root = root.resolve()
     _refuse_inside(root)
-    trusted = _directory_source(root, revision_text)
-    if trusted is not None:
-        temporary = [
-            tempfile.TemporaryDirectory(prefix="qg-tree-"),
-            tempfile.TemporaryDirectory(prefix="qg-merge-"),
-        ]
-        return _prepare_source(
-            root, trusted, temporary, allowed, trusted.root
-        )
-    _refuse_graft(root)
-    revision = _TrustedRevision(root, _commit(root, revision_text))
+    source = _directory_source(root, value)
     temporary = [
-        tempfile.TemporaryDirectory(prefix="qg-rev-"),
+        tempfile.TemporaryDirectory(prefix="qg-tree-"),
         tempfile.TemporaryDirectory(prefix="qg-merge-"),
     ]
-    return _prepare_source(root, revision, temporary, allowed)
+    return _prepare_source(root, source, temporary, allowed)

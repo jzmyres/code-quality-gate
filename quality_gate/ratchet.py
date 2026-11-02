@@ -105,8 +105,6 @@ class FindingResult:
     error: str | None = None
     measurement: dict[str, Any] | None = None
     locations: tuple[Location, ...] | None = None
-    on_changed_lines: bool | None = None
-    change_scope_evaluated: bool = False
     direction: str = "max"
 
     def to_json(self) -> dict[str, Any]:
@@ -129,8 +127,6 @@ class FindingResult:
             [location.to_json() for location in self.locations]
             if self.locations is not None else None
         )
-        if self.change_scope_evaluated:
-            result["on_changed_lines"] = self.on_changed_lines
         return result
 
 
