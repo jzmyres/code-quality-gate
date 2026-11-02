@@ -696,9 +696,8 @@ baseline. Each selected check must be satisfied; `all` also requires every other
 The gate validates the entire request before writing, so a failed check refuses all requested prunes.
 An unknown id or a check without a baseline exits 2. A refused or failed prune makes the command exit 1
 and leaves `decision` reporting the gate evaluation. If a write itself fails, earlier writes in the
-same request may already have completed. Under `--policy-from`, the run identity is validated after
-the checks and before any write, and each pruned path may differ only by the exact bytes the gate
-generated; any other difference is an identity error (exit 2).
+same request may already have completed. `--prune` with `--policy-from` is a usage error (exit 2)
+naming both options, before any check runs; `--prune` without `--policy-from` is unchanged.
 
 The decision is `error` (exit 2) for invalid policy, usage or configuration, `rejected` (exit 1) when
 inventory, hygiene, any enforced check or any obligation is not satisfied, `accepted_with_exceptions`
@@ -726,10 +725,10 @@ candidate baseline keeps every trusted entry. Protected candidate files must be 
 following a symlink. The trusted directory compares files and globs only, so the caller checks a
 submodule pin. An unauthorized change to another protected path makes the decision `blocked` (exit 1),
 while `--allow-protected PATH` accepts a reviewed replacement and reports it as authorized. The gate
-records protected-input, tool-payload and gate-program identities before the checks, again after them
-before a prune write, and once more after a prune write, re-enumerating the protected scope (including
-ignored untracked files); an added, removed or changed protected path makes the decision `error`
-(exit 2). A performed prune may change its baseline path only by exactly the bytes the gate generated.
+records protected-input, tool-payload and gate-program identities before the checks and again after
+them, re-enumerating the protected scope (including ignored untracked files); an added, removed or
+changed protected path makes the decision `error` (exit 2). `--prune` with `--policy-from` is a
+usage error (exit 2).
 It refuses to run from a gate program inside the candidate root. A trust result reports `trust.path`
 and `trust.digest`. The full contract is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in
 [`docs/SCHEMA.md`](docs/SCHEMA.md). Test-process measurements are trusted, and a consumer's pinned gate

@@ -693,42 +693,6 @@ class MultiplePruneTests(FixtureCase):
         self.assert_both_bounds(2)
 
 
-class MultiplePruneTrustTests(TrustCase):
-    def setUp(self) -> None:
-        super().setUp()
-        prepare_multiple_prune(self)
-
-    def test_trusted_prune_all_records_each_exact_write(self) -> None:
-        revision = self.directory_revision()
-        result, document = self.trust_json(revision, "--prune", "all", env=self.default_tool_env())
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertTrue(document["prune"]["performed"])
-        for path in (BASELINE, "second.toml"):
-            self.assertIn("bound = 2", self.read_file(path))
-            before = document["trust"]["identity_before"]["protected"][path]
-            after = document["trust"]["identity_after"]["protected"][path]
-            self.assertNotEqual(before["candidate_sha256"], after["candidate_sha256"])
-
-    def test_changed_protected_input_prevents_all_writes(self) -> None:
-        writer = (
-            "import pathlib; "
-            "pathlib.Path('second.toml').write_text('altered'); print(1)"
-        )
-        self.write_config(multi_verification_config().replace(
-            "[checks.tests]", "[checks.rewrite]\nadapter = \"command\"\ntier = 1\n"
-            "enforcement = \"enforced\"\nrun = " + json.dumps([sys.executable, "-c", writer])
-            + "\n\n[checks.tests]", 1,
-        ))
-        revision = self.directory_revision()
-        before = self.read_file(BASELINE)
-        result, document = self.trust_json(revision, "--prune", "all", env=self.default_tool_env())
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertFalse(document["prune"]["performed"])
-        self.assertIn("second.toml", document["error"])
-        self.assertEqual(self.read_file(BASELINE), before)
-        self.assertEqual(self.read_file("second.toml"), "altered")
-
-
 class VerificationTrustTests(FindingMixin, TrustCase):
     def test_candidate_cannot_authorize_a_file_suppression(self) -> None:
         revision = self.prepare(tests=1, noqa=2, floor=1, ceiling=2)
@@ -1001,38 +965,6 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         entry = self.protected(document, BASELINE)
         self.assertEqual(entry["status"], "tightened")
         self.bounds(document, (1, 2), (4, 3))
-
-    def test_check_rewriting_an_authorized_floor_then_prune_fails(self) -> None:
-        weakened = verification_baseline([executed_entry(1)])
-        rewrite = (
-            "import pathlib; "
-            f"pathlib.Path({BASELINE!r}).write_text({weakened!r}); "
-            "print(1)"
-        )
-        revision = self.prepare(
-            tests=1,
-            noqa=0,
-            floor=2,
-            ceiling=0,
-            config=rewriting_config(rewrite),
-        )
-        result, document = self.trust_json(
-            revision,
-            "--allow-protected",
-            BASELINE,
-            "--prune",
-            "verification",
-            env=self.default_tool_env(),
-        )
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertEqual(document["decision"], "error")
-        self.assertIn(BASELINE, document["error"])
-        self.assertIn("changed during the run", document["error"])
-        self.assertFalse(document["prune"]["performed"])
-        self.assertEqual(self.read_file(BASELINE), weakened)
-        check = self.check_by_id(document, "verification")
-        self.assertEqual(self.finding(check, "tests:tests:executed")["bound"], 2)
-
 
 if __name__ == "__main__":
     unittest.main()

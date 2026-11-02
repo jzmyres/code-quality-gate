@@ -494,32 +494,6 @@ checks = ["crap"]
         self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["run"])
 
 class ElispCrapTrustTests(TrustCase):
-    def test_prune_resolves_colon_names_only_in_selected_files(self) -> None:
-        (self.repo / "a.py").unlink()
-        self.add_file("src/core.el", MODULE)
-        self.add_file("src/core.el:outside.el", "(defun outside () 1)\n")
-        self.add_file("tests/suite.el", SUITE)
-        text = crap_config().replace('pattern = "src/*.el"', 'pattern = "src/core.el"')
-        text += '''\n[[rule]]
-pattern = "src/core.el:outside.el"
-class = "suite"
-reason = "unselected file"
-'''
-        self.write_config(text)
-        self.add_file("crap.toml", baseline_text([
-            {"subject": "src/core.el:gone:member", "bound": 9, "reason": "removed"},
-            {"subject": "src/core.el:outside.el:member", "bound": 9, "reason": "outside domain"},
-        ], check="crap", metric_version="elisp-edebug/1"))
-        revision = self.directory_revision()
-        result, document = self.trust_json(revision, "--prune", "crap")
-        self.assertEqual(result.returncode, 0, output(result))
-        check = self.check_by_id(document, "crap")
-        self.assertEqual(check["resolved_baseline_entries"], ["src/core.el:gone:member"])
-        self.assertEqual(check["unmeasured_baseline_entries"], ["src/core.el:outside.el:member"])
-        entries = tomllib.loads(self.read_file("crap.toml"))["entry"]
-        self.assertEqual([item["subject"] for item in entries], ["src/core.el:outside.el:member"])
-        self.assertTrue(document["prune"]["performed"])
-
     def test_trusted_policy_refuses_suite_symlink_outside_candidate(self) -> None:
         (self.repo / "a.py").unlink()
         self.add_file("src/core.el", MODULE)

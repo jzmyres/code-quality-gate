@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -102,7 +102,6 @@ class Config:
     required_tiers: tuple[int, ...]
     not_applicable: tuple[NotApplicable, ...]
     protect_paths: tuple[str, ...] = ()
-    prune_paths: dict[str, Path] = field(default_factory=dict)
 
 
 def _config_error(path: Path, key: str, expected: str, actual: str) -> ConfigError:

@@ -220,14 +220,6 @@ DECISIONS = (
         "A trusted gate must be outside the candidate.",
     ),
     Decision(
-        "trust_prune_identity",
-        "quality_gate/trust.py",
-        "_allowed_change",
-        "comparison",
-        'new_entry.get("candidate_sha256") == _sha256(written)',
-        "A prune may change only the exact bytes written by the gate.",
-    ),
-    Decision(
         "trust_identity_comparison",
         "quality_gate/trust.py",
         "_section_problems",

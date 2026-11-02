@@ -87,9 +87,6 @@ class Trust:
     )
     identity_before: dict[str, Any] | None = None
     identity_after: dict[str, Any] | None = None
-    identity_after_checks: dict[str, Any] | None = None
-    identity_problems: list[str] = field(default_factory=list)
-    prune_writes: dict[str, bytes | None] = field(default_factory=dict)
 
     def activate(self):
         return tools_module.lock_override(self.lock_path, self.lock_tools)
@@ -112,24 +109,6 @@ class Trust:
             "identity_after": self.identity_after,
         }
 
-    def before_prune(self) -> str | None:
-        """Refuse pruning when a protected input changed during the checks."""
-        after = _capture_identity(self)
-        self.identity_after_checks = after
-        self.identity_problems = _identity_problems(
-            self.identity_before or {}, after
-        )
-        return "; ".join(self.identity_problems) or None
-
-    def record_prune_write(
-        self, destination: Path, written: bytes | None
-    ) -> None:
-        try:
-            relative = destination.relative_to(self.root).as_posix()
-        except ValueError:
-            return
-        self.prune_writes[relative] = written
-
     def report_blocked(self) -> bool:
         blocked = _blocked_paths(self.protected)
         if not blocked:
@@ -148,15 +127,7 @@ class Trust:
         self, code: int, document: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         after = _capture_identity(self)
-        start = self.identity_after_checks or self.identity_before or {}
-        problems = list(
-            dict.fromkeys(
-                [
-                    *self.identity_problems,
-                    *_identity_problems(start, after, self.prune_writes),
-                ]
-            )
-        )
+        problems = _identity_problems(self.identity_before or {}, after)
         self.identity_after = after
         document["schema"] = RESULT_SCHEMA
         document["trust"] = self.to_json()
@@ -710,7 +681,6 @@ def _apply_baselines(
     rev_names = _baseline_names(rev_config)
     _baseline_names(config)
     checks: dict[str, Any] = {}
-    prune_paths: dict[str, Path] = {}
     statuses: dict[str, str] = {}
     ignored_entries: dict[str, tuple[str, ...]] = {}
     for name, check in config.checks.items():
@@ -733,9 +703,8 @@ def _apply_baselines(
         checks[name] = replace(
             check, baseline=root / relative, effective_baseline=tuple(entries)
         )
-        prune_paths[name] = root / relative
     return (
-        replace(config, root=root, checks=checks, prune_paths=prune_paths),
+        replace(config, root=root, checks=checks),
         statuses,
         ignored_entries,
     )
@@ -893,69 +862,16 @@ def _capture_identity(trust: Trust) -> dict[str, Any]:
     }
 
 
-def checked_prune_path(root: Path, destination: Path) -> Path:
-    """Refuse a prune write that would leave the candidate."""
-    try:
-        relative = destination.relative_to(root).as_posix()
-    except ValueError:
-        raise UsageError(
-            f"{destination}: prune: expected a path inside the candidate "
-            f"root {root}"
-        ) from None
-    _candidate_parent(root, relative)
-    try:
-        mode = destination.lstat().st_mode
-    except OSError:
-        return destination
-    if not stat.S_ISREG(mode):
-        raise UsageError(
-            f"{destination}: prune: expected a regular file inside the "
-            f"candidate, got {_kind_name(mode)}"
-        )
-    return destination
-
-
-_UNWRITTEN = object()
-
-
-def _prune_source_is_file(entry: dict[str, Any]) -> bool:
-    return "rev_sha256" in entry and "candidate_sha256" in entry
-
-
-def _same_revision_files(old: dict[str, Any], new: dict[str, Any]) -> bool:
-    return (
-        _prune_source_is_file(old)
-        and _prune_source_is_file(new)
-        and old.get("rev_sha256") == new.get("rev_sha256")
-    )
-
-
-def _allowed_change(
-    old: Any, new: Any, written: Any
-) -> bool:
-    if written is _UNWRITTEN:
-        return old == new
-    old_entry = old or {}
-    new_entry = new or {}
-    return (
-        _same_revision_files(old_entry, new_entry)
-        and new_entry.get("candidate_sha256") == _sha256(written)
-    )
-
-
 def _protected_problems(
     before: dict[str, Any],
     after: dict[str, Any],
-    writes: dict[str, bytes | None],
 ) -> list[str]:
     old = before.get("protected", {})
     new = after.get("protected", {})
     return [
         f"protected input {name} changed during the run"
         for name in sorted(set(old) | set(new))
-        if not _allowed_change(
-            old.get(name), new.get(name), writes.get(name, _UNWRITTEN)
-        )
+        if old.get(name) != new.get(name)
     ]
 
 
@@ -982,10 +898,8 @@ def _section_problems(
 def _identity_problems(
     before: dict[str, Any],
     after: dict[str, Any],
-    writes: dict[str, bytes | None] | None = None,
 ) -> list[str]:
-    allow = writes or {}
-    protected = _protected_problems(before, after, allow)
+    protected = _protected_problems(before, after)
     effective = _section_problems(
         before, after, "effective_inputs", "effective input"
     )

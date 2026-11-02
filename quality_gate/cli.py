@@ -171,6 +171,10 @@ def _run_tools(args: Any) -> int:
 
 
 def _run_trusted_check(root: Path, args: Any) -> int:
+    if args.prune:
+        raise UsageError(
+            "qg.py: --prune: cannot be combined with --policy-from"
+        )
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
     return command_check(
         root,

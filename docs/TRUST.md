@@ -162,20 +162,9 @@ the run. The checks still run against the candidate and are reported in full.
 
 ## Prune under `--policy-from`
 
-`check --prune ID --policy-from DIR` writes the effective baseline, which
-is the trusted baseline tightened by the measurement: a `max` bound is
-lowered, a `min` floor is raised. It never adds an entry, loosens a bound, or keeps an
-entry that exists only in the candidate. A baseline path whose parent is a
-symlink inside the candidate is refused before the write.
-
-The gate validates the run identity after the checks and before this write. A
-protected input that changed during the checks fails the run (exit 2) and
-nothing is pruned, so a check cannot weaken a baseline and have pruning keep
-the weakened value. After the write, the pruned path may differ from its
-pre-prune content only by exactly the bytes the gate generated; any other
-difference fails the run naming the path. The written content is derived from
-the trusted baseline and the measurement, never from the candidate's loosened
-entries.
+`check --prune ID --policy-from DIR` is a usage error (exit 2) naming both
+options, before any check runs and before anything in the candidate is written.
+`--prune` without `--policy-from` is unchanged.
 
 ## Identity
 
@@ -191,16 +180,13 @@ Before any check runs, the gate records in `trust.identity_before`:
   tracking status, except the running interpreter's `__pycache__` directories).
 
 It enumerates the protected scope again after the checks, including ignored
-untracked files, and compares those facts before any prune write. Any protected
-path added, removed or changed under that scope, any effective input whose
-recorded value changed, and any pinned tool payload or gate file that changed
-during the run makes the decision `error` (exit 2) with a message naming what
-changed, and a requested prune writes nothing. The identity also tracks the
-candidate source of a baseline introduced by an authorized policy. Without a
-prune write `trust.identity_after` records that same
-snapshot; after a performed prune it records the identity captured once more
-after the write, where only the pruned path may differ and only by exactly the
-bytes the gate generated (see above). A missing tool install is recorded as
+untracked files, and compares those facts. Any protected path added, removed or
+changed under that scope, any effective input whose recorded value changed, and
+any pinned tool payload or gate file that changed during the run makes the
+decision `error` (exit 2) with a message naming what changed. The identity also
+tracks the candidate source of a baseline introduced by an authorized policy.
+`trust.identity_after` records the snapshot captured after the checks. A
+missing tool install is recorded as
 `null`; a tree that has no payload digest is recorded as `invalid`; a candidate
 path that is refused as a non-regular file is recorded as `refused`.
 

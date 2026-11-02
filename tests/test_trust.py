@@ -265,128 +265,34 @@ class BaselineTrustTests(TrustCase):
         self.assertEqual(entry["ignored_entries"], [])
         self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
 
-    def test_changed_effective_baseline_fails_identity_before_prune(self) -> None:
-        self.write_clones_baseline()
-        revision = self.directory_revision()
-        trust = prepare_trust(self.repo, revision, [])
-        self.addCleanup(trust.close)
-        check = trust.config.checks["clones"]
-        self.assertIsNotNone(check.effective_baseline)
-        entry = check.effective_baseline[0]
-        trust.config.checks["clones"] = replace(
-            check, effective_baseline=(replace(entry, bound=99),)
-        )
-        refusal = trust.before_prune()
-        self.assertIn(
-            "effective input baseline quality-gate-clones.toml", refusal
-        )
-        key = "baseline quality-gate-clones.toml"
-        self.assertNotEqual(
-            trust.identity_before["effective_inputs"][key],
-            trust.identity_after_checks["effective_inputs"][key],
-        )
 
-    def test_prune_through_a_symlinked_parent_is_refused(self) -> None:
-        self.write_config(with_clones(baseline="cfg/clones.toml"))
-        self.add_file(
-            "cfg/clones.toml",
-            baseline_text(
-                [
-                    {
-                        "subject": "fp1",
-                        "bound": 5,
-                        "files": list(CLONE_FILES),
-                        "reason": "reviewed mirror",
-                    }
-                ]
-            ),
-        )
-        revision = self.directory_revision()
-        outside = self.base / "outside"
-        outside.mkdir()
-        target = outside / "clones.toml"
-        (self.repo / "cfg" / "clones.toml").replace(target)
-        (self.repo / "cfg").rmdir()
-        (self.repo / "cfg").symlink_to(outside)
-        before = target.read_text(encoding="utf-8")
-        result, _document = self.trust_json(
-            revision, "--prune", "clones", env=self.clone_env()
-        )
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertIn("cfg/clones.toml", result.stderr)
-        self.assertEqual(target.read_text(encoding="utf-8"), before)
+class PruneTrustRefusalTests(TrustCase):
+    def candidate_files(self) -> dict[str, bytes]:
+        return {
+            path.relative_to(self.repo).as_posix(): path.read_bytes()
+            for path in self.repo.rglob("*")
+            if path.is_file()
+            and ".git" not in path.relative_to(self.repo).parts
+        }
 
-    def test_prune_refuses_a_parent_symlinked_during_the_run(self) -> None:
-        outside = self.base / "outside"
-        outside.mkdir()
-        sentinel = outside / "clones.toml"
-        sentinel.write_text("sentinel\n", encoding="utf-8")
-        writer = (
-            "import pathlib, shutil; "
-            "shutil.rmtree('cfg'); "
-            f"pathlib.Path('cfg').symlink_to({str(outside)!r}); "
-            "print(1)"
-        )
-        self.write_config(
-            with_clones(baseline="cfg/clones.toml").replace(
-                'run = ["python3", "-c", "print(1)"]',
-                f'run = [{json.dumps(sys.executable)}, "-c", '
-                f'{json.dumps(writer)}]',
-            )
-        )
-        self.add_file(
-            "cfg/clones.toml",
-            baseline_text(
-                [
-                    {
-                        "subject": "fp1",
-                        "bound": 5,
-                        "files": list(CLONE_FILES),
-                        "reason": "reviewed mirror",
-                    }
-                ]
-            ),
-        )
-        revision = self.directory_revision()
-        result, document = self.trust_json(
-            revision, "--prune", "clones", env=self.clone_env()
-        )
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertFalse(document["prune"]["performed"])
-        self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel\n")
-
-    def test_prune_writes_trusted_baseline_lowered(self) -> None:
+    def test_prune_with_policy_from_is_a_usage_error(self) -> None:
+        self.write_config(with_clones())
         self.write_clones_baseline(bound=5)
         revision = self.directory_revision()
-        self.add_file(
-            "quality-gate-clones.toml",
-            baseline_text(
-                [
-                    {
-                        "subject": "fp1",
-                        "bound": 9,
-                        "files": list(CLONE_FILES),
-                        "reason": "candidate raised it",
-                    },
-                    {
-                        "subject": "fp2",
-                        "bound": 1,
-                        "files": list(CLONE_FILES),
-                        "reason": "candidate addition",
-                    },
-                ]
-            ),
+        before = self.candidate_files()
+        result = self.run_qg(
+            "check",
+            "--prune",
+            "clones",
+            "--policy-from",
+            revision,
+            env=self.clone_env(),
         )
-        result, document = self.trust_json(
-            revision, "--prune", "clones", env=self.clone_env()
-        )
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertTrue(document["prune"]["performed"])
-        text = self.read_file("quality-gate-clones.toml")
-        self.assertIn('subject = "fp1"', text)
-        self.assertIn("bound = 1", text)
-        self.assertNotIn("fp2", text)
-        self.assertNotIn("bound = 9", text)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("--prune", result.stderr)
+        self.assertIn("--policy-from", result.stderr)
+        self.assertNotIn("check: inventory", result.stderr + result.stdout)
+        self.assertEqual(self.candidate_files(), before)
 
 
 class StubFloorTrustTests(TrustCase):
@@ -844,15 +750,6 @@ class IdentityDecisionTests(unittest.TestCase):
         self.assertEqual(merged, [floor])
         self.assertEqual(ignored, ("stub-subject",))
         self.assertFalse(tightened)
-
-    def test_trust_prune_identity_allows_only_the_exact_generated_bytes(self) -> None:
-        before = {"rev_sha256": "revision", "candidate_sha256": "old"}
-        written = b"trusted, tightened baseline"
-        after = {"rev_sha256": "revision", "candidate_sha256": trust._sha256(written)}
-        other = {"rev_sha256": "revision", "candidate_sha256": trust._sha256(b"altered")}
-        self.assertTrue(trust._allowed_change(before, after, written))
-        self.assertFalse(trust._allowed_change(before, other, written))
-        self.assertFalse(trust._allowed_change(before, {**after, "rev_sha256": "changed"}, written))
 
 
 class IdentityTrustTests(TrustCase):

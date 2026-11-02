@@ -20,7 +20,6 @@ from .policy import (
     Config,
     GateError,
     UnsupportedError,
-    UsageError,
 )
 from .ratchet import (
     BaselineEntry,
@@ -39,7 +38,6 @@ from .runner import (
     check_deadline,
     check_time,
 )
-from .trust import checked_prune_path
 
 
 RATCHET_BUDGET_SECONDS = 600
@@ -684,23 +682,15 @@ def _release_evidence(
     return cleanup_errors
 
 
-def _record_prune(
-    trust: Any, destination: Path, written: bytes | None
-) -> None:
-    if trust is not None:
-        trust.record_prune_write(destination, written)
-
-
 def _write_pruned(
     check: CheckDef,
     result: CheckResult,
     destination: Path,
-    trust: Any = None,
 ) -> tuple[bool, str | None]:
     existed = destination.exists()
     try:
         assert result.ratchet is not None
-        written = write_baseline(
+        write_baseline(
             destination,
             pruned_entries(result.ratchet),
             check_id=check.id,
@@ -709,7 +699,6 @@ def _write_pruned(
     except GateError as error:
         print(f"check: {check.id}: {error}", file=sys.stderr)
         return False, str(error)
-    _record_prune(trust, destination, written)
     if destination.exists():
         print(f"check: {check.id}: baseline updated at {destination}")
     elif existed:
@@ -725,20 +714,6 @@ def _prune_refusal(prune_id: str, requested: list[str]) -> dict[str, Any]:
         file=sys.stderr,
     )
     return {"requested": requested, "performed": False, "reason": reason}
-
-
-def _checked_prune_destination(
-    config: Config,
-    prune_id: str,
-    destination: Path,
-) -> tuple[Path | None, str | None]:
-    if prune_id not in config.prune_paths:
-        return destination, None
-    try:
-        return checked_prune_path(config.root, destination), None
-    except UsageError as error:
-        print(f"check: {prune_id}: {error}", file=sys.stderr)
-        return None, str(error)
 
 
 def _prune_check_result(
@@ -759,7 +734,6 @@ def _perform_prune(
     config: Config,
     requested: list[str],
     results: list[CheckResult],
-    trust: Any = None,
 ) -> dict[str, Any]:
     if not requested:
         return {"requested": [], "performed": False, "reason": None}
@@ -767,30 +741,20 @@ def _perform_prune(
     refusal = _prune_targets_refusal(results, ids, requested)
     if refusal is not None:
         return refusal
-    return _guarded_prune(config, ids, requested, results, trust)
-
-
-def _guarded_prune(
-    config: Config, ids: list[str], requested: list[str],
-    results: list[CheckResult], trust: Any,
-) -> dict[str, Any]:
-    if trust is not None:
-        reason = trust.before_prune()
-        if reason is not None:
-            return {"requested": requested, "performed": False, "reason": reason}
-    destinations, reason = _prune_destinations(config, ids)
-    if reason is not None:
-        return {"requested": requested, "performed": False, "reason": reason}
-    return _write_prune_set(config, results, requested, destinations, trust)
+    return _write_prune_set(
+        config, results, requested, _prune_destinations(config, ids)
+    )
 
 
 def _write_prune_set(
     config: Config, results: list[CheckResult], requested: list[str],
-    destinations: list[tuple[str, Path]], trust: Any,
+    destinations: list[tuple[str, Path]],
 ) -> dict[str, Any]:
     for identifier, destination in destinations:
         target = _prune_check_result(results, identifier)
-        performed, reason = _write_pruned(config.checks[identifier], target, destination, trust)
+        performed, reason = _write_pruned(
+            config.checks[identifier], target, destination
+        )
         if not performed:
             return {"requested": requested, "performed": False, "reason": reason}
     return {"requested": requested, "performed": True, "reason": None}
@@ -815,17 +779,13 @@ def _first_unsatisfied(results: list[CheckResult]) -> CheckResult | None:
 
 def _prune_destinations(
     config: Config, ids: list[str]
-) -> tuple[list[tuple[str, Path]], str | None]:
+) -> list[tuple[str, Path]]:
     destinations = []
     for identifier in ids:
         check = config.checks[identifier]
         assert check.baseline is not None
-        path = config.prune_paths.get(identifier, check.baseline)
-        destination, reason = _checked_prune_destination(config, identifier, path)
-        if destination is None:
-            return [], reason
-        destinations.append((identifier, destination))
-    return destinations, None
+        destinations.append((identifier, check.baseline))
+    return destinations
 
 
 def _builtin_failures(results: list[CheckResult]) -> list[str]:
@@ -996,7 +956,7 @@ def _finalize_check(
     prune_ids: list[str], trust: Any,
 ) -> tuple[int, dict[str, Any]]:
     obligations = gate_result.obligations(config, results)
-    prune_document = _perform_prune(config, prune_ids, results, trust)
+    prune_document = _perform_prune(config, prune_ids, results)
     configuration_error = next((result.reason for result in results if result.configuration_error), None)
     decision = "error" if configuration_error is not None else gate_result.decision(results, obligations)
     _print_decision(decision, configuration_error, results, obligations)
