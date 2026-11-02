@@ -1,95 +1,81 @@
 ---
 name: trust-root-change
-description: Checklist for changing the gate's trust root, protected inputs, baseline merge, prune or run identity.
-verified: 2026-11-01
-commit: af07f0e
-paths: docs/TRUST.md, docs/SCHEMA.md, quality-gate.toml, quality_gate/trust.py, quality_gate/cli.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/changes.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py, tests/test_changed.py
+description: Checklist for changing the gate's trusted directory, protected inputs, baseline merge or run identity.
+verified: 2026-11-02
+commit: 85b72352531e
+paths: docs/TRUST.md, docs/SCHEMA.md, quality-gate.toml, quality_gate/trust.py, quality_gate/cli.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py
 ---
 
 # Changing the trust root
 
-Trusted-input reads (`--policy-from REV|DIR` and `--changed-from REV`) treat the candidate working tree as
-untrusted. An absolute `--policy-from` is directory mode: a caller-extracted, read-only tree outside the
-candidate, read with plain file reads; `REV` mode and `--changed-from` still read Git objects. A green
-`make -k check` does not prove trust closure: the suite covers the probes below, but a new trust path needs
-its own adversarial test. Use this for `quality_gate/trust.py`, `cli.py`, `changes.py`, `covrun.py`,
-`[protect]` or identity/prune changes.
+`--policy-from DIR` is the only trust mode: a caller-extracted, read-only tree outside the candidate, read
+with plain file reads. QF115 deleted the revision reader, `--changed-from` and the gitlink comparison; QF116
+refuses `--prune` with `--policy-from`. A green `make -k check` does not prove trust closure: the suite covers
+the probes below, but a new trust path needs its own adversarial test. Use this for `quality_gate/trust.py`,
+`cli.py`, `[protect]`, identity or baseline-merge changes.
 
-1. **Read the contract.** `docs/TRUST.md` defines protected inputs, statuses, the baseline merge, directory
-   mode and identity; `docs/SCHEMA.md` has the `trust` result and exit codes. `tests/test_trust.py` builds
-   fixture repositories with `git init` for the `--policy-from` path; `tests/test_changed.py` does the same for
-   `--changed-from`. Follow their helpers. With `--policy-from`, `trust._refuse_inside` refuses a gate program
-   inside the candidate root, so run a trusted copy outside it. `_directory_source` treats every absolute
-   `--policy-from` as directory mode, resolves it, and refuses a missing directory or one inside the candidate;
-   `cli._run_trusted_check` refuses `--changed-from` in that mode. Directory mode compares files and globs only,
-   not a gitlink commit, so its caller checks a submodule pin. In `REV` mode a protected path may be a gitlink;
-   the candidate's index commit and checked-out HEAD must agree with the trusted tree, while a missing
-   uninitialized checkout is allowed. If a check depends on a configuration file, add that file to
-   `[protect] paths` and pass it explicitly (Ruff uses `--config ruff.toml`); otherwise a candidate changes tool
-   behavior without touching a protected input.
-2. **One Git policy, authenticated revision reads, plain directory reads.** `files.git_argv` builds every
-   command the gate runs on a candidate repository: `git --no-replace-objects -c safe.directory=ROOT -c
-   core.fsmonitor=false -C ROOT`; `trust._git`, `files._git` and `gate_result._git` call it, and `checks`,
-   `changes` and `worklist` use it directly for inventory/hygiene argv, worktree diffs, pack/clone and churn.
-   Every Git read of a trusted revision goes through `trust._TrustedRevision`: `prepare_trust` reads
-   `--policy-from REV` (resolved by `_commit`) and `changes.changed_lines` reads `--changed-from`. The
-   revision reader reads the resolved commit, walks each tree and reads each blob by id, hashes type, size and
-   content in the repository's object format and refuses a mismatch (exit 2, naming the object, its path and
-   the flag). `_commit` turns a `--policy-from` commit whose git resolution reports "hash mismatch" into the
-   shared "object content does not match its ID" diagnostic; `changes.resolve_revision` still resolves
-   `--changed-from` with `git rev-parse --verify` and does not normalize that text (deferred after QF110), so
-   a forged `--changed-from` commit is refused with Git's own wording. `_refuse_graft` runs before the
-   revision is read. Directory mode reads its trusted inputs with no Git command: `prepare_trust` skips
-   `_commit` and `_refuse_graft`, so `trust._TrustedTree` never consults a graft, replacement ref or candidate
-   object; candidate inventory still runs `git ls-files`. A new bare `git` call or a hand-built argument list
-   loses replacement-ref and fsmonitor isolation.
+1. **Read the contract.** `docs/TRUST.md` defines protected inputs, statuses, the baseline merge, the
+   directory and identity; `docs/SCHEMA.md` has the `trust` result and exit codes. `tests/test_trust.py`
+   builds fixture repositories and extracts a trusted directory with `trusted_directory`; follow its helpers.
+   `prepare_trust` resolves the candidate root, calls `_refuse_inside` so a gate program inside the candidate
+   is refused, then `_directory_source`: it requires an absolute path, resolves it, refuses a missing path, a
+   non-directory and a directory inside the candidate. A relative path or revision is "expected an absolute
+   trusted directory". With `--policy-from`, `cli._run_trusted_check` refuses `--prune` before `prepare_trust`;
+   the trusted check writes nothing into the candidate. If a check depends on a configuration file, add that
+   file to `[protect] paths` and pass it explicitly (Ruff uses `--config ruff.toml`); otherwise a candidate
+   changes tool behavior without touching a protected input.
+2. **One Git policy, no trusted input from the candidate's `.git`.** `files.git_argv` builds every command the
+   gate runs on a candidate repository: `git --no-replace-objects -c safe.directory=ROOT -c
+   core.fsmonitor=false -C ROOT`; `trust._git`, `files._git` and `gate_result._git` call it, and `checks` and
+   `worklist` use it directly for inventory/hygiene argv, pack/clone and churn. `trust._TrustedTree` reads
+   `DIR` with no Git command; candidate inventory still runs `git ls-files`. A new bare `git` call or a
+   hand-built argument list loses replacement-ref and fsmonitor isolation.
 3. **Candidate and trusted-tree reads are regular files.** `_open_candidate` opens with
    `O_NOFOLLOW|O_NONBLOCK`, and `_read_regular` requires `fstat` to report a regular file;
    `_candidate_parent` rejects a symlinked parent. `Path.read_text()` follows symlinks and can block on a FIFO;
-   do not use it for a protected input. `trust._TrustedTree.read` uses `_safe_join` and the same
+   do not use it for a protected input. `trust._TrustedTree` uses `_safe_join` and the same
    `O_NOFOLLOW|O_NONBLOCK` open, follows no symlink (a symlink reads as missing), walks no symlinked directory,
    caches only successful reads, and `digest()` hashes each read path, a NUL and the file SHA-256 in sorted
-   order.
+   order. `Trust.to_json` reports the directory path and that digest, never `policy_from`.
 4. **Use the subject's direction everywhere.** `load_baseline` and `evaluate` both set each
    `BaselineEntry.direction` with `ratchet.subject_direction`, which asks the adapter's
    `entry_direction(subject, configured)`, then its `default_direction`, then the policy's `direction`.
    `_evaluate_finding` asks the same rule before choosing `_min_verdict` or `_max_verdict`, and
-   `_merge_revision_entry`/`_prune_entry` read `entry.direction` rather than asking the adapter again. A merge or
-   prune that recomputed direction locally, or dropped a floor, loosens the ratchet (QF44). `_merge_revision_entry`
-   keeps a trusted `min` floor when the candidate omits it, applies a candidate removal only for `max`, and
-   preserves every trusted entry when the candidate baseline cannot be parsed. The merged tuple goes on
-   `CheckDef.effective_baseline`; `checks._baseline_entries` returns it first, and no check passes a baseline path
-   to a child process. An authorized policy's new baseline is read from the candidate, but still validated before
-   the checks.
-5. **Identity and prune.** `_capture_identity` runs before the checks and records `protected`,
-   `effective_inputs` (policy, lock, tool pins and each effective baseline digest), `tools` and `gate`.
-   `Trust.trusted` selects `_tree_protected_identity` (directory mode: file SHA-256 pairs only, `revision` is
-   `DIR`'s path) or `_revision_protected_identity` (gitlink kinds and commits too); directory mode's `to_json`
-   reports `{"path", "digest"}` instead of `policy_from`. When a prune is requested, `Trust.before_prune`
-   captures it again after the checks and must find no difference in any of those sections before anything is
-   written. `_write_pruned` records exactly the bytes
-   `write_baseline` returned with `Trust.record_prune_write`, and `Trust.finish` allows that write to change
-   only the path's `candidate_sha256` to the digest of those bytes; every other difference fails the run
-   naming the path. Do not reintroduce a path-wide or per-check exemption.
+   `_merge_revision_entry`/`_prune_entry` read `entry.direction` rather than asking the adapter again. A merge
+   or prune that recomputed direction locally, or dropped a floor, loosens the ratchet (QF44).
+   `_merge_revision_entry` keeps a trusted `min` floor when the candidate omits it, applies a candidate
+   removal only for `max`, and preserves every trusted entry when the candidate baseline cannot be parsed.
+   The merged tuple goes on `CheckDef.effective_baseline`; `checks._baseline_entries` returns it first, and no
+   check passes a baseline path to a child process. An authorized policy's new baseline is read from the
+   candidate, but still validated before the checks.
+5. **Identity and no trust writes.** `_capture_identity` runs before the checks and records `revision` (the
+   `DIR` path), `protected` file SHA-256 pairs, `effective_inputs` (policy, lock, tool pins and each effective
+   baseline digest), `tools` and `gate`. There is no revision or gitlink variant left: `_capture_identity`
+   always uses `_tree_protected_identity`, and `Trust.finish` records `identity_after` and compares it with
+   `_identity_problems`. Any protected or effective input, tool payload or gate file that changes during the
+   run makes the decision `error` (exit 2) naming it. `--prune` with `--policy-from` is a usage error before
+   the checks, and `_write_pruned` is the plain path used only without trust; do not reintroduce a trust
+   prune write, an identity exemption or `Config.prune_paths`.
 6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version,
    payload digest, gate-owned coverage config and registry directory as arguments and loads the
    standard-library `payload.py` by file path, so the measured interpreter never imports `quality_gate` (QF7).
    Do not move that verifier into the package import graph or start a nested verifier interpreter.
-   `payload.PayloadError` is a plain exception, not a `GateError`;
-   each caller that reads a payload catches it at its own boundary and converts it to that boundary's error;
-   `tools._build_install` raises `UsageError` (exit 2) for an unreadable build tree, and `command_tools_fetch`
-   returns `error.exit_code`.
-7. **Probe the cases.** Cover a replacement ref (`git replace A B`, checked with `git --no-replace-objects
-   show A:FILE`), an `info/grafts` file, a forged trusted object (a loose policy blob, a tree and a baseline
-   blob are refused with exit 2 naming the object and path; `--changed-from` base blobs and trees go through
-   the same reader, but a forged `--changed-from` commit still shows Git's "hash mismatch" text), an
-   unmodified repository with packed objects, a candidate that omits a `min` floor, a malformed candidate
-   baseline, a protected symlink, FIFO and symlinked parent, a prune through a symlinked parent, a protected
-   file created during a check, a check that rewrites an authorized baseline then requests a prune, a gate
-   program inside the candidate, a moved or inconsistent protected gitlink, a candidate `ruff.toml` that
-   weakens lint, and a candidate repository with `core.fsmonitor` set (record it with a marker file). For
-   directory mode, cover the same verdict as `REV` for a loosened baseline, a protected file and an authorized
-   replacement; a forged candidate policy blob (the directory's policy still wins); a missing directory and one
-   inside the candidate (exit 2); `--changed-from` with `DIR` (exit 2); and a symlinked policy or protected file
-   inside `DIR` (not followed). Run `python3 -I -m unittest discover -s tests -p 'test_trust.py'`, `python3 -I
-   -m unittest discover -s tests -p 'test_changed.py'`, then `make -k check`.
+   `payload.PayloadError` is a plain exception, not a `GateError`; each caller that reads a payload catches it
+   at its own boundary and converts it to that boundary's error; `tools._build_install` raises `UsageError`
+   (exit 2) for an unreadable build tree, and `command_tools_fetch` returns `error.exit_code`.
+7. **Probe the cases.** Cover a loosened and a tightened baseline, a candidate that omits a `min` floor, a
+   malformed candidate baseline, a protected file that is blocked or authorized, a protected symlink, FIFO and
+   symlinked parent, a protected file created or changed during a check, an authorized policy and lock, a
+   replaced object in the candidate store (the directory still wins), a candidate `ruff.toml` that weakens
+   lint, a candidate repository with `core.fsmonitor` set (record it with a marker file), a missing directory
+   and one inside the candidate, `--policy-from` with a relative path, `HEAD` and a commit id (exit 2), the
+   unknown `--changed-from`, and a symlinked policy or protected file inside `DIR` (not followed). Cover the
+   prune refusal with `--prune ID --policy-from DIR`: exit 2, both names in stderr, and every candidate file
+   byte-identical. Run `python3 -I -m unittest discover -s tests -p 'test_trust.py'` and the same for
+   `test_inventory.py`, then `test_verification.py`/`test_ratchet.py` when the merge or identity changes; the
+   owner runs the full gate and mutation.
+8. **Deleting a trust feature.** Delete the feature's `tests/mutate_gate.py` `Decision`, the tests that
+   reached it, and every doc/result field only it set; then grep outside `.agents` for each named symbol.
+   Replace its tests with directory-form tests that still reach and kill the remaining trust decisions. For a
+   new refusal, remove the guard in a disposable copy and confirm the refusal test fails at the guard
+   assertion, not at a later symptom.
