@@ -21,6 +21,7 @@ from .policy import (
     Config,
     GateError,
     UnsupportedError,
+    UsageError,
 )
 from .ratchet import (
     BaselineEntry,
@@ -365,6 +366,40 @@ def _test_check_dependencies(
     ]
 
 
+def _require_distinct(command: str, identifiers: list[str]) -> None:
+    seen: set[str] = set()
+    for identifier in identifiers:
+        if identifier in seen:
+            raise UsageError(f"qg.py {command}: duplicate check id {identifier!r}")
+        seen.add(identifier)
+
+
+def _required(config: Config, check: CheckDef) -> list[str]:
+    descriptor = adapter_for(check.adapter)
+    assert descriptor is not None
+    if descriptor.requires_tests:
+        prior: dict[str, CheckDef] = {}
+        for candidate in config.checks.values():
+            if candidate.id == check.id:
+                break
+            prior[candidate.id] = candidate
+        return _test_check_dependencies(check, prior)
+    required = getattr(check.spec, "requires", None)
+    return [required] if required is not None else []
+
+
+def _needed_order(config: Config, selected: list[CheckDef]) -> list[str]:
+    needed = {check.id for check in selected}
+    for check in reversed(list(config.checks.values())):
+        if check.id in needed:
+            needed.update(_required(config, check))
+    return _policy_order(config, needed)
+
+
+def _policy_order(config: Config, needed: set[str]) -> list[str]:
+    return [identifier for identifier in config.checks if identifier in needed]
+
+
 def _check_descriptor(check: CheckDef) -> Any:
     descriptor = adapter_for(check.adapter)
     if descriptor is None:
@@ -547,9 +582,9 @@ def _prune_option_error(
     )
 
 
-def _run_limit(config: Config) -> float:
+def _run_limit(selected_checks: Iterable[CheckDef]) -> float:
     return (
-        sum(_check_budget(check) for check in config.checks.values())
+        sum(_check_budget(check) for check in selected_checks)
         + RUN_ALLOWANCE_SECONDS
     )
 
@@ -574,14 +609,17 @@ def _run_policy_checks(
     files: list[str],
     classes: dict[str, str],
     inventory_code: int,
+    selected_ids: list[str] | None = None,
 ) -> list[CheckResult]:
+    selected = list(config.checks) if selected_ids is None else selected_ids
+    selected_checks = [config.checks[identifier] for identifier in selected]
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
-    last_users = _evidence_last_users(config.checks.values())
-    previous = _arm_run_limit(_run_limit(config))
+    last_users = _evidence_last_users(selected_checks)
+    previous = _arm_run_limit(_run_limit(selected_checks))
     try:
         try:
-            for check in config.checks.values():
+            for check in selected_checks:
                 if inventory_code != 0:
                     print(
                         f"check: {check.id}: skipped because inventory failed",
@@ -790,8 +828,9 @@ def _result_document(
     obligations: list[dict[str, Any]],
     prune: dict[str, Any],
     trust: Any = None,
+    selected: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    document = {
         "schema": 2,
         "gate_version": gate_result.gate_version(),
         "revision": gate_result.consumer_revision(root),
@@ -805,6 +844,9 @@ def _result_document(
         "obligations": obligations,
         "prune": prune,
     }
+    if selected is not None:
+        document["selected"] = list(selected)
+    return document
 
 
 def _prune_id_problem(config: Config, prune_id: str) -> str | None:
@@ -897,6 +939,8 @@ def _print_decision(
             f"check: passed with exceptions ({len(results)} checks)",
             flush=True,
         )
+    elif decision == "partial":
+        print(f"check: partial run passed ({len(results)} checks)", flush=True)
     else:
         print(f"check: passed ({len(results)} checks)", flush=True)
 
@@ -905,27 +949,58 @@ def _print_decision(
 def _decision_exit_code(decision: str, prune_ids: list[str], prune: dict[str, Any]) -> int:
     if decision == "error":
         return 2
-    if decision not in ("accepted", "accepted_with_exceptions"):
+    if decision not in ("accepted", "accepted_with_exceptions", "partial"):
         return 1
     return 1 if prune_ids and not prune["performed"] else 0
 
 
+def _check_decision(
+    results: list[CheckResult],
+    obligations: list[dict[str, Any]],
+    partial: bool,
+) -> tuple[str, str | None]:
+    configuration_error = next(
+        (result.reason for result in results if result.configuration_error), None
+    )
+    if configuration_error is not None:
+        return "error", configuration_error
+    return gate_result.decision(results, obligations, partial=partial), None
+
+
 def _finalize_check(
     root: Path, config: Config, results: list[CheckResult],
-    prune_ids: list[str], trust: Any,
+    prune_ids: list[str], trust: Any, selected: list[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    obligations = gate_result.obligations(config, results)
+    partial = selected is not None
+    obligations = [] if partial else gate_result.obligations(config, results)
     prune_document = _perform_prune(config, prune_ids, results)
-    configuration_error = next((result.reason for result in results if result.configuration_error), None)
-    decision = "error" if configuration_error is not None else gate_result.decision(results, obligations)
+    decision, configuration_error = _check_decision(results, obligations, partial)
     _print_decision(decision, configuration_error, results, obligations)
     exit_code = _decision_exit_code(decision, prune_ids, prune_document)
     document = _result_document(
-        root, config, decision, results, obligations, prune_document, trust
+        root, config, decision, results, obligations, prune_document, trust,
+        selected,
     )
     if configuration_error is not None:
         document["error"] = configuration_error
     return exit_code, document
+
+
+def _reject_unknown_checks(config: Config, identifiers: list[str]) -> None:
+    known = ", ".join(config.checks) or "none"
+    for identifier in identifiers:
+        if identifier not in config.checks:
+            raise UsageError(
+                f"qg.py check: unknown check {identifier!r}; known checks: {known}"
+            )
+
+
+def _selected_check_ids(config: Config, only_ids: list[str] | None) -> list[str] | None:
+    if only_ids is None:
+        return None
+    _require_distinct("check", only_ids)
+    _reject_unknown_checks(config, only_ids)
+    return _needed_order(config, [config.checks[identifier] for identifier in only_ids])
 
 
 def _check_command(
@@ -933,14 +1008,18 @@ def _check_command(
     config: Config,
     prune_ids: list[str],
     trust: Any = None,
+    only_ids: list[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     problem = _prune_request_problem(config, prune_ids)
     if problem is not None:
         return _prune_option_error(root, config, prune_ids, problem)
+    selected = _selected_check_ids(config, only_ids)
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
-    results.extend(_run_policy_checks(root, config, files, classes, code))
-    return _finalize_check(root, config, results, prune_ids, trust)
+    results.extend(
+        _run_policy_checks(root, config, files, classes, code, selected)
+    )
+    return _finalize_check(root, config, results, prune_ids, trust, selected)
 
 
 def _run_check_document(
@@ -949,11 +1028,12 @@ def _run_check_document(
     prune_ids: list[str],
     json_output: bool,
     trust: Any = None,
+    only_ids: list[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     if not json_output:
-        return _check_command(root, config, prune_ids, trust)
+        return _check_command(root, config, prune_ids, trust, only_ids)
     with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_ids, trust)
+        return _check_command(root, config, prune_ids, trust, only_ids)
 
 
 def command_check(
@@ -962,18 +1042,19 @@ def command_check(
     *,
     json_output: bool = False,
     prune_ids: list[str] | None = None,
+    only_ids: list[str] | None = None,
     trust: Any = None,
 ) -> int:
     requested = prune_ids or []
     if trust is None:
         code, document = _run_check_document(
-            root, config, requested, json_output
+            root, config, requested, json_output, only_ids=only_ids
         )
     else:
         try:
             with trust.activate():
                 code, document = _run_check_document(
-                    root, config, requested, json_output, trust
+                    root, config, requested, json_output, trust, only_ids
                 )
             code, document = trust.finish(code, document)
         finally:

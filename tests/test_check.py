@@ -69,6 +69,47 @@ SLEEP_STUB = adapters.AdapterDescriptor(
 )
 
 
+def _parse_requires(raw, root, path, full_key):
+    required = policy._string(raw, "requires", path, f"{full_key}.requires")
+    return adapters.ParsedSpec(
+        SimpleNamespace(requires=required), "requires/1", ("static",),
+        requires=required,
+    )
+
+
+def _run_requires(context):
+    return stub_check_result(context.check, 60)
+
+
+REQUIRES_STUB = adapters.AdapterDescriptor(
+    "requires-stub", ("requires",), _parse_requires, _run_requires,
+)
+
+
+def _two_check_config(lint_run: str = '["python3", "-c", "print(1)"]') -> str:
+    return BASE_CONFIG.replace(
+        'checks = ["smoke"]', 'checks = ["smoke", "lint"]'
+    ) + (
+        '\n[checks.lint]\nadapter = "command"\ntier = 1\n'
+        'enforcement = "enforced"\n'
+        f"run = {lint_run}\n"
+        "tests_pattern = '(\\d+)'\n"
+    )
+
+
+def _prerequisite_config() -> str:
+    return BASE_CONFIG.replace(
+        'checks = ["smoke"]', 'checks = ["tests", "verify"]'
+    ) + (
+        '\n[checks.tests]\nadapter = "command"\ntier = 1\n'
+        'enforcement = "enforced"\n'
+        'run = ["python3", "-c", "print(1)"]\n'
+        "tests_pattern = '(\\d+)'\n\n"
+        '[checks.verify]\nadapter = "requires-stub"\ntier = 1\n'
+        'enforcement = "enforced"\nrequires = "tests"\n'
+    )
+
+
 def _sleep_config(entries):
     names = ", ".join(json.dumps(name) for name, _sleep, _budget in entries)
     lines = [
@@ -242,6 +283,7 @@ class CheckTests(FixtureCase):
         inventory = self.check_by_id(document, "inventory")
         self.assertEqual(inventory["outcome"], "fail")
         self.assertIn("unclassified", inventory["reason"])
+        self.assertNotIn("selected", document)
 
     def test_in_process_diagnostics_keep_the_last_four_kib(self) -> None:
         messages = [f"{index:04d} " + "x" * 100 for index in range(100)]
@@ -263,6 +305,88 @@ class CheckTests(FixtureCase):
             "check: clones: skipped because inventory failed",
             "check: failed (inventory, smoke, clones, obligation python tier 1)",
         )
+
+
+class PartialRunTests(FixtureCase):
+    def test_only_runs_inventory_hygiene_and_the_named_check(self) -> None:
+        self.write_config(_two_check_config())
+        result, document = self.run_json("--only", "smoke")
+        text = output(result)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("check: inventory", text)
+        self.assertIn("check: hygiene", text)
+        self.assertIn("check: smoke (command)", text)
+        self.assertNotIn("check: lint (command)", text)
+        self.assertEqual(document["decision"], "partial")
+        self.assertEqual(document["selected"], ["smoke"])
+        self.assertEqual(document["obligations"], [])
+        self.assertIn("check: partial run passed (3 checks)", text)
+
+    def test_a_selected_failing_check_is_rejected(self) -> None:
+        self.write_config(
+            _two_check_config('["python3", "-c", "raise SystemExit(1)"]')
+        )
+        result, document = self.run_json("--only", "lint")
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["selected"], ["lint"])
+        self.assertEqual(document["obligations"], [])
+
+    def test_a_selected_check_runs_its_prerequisite_first(self) -> None:
+        self.write_config(_prerequisite_config())
+        with mock.patch.dict(adapters.ADAPTERS, {REQUIRES_STUB.name: REQUIRES_STUB}):
+            result, document = self.run_json("--only", "verify")
+        text = output(result)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("check: tests (command)", text)
+        self.assertIn("check: verify (requires-stub)", text)
+        self.assertLess(
+            text.index("check: tests (command)"),
+            text.index("check: verify (requires-stub)"),
+        )
+        self.assertEqual(document["decision"], "partial")
+        self.assertEqual(document["selected"], ["tests", "verify"])
+
+
+class PartialRunArgumentTests(FixtureCase):
+    def test_unknown_check_id_exits_two_before_any_check(self) -> None:
+        self.write_config(_two_check_config())
+        result = self.run_qg("check", "--only", "nope")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("unknown check 'nope'", text)
+        self.assertNotIn("check: inventory", text)
+
+    def test_repeated_check_id_exits_two_before_any_check(self) -> None:
+        self.write_config(_two_check_config())
+        result = self.run_qg("check", "--only", "smoke", "smoke")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("duplicate check id 'smoke'", text)
+        self.assertNotIn("check: inventory", text)
+
+    def test_only_with_prune_exits_two_before_any_check(self) -> None:
+        self.write_config(_two_check_config())
+        result = self.run_qg("check", "--only", "smoke", "--prune", "smoke")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("--only", text)
+        self.assertIn("--prune", text)
+        self.assertNotIn("check: inventory", text)
+
+    def test_only_with_policy_from_exits_two_before_any_check(self) -> None:
+        self.write_config(_two_check_config())
+        self.commit_all()
+        trusted = self.trusted_directory("HEAD")
+        result = self.run_qg(
+            "check", "--only", "smoke", "--policy-from", str(trusted)
+        )
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertIn("--only", text)
+        self.assertIn("--policy-from", text)
+        self.assertNotIn("check: inventory", text)
 
 
 class EvidenceCleanupTests(FixtureCase):
@@ -453,6 +577,18 @@ class RunLimitTests(FixtureCase):
         self.assert_run_limit(
             [("first", 0, 1), ("second", 30, 2)], 4, "second", 1
         )
+
+    def test_a_partial_run_limit_sums_only_the_selected_checks(self) -> None:
+        self.write_config(
+            _sleep_config([("sleep", 30, 1), ("unselected", 0, 100)])
+        )
+        started = time.monotonic()
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
+            code, stdout, stderr = self.run_cli("check", "--only", "sleep")
+        self.assertEqual(code, 2, stderr)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn("1 s limit", stderr)
+        self.assertNotIn("unselected", stdout)
 
     @staticmethod
     def _handler(_signum: int, _frame: object) -> None:

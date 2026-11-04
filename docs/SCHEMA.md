@@ -414,10 +414,13 @@ Top-level keys:
 * `policy_sha256` - the effective policy file's SHA-256, or null. With
   `--policy-from` and an unauthorized candidate policy, this is the trusted
   directory's policy; an authorized replacement is the candidate's.
-* `decision` - `accepted`, `accepted_with_exceptions`, `rejected`,
-  `blocked` or `error`.
+* `decision` - `accepted`, `accepted_with_exceptions`, `partial`,
+  `rejected`, `blocked` or `error`.
 * `checks` - inventory, hygiene and every configured check, in that order.
-* `obligations` - one entry per code class and required tier.
+* `obligations` - one entry per code class and required tier; empty on a
+  partial run.
+* `selected` - present only on a `check --only` result: the ids that ran, in
+  policy order, prerequisites included.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
 * `trust` - present only on a `--policy-from` result; see below.
@@ -547,9 +550,12 @@ Obligation status is `satisfied`, `exempted` (with `reason`) or
 the checks that counted.
 
 The decision is `rejected` when inventory or hygiene fails, when an enforced
-check is not satisfied, or when any obligation is `unsatisfied`.
-`accepted_with_exceptions` means every obligation and enforced check is
-satisfied, but a baseline exception or a non-passing advisory check exists.
+check is not satisfied, or when any obligation is `unsatisfied`. A
+`check --only` run evaluates no obligations; it is `rejected` when inventory,
+hygiene or any enforced check that ran is not satisfied, and `partial` (exit
+0) otherwise. `accepted_with_exceptions` means every obligation and enforced
+check is satisfied, but a baseline exception or a non-passing advisory check
+exists.
 `blocked` (exit 1, trust runs only) means an unauthorized protected path other
 than the policy, a baseline or the tools lock differs from the trusted
 directory; the checks still ran and are reported. `error` (exit 2) is invalid policy, usage,

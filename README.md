@@ -566,6 +566,7 @@ The default tools directory is shared by every repository using the gate on this
 
     python3 -I qg.py check
     python3 -I qg.py check --json
+    python3 -I qg.py check --only ruff clones
     python3 -I qg.py check --prune clones
     python3 -I qg.py check --prune clones --prune verification
     python3 -I qg.py check --prune all
@@ -577,10 +578,18 @@ prints progress on stdout and failures on stderr. When inventory fails, configur
 as skipped and the combined check still fails; hygiene still runs. Configuration errors exit 2 before
 any check starts.
 
+`check --only CHECK [CHECK ...]` runs inventory and hygiene, then exactly those checks and the checks
+they require, in policy order. Nothing else runs. An unknown or repeated check id is a usage error
+(exit 2) naming it, before any check runs. A partial run never prunes and never runs under a trusted
+directory: `--only` with `--prune` or with `--policy-from` is a usage error (exit 2) naming both
+options, before any check runs. A partial run is never a verdict on the tree; use the full `check` for
+that.
+
 `check --json` writes exactly one JSON result to stdout and sends all human-readable lines to stderr.
 The result schema is `2`; a `--policy-from` result is schema `3` and adds `trust` (see below). Its
 top-level keys are `schema`, `gate_version`, `revision`, `dirty`, `policy_sha256`, `decision`,
-`checks`, `obligations` and `prune`; a `decision = "error"` document also has `error`.
+`checks`, `obligations` and `prune`; a `decision = "error"` document also has `error`, and a
+`check --only` document has `selected`.
 
 `checks` contains inventory, hygiene and every configured check, in that order. Each check has `id`,
 `kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
@@ -617,6 +626,10 @@ are all zombies counts as stopped, because a zombie cannot run and a container's
 it. Termination and reaping can add a small amount of time after the budget. Check output is captured
 up to 1 MiB; later bytes are counted and discarded. A consumer therefore never has to parse stderr to
 learn why a check failed.
+
+A partial run's `selected` lists the check ids that ran, in policy order, prerequisites included. It
+has no `selected` key on a full run. A partial run evaluates no obligations, so its `obligations` is
+empty.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`, `locations` and `expired`; baseline
@@ -706,9 +719,12 @@ naming both options, before any check runs; `--prune` without `--policy-from` is
 
 The decision is `error` (exit 2) for invalid policy, usage or configuration, or when the run exceeds
 its limit, `rejected` (exit 1) when
-inventory, hygiene, any enforced check or any obligation is not satisfied, `accepted_with_exceptions`
-(exit 0) when every obligation and enforced check is satisfied but at least one finding passes only through
-a baseline entry or an advisory check does not pass, and `accepted` (exit 0) otherwise. With `--json`,
+inventory, hygiene, any enforced check or any obligation is not satisfied, `partial` (exit 0) when a
+`--only` run's inventory, hygiene and every enforced check that ran are satisfied, and
+`accepted_with_exceptions` (exit 0) when every obligation and enforced check is satisfied but at least
+one finding passes only through a baseline entry or an advisory check does not pass, and `accepted`
+(exit 0) otherwise. A partial run evaluates no obligations, so its rejection depends only on the checks
+that ran. With `--json`,
 usage errors (unknown options, bad arguments) still write one error document with `decision = "error"`
 and exit 2. An argument containing NUL is a configuration error.
 

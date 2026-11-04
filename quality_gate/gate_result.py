@@ -190,14 +190,25 @@ def _has_exceptions(results: list[Any]) -> bool:
     )
 
 
-def decision(results: Iterable[Any], obligations: Iterable[Any]) -> str:
-    results = list(results)
-    if not (
+def _run_passes(results: list[Any], obligations: Iterable[Any]) -> bool:
+    return (
         _builtins_pass(results)
         and _enforced_checks_pass(results)
         and all(item["status"] != "unsatisfied" for item in obligations)
-    ):
+    )
+
+
+def decision(
+    results: Iterable[Any],
+    obligations: Iterable[Any],
+    *,
+    partial: bool = False,
+) -> str:
+    results = list(results)
+    if not _run_passes(results, [] if partial else obligations):
         return "rejected"
+    if partial:
+        return "partial"
     return "accepted_with_exceptions" if _has_exceptions(results) else "accepted"
 
 

@@ -18,8 +18,9 @@ from .checks import (
     CheckResult,
     _evidence_last_users,
     _inventory_check,
+    _needed_order,
     _release_evidence,
-    _test_check_dependencies,
+    _require_distinct,
     run_check,
 )
 from .files import _type_name, enumerate_files, git_argv
@@ -122,47 +123,13 @@ def _requested_check(config: Config, identifier: str) -> CheckDef:
     return check
 
 
-def _require_distinct(identifiers: list[str]) -> None:
-    seen: set[str] = set()
-    for identifier in identifiers:
-        if identifier in seen:
-            raise UsageError(f"qg.py worklist: duplicate check id {identifier!r}")
-        seen.add(identifier)
-
-
 def _select_checks(config: Config, identifiers: list[str]) -> list[CheckDef]:
-    _require_distinct(identifiers)
+    _require_distinct("worklist", identifiers)
     if identifiers:
         return [
             _requested_check(config, identifier) for identifier in identifiers
         ]
     return [check for check in config.checks.values() if _qualifies(check)]
-
-
-def _required(config: Config, check: CheckDef) -> list[str]:
-    descriptor = adapter_for(check.adapter)
-    assert descriptor is not None
-    if descriptor.requires_tests:
-        prior: dict[str, CheckDef] = {}
-        for candidate in config.checks.values():
-            if candidate.id == check.id:
-                break
-            prior[candidate.id] = candidate
-        return _test_check_dependencies(check, prior)
-    required = getattr(check.spec, "requires", None)
-    return [required] if required is not None else []
-
-
-def _needed_order(config: Config, selected: list[CheckDef]) -> list[str]:
-    needed = {check.id for check in selected}
-    for check in reversed(list(config.checks.values())):
-        if check.id in needed:
-            needed.update(_required(config, check))
-    return _policy_order(config, needed)
-
-
-def _policy_order(config: Config, needed: set[str]) -> list[str]:
-    return [identifier for identifier in config.checks if identifier in needed]
 
 
 def _expect_git(result: RunResult, action: str) -> None:

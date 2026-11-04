@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="write one JSON result document to stdout",
     )
     check.add_argument(
+        "--only",
+        metavar="CHECK",
+        nargs="+",
+        help="run only these checks and their prerequisites as a partial run",
+    )
+    check.add_argument(
         "--prune",
         metavar="ID|all",
         action="append",
@@ -145,6 +151,7 @@ def _reject_nul(raw: list[str]) -> None:
 
 
 def _dispatch(root: Path, config: Any, args: Any) -> int:
+    _reject_partial_options(args)
     if args.command == "inventory":
         return command_inventory(root, config, args.list_class)
     if args.command == "hygiene":
@@ -156,6 +163,7 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         config,
         json_output=args.json,
         prune_ids=args.prune,
+        only_ids=args.only,
     )
 
 
@@ -171,6 +179,7 @@ def _run_tools(args: Any) -> int:
 
 
 def _run_trusted_check(root: Path, args: Any) -> int:
+    _reject_partial_options(args)
     if args.prune:
         raise UsageError(
             "qg.py: --prune: cannot be combined with --policy-from"
@@ -181,6 +190,7 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         trust.config,
         json_output=args.json,
         prune_ids=args.prune,
+        only_ids=args.only,
         trust=trust,
     )
 
@@ -199,6 +209,15 @@ def _run_trusted_inventory(root: Path, args: Any) -> int:
         return code
     finally:
         trust.close()
+
+
+def _reject_partial_options(args: Any) -> None:
+    if not getattr(args, "only", None):
+        return
+    if args.prune:
+        raise UsageError("qg.py: --only: cannot be combined with --prune")
+    if args.policy_from is not None:
+        raise UsageError("qg.py: --only: cannot be combined with --policy-from")
 
 
 def _run_gate(root: Path, args: Any) -> int:
