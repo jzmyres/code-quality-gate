@@ -358,6 +358,15 @@ class MutationRunnerTests(unittest.TestCase):
         self.assertEqual(report.outcomes[0].status, "killed")
         self.assertIn("return False", original.read_text(encoding="utf-8"))
 
+    def test_every_declared_decision_resolves_in_the_repository(self) -> None:
+        prepared = mutation._prepare(GATE, mutation.DECISIONS)
+        self.assertEqual([decision for decision, _source in prepared], list(mutation.DECISIONS))
+        for decision, mutated in prepared:
+            original = (GATE / decision.module).read_text(encoding="utf-8")
+            self.assertNotEqual(
+                mutated, original, f"{decision.name}: mutation did not change {decision.module}"
+            )
+
     def test_no_mutation_names_the_declared_function(self) -> None:
         self.source("def decision():\n    return 1\n")
         report = self.run_fixture(self.decision("no_mutation", "decision", "return 1"))

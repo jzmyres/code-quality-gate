@@ -1106,8 +1106,9 @@ This design changes these guarantees:
 To protect another decision, add a named `Decision` to the list with its module, function, operator,
 exact source expression or statement, and a reason. The target must identify exactly one applicable
 node in that function; missing functions, ambiguous targets and decisions that yield no mutation fail
-closed. Add a test that would fail for that fault, then run `make mutation` to confirm the mutant is
-killed.
+closed. The ordinary suite checks that every declared decision resolves, so a change that moves a
+target fails `make check` too. Add a test that would fail for that fault, then run `make mutation` to
+confirm the mutant is killed.
 
 ## Continuous integration
 
