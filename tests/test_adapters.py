@@ -10,7 +10,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from support import GATE, baseline_text, stub_check_result
@@ -182,15 +181,6 @@ class AdapterRegistrationTests(unittest.TestCase):
     def test_descriptor_has_no_language_version_fields(self) -> None:
         fields = {field.name for field in dataclasses.fields(adapters.AdapterDescriptor)}
         self.assertFalse({"minimum_emacs_version", "emacs_version", "minimum_python_version"} & fields)
-
-    def test_arguments_use_only_declared_fields(self) -> None:
-        spec = SimpleNamespace(run=("ignored",), emacs="ignored", launch=("tool", "--flag"),
-                               path="some/path")
-        for fields, expected in (((), []), (("launch",), ["tool", "--flag"]),
-                                 (("path", "launch"), ["some/path", "tool", "--flag"])):
-            with self.subTest(fields=fields):
-                descriptor = dataclasses.replace(STUB, argument_fields=fields)
-                self.assertEqual(list(descriptor.arguments(spec)), expected)
 
     def test_fixed_or_configured_defaults_register_without_subject_rule(self) -> None:
         for default in (None, "max", "min"):

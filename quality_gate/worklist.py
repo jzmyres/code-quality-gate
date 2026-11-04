@@ -3,17 +3,11 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
-import shutil
-import stat
 import sys
-import tempfile
-from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .adapters import adapter_for
 from .checks import (
     CheckResult,
     _inventory_check,
@@ -21,7 +15,7 @@ from .checks import (
     _require_distinct,
     _run_policy_checks,
 )
-from .files import _type_name, enumerate_files, git_argv
+from .files import git_argv
 from .policy import CheckDef, Config, GateError, UsageError
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
 from .runner import RunResult, run
@@ -128,130 +122,6 @@ def _select_checks(config: Config, identifiers: list[str]) -> list[CheckDef]:
             _requested_check(config, identifier) for identifier in identifiers
         ]
     return [check for check in config.checks.values() if _qualifies(check)]
-
-
-def _expect_git(result: RunResult, action: str) -> None:
-    if result.execution != "completed" or result.returncode != 0:
-        detail = (
-            result.stderr_text.strip() or result.error
-            or f"{result.execution} (exit {result.returncode})"
-        )
-        raise GateError(f"{action}: {detail}")
-
-
-def _copy_git_path(root: Path, name: str) -> Path:
-    result = run(
-        git_argv(root, "rev-parse", "--path-format=absolute", "--git-path", name),
-        budget_seconds=GIT_BUDGET_SECONDS, capture_limit=None,
-    )
-    _expect_git(result, f"cannot locate Git {name}")
-    return Path(os.fsdecode(result.stdout).rstrip("\n"))
-
-
-def _copy_index_objects(root: Path, destination: Path) -> None:
-    pack = destination / ".git" / "objects" / "pack" / "worklist-index"
-    result = run(
-        git_argv(root, "pack-objects", "--revs", "--indexed-objects", "--non-empty",
-                 "--quiet", str(pack)),
-        budget_seconds=600,
-    )
-    _expect_git(result, "cannot copy staged Git objects")
-
-
-def _clone_repository(root: Path, destination: Path) -> None:
-    result = run(
-        git_argv(root, "clone", "--quiet", "--no-local", "--no-hardlinks", "--no-checkout",
-                 "--", str(root), str(destination)),
-        budget_seconds=600,
-    )
-    _expect_git(result, "cannot copy Git repository")
-
-
-def _copy_index(root: Path, destination: Path) -> None:
-    index = _copy_git_path(root, "index")
-    if index.exists():
-        _copy_index_objects(root, destination)
-        shutil.copy2(index, destination / ".git" / "index")
-        for shared in index.parent.glob("sharedindex.*"):
-            shutil.copy2(shared, destination / ".git" / shared.name)
-
-
-def _copy_exclude(root: Path, destination: Path) -> None:
-    exclude = _copy_git_path(root, "info/exclude")
-    if exclude.exists():
-        shutil.copy2(exclude, destination / ".git" / "info" / "exclude")
-
-
-def _enumeration_config(root: Path, key: str) -> str | None:
-    value_type = "--path" if key == "core.excludesFile" else "--bool"
-    result = run(
-        git_argv(root, "config", "--null", value_type, "--get", key),
-        budget_seconds=GIT_BUDGET_SECONDS, capture_limit=None,
-    )
-    if result.execution == "completed" and result.returncode == 1:
-        return None
-    _expect_git(result, f"cannot read Git configuration {key}")
-    return os.fsdecode(result.stdout).removesuffix("\0")
-
-
-def _copy_enumeration_config(root: Path, destination: Path) -> None:
-    # Read effective values, including local includes and worktree configuration.
-    # These control excludes, filename matching and deleted-file detection.
-    for key in ("core.excludesFile", "core.ignoreCase", "core.precomposeUnicode", "core.symlinks"):
-        value = _enumeration_config(root, key)
-        if value is None:
-            continue
-        if key == "core.excludesFile" and value:
-            value = os.path.abspath(root / value)
-        result = run(
-            git_argv(destination, "config", "--local", key, value),
-            budget_seconds=GIT_BUDGET_SECONDS,
-        )
-        _expect_git(result, f"cannot copy Git configuration {key}")
-
-
-def _copy_regular_file(source: str, destination: str) -> str:
-    mode = Path(source).lstat().st_mode
-    if not stat.S_ISREG(mode):
-        kind = _type_name(mode) or stat.filemode(mode)
-        raise GateError(f"cannot copy repository path {source}: unsupported file type {kind}")
-    return shutil.copy2(source, destination)
-
-
-def _compare_enumeration(root: Path, destination: Path) -> None:
-    original = Counter(enumerate_files(root))
-    copied = Counter(enumerate_files(destination))
-    if original != copied:
-        missing = sorted((original - copied).elements())
-        added = sorted((copied - original).elements())
-        raise GateError(
-            f"copy inventory differs from original: missing paths {missing!r}; added paths {added!r}"
-        )
-
-
-def _copy_tree(root: Path, destination: Path) -> None:
-    _clone_repository(root, destination)
-    try:
-        shutil.copytree(root, destination, dirs_exist_ok=True, symlinks=True,
-                        copy_function=_copy_regular_file, ignore=shutil.ignore_patterns(".git"))
-        _copy_index(root, destination)
-        _copy_exclude(root, destination)
-        _copy_enumeration_config(root, destination)
-        _compare_enumeration(root, destination)
-    except (OSError, shutil.Error) as error:
-        raise GateError(f"cannot copy repository {root}: {error}") from error
-
-
-def _copy_config(config: Config, root: Path) -> Config:
-    checks: dict[str, CheckDef] = {}
-    for check in config.checks.values():
-        baseline = check.baseline
-        if baseline is not None:
-            path = Path(os.path.abspath(baseline))
-            if path.is_relative_to(config.root):
-                baseline = root / path.relative_to(config.root)
-        checks[check.id] = replace(check, baseline=baseline)
-    return replace(config, root=root, path=root / config.path.name, checks=checks)
 
 
 def _run_selected(
@@ -474,55 +344,6 @@ def _collect_slack(
     return slack, notes
 
 
-def _run_copied(
-    root: Path, config: Config, selected: list[CheckDef]
-) -> tuple[CheckResult, dict[str, CheckResult], list[str]]:
-    _reject_original_arguments(root, config, selected)
-    with tempfile.TemporaryDirectory(prefix="qg-worklist-") as temporary:
-        copied_root = Path(temporary) / "repo"
-        _copy_tree(root, copied_root)
-        copied_config = _copy_config(config, copied_root)
-        copied_checks = [copied_config.checks[check.id] for check in selected]
-        return _run_selected(copied_root, copied_config, copied_checks)
-
-
-def _original_argument_target(root: Path, argument: str, identifier: str) -> Path | None:
-    values = (argument, argument.partition("=")[2]) if argument.startswith("--") else (argument,)
-    for value in values:
-        path = Path(value)
-        if path.is_absolute():
-            try:
-                resolved = path.resolve()
-            except (OSError, RuntimeError, ValueError) as error:
-                raise GateError(
-                    f"check {identifier!r}: cannot resolve argument {argument!r}: {error}"
-                ) from error
-            if resolved.is_relative_to(root):
-                return resolved
-    return None
-
-
-def _reject_original_arguments(root: Path, config: Config, selected: list[CheckDef]) -> None:
-    canonical_root = root.resolve()
-    paths = {str(root.absolute()), str(canonical_root)}
-    for identifier in _needed_order(config, selected):
-        check = config.checks[identifier]
-        descriptor = adapter_for(check.adapter)
-        assert descriptor is not None
-        for argument in descriptor.arguments(check.spec):
-            if any(path in argument for path in paths):
-                raise GateError(
-                    f"check {identifier!r}: argument {argument!r} contains the original repository's "
-                    "absolute path; use a repository-relative path"
-                )
-            target = _original_argument_target(canonical_root, argument, identifier)
-            if target is not None:
-                raise GateError(
-                    f"check {identifier!r}: argument {argument!r} resolves into the original "
-                    f"repository at {str(target)!r}; use a repository-relative path"
-                )
-
-
 def _worklist_report(
     root: Path, config: Config, check_ids: list[str]
 ) -> tuple[int, list[Row], list[Slack], list[Note]]:
@@ -530,7 +351,7 @@ def _worklist_report(
     if not selected:
         return 0, [], [], []
     try:
-        inventory, results, order = _run_copied(root, config, selected)
+        inventory, results, order = _run_selected(root, config, selected)
     except UsageError:
         raise
     except (GateError, OSError) as error:

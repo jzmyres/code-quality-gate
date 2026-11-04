@@ -1,11 +1,11 @@
 """End-to-end tests for the churn x current-value worklist."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
-import re
 import shutil
-import socket
 import subprocess
 import time
 import unittest
@@ -176,22 +176,6 @@ def _bridge_run(context):
                          tests_ran=required.tests_ran, tests_skipped=required.tests_skipped)
 
 
-def _fixture_command_parse(raw, root, path, full_key):
-    from types import SimpleNamespace
-    return adapters.ParsedSpec(SimpleNamespace(launch=tuple(raw["launch"])), "fixture/1",
-                               ("tests",))
-
-
-def _fixture_command_run(context):
-    check = context.check
-    from quality_gate.checks import _check_result
-    from quality_gate.runner import run
-    started = time.monotonic()
-    child = run(check.spec.launch, cwd=context.root, budget_seconds=10)
-    return _check_result(check, started, "pass" if child.returncode == 0 else "fail",
-                         tests_ran=1, tests_skipped=0)
-
-
 def run_worklist(
     case: FixtureCase, *args: str, env: dict[str, str] | None = None
 ):
@@ -342,21 +326,6 @@ class WorklistElispTests(FixtureCase):
         self.assertEqual(rows[0]["value"], 12.0)
         self.assertEqual(rows[0]["churn_x_value"], 12.0)
 
-    def test_emacs_through_an_alias_is_refused_before_any_check(self) -> None:
-        alias = self.base / "emacs-alias"
-        alias.symlink_to(self.repo, target_is_directory=True)
-        argument = str(alias / "src/core.el")
-        self.write_config(combined_config().replace(
-            'suite = "tests/suite.el"', f'suite = "tests/suite.el"\nemacs = {json.dumps(argument)}'))
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "elisp-crap")
-        self.assertEqual((result.returncode, result.stdout), (1, ""), output(result))
-        self.assertIn("check 'legacy-tests'", result.stderr)
-        self.assertIn("resolves into the original repository", result.stderr)
-        self.assertIn(argument, result.stderr)
-        self.assertNotIn("check: ", result.stderr)
-        self.assertEqual(snapshot_tree(self.repo), before)
-
 
 class WorklistNoteTests(FixtureCase):
     def setUp(self) -> None:
@@ -506,30 +475,6 @@ class WorklistGitFailureTests(FixtureCase):
         self.assertIn("128", result.stderr)
         self.assertNotIn("CHURN", result.stdout)
 
-    def test_failure_to_prepare_the_copy_ranks_nothing_and_preserves_the_tree(self) -> None:
-        for argument, message in (("clone", "cannot copy Git repository"),
-                                  ("--git-path", "cannot locate Git index"),
-                                  ("pack-objects", "cannot copy staged Git objects")):
-            with self.subTest(argument=argument):
-                before = snapshot_tree(self.repo)
-                result = run_worklist(self, "--json", "crap", env=self.fake_git_failing(argument))
-                self.assertEqual(result.returncode, 1, output(result))
-                self.assertIn(message, result.stderr)
-                self.assertIn("simulated Git failure", result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_failure_to_copy_working_files_ranks_nothing(self) -> None:
-        os.mkfifo(self.repo / "blocked-pipe")
-        result = self.run_qg("worklist", "--json", "crap", timeout=10,
-                             env=self.default_tool_env())
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("cannot copy repository", result.stderr)
-        self.assertIn("blocked-pipe", result.stderr)
-        self.assertIn("FIFO", result.stderr)
-        self.assertNotIn("check: tests", result.stderr)
-        self.assertEqual(result.stdout, "")
-
 
 class WorklistChurnTests(FixtureCase):
     def setUp(self) -> None:
@@ -655,23 +600,6 @@ class WorklistMinimumTests(FixtureCase):
             ]),
         )
         self.commit_all()
-
-    def test_later_prerequisite_with_an_embedded_original_path_prevents_all_runs(self) -> None:
-        argument = f"--output={self.repo / 'written.txt'}"
-        second = ('[checks.second-tests]\nadapter = "python_tests"\ntier = 1\n'
-                  'enforcement = "enforced"\n'
-                  f'run = ["{{python}}", "-c", "print(1)", {json.dumps(argument)}]\n'
-                  "tests_pattern = '(\\d+)'\n\n")
-        self.write_config(verification_config(requires=None).replace(
-            "[checks.verification]", second + "[checks.verification]"))
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "verification")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("check 'second-tests'", result.stderr)
-        self.assertIn(argument, result.stderr)
-        self.assertIn("repository-relative path", result.stderr)
-        self.assertNotIn("check: ", result.stderr)
-        self.assertEqual(snapshot_tree(self.repo), before)
 
     def test_implicit_verification_runs_every_earlier_producer(self) -> None:
         second = ('[checks.second-tests]\nadapter = "python_tests"\ntier = 1\n'
@@ -843,333 +771,57 @@ class WorklistSchemaTests(FixtureCase):
         })
 
 
-class WorklistReadOnlyTests(FixtureCase):
-    def setUp(self) -> None:
-        super().setUp()
-        writer = (PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
-                  "    def test_write(self):\n"
-                  "        pathlib.Path('test-results.json').write_text('{}')\n"
-                  "        source = pathlib.Path('pkg/alpha.py')\n"
-                  "        source.write_text(source.read_text() + '# changed by test\\n')\n")
-        write_debt_fixture(self, test_body=writer)
-
-    def test_tree_and_baselines_are_byte_identical(self) -> None:
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertFalse((self.repo / "test-results.json").exists(), "test wrote into the original tree")
-        self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_copy_preserves_staged_contents_for_checks_that_use_git(self) -> None:
-        self.add_file("pkg/alpha.py", ALPHA + "# staged\n")
-        self.git("add", "pkg/alpha.py")
-        self.add_file("pkg/alpha.py", ALPHA + "# unstaged\n")
-        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
-                      + "\nimport subprocess\n\nclass Sample(unittest.TestCase):\n"
-                      + "    def test_index(self):\n"
-                      + "        cmd = ['git', 'show', ':pkg/alpha.py']\n"
-                      + "        staged = subprocess.check_output(cmd, text=True)\n"
-                      + "        self.assertIn('# staged', staged)\n"
-                      + "        self.assertNotIn('# unstaged', staged)\n")
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_linked_worktree_runs_without_writing_its_shared_git_directory(self) -> None:
-        linked = self.base / "linked"
-        self.git("worktree", "add", "--detach", str(linked))
-        before_repo = snapshot_tree(self.repo)
-        before_linked = snapshot_tree(linked)
-        result = self.run_qg("worklist", "--json", "crap", repo=linked,
-                             env=self.default_tool_env())
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertFalse((linked / "test-results.json").exists())
-        self.assertEqual(snapshot_tree(linked), before_linked)
-        self.assertEqual(snapshot_tree(self.repo), before_repo)
-
-    def test_writing_through_a_relative_link_stays_in_the_copy(self) -> None:
-        self.add_file(".gitignore", "__pycache__/\npkg/data-link\n")
-        (self.repo / "pkg/data-link").symlink_to("alpha.py")
-        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
-                      + "\nclass Sample(unittest.TestCase):\n"
-                      + "    def test_link(self):\n"
-                      + "        link = pathlib.Path('pkg/data-link')\n"
-                      + "        link.write_text(link.read_text() + '# from link\\n')\n")
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(snapshot_tree(self.repo), before)
-
-
-class WorklistOriginalArgumentTests(FixtureCase):
+class WorklistInPlaceTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
         write_debt_fixture(self)
-        self.add_file("tests/absolute_writer.py",
-                      "from pathlib import Path\n"
-                      "Path(__file__).with_name('written.txt').write_text('changed')\n"
-                      "print('Ran 1 test in 0.0s')\n")
-        self.alias = self.base / "alias"
-        self.alias.symlink_to(self.repo, target_is_directory=True)
+        self.second = self.base / "second"
+        self.git("clone", "-q", str(self.repo), str(self.second))
 
-    def writer_command(self, *arguments: str) -> None:
-        self.write_config(crap_config().replace(
-            '["{python}", "-m", "unittest", "discover", "-s", "tests"]',
-            json.dumps(["{python}", *arguments]),
-        ))
+    def sample_test(self, body: str) -> str:
+        return (PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+                "    def test_run(self):\n" + body)
 
-    def assert_argument_refused(self, argument: str, *, repo: Path | None = None,
-                                check_id: str = "crap") -> None:
-        before = snapshot_tree(self.repo)
-        result = self.run_qg("worklist", "--json", check_id, repo=repo,
-                             env=self.default_tool_env())
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("check 'tests'", result.stderr)
-        self.assertIn(argument, result.stderr)
-        self.assertIn("resolves into the original repository", result.stderr)
-        self.assertIn(str(self.repo / "tests/absolute_writer.py"), result.stderr)
-        self.assertIn("repository-relative path", result.stderr)
-        self.assertNotIn("check: ", result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertFalse((self.repo / "tests/written.txt").exists())
-        self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_repo_alias_script_is_refused_before_any_check(self) -> None:
-        argument = str(self.alias / "tests/absolute_writer.py")
-        self.writer_command(argument)
-        self.assert_argument_refused(argument, repo=self.alias)
-
-    def test_unrelated_alias_script_is_refused_before_any_check(self) -> None:
-        elsewhere = self.base / "elsewhere"
-        elsewhere.mkdir()
-        other_alias = elsewhere / "another-alias"
-        other_alias.symlink_to(self.repo, target_is_directory=True)
-        argument = str(other_alias / "tests/absolute_writer.py")
-        self.writer_command(argument)
-        self.assert_argument_refused(argument)
-
-    def test_option_value_through_alias_is_refused_before_any_check(self) -> None:
-        argument = f"--output={self.alias / 'tests/absolute_writer.py'}"
-        self.writer_command("tests/absolute_writer.py", argument)
-        self.assert_argument_refused(argument)
-
-    def test_command_through_an_alias_is_refused_before_any_check(self) -> None:
-        argument = str(self.alias / "tests/absolute_writer.py")
-        text = verification_config().replace('adapter = "python_tests"', 'adapter = "command"')
-        text = text.replace('["{python}", "-m", "unittest", "discover", "-s", "tests"]',
-                            json.dumps(["python3", argument]))
-        self.write_config(text)
-        self.assert_argument_refused(argument, check_id="verification")
-
-    def test_new_adapter_command_field_through_an_alias_is_refused(self) -> None:
-        descriptor = adapters.AdapterDescriptor(
-            "fixture-command", ("launch", "tests_pattern", "skipped_pattern"),
-            _fixture_command_parse, _fixture_command_run, argument_fields=("launch",),
+    def test_a_check_write_lands_in_the_repository_without_changing_the_report(self) -> None:
+        writing = self.sample_test(
+            "        pathlib.Path('test-results.json').write_text('{}')\n")
+        quiet = self.sample_test("        self.assertTrue(True)\n")
+        self.add_file("tests/test_sample.py", writing)
+        (self.second / "tests/test_sample.py").write_text(quiet, encoding="utf-8")
+        written = run_worklist(self, "--json", "crap")
+        self.assertEqual(written.returncode, 0, output(written))
+        self.assertTrue((self.repo / "test-results.json").exists())
+        quiet_result = self.run_qg(
+            "worklist", "--json", "crap", repo=self.second,
+            env=self.default_tool_env(),
         )
-        argument = str(self.alias / "tests/absolute_writer.py")
-        text = verification_config().replace('adapter = "python_tests"', 'adapter = "fixture-command"')
-        text = text.replace('run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]',
-                            f'launch = {json.dumps(["python3", argument])}')
-        self.write_config(text)
-        with mock.patch.dict(adapters.ADAPTERS, {"fixture-command": descriptor}):
-            self.assert_argument_refused(argument, check_id="verification")
-
-    def test_absolute_paths_outside_repository_are_accepted(self) -> None:
-        interpreter = shutil.which("python3")
-        self.assertIsNotNone(interpreter)
-        for argument in (interpreter, f"--interpreter={interpreter}"):
-            with self.subTest(argument=argument):
-                self.writer_command("tests/absolute_writer.py", argument)
-                before = snapshot_tree(self.repo)
-                result = run_worklist(self, "--json", "crap")
-                self.assertEqual(result.returncode, 0, output(result))
-                self.assertIn("check: tests", result.stderr)
-                self.assertEqual(snapshot_tree(self.repo), before)
-
-    def assert_resolution_refused(self, argument: str, error: str) -> None:
-        self.writer_command("tests/absolute_writer.py", argument)
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual((result.returncode, result.stdout), (1, ""), output(result))
-        self.assertEqual(snapshot_tree(self.repo), before)
-        self.assertFalse((self.repo / "tests/written.txt").exists())
-        self.assertNotRegex(result.stderr, r"Traceback|check: ")
-        self.assertRegex(
-            result.stderr,
-            rf"(?m)^worklist: check 'tests': cannot resolve argument {re.escape(repr(argument))}: "
-            rf"[^\n]*{re.escape(error)}[^\n]*$",
-        )
-
-    def test_nul_argument_is_refused_before_any_check(self) -> None:
-        # Policy already rejects NUL; bypass that guard only in this test
-        # so the worklist's resolution boundary sees the decoded argument.
-        path = str(self.base / "invalid\x00argument")
-        with mock.patch.object(policy, "_argv_list", policy._string_list):
-            for argument in (path, f"--output={path}"):
-                with self.subTest(argument=argument):
-                    self.assert_resolution_refused(argument, "embedded null")
-                    self.assertIn(r"\u0000", (self.repo / "quality-gate.toml").read_text())
-
-    def test_resolution_errors_are_refused_before_any_check(self) -> None:
-        path = str(self.base / "unresolvable")
-        real_resolve = Path.resolve
-        for error in (RuntimeError, OSError):
-            for argument in (path, f"--output={path}"):
-                with self.subTest(error=error.__name__, argument=argument):
-                    def failing_resolve(target, *args, _error=error, **kwargs):
-                        if str(target) == path:
-                            raise _error("injected resolution failure")
-                        return real_resolve(target, *args, **kwargs)
-                    with mock.patch.object(Path, "resolve", failing_resolve):
-                        self.assert_resolution_refused(
-                            argument, "injected resolution failure"
-                        )
+        self.assertEqual(quiet_result.returncode, 0, output(quiet_result))
+        self.assertFalse((self.second / "test-results.json").exists())
+        self.assertEqual(self.parse_json(written), self.parse_json(quiet_result))
 
 
-class WorklistCopyTests(FixtureCase):
+class WorklistCheckErrorTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
         write_debt_fixture(self)
 
-    def test_repository_symlinks_keep_their_targets_under_check_and_worklist(self) -> None:
-        self.add_file(".gitignore", "__pycache__/\nlinks/\n")
-        links = self.repo / "links"
-        links.mkdir()
-        (links / "relative").symlink_to("../pkg/alpha.py")
-        (links / "absolute").symlink_to(self.repo / "pkg/alpha.py")
-        (links / "directory").symlink_to("../pkg", target_is_directory=True)
-        (self.repo / "links.md").symlink_to("README.md")
-        self.git("add", "links.md")
-        targets = {"relative": "../pkg/alpha.py", "absolute": str(self.repo / "pkg/alpha.py"),
-                   "directory": "../pkg"}
-        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
-                      + "\nimport os\n\nclass Sample(unittest.TestCase):\n"
-                      + "    def test_links(self):\n"
-                      + "        self.assertTrue(pathlib.Path('links.md').is_symlink())\n"
-                      + "        self.assertEqual(os.readlink('links.md'), 'README.md')\n"
-                      + f"        targets = {targets!r}\n"
-                      + "        for name, target in targets.items():\n"
-                      + "            link = pathlib.Path('links') / name\n"
-                      + "            self.assertTrue(link.is_symlink(), str(link))\n"
-                      + "            self.assertEqual(os.readlink(link), target)\n")
-        check = self.run_qg("check", env=self.default_tool_env())
-        self.assertEqual(check.returncode, 0, output(check))
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_dangling_link_is_copied_without_opening_its_target(self) -> None:
-        self.add_file(".gitignore", "__pycache__/\nbroken-link\n")
-        (self.repo / "broken-link").symlink_to("missing-target")
-        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
-                      + "\nimport os\n\nclass Sample(unittest.TestCase):\n"
-                      + "    def test_dangling(self):\n"
-                      + "        self.assertTrue(pathlib.Path('broken-link').is_symlink())\n"
-                      + "        self.assertEqual(os.readlink('broken-link'), 'missing-target')\n")
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 0, output(result))
-
-    def test_ignored_link_to_external_fifo_is_never_opened(self) -> None:
-        fifo = self.base / "external-fifo"
-        os.mkfifo(fifo)
-        self.add_file(".gitignore", "__pycache__/\nfifo-link\n")
-        (self.repo / "fifo-link").symlink_to(fifo)
-        self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
-                      + "\nimport os\n\nclass Sample(unittest.TestCase):\n"
-                      + "    def test_fifo_link(self):\n"
-                      + "        self.assertTrue(pathlib.Path('fifo-link').is_symlink())\n"
-                      + f"        self.assertEqual(os.readlink('fifo-link'), {str(fifo)!r})\n")
-        result = self.run_qg("worklist", "--json", "crap", timeout=15,
-                             env=self.default_tool_env())
-        self.assertEqual(result.returncode, 0, output(result))
-
-    def test_ignored_special_files_stop_before_any_check(self) -> None:
-        self.add_file(".gitignore", "__pycache__/\nblocked\n")
-        path = self.repo / "blocked"
-        with socket.socket(socket.AF_UNIX) as server:
-            server.bind(str(path))
-            self.assert_special_file_refused("socket")
-        path.unlink()
-        os.mkfifo(path)
-        self.assert_special_file_refused("FIFO")
-
-    def assert_special_file_refused(self, kind: str) -> None:
-        result = self.run_qg("worklist", "--json", "crap", timeout=10,
-                             env=self.default_tool_env())
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("blocked", result.stderr)
-        self.assertIn(kind, result.stderr)
-        self.assertNotIn("check: tests", result.stderr)
-        self.assertEqual(result.stdout, "")
-
-    def local_excludes_fixture(self, excludes_path: str) -> None:
-        excludes = self.repo / ".git" / "local-excludes"
-        excludes.write_text("private-data\n", encoding="utf-8")
-        self.git("config", "core.excludesFile", excludes_path)
-        self.add_file("private-data", "ignored only by local configuration\n")
-
-    def test_local_excludes_file_is_preserved_as_an_absolute_path(self) -> None:
-        for excludes_path in (".git/local-excludes", str(self.repo / ".git/local-excludes")):
-            with self.subTest(excludes_path=excludes_path):
-                self.local_excludes_fixture(excludes_path)
-                self.add_file("tests/test_sample.py", PASSING_TEST)
-                check = self.run_qg("check", env=self.default_tool_env())
-                self.assertEqual(check.returncode, 0, output(check))
-                self.add_file("tests/test_sample.py", PYTHON_TEST_HEADER
-                              + "\nimport subprocess\n\nclass Sample(unittest.TestCase):\n"
-                              + "    def test_excludes(self):\n"
-                              + "        value = subprocess.check_output(\n"
-                              + "            ['git', 'config', '--path', 'core.excludesFile'],\n"
-                              + "            text=True).strip()\n"
-                              + "        self.assertTrue(pathlib.Path(value).is_absolute())\n")
-                before = snapshot_tree(self.repo)
-                result = run_worklist(self, "--json", "crap")
-                self.assertEqual(result.returncode, 0, output(result))
-                self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_missing_config_carry_over_reports_enumeration_difference(self) -> None:
-        self.local_excludes_fixture(".git/local-excludes")
-        before = snapshot_tree(self.repo)
-        with mock.patch.object(worklist, "_copy_enumeration_config",
-                               lambda root, destination: None):
-            result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("copy inventory differs from original", result.stderr)
-        self.assertIn("private-data", result.stderr)
-        self.assertNotIn("check: tests", result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(snapshot_tree(self.repo), before)
-
-    def test_local_case_matching_is_preserved(self) -> None:
-        self.git("config", "core.ignoreCase", "true")
-        self.add_file(".gitignore", "__pycache__/\nPRIVATE-DATA\n")
-        self.add_file("private-data", "ignored with local case matching\n")
-        check = self.run_qg("check", env=self.default_tool_env())
-        self.assertEqual(check.returncode, 0, output(check))
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 0, output(result))
-
-    def test_original_paths_in_prerequisite_arguments_stop_all_checks(self) -> None:
-        script = self.add_file("tests/absolute_writer.py",
-                               "from pathlib import Path\n"
-                               "Path(__file__).with_name('written.txt').write_text('changed')\n"
-                               "print('1 test')\n")
-        config = crap_config().replace(
-            '["{python}", "-m", "unittest", "discover", "-s", "tests"]',
-            json.dumps(["{python}", str(script)]),
-        )
-        self.write_config(config)
-        before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "crap")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("check 'tests'", result.stderr)
-        self.assertIn(str(script), result.stderr)
-        self.assertIn("use a repository-relative path", result.stderr)
-        self.assertNotIn("check: tests", result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(snapshot_tree(self.repo), before)
+    def test_an_error_running_the_selected_checks_ranks_nothing(self) -> None:
+        config = policy.load_config(self.repo)
+        for error in (
+            policy.GateError("cannot run the selected checks"),
+            OSError("cannot create the run directory"),
+        ):
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                worklist, "_run_policy_checks", side_effect=error
+            ), contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                code = worklist.command_worklist(
+                    self.repo, config, ["crap"], False
+                )
+            self.assertEqual(code, 1)
+            self.assertNotIn("worklist: churn x current value", stdout.getvalue())
+            self.assertNotIn("CHURNxVALUE", stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), f"worklist: {error}\n")
 
 
 class WorklistRunLimitTests(FixtureCase):

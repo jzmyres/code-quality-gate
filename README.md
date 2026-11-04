@@ -61,7 +61,7 @@ result, `gate_result.py` computes identity, obligations and the decision, `trust
 argument parser and dispatch. `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
-parser, run function, argument fields, location coverage, number display, subject noun, failure wording,
+parser, run function, location coverage, number display, subject noun, failure wording,
 direction rule, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
 configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
 The registry is the only list of supported adapters. A test adapter reports how many tests ran and
@@ -81,12 +81,6 @@ empty noun prints the bare subject. Its `failure_wording` defaults to `"metric"`
 `value X exceeds threshold Y` (or minimum-bound wording). The `"occurrences"` form used
 by clones prints `occurs X time(s), exceeding threshold Y`. These choices come from
 the descriptor, including when it is registered under another name.
-
-The descriptor's `argument_fields` names the spec fields holding commands or paths. Each field is
-a string or a sequence of argument strings. The worklist checks exactly those fields for references
-to the original repository before running checks in its copy; the default empty tuple checks none.
-Command and Python test descriptors declare `run`; Emacs Lisp test and lint descriptors declare
-`emacs` and `load_path`, with `suite` also declared by the test descriptor.
 
 An adapter's baseline entries and findings use the same direction for each subject. A descriptor can
 declare `entry_direction(subject, configured)` to choose it; otherwise its `default_direction` applies,
@@ -648,22 +642,8 @@ bound fails.
 configured check that has a baseline and a threshold; with ids it covers exactly those checks. For
 each selected check it runs the check and every check it requires, in policy order, using the same
 producer selection as `check`, including every earlier test producer needed by verification when
-`requires` is omitted. The checks run in a temporary copy of the working tree, with its Git index and
-history. Symlinks keep their targets unchanged. A FIFO, socket or device anywhere in the copied tree,
-even if ignored, stops the worklist before any check runs; the error names the path and type. The copy
-carries Git's enumeration configuration, including an absolute `core.excludesFile`, and its inventory
-file list must match the original's; a difference stops the worklist and names the differing paths.
-A selected check or prerequisite whose command arguments contain the original repository's absolute
-path or resolved real path is refused before any check runs. Absolute arguments, including values in
-`--name=VALUE` options, are also resolved through symlinks and refused if they point into the original
-repository. The error names the check, argument and resolved repository path; use repository-relative
-paths. An argument that cannot be resolved is also refused before any check runs; the error names
-the check, argument and underlying resolution error.
-
-A check's writes through its working directory, relative paths and configured paths land in the copy;
-baselines are relocated there. The copy is not a sandbox. Code that computes absolute paths
-to the original, or writes through a symlink targeting the original, can still write there. Run
-untrusted code under a sandbox.
+`requires` is omitted. The checks run in the repository itself, as with `check`, and may write what `check` writes.
+The worklist no longer runs its checks in a temporary copy.
 
 The report lists every `max` baseline entry whose
 bound is above the check's threshold, ranked by churn times the current measured value, highest first.
@@ -683,8 +663,7 @@ subject is a note reading `no longer exists`. A floor outside the measured domai
 `--json` writes one machine-readable document of rows and notes; its schema is in `docs/SCHEMA.md`.
 
 The command exits 0 after writing the report. It exits 1, ranking nothing, when a selected check or one
-it requires does not pass, when the tree cannot be copied, or when Git fails or its output is truncated;
-the error names the problem. It exits 2 for an unknown or repeated check id, or a check with no baseline
+it requires does not pass, or when Git fails or its output is truncated; the error names the problem. It exits 2 for an unknown or repeated check id, or a check with no baseline
 or threshold.
 
 ### Locations
