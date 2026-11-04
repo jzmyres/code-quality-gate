@@ -2,7 +2,7 @@
 name: time-limits
 description: Checklist for changing the gate's run limit, per-check deadline, subprocess budgets or step names.
 verified: 2026-11-04
-commit: 84907174c50f
+commit: e7bb45595b63
 paths: quality_gate/runner.py, quality_gate/checks.py, quality_gate/cli.py, quality_gate/python_tests.py, quality_gate/clones.py, quality_gate/verification.py, tests/test_check.py, tests/test_runner.py, tests/test_command_checks.py, tests/test_python_tests.py, README.md, docs/SCHEMA.md
 ---
 
@@ -11,8 +11,9 @@ paths: quality_gate/runner.py, quality_gate/checks.py, quality_gate/cli.py, qual
 QF118 replaced supervised analysis workers with one run limit; there is no worker registry, cancellation or
 `analysis_step` left. `checks` owns the run limit and the per-check context; `runner` owns each subprocess.
 
-1. **Keep exactly two budgets.** The run limit is `checks._run_limit(config)`: the sum of
-   `_check_budget(check)` over `config.checks` plus `RUN_ALLOWANCE_SECONDS = 300`. A subprocess gets
+1. **Keep exactly two budgets.** The run limit is `checks._run_limit(selected_checks)`: the sum of
+   `_check_budget(check)` over the checks that run plus `RUN_ALLOWANCE_SECONDS = 300`; `_run_policy_checks`
+   passes every configured check for a full run and the selected ids for `check --only`. A subprocess gets
    `runner.remaining_budget(seconds)`, the smaller of its own seconds and the current check's remaining time,
    and `runner._run_budget` sets its grace to 0 inside a check. The allowance is required: the timer starts
    before every subprocess, so a limit equal to the budgets makes the run win over a hanging last check, and that
@@ -37,7 +38,9 @@ QF118 replaced supervised analysis workers with one run limit; there is no worke
    `mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", ...)` with 0 and 1; assert exit 2, the limit and check
    names in stderr, the JSON error document, and after both a passing run and a timeout that
    `signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)` and `signal.getsignal(signal.SIGALRM)` is the
-   handler installed before the run.
+   handler installed before the run. Add a `--only` case whose selected sleep has budget 1 and whose
+   unselected sleep has budget 100: the run limit message must name `1 s limit`, so the limit sums only the
+   checks that run.
 6. **Probe the kill with the liveness test, not `killpg`.** `tests/test_runner.py:RunInterruptTests` arms a
    real `ITIMER_REAL` at 1 s whose handler raises, runs `sh -c 'echo $$ > PIDFILE; sleep 30 & wait'` with
    `budget_seconds=60`, and asserts the run raises, the timer is disarmed and `runner._group_alive(pid)` is

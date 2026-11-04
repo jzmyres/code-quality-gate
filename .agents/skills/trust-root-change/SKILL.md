@@ -2,7 +2,7 @@
 name: trust-root-change
 description: Checklist for changing the gate's trusted directory, protected inputs, baseline merge or run identity.
 verified: 2026-11-04
-commit: 84907174c50f
+commit: e7bb45595b63
 paths: docs/TRUST.md, docs/SCHEMA.md, quality-gate.toml, quality_gate/trust.py, quality_gate/cli.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py
 ---
 
@@ -20,7 +20,8 @@ the probes below, but a new trust path needs its own adversarial test. Use this 
    `prepare_trust` resolves the candidate root, calls `_refuse_inside` so a gate program inside the candidate
    is refused, then `_directory_source`: it requires an absolute path, resolves it, refuses a missing path, a
    non-directory and a directory inside the candidate. A relative path or revision is "expected an absolute
-   trusted directory". With `--policy-from`, `cli._run_trusted_check` refuses `--prune` before `prepare_trust`;
+   trusted directory". With `--policy-from`, `cli._run_trusted_check` calls `_reject_partial_options`, which
+   refuses `--only` with `--prune` or `--policy-from`, then refuses `--prune`, all before `prepare_trust`;
    the trusted check writes nothing into the candidate. If a check depends on a configuration file, add that
    file to `[protect] paths` and pass it explicitly (Ruff uses `--config ruff.toml`); otherwise a candidate
    changes tool behavior without touching a protected input.
@@ -57,7 +58,7 @@ the probes below, but a new trust path needs its own adversarial test. Use this 
    `_identity_problems`. Any protected or effective input, tool payload or gate file that changes during the
    run makes the decision `error` (exit 2) naming it. `prepare_trust` cleans up its two temporary trees
    when `_prepare_source` raises, so a failed preparation leaves no `qg-tree-*` or `qg-merge-*` directory
-   (`PreparationCleanupTests`). `--prune` with `--policy-from` is a usage error before
+   (`PreparationCleanupTests`). `--prune` and `--only` with `--policy-from` are usage errors before
    the checks, and `_write_pruned` is the plain path used only without trust; do not reintroduce a trust
    prune write, an identity exemption or `Config.prune_paths`.
 6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version,
@@ -74,8 +75,8 @@ the probes below, but a new trust path needs its own adversarial test. Use this 
    lint, a candidate repository with `core.fsmonitor` set (record it with a marker file), a missing directory
    and one inside the candidate, `--policy-from` with a relative path, `HEAD` and a commit id (exit 2), the
    unknown `--changed-from`, and a symlinked policy or protected file inside `DIR` (not followed). Cover the
-   prune refusal with `--prune ID --policy-from DIR`: exit 2, both names in stderr, and every candidate file
-   byte-identical. Run `python3 -I -m unittest discover -s tests -p 'test_trust.py'` and the same for
+   prune and partial refusals with `--prune ID --policy-from DIR` and `--only ID --policy-from DIR`: exit 2,
+   both names in stderr, no check line printed, and every candidate file byte-identical. Run `python3 -I -m unittest discover -s tests -p 'test_trust.py'` and the same for
    `test_inventory.py`, then `test_verification.py`/`test_ratchet.py` when the merge or identity changes; the
    owner runs the full gate and mutation.
 8. **Deleting a trust feature.** Delete the feature's `tests/mutate_gate.py` `Decision`, the tests that

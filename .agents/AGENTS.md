@@ -66,28 +66,29 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   every baseline before the checks (`CheckDef.effective_baseline`, `identity_before.effective_inputs`). A baseline
   passed to `--allow-protected` is read whole from the candidate (`_required_candidate_entries`); any other
   changed baseline is merged entry by entry, so a tightening applies and a loosening is ignored. QF116
-  refuses `--prune` with `--policy-from` as a usage error before any check; `_write_pruned` is the only remaining
-  prune path and no trust identity exemption exists, so any protected or effective input, tool payload or gate file
-  that changes during the run is an error. `quality-gate.toml` protects `ruff.toml` and the Ruff check passes it
-  explicitly, but any other tool configuration must be added to `[protect] paths` and passed. `prepare_trust`
-  removes its two temporary trees when `_prepare_source` raises (`PreparationCleanupTests` in
-  `tests/test_trust.py`), so a failed preparation leaves nothing behind. The checklist is
+  refuses `--prune` with `--policy-from` as a usage error before any check, and QF121's `_reject_partial_options`
+  likewise refuses `--only` with `--policy-from` (and with `--prune`) before `prepare_trust`; `_write_pruned` is
+  the only remaining prune path and no trust identity exemption exists, so any protected or effective input, tool
+  payload or gate file that changes during the run is an error. `quality-gate.toml` protects `ruff.toml` and the
+  Ruff check passes it explicitly, but any other tool configuration must be added to `[protect] paths` and
+  passed. `prepare_trust` removes its two temporary trees when `_prepare_source` raises
+  (`PreparationCleanupTests` in `tests/test_trust.py`), so a failed preparation leaves nothing behind. The checklist is
   `.agents/skills/trust-root-change/SKILL.md`.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/trust.py, quality_gate/cli.py, quality_gate/checks.py, quality-gate.toml, docs/TRUST.md, docs/SCHEMA.md, tests/test_trust.py]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/trust.py, quality_gate/cli.py, quality_gate/checks.py, quality-gate.toml, docs/TRUST.md, docs/SCHEMA.md, tests/test_trust.py]
 
 - **Every git command on a candidate repository goes through `files.git_argv`.** It adds
   `--no-replace-objects`, `safe.directory=ROOT` and `core.fsmonitor=false`; `trust._git`, `files._git` and
   `gate_result._git` call it, and `checks` and `worklist` use it directly for inventory/hygiene argv,
   pack/clone and churn. A bare `git` call lets a candidate-configured fsmonitor or replacement ref change
   what the gate reads.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/files.py, quality_gate/trust.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/worklist.py]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/files.py, quality_gate/trust.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/worklist.py]
 
 - **An unmeasured entry resolves by domain, not direction.** `ratchet._record_unmeasured` resolves every entry
   absent from the findings when its subject lies in the adapter's complete `Domain`, whatever its direction, and
   `pruned_entries` then drops it. A measured `min` entry never resolves by itself; `_min_verdict` only handles a
   measured minimum. QF14 corrected `docs/SCHEMA.md` and README to say this. When changing resolution, docs or
   tests, probe a complete domain with an absent entry, not only measured findings.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
 
 - **Pruning a verification baseline tightens every measured entry in that check.** `ratchet._prune_entry`
   raises a `min` bound to the measurement, and verification makes `tests:*:executed` a `min` floor, so a prune
@@ -106,11 +107,12 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   same way; `str.splitlines()` also splits U+2028, U+2029, U+0085 and friends and shifts the line number of a
   later directive (QF99). `splitlines()` stays fine for command output. Assert the `locations` of a new
   located finding in `tests/test_verification.py`.
-  [verified 2026-11-04 @ 1bfa24f12813; paths: quality_gate/checks.py, quality_gate/ratchet.py, quality_gate/verification.py, tests/test_verification.py]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/checks.py, quality_gate/ratchet.py, quality_gate/verification.py, tests/test_verification.py]
 
 - **The run has one wall-clock limit; a check's subprocesses share its budget, and every phase is named with
-  `mark_step`.** `checks._run_policy_checks` arms one `SIGALRM` timer before its loop for `_run_limit(config)`
-  (the sum of `_check_budget(check)` over `config.checks` plus `RUN_ALLOWANCE_SECONDS = 300`) and
+  `mark_step`.** `checks._run_policy_checks` arms one `SIGALRM` timer before its loop for `_run_limit(selected_checks)`
+  (the sum of `_check_budget(check)` over the checks that run plus `RUN_ALLOWANCE_SECONDS = 300`; a
+  `check --only` run passes its selected ids, a full run passes every configured check) and
   `_disarm_run_limit` cancels it and restores the previous handler in a `finally`; the handler raises
   `runner.RunTimeout`, a `UsageError` (exit 2) that names the limit, the allowance, the check and its step. The
   allowance is load-bearing: the timer starts before every subprocess, so a limit of exactly the budgets always
@@ -130,9 +132,10 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   member, an unreadable entry or `/proc` counts as alive), and off Linux it is alive. `_process_finished`
   therefore ends a run whose orphan a PID 1 left a zombie, and `RunInterruptTests` asserts `_group_alive(pid)`
   is False after the kill instead of `killpg` raising. `RunLimitTests` in `tests/test_check.py` covers allowance
-  0 and 1, the JSON error document and timer/handler restoration; `RunInterruptTests` in
+  0 and 1, the JSON error document, timer/handler restoration and a partial run whose limit sums only the
+  selected checks; `RunInterruptTests` in
   `tests/test_runner.py` covers the kill on an interrupt.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/runner.py, quality_gate/checks.py, quality_gate/cli.py, tests/test_check.py, tests/test_runner.py, README.md, docs/SCHEMA.md]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/runner.py, quality_gate/checks.py, quality_gate/cli.py, tests/test_check.py, tests/test_runner.py, README.md, docs/SCHEMA.md]
 
 - **The mutation runner's kill evidence is the probe's `reached` set, and a kill needs a test that passed
   in the probe and does not pass on the mutant.** `tests/mutate_gate.py:_probe` copies the frozen tree once,
@@ -154,7 +157,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   workers are 2. Keep `tests/test_mutation.py` covering body/setUp/tearDown/cleanup/subtest/child positions, an
   error kill, an import failure, no reach, unattributed hits, a failing probe, exactly one unmutated run, an
   order-dependent test and the worker default; the QF117 accept run reported 24/24 killed.
-  [verified 2026-11-04 @ 84907174c50f; paths: tests/mutate_gate.py, tests/test_mutation.py, README.md]
+  [verified 2026-11-04 @ e7bb45595b63; paths: tests/mutate_gate.py, tests/test_mutation.py, README.md]
 
 - **One subject-direction rule feeds loading, evaluation, pruning and the trusted merge.**
   `ratchet.subject_direction` delegates to the adapter descriptor's `direction_for_subject`, which asks
@@ -166,7 +169,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   `min` floor vanished). When adding a descriptor kind or a per-subject rule, test loading/evaluation, prune
   and the trusted merge with a stub adapter in `tests/test_ratchet.py`, `tests/test_trust.py` and
   `tests/test_adapters.py`.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/ratchet.py, quality_gate/adapters.py, quality_gate/trust.py, quality_gate/checks.py, tests/test_ratchet.py, tests/test_trust.py, tests/test_adapters.py]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/ratchet.py, quality_gate/adapters.py, quality_gate/trust.py, quality_gate/checks.py, tests/test_ratchet.py, tests/test_trust.py, tests/test_adapters.py]
 
 - **A test check reports the counts it parses, never a reconstruction of per-test outcomes.** The Python and
   Emacs adapters set `tests_ran` and `tests_skipped`; `verification._recorded_test_counts` reads only those,
@@ -177,7 +180,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   reports `outcome = "fail"` with reason "command exited N" and the output tail in diagnostics; zero executed
   tests is not a pass. Do not re-add parsing of `FAILED (...)`, `FAIL:`/`ERROR:` headings or fixture names;
   add the count to both adapters and a verification test instead.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/python_tests.py, quality_gate/elisp_tests.py, quality_gate/verification.py, quality_gate/checks.py, tests/test_python_tests.py, tests/test_verification.py, docs/SCHEMA.md, README.md]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/python_tests.py, quality_gate/elisp_tests.py, quality_gate/verification.py, quality_gate/checks.py, tests/test_python_tests.py, tests/test_verification.py, docs/SCHEMA.md, README.md]
 
 - **The clone check refuses inline jscpd ignore directives before it runs the tool, and its regression must
   show the bypass.** `clones._refuse_directives` runs after `mark_step("clone source scan")` inside
@@ -191,26 +194,43 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   clones: the first QF98 fixture left that run `unsupported` ("jscpd ... analyzed no files"), and the review
   reproduced `accepted` only after giving each file ~30 unique assignments. Before landing a refusal,
   remove it in a disposable copy and confirm the bypass really passes.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/clones.py, tests/test_clones.py, tests/support.py, tests/test_adapters.py, tests/test_check.py, README.md]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/clones.py, tests/test_clones.py, tests/support.py, tests/test_adapters.py, tests/test_check.py, README.md]
 
 - **Test evidence is released through one helper by both the check command and the worklist.**
   `checks._evidence_last_users` maps each result to its last dependent check; `_release_evidence` clears
   `result.temporary` once that check has run (or when called without a finished check) and reports a failed
   removal through `_cleanup_evidence`: stderr "check: ID: cannot remove evidence directory NAME: ..." plus
-  the same message on that result's `diagnostics.error`. `worklist._run_selected` computes last users over
+  the same message on that result's `diagnostics.error`. `_run_policy_checks` passes the checks it will run to
+  `_evidence_last_users` (every configured check for a full run, only the selected ids for `check --only`), so a
+  partial run releases only the evidence its checks own. `worklist._run_selected` computes last users over
   its selected order, releases after each last user and again in a `finally`, and passes the messages out as
   a fourth list so `_worklist_report` exits 1. Leaving cleanup to the `TemporaryDirectory` finalizer only
   emits an implicit `ResourceWarning` and loses the failure.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/checks.py, quality_gate/worklist.py, tests/test_worklist.py, README.md]
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/checks.py, quality_gate/worklist.py, tests/test_worklist.py, README.md]
 
 - **A refusal test must assert the refusal, and its removal demonstration must fail there.** A guard added to
   `cli.py` or `trust.py` is proven by a test that asserts exit 2, the message naming the option or path, and the
   unchanged state; a test that only expects a nonzero exit can pass for an unrelated reason. The first QF116
   refusal test used a fixture without the `clones` check, so the removal demo failed on
   "unknown check 'clones'" rather than on the guard's refusal; after setting up the check and asserting both
-  option names in stderr plus a byte-identical candidate, removing the guard failed at that assertion. When a
-  spec asks for a remove-the-guard demonstration, quote the assertion that fails, not a later symptom.
-  [verified 2026-11-04 @ 84907174c50f; paths: quality_gate/cli.py, quality_gate/trust.py, tests/test_trust.py]
+  option names in stderr plus a byte-identical candidate, removing the guard failed at that assertion. QF121's
+  `--only` refusals (`--prune` and `--policy-from`) also assert exit 2, both option names and that no check line
+  printed. When a spec asks for a remove-the-guard demonstration, quote the assertion that fails, not a later
+  symptom.
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/cli.py, quality_gate/trust.py, tests/test_trust.py]
+
+- **`check --only` and `worklist` share one check-selection implementation in `checks.py`.**
+  `_require_distinct(command, identifiers)` puts the command in its duplicate-id message; `_required`,
+  `_needed_order` and `_policy_order` live there, and `worklist.py` imports them. `_selected_check_ids` runs
+  `_require_distinct("check", ...)` and `_reject_unknown_checks` before `_inventory_check`, then `_needed_order`
+  in policy order, and `cli._reject_partial_options` refuses `--only` with `--prune` or `--policy-from` before
+  any check runs (`_run_trusted_check` before `prepare_trust`, `_dispatch` after `load_config`).
+  `_run_policy_checks` takes `selected_ids` (None means every configured check), so the run
+  limit, evidence last-users and results cover exactly the checks that run. `_finalize_check` passes `selected`,
+  builds `obligations = []`, and `gate_result.decision(..., partial=True)` returns `partial` after the built-in
+  and enforced checks pass; a full run has no `selected` key. A new selection caller imports these helpers
+  rather than copying prerequisite closure.
+  [verified 2026-11-04 @ e7bb45595b63; paths: quality_gate/checks.py, quality_gate/worklist.py, quality_gate/cli.py, quality_gate/gate_result.py, tests/test_check.py, tests/test_worklist.py, README.md, docs/SCHEMA.md]
 
 - **Copy only the working files for a disposable demo.** `cp -a` of this clone fails on `.git/objects` with
   `preserving permissions ... Invalid argument` and leaves a partial copy. Copy the files the command needs
