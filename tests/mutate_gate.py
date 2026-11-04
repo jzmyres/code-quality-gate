@@ -179,7 +179,7 @@ DECISIONS = (
     Decision(
         "gate_obligation",
         "quality_gate/gate_result.py",
-        "decision",
+        "_run_passes",
         "comparison",
         'item["status"] != "unsatisfied"',
         "An unsatisfied obligation rejects the gate.",
