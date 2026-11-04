@@ -2,7 +2,7 @@
 name: retire-adapter
 description: Checklist for removing an adapter with its registration, tests, mutation decisions and docs.
 verified: 2026-11-04
-commit: f17841f57b84
+commit: 1bfa24f12813
 paths: quality_gate/adapters.py, quality_gate/policy.py, quality_gate/clones.py, quality_gate/runner.py, tests/mutate_gate.py, tests/test_adapters.py, tests/test_policy.py, tests/test_runner.py, docs/SCHEMA.md, README.md, CLAUDE.md
 ---
 
@@ -25,9 +25,9 @@ and the `git show archive/owners-2026-10-31:PATH` path must be checked in the la
    `_live_group_members` at CRAP 30.0; `_pending_errors` at 6.6) and policy's `_validate_fixed_header`
    (11.1) because the owners tests were their only coverage. The validator had no remaining caller and went
    with its descriptor field; the runner helpers had callers and gained focused tests in
-   `tests/test_runner.py`, and the next gate run passed CRAP (the QF117 gate run reported 800 functions
-   within threshold). Delete the dead helper with its last caller or add the focused test; never add a CRAP
-   baseline entry.
+   `tests/test_runner.py`. QF118 later deleted those helpers and their tests with the worker machinery, and
+   its gate reported 751 functions within threshold. Delete the dead helper with its last caller or add the
+   focused test; never add a CRAP baseline entry.
 3. **Remove the adapter's mutation decisions.** `tests/mutate_gate.py` carried five owners `Decision`s; the list
    has 24 at this stamp, and the mutation report must match the list. Recount `DECISIONS` after the deletion.
 4. **Move a helper the removed module exported.** `clones._read_regular` and `_parent_fd` moved from

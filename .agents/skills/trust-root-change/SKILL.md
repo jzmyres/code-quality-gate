@@ -1,8 +1,8 @@
 ---
 name: trust-root-change
 description: Checklist for changing the gate's trusted directory, protected inputs, baseline merge or run identity.
-verified: 2026-11-02
-commit: 85b72352531e
+verified: 2026-11-04
+commit: 1bfa24f12813
 paths: docs/TRUST.md, docs/SCHEMA.md, quality-gate.toml, quality_gate/trust.py, quality_gate/cli.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py
 ---
 
@@ -47,7 +47,9 @@ the probes below, but a new trust path needs its own adversarial test. Use this 
    removal only for `max`, and preserves every trusted entry when the candidate baseline cannot be parsed.
    The merged tuple goes on `CheckDef.effective_baseline`; `checks._baseline_entries` returns it first, and no
    check passes a baseline path to a child process. An authorized policy's new baseline is read from the
-   candidate, but still validated before the checks.
+   candidate, but still validated before the checks. `_apply_baselines` reads a baseline named in
+   `--allow-protected` whole from the candidate (`_required_candidate_entries`); any other changed baseline
+   is merged entry by entry, so a tightening applies and a loosening is ignored.
 5. **Identity and no trust writes.** `_capture_identity` runs before the checks and records `revision` (the
    `DIR` path), `protected` file SHA-256 pairs, `effective_inputs` (policy, lock, tool pins and each effective
    baseline digest), `tools` and `gate`. There is no revision or gitlink variant left: `_capture_identity`
