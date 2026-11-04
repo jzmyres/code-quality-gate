@@ -2,7 +2,7 @@
 name: time-limits
 description: Checklist for changing the gate's run limit, per-check deadline, subprocess budgets or step names.
 verified: 2026-11-04
-commit: 1bfa24f12813
+commit: 84907174c50f
 paths: quality_gate/runner.py, quality_gate/checks.py, quality_gate/cli.py, quality_gate/python_tests.py, quality_gate/clones.py, quality_gate/verification.py, tests/test_check.py, tests/test_runner.py, tests/test_command_checks.py, tests/test_python_tests.py, README.md, docs/SCHEMA.md
 ---
 
@@ -38,9 +38,17 @@ QF118 replaced supervised analysis workers with one run limit; there is no worke
    names in stderr, the JSON error document, and after both a passing run and a timeout that
    `signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)` and `signal.getsignal(signal.SIGALRM)` is the
    handler installed before the run.
-6. **Probe the kill.** `tests/test_runner.py:RunInterruptTests` arms a real `ITIMER_REAL` at 1 s whose handler
-   raises, runs `sh -c 'echo $$ > PIDFILE; sleep 30 & wait'` with `budget_seconds=60`, and asserts the run
-   raises, the timer is disarmed and `os.killpg(pid, 0)` raises `ProcessLookupError`.
+6. **Probe the kill with the liveness test, not `killpg`.** `tests/test_runner.py:RunInterruptTests` arms a
+   real `ITIMER_REAL` at 1 s whose handler raises, runs `sh -c 'echo $$ > PIDFILE; sleep 30 & wait'` with
+   `budget_seconds=60`, and asserts the run raises, the timer is disarmed and `runner._group_alive(pid)` is
+   False. Do not assert that `os.killpg(pid, 0)` raises `ProcessLookupError`: a killed child can stay a
+   zombie in the group, so `killpg` still succeeds; the QF120 spec reports CI failing on exactly that.
+   `_group_alive` asks `killpg` first (`ProcessLookupError` is dead, another `OSError` alive) and then, on
+   Linux, scans `/proc/*/stat` with `_proc_group_member` for a member of the group whose state is not `Z` or
+   `X`; `_process_finished` uses it, so a finished command whose orphan a container's PID 1 never reaps
+   completes instead of failing at its budget. `GroupAliveTests` covers a zombie group, a running group and an
+   unreaped orphan through a child that sets `PR_SET_CHILD_SUBREAPER` and never reaps, and
+   `ProcGroupMemberTests` covers the stat-line cases on files it writes.
 7. **Run the focused tests and the lint.** `python3 -I -m unittest discover -s tests -p test_runner.py`, the
    same for `test_check.py`, `test_command_checks.py` and `test_python_tests.py`, then the Ruff command from
    CLAUDE.md on the changed Python files. Before finishing, `grep -rnw` outside `.agents` for `analysis_step`,

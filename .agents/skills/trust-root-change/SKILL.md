@@ -2,7 +2,7 @@
 name: trust-root-change
 description: Checklist for changing the gate's trusted directory, protected inputs, baseline merge or run identity.
 verified: 2026-11-04
-commit: 1bfa24f12813
+commit: 84907174c50f
 paths: docs/TRUST.md, docs/SCHEMA.md, quality-gate.toml, quality_gate/trust.py, quality_gate/cli.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py
 ---
 
@@ -55,7 +55,9 @@ the probes below, but a new trust path needs its own adversarial test. Use this 
    baseline digest), `tools` and `gate`. There is no revision or gitlink variant left: `_capture_identity`
    always uses `_tree_protected_identity`, and `Trust.finish` records `identity_after` and compares it with
    `_identity_problems`. Any protected or effective input, tool payload or gate file that changes during the
-   run makes the decision `error` (exit 2) naming it. `--prune` with `--policy-from` is a usage error before
+   run makes the decision `error` (exit 2) naming it. `prepare_trust` cleans up its two temporary trees
+   when `_prepare_source` raises, so a failed preparation leaves no `qg-tree-*` or `qg-merge-*` directory
+   (`PreparationCleanupTests`). `--prune` with `--policy-from` is a usage error before
    the checks, and `_write_pruned` is the plain path used only without trust; do not reintroduce a trust
    prune write, an identity exemption or `Config.prune_paths`.
 6. **Child processes carry effective inputs.** `covrun.py` gets the effective coverage directory, version,
