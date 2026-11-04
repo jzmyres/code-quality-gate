@@ -1032,9 +1032,8 @@ processes are attributed to the test that started them; a hit that cannot be att
 as unattributed. The declared decisions in `tests/mutate_gate.py` cover baseline bounds, threshold
 and expiry comparisons, verification floors, prune refusal and exit status, gate decisions, trust-root
 identity and protection, and the rule that an ERT run must execute a test. They use comparison flips,
-boolean negation, an
-opposite boolean return, and removal of a raise. This is a selected set of faults, not an exhaustive
-measurement of every possible change.
+boolean negation, an opposite boolean return, and removal of a raise. This is a selected set of faults,
+not an exhaustive measurement of every possible change.
 
 Each mutant's copy is first imported with `python3 -I`, with the copy's root first on `sys.path`; a
 module that fails to import makes the mutant `invalid`, which fails the run. A valid mutant then runs
