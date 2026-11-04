@@ -1022,40 +1022,49 @@ baseline, policy, protected-path, prune and identity rules.
 ## Mutation-testing the gate
 
 `make mutation` runs the gate's own complete unittest suite against isolated copies of its code.
-It freezes the source and tests once and requires a passing unmodified suite. It then runs the
-complete suite once more on an unmutated copy as a probe: in that copy, each declared target records
-a "reached" event naming its decision and the current test. The runner exposes the current test ID
-through the environment, so hits from child processes are attributed to the test that started them;
-a hit that cannot be attributed is recorded as unattributed. The declared
-decisions in `tests/mutate_gate.py` cover baseline bounds, threshold and expiry comparisons,
-verification floors, prune refusal and exit status, gate decisions, trust-root identity and protection,
-and the rule that an ERT run must execute a test. They use comparison flips, boolean negation, an opposite boolean return,
-and removal of a raise. This is a selected set of faults, not an exhaustive measurement of every
-possible change.
+It freezes the source and tests once. The probe is the only unmutated run of the complete suite: it
+is instrumented so each declared target records a "reached" event naming its decision and the current
+test; the marker file records only reached events. The probe must pass with no errors, skipped tests,
+expected failures or unexpected successes, and it must run at least one test; otherwise the command
+fails before any mutant runs. Its test IDs give suite order and its reached events give each target's
+reaching tests. The runner exposes the current test ID through the environment, so hits from child
+processes are attributed to the test that started them; a hit that cannot be attributed is recorded
+as unattributed. The declared decisions in `tests/mutate_gate.py` cover baseline bounds, threshold
+and expiry comparisons, verification floors, prune refusal and exit status, gate decisions, trust-root
+identity and protection, and the rule that an ERT run must execute a test. They use comparison flips,
+boolean negation, an
+opposite boolean return, and removal of a raise. This is a selected set of faults, not an exhaustive
+measurement of every possible change.
 
-Each copied module records its own run in a marker file: a line when the import starts, one when
-the import completes, and a traceback for any uncaught exception or `unittest` error, including errors
-in subtests and in child processes that import the module. A failed fixture assertion, including
-one in an async, class or module fixture or in a cleanup, is recorded as a fixture failure in the
-parent run and in a child process that imports the module, including an assertion reported through
-a subtest. A mutant first runs
-only the tests the probe recorded as reaching its target, in their original order, stopping at the
-first assertion failure. That failure is a kill only when the mutant's module was loaded and imported, the marker
-records no import or execution error or fixture failure, and the same selection passes on an
-unmutated copy; each distinct selection is checked once unmutated and reused. A mutant whose selected
-tests all pass, one that no test reached, one with unattributed hits, or one whose selection fails
-unmutated gets the complete-suite run: it is killed only when the same complete suite runs, loads and imports that
-mutant, and fails an assertion while the marker file records no import, execution or fixture failure;
-assertion text is never inspected. Any recorded error makes the mutant an error even if the parent
-suite passes. Survivors are therefore mutants that survived the complete suite, so the kill and
-survival guarantees are unchanged. Survivors, timeouts, a missing or incomplete marker, a recorded
-import or execution failure, skipped tests, suite errors, invalid decisions and a failing unmodified
-suite all fail the command; if the probe run itself does not pass, every mutant uses the complete
-suite. Each mutant's line names the path that decided it: the number of selected tests or "full
-suite" with the reason, and the final summary reports the probe time and the total time. Each suite
-has a 900-second limit; independent mutant copies run concurrently and their results are printed in
-declaration order. The slow mutation run is separate from `make check` and uses the same pinned tools
-cache as the ordinary tests.
+Each mutant's copy is first imported with `python3 -I`, with the copy's root first on `sys.path`; a
+module that fails to import makes the mutant `invalid`, which fails the run. A valid mutant then runs
+only the tests the probe recorded as reaching its target, in suite order and with failfast. Any of
+those tests that fails, errors or unexpectedly succeeds kills the mutant, wherever its assertion
+sits: in the test body, a fixture, a cleanup, a subtest or a child process. A run that times out,
+writes no valid report, exits inconsistently with its report, skips a test or does not execute the
+selected tests in order is an error or timed out, never a kill. All selected tests passing means the
+mutant survived. A mutant that no test reached survives with "no test reached its target" and runs no
+suite; one with unattributed hits runs the complete suite with the same kill, survival and error
+rules.
+
+For every kill, the runner reruns exactly the non-passing test IDs on a fresh pristine copy. If any
+of them fails there too, the outcome is `unstable` rather than `killed`: the test is order-dependent
+or flaky and must be fixed, and the run fails.
+
+Each mutant's line names the path that decided it: the number of selected tests, "no test reached its
+target" or "full suite (unattributed hits)", and the final summary reports the probe time and the
+total time. Each suite has a 900-second limit and the process group is killed on timeout. Independent
+mutant copies run concurrently with two workers by default, because four on this four-CPU host shared
+with agents coincided with swap exhaustion. Results are printed in declaration order. The slow
+mutation run is separate from `make check` and uses the same pinned tools cache as the ordinary tests.
+The command passes only when every outcome is `killed` and there are no errors.
+
+This design changes these guarantees:
+
+- Dropped: a kill is only a failing assertion, never an error; fixture failures are never kills; each
+  selection is checked once unmutated.
+- Kept: survivors fail the run; skipped tests fail the run; exact AST target matching; selected tests
+  run in suite order.
 
 To protect another decision, add a named `Decision` to the list with its module, function, operator,
 exact source expression or statement, and a reason. The target must identify exactly one applicable

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ast
 import copy
-import hashlib
 import json
 import os
 import shutil
@@ -259,6 +258,7 @@ class Report:
 class _Probe:
     selections: dict[str, tuple[str, ...]]
     unattributed: frozenset[str]
+    ids: tuple[str, ...]
     failure: str | None
 
 
@@ -383,53 +383,8 @@ def _insert_reached(source: str, decisions: tuple[Decision, ...]) -> str:
     return source
 
 
-_FIXTURE_FRAMES = (
-    "setUp",
-    "tearDown",
-    "asyncSetUp",
-    "asyncTearDown",
-    "_callSetUp",
-    "_callTearDown",
-    "_callCleanup",
-    "doCleanups",
-    "setUpClass",
-    "tearDownClass",
-    "setUpModule",
-    "tearDownModule",
-    "doClassCleanups",
-)
-
-
-# unittest reports a subtest from its own context manager, so a subtest in a
-# cleanup loses the cleanup callers from its traceback.  That failure is still a
-# cleanup failure, and these are the cleanup frames of the one fixture list.
-_CLEANUP_FRAMES = tuple(name for name in _FIXTURE_FRAMES if "Cleanup" in name)
-
-
-def _fixture_frame(name: str) -> bool:
-    return name in _FIXTURE_FRAMES
-
-
-def _cleanup_call() -> bool:
-    frame = sys._getframe()
-    while frame is not None:
-        if frame.f_code.co_name in _CLEANUP_FRAMES:
-            return True
-        frame = frame.f_back
-    return False
-
-
-def _fixture_failure(error, *, subtest: bool = False) -> bool:
-    trace = error[2]
-    while trace is not None:
-        if _fixture_frame(trace.tb_frame.f_code.co_name):
-            return True
-        trace = trace.tb_next
-    return subtest and _cleanup_call()
-
-
 def _instrument(
-    source: str, marker: Path, token: str, reached: tuple[Decision, ...] = ()
+    source: str, marker: Path, token: str, reached: tuple[Decision, ...]
 ) -> str:
     tree = ast.parse(source)
     prefix = 0
@@ -445,19 +400,13 @@ def _instrument(
             prefix = node.end_lineno
         else:
             break
-    if reached:
-        source = _insert_reached(source, reached)
+    source = _insert_reached(source, reached)
     lines = source.splitlines(keepends=True)
-    # Existing and future TestResult subclasses may override callbacks without
-    # delegating to the base class, so instrument each implementation.
     preamble = (
         "\n"
-        "import json as _qg_mutation_json, os as _qg_mutation_os, sys as _qg_mutation_sys, "
-        "traceback as _qg_mutation_traceback, unittest as _qg_mutation_unittest\n"
+        "import json as _qg_mutation_json, os as _qg_mutation_os\n"
         f"_qg_mutation_marker = {str(marker)!r}\n"
         f"_qg_mutation_token = {token!r}\n"
-        f"_qg_mutation_fixture_frames = {_FIXTURE_FRAMES!r}\n"
-        f"_qg_mutation_cleanup_frames = {_CLEANUP_FRAMES!r}\n"
         "def _qg_mutation_record(event, detail=''):\n"
         "    test = _qg_mutation_os.environ.get('QG_MUTATION_TEST') or 'unattributed'\n"
         "    with open(_qg_mutation_marker, 'a', encoding='utf-8') as _qg_mutation_file:\n"
@@ -466,74 +415,8 @@ def _instrument(
         "def _qg_mutation_reached(name, value):\n"
         "    _qg_mutation_record('reached', name)\n"
         "    return value\n"
-        "_qg_mutation_record('loaded')\n"
-        "def _qg_mutation_hook(exc_type, exc, tb):\n"
-        "    detail = ''.join(_qg_mutation_traceback.format_exception(exc_type, exc, tb))\n"
-        "    _qg_mutation_record('failure', detail)\n"
-        "    _qg_mutation_sys.__excepthook__(exc_type, exc, tb)\n"
-        "_qg_mutation_sys.excepthook = _qg_mutation_hook\n"
-        "def _qg_mutation_test_error(error):\n"
-        "    detail = ''.join(_qg_mutation_traceback.format_exception(*error))\n"
-        "    _qg_mutation_record('error', detail)\n"
-        "def _qg_mutation_fixture_frame(name):\n"
-        "    return name in _qg_mutation_fixture_frames\n"
-        "def _qg_mutation_cleanup_call():\n"
-        "    frame = _qg_mutation_sys._getframe()\n"
-        "    while frame is not None:\n"
-        "        if frame.f_code.co_name in _qg_mutation_cleanup_frames:\n"
-        "            return True\n"
-        "        frame = frame.f_back\n"
-        "    return False\n"
-        "def _qg_mutation_test_fixture(test, error, subtest=False):\n"
-        "    trace = error[2]\n"
-        "    while trace is not None:\n"
-        "        if _qg_mutation_fixture_frame(trace.tb_frame.f_code.co_name):\n"
-        "            _qg_mutation_record('fixture', test.id())\n"
-        "            return\n"
-        "        trace = trace.tb_next\n"
-        "    if subtest and _qg_mutation_cleanup_call():\n"
-        "        _qg_mutation_record('fixture', test.id())\n"
-        "def _qg_mutation_wrap_failure(original):\n"
-        "    def add_failure(self, test, error):\n"
-        "        _qg_mutation_test_fixture(test, error)\n"
-        "        return original(self, test, error)\n"
-        "    return add_failure\n"
-        "def _qg_mutation_wrap_error(original):\n"
-        "    def add_error(self, test, error):\n"
-        "        _qg_mutation_test_error(error)\n"
-        "        return original(self, test, error)\n"
-        "    return add_error\n"
-        "def _qg_mutation_wrap_subtest(original):\n"
-        "    def add_subtest(self, test, subtest, error):\n"
-        "        if error is not None:\n"
-        "            _qg_mutation_test_fixture(test, error, True)\n"
-        "            if not issubclass(error[0], test.failureException):\n"
-        "                _qg_mutation_test_error(error)\n"
-        "        return original(self, test, subtest, error)\n"
-        "    return add_subtest\n"
-        "def _qg_mutation_wrap_result(result):\n"
-        "    if 'addFailure' in result.__dict__:\n"
-        "        result.addFailure = _qg_mutation_wrap_failure(result.addFailure)\n"
-        "    if 'addError' in result.__dict__:\n"
-        "        result.addError = _qg_mutation_wrap_error(result.addError)\n"
-        "    if 'addSubTest' in result.__dict__:\n"
-        "        result.addSubTest = _qg_mutation_wrap_subtest(result.addSubTest)\n"
-        "    for child in result.__subclasses__():\n"
-        "        _qg_mutation_wrap_result(child)\n"
-        "def _qg_mutation_subclass_hook(previous):\n"
-        "    def init_subclass(cls, **kwargs):\n"
-        "        if previous is None:\n"
-        "            super(_qg_mutation_unittest.TestResult, cls).__init_subclass__(**kwargs)\n"
-        "        else:\n"
-        "            previous.__get__(None, cls)(**kwargs)\n"
-        "        _qg_mutation_wrap_result(cls)\n"
-        "    return classmethod(init_subclass)\n"
-        "_qg_mutation_wrap_result(_qg_mutation_unittest.TestResult)\n"
-        "_qg_mutation_unittest.TestResult.__init_subclass__ = _qg_mutation_subclass_hook(\n"
-        "    _qg_mutation_unittest.TestResult.__dict__.get('__init_subclass__'))\n"
     )
-    trailer = "\n_qg_mutation_record('imported')\n"
-    return "".join(lines[:prefix]) + preamble + "".join(lines[prefix:]) + trailer
+    return "".join(lines[:prefix]) + preamble + "".join(lines[prefix:])
 
 
 def _prepare(source_root: Path, decisions: tuple[Decision, ...]) -> list[tuple[Decision, str]]:
@@ -563,7 +446,6 @@ class _TestResult(unittest.TextTestResult):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ids: list[str] = []
-        self.fixture_failures: list[str] = []
         self.previous_tests: list[str | None] = []
 
     def startTest(self, test):
@@ -579,19 +461,6 @@ class _TestResult(unittest.TextTestResult):
             os.environ.pop(_CURRENT_TEST_ENV, None)
         else:
             os.environ[_CURRENT_TEST_ENV] = previous
-
-    def _record_fixture(self, test, error, *, subtest: bool = False) -> None:
-        if _fixture_failure(error, subtest=subtest):
-            self.fixture_failures.append(test.id())
-
-    def addFailure(self, test, error):
-        self._record_fixture(test, error)
-        super().addFailure(test, error)
-
-    def addSubTest(self, test, subtest, error):
-        if error is not None:
-            self._record_fixture(test, error, subtest=True)
-        super().addSubTest(test, subtest, error)
 
 
 def _filter_suite(suite: unittest.TestSuite, selected: set[str]) -> unittest.TestSuite:
@@ -623,8 +492,7 @@ def _suite(
     report = {
         "ids": result.ids,
         "failures": [test.id() for test, _ in result.failures],
-        "fixture_failures": result.fixture_failures,
-        "errors": [f"{test.id()}: {trace[-5000:]}" for test, trace in result.errors],
+        "errors": [test.id() for test, _ in result.errors],
         "skipped": [test.id() for test, _ in result.skipped],
         "expected_failures": [test.id() for test, _ in result.expectedFailures],
         "unexpected_successes": [test.id() for test in result.unexpectedSuccesses],
@@ -662,7 +530,7 @@ def _run_suite(
     env = {
         key: value
         for key, value in os.environ.items()
-        if key != "QG_PYTHON" and not key.startswith("COVERAGE_")
+        if key not in ("QG_PYTHON", _CURRENT_TEST_ENV) and not key.startswith("COVERAGE_")
     }
     try:
         with tempfile.TemporaryFile() as output:
@@ -689,7 +557,6 @@ def _run_suite(
         fields = (
             "ids",
             "failures",
-            "fixture_failures",
             "errors",
             "skipped",
             "expected_failures",
@@ -706,15 +573,13 @@ def _run_suite(
         result["failures"] or result["errors"] or result["unexpected_successes"]
     ):
         return "error", result, f"unexpected suite exit {process.returncode}; {tail}"
-    if result["errors"]:
-        return "error", result, "test execution, setup, or import error: " + "\n".join(result["errors"][:3])
-    if result["fixture_failures"]:
-        return "error", result, "test setup or cleanup failure: " + ", ".join(result["fixture_failures"][:3])
-    if result["skipped"] or result["expected_failures"] or result["unexpected_successes"]:
-        return "error", result, "suite has skipped, expected-failure, or unexpected-success tests"
+    if result["skipped"] or result["expected_failures"]:
+        return "error", result, "suite has skipped or expected-failure tests"
     if not result["ids"]:
         return "error", result, "suite ran zero tests"
-    return ("failed" if result["failures"] else "passed"), result, tail
+    if result["failures"] or result["errors"] or result["unexpected_successes"]:
+        return "failed", result, tail
+    return "passed", result, tail
 
 
 def _copy(source_root: Path, destination: Path) -> None:
@@ -739,22 +604,12 @@ def _marker_events(marker: Path, token: str) -> list[dict]:
         if (
             isinstance(event, dict)
             and event.get("token") == token
-            and event.get("event") in ("loaded", "imported", "failure", "error", "fixture", "reached")
+            and event.get("event") == "reached"
             and isinstance(event.get("detail"), str)
             and isinstance(event.get("test", ""), str)
         ):
             events.append(event)
     return events
-
-
-def _marker_failure(events: list[dict]) -> str | None:
-    failures = [event["detail"] for event in events if event["event"] in ("failure", "error")]
-    return failures[-1][-5000:] if failures else None
-
-
-def _marker_fixture(events: list[dict]) -> str | None:
-    fixtures = [event["detail"] for event in events if event["event"] == "fixture"]
-    return fixtures[-1] if fixtures else None
 
 
 def _probe(
@@ -764,12 +619,11 @@ def _probe(
     decisions: tuple[Decision, ...],
     timeout: float,
     driver: Path,
-    ordered_ids: list[str],
 ) -> tuple[_Probe, float]:
     base.mkdir()
     root = base / "copy"
     _copy(source_root, root)
-    marker = base / "loaded"
+    marker = base / "marker"
     token = "probe"
     groups: dict[str, list[Decision]] = {}
     for decision in decisions:
@@ -780,11 +634,11 @@ def _probe(
             _instrument(source, marker, token, tuple(group)), encoding="utf-8"
         )
     started = time.monotonic()
-    status, _result, detail = _run_suite(root, tests, base, timeout, driver)
+    status, result, detail = _run_suite(root, tests, base, timeout, driver)
     elapsed = time.monotonic() - started
     if status != "passed":
-        return _Probe({}, frozenset(), f"suite {status}: {detail}"), elapsed
-    return _probe_hits(_marker_events(marker, token), decisions, ordered_ids), elapsed
+        return _Probe({}, frozenset(), (), f"suite {status}: {detail}"), elapsed
+    return _probe_hits(_marker_events(marker, token), decisions, result["ids"]), elapsed
 
 
 def _probe_hits(
@@ -795,8 +649,6 @@ def _probe_hits(
     seen = {decision.name: set() for decision in decisions}
     unattributed: set[str] = set()
     for event in events:
-        if event["event"] != "reached":
-            continue
         name = event["detail"]
         if name not in names:
             continue
@@ -813,159 +665,147 @@ def _probe_hits(
             for name, ids in selections.items()
         },
         frozenset(unattributed),
+        tuple(ordered_ids),
         None,
     )
-
-
-def _selection_choice(
-    decision: Decision, probe: _Probe, failures: dict[tuple[str, ...], str | None]
-) -> tuple[tuple[str, ...], str | None]:
-    if probe.failure is not None:
-        return (), f"probe did not pass ({probe.failure})"
-    if decision.name in probe.unattributed:
-        return (), "unattributed hits"
-    selection = probe.selections.get(decision.name, ())
-    if not selection:
-        return (), "no test reached"
-    return (selection, None) if failures.get(selection) is None else ((), failures[selection])
-
-
-def _selection_failures(
-    source_root: Path,
-    tests: str,
-    work: Path,
-    selections: set[tuple[str, ...]],
-    timeout: float,
-    driver: Path,
-    workers: int,
-) -> dict[tuple[str, ...], str | None]:
-    distinct = sorted(selections)
-    if not distinct:
-        return {}
-
-    def check(pair: tuple[int, tuple[str, ...]]) -> str | None:
-        index, selection = pair
-        base = work / f"selection-{index:03d}"
-        try:
-            base.mkdir()
-            root = base / "copy"
-            _copy(source_root, root)
-            status, result, _detail = _run_suite(
-                root, tests, base, timeout, driver, selected=selection, failfast=True
-            )
-            if status == "passed" and result["ids"] == list(selection):
-                return None
-            return f"selection failed unmutated ({status})"
-        except Exception as error:
-            return f"selection failed unmutated ({type(error).__name__}: {error})"
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(check, enumerate(distinct)))
-    return dict(zip(distinct, results, strict=True))
 
 
 def _selected_label(count: int) -> str:
     return f"{count} selected test" + ("" if count == 1 else "s")
 
 
-def _mutant_copy(
-    source_root: Path, base: Path, item: tuple[Decision, str]
-) -> tuple[Decision, Path, Path, str]:
-    decision, mutated = item
+def _fresh_copy(
+    source_root: Path, base: Path, item: tuple[Decision, str] | None = None
+) -> Path:
     base.mkdir()
     root = base / "copy"
     _copy(source_root, root)
-    marker = base / "loaded"
-    token = decision.name + ":" + hashlib.sha256(mutated.encode("utf-8")).hexdigest()
-    (root / decision.module).write_text(_instrument(mutated, marker, token), encoding="utf-8")
-    return decision, root, marker, token
+    if item is not None:
+        decision, mutated = item
+        (root / decision.module).write_text(mutated, encoding="utf-8")
+    return root
+
+
+def _import_check(root: Path, module: str, timeout: float) -> str | None:
+    dotted = Path(module).with_suffix("").as_posix().replace("/", ".")
+    code = f"import sys; sys.path.insert(0, {str(root)!r}); import {dotted}"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", code],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"module {dotted} import exceeded {timeout:g} seconds"
+    except OSError as error:
+        return f"cannot import module {dotted}: {error}"
+    if completed.returncode != 0:
+        return f"module {dotted} failed to import: {completed.stderr.strip()[-5000:]}"
+    return None
+
+
+def _nonpassing_ids(order: list[str], result: dict) -> list[str]:
+    failed = set(result["failures"]) | set(result["errors"]) | set(result["unexpected_successes"])
+    return [
+        test
+        for test in order
+        if any(item == test or item.startswith(test + " ") for item in failed)
+    ]
+
+
+def _stable(
+    decision: Decision,
+    source_root: Path,
+    tests: str,
+    base: Path,
+    nonpassing: list[str],
+    timeout: float,
+    driver: Path,
+    label: str,
+) -> Outcome:
+    state = base / "stable"
+    root = _fresh_copy(source_root, state)
+    status, _result, detail = _run_suite(
+        root, tests, state, timeout, driver, selected=tuple(nonpassing), failfast=True
+    )
+    if status == "failed":
+        return Outcome(
+            decision.name,
+            "unstable",
+            f"{label}: {', '.join(nonpassing)} failed unmutated",
+        )
+    if status != "passed":
+        return Outcome(decision.name, status, f"{label}: unstable check {status}: {detail}")
+    return Outcome(decision.name, "killed", f"{label}: {', '.join(nonpassing)}")
 
 
 def _targeted(
+    decision: Decision,
     source_root: Path,
     tests: str,
     base: Path,
-    item: tuple[Decision, str],
+    root: Path,
+    selection: tuple[str, ...],
     timeout: float,
     driver: Path,
-    selection: tuple[str, ...],
-) -> Outcome | str:
-    decision, root, marker, token = _mutant_copy(source_root, base, item)
-    status, result, _detail = _run_suite(
-        root, tests, base, timeout, driver, selected=selection, failfast=True
+) -> Outcome:
+    label = _selected_label(len(selection))
+    work = base / "selected"
+    work.mkdir()
+    status, result, detail = _run_suite(
+        root, tests, work, timeout, driver, selected=selection, failfast=True
     )
-    events = _marker_events(marker, token)
-    failure = _marker_failure(events)
-    if failure is not None:
-        return "selected run recorded an import or execution failure"
-    fixture = _marker_fixture(events)
-    if fixture is not None:
-        return f"selected run recorded a test setup or cleanup failure: {fixture}"
-    suite_fixtures = result.get("fixture_failures") if result else None
-    if suite_fixtures:
-        return (
-            "selected run recorded a test setup or cleanup failure: "
-            + ", ".join(suite_fixtures[:3])
-        )
     if status in ("error", "timed out"):
-        return f"selected run {status}"
-    if not any(event["event"] == "loaded" for event in events):
-        return "selected run did not load the mutant"
-    if not any(event["event"] == "imported" for event in events):
-        return "selected run did not complete the mutant import"
+        return Outcome(decision.name, status, f"{label}: {detail}")
     ids = result["ids"]
     if ids != list(selection[: len(ids)]):
-        return "selected run did not execute the selected tests in order"
-    if status == "failed":
-        if not ids:
-            return "selected run recorded no executed test"
         return Outcome(
-            decision.name,
-            "killed",
-            f"{_selected_label(len(selection))}: {', '.join(result['failures'][:3])}",
+            decision.name, "error", f"{label}: did not execute the selected tests in order"
         )
-    if ids != list(selection):
-        return "selected run did not execute every selected test"
-    return "selected tests passed"
+    if status == "passed":
+        if ids != list(selection):
+            return Outcome(
+                decision.name, "error", f"{label}: did not execute every selected test"
+            )
+        return Outcome(decision.name, "survived", f"{label}: the selected tests passed")
+    nonpassing = _nonpassing_ids(list(selection), result)
+    if not nonpassing:
+        return Outcome(decision.name, "error", f"{label}: {detail}")
+    return _stable(decision, source_root, tests, base, nonpassing, timeout, driver, label)
 
 
 def _full(
+    decision: Decision,
     source_root: Path,
     tests: str,
     base: Path,
-    item: tuple[Decision, str],
-    timeout: float,
+    root: Path,
     baseline_ids: list[str],
+    timeout: float,
     driver: Path,
-    reason: str,
 ) -> Outcome:
-    decision, root, marker, token = _mutant_copy(source_root, base, item)
-    status, result, detail = _run_suite(root, tests, base, timeout, driver)
-    events = _marker_events(marker, token)
-    failure = _marker_failure(events)
-    fixture = _marker_fixture(events)
-    prefix = f"full suite: {reason}"
-    if failure is not None:
-        return Outcome(decision.name, "error", prefix + ": mutant import or execution failure: " + failure)
-    if fixture is not None:
-        return Outcome(decision.name, "error", prefix + ": test setup or cleanup failure: " + fixture)
+    label = "full suite (unattributed hits)"
+    work = base / "full"
+    work.mkdir()
+    status, result, detail = _run_suite(root, tests, work, timeout, driver)
     if status in ("error", "timed out"):
-        return Outcome(decision.name, status, f"{prefix}: {detail}")
-    if not any(event["event"] == "loaded" for event in events):
+        return Outcome(decision.name, status, f"{label}: {detail}")
+    if result["ids"] != baseline_ids:
         return Outcome(
             decision.name,
             "error",
-            prefix + ": mutated module was not shown to be loaded by the suite",
+            f"{label}: mutant did not run the same tests as the probe",
         )
-    if not any(event["event"] == "imported" for event in events):
-        return Outcome(decision.name, "error", prefix + ": mutated module did not complete import")
-    if result["ids"] != baseline_ids:
+    if status == "passed":
         return Outcome(
-            decision.name, "error", prefix + ": mutant did not run the same tests as the passing suite"
+            decision.name, "survived", f"{label}: the suite passed with the mutation"
         )
-    if status == "failed":
-        return Outcome(decision.name, "killed", f"{prefix}: {', '.join(result['failures'][:3])}")
-    return Outcome(decision.name, "survived", prefix + ": the suite passed with the mutation")
+    nonpassing = _nonpassing_ids(baseline_ids, result)
+    if not nonpassing:
+        return Outcome(decision.name, "error", f"{label}: {detail}")
+    return _stable(decision, source_root, tests, base, nonpassing, timeout, driver, label)
 
 
 def _one(
@@ -977,28 +817,22 @@ def _one(
     baseline_ids: list[str],
     driver: Path,
     probe: _Probe,
-    selection_failures: dict[tuple[str, ...], str | None],
 ) -> Outcome:
     decision, _mutated = item
     try:
-        base.mkdir()
-        selection, reason = _selection_choice(decision, probe, selection_failures)
-        if reason is None:
-            targeted = _targeted(
-                source_root, tests, base / "selected", item, timeout, driver, selection
+        root = _fresh_copy(source_root, base, item)
+        invalid = _import_check(root, decision.module, timeout)
+        if invalid is not None:
+            return Outcome(decision.name, "invalid", invalid)
+        if decision.name in probe.unattributed:
+            return _full(
+                decision, source_root, tests, base, root, baseline_ids, timeout, driver
             )
-            if isinstance(targeted, Outcome):
-                return targeted
-            reason = targeted
-        return _full(
-            source_root,
-            tests,
-            base / "full",
-            item,
-            timeout,
-            baseline_ids,
-            driver,
-            reason,
+        selection = probe.selections.get(decision.name, ())
+        if not selection:
+            return Outcome(decision.name, "survived", "no test reached its target")
+        return _targeted(
+            decision, source_root, tests, base, root, selection, timeout, driver
         )
     except Exception as error:
         return Outcome(decision.name, "error", f"mutation setup failed: {type(error).__name__}: {error}")
@@ -1010,7 +844,7 @@ def run_mutations(
     *,
     tests: str = "tests",
     timeout: float = 900,
-    workers: int = 4,
+    workers: int = 2,
 ) -> Report:
     source_root = source_root.resolve()
     started = time.monotonic()
@@ -1033,37 +867,20 @@ def run_mutations(
             if original_driver.is_relative_to(source_root):
                 original_driver = pristine / original_driver.relative_to(source_root)
             shutil.copyfile(original_driver, driver)
-            baseline = work / "baseline"
-            baseline.mkdir()
-            _copy(pristine, baseline / "copy")
-            status, result, detail = _run_suite(baseline / "copy", tests, baseline, timeout, driver)
-            if status != "passed":
-                return Report(
-                    (),
-                    (f"unmutated suite {status}: {detail}",),
-                    0.0,
-                    time.monotonic() - started,
-                )
-            print(f"unmutated suite: passed ({len(result['ids'])} tests)", flush=True)
-
             probe, probe_seconds = _probe(
-                pristine, tests, work / "probe", decisions, timeout, driver, result["ids"]
+                pristine, tests, work / "probe", decisions, timeout, driver
             )
             if probe.failure is not None:
-                print(f"probe: {probe.failure}; every mutant runs the full suite", flush=True)
-            else:
-                reached = sum(bool(selection) for selection in probe.selections.values())
-                print(
-                    f"probe: {reached} / {len(decisions)} targets reached in {probe_seconds:.1f} s",
-                    flush=True,
+                return Report(
+                    (),
+                    (f"probe {probe.failure}",),
+                    probe_seconds,
+                    time.monotonic() - started,
                 )
-            candidates = set()
-            for decision in decisions:
-                selection, reason = _selection_choice(decision, probe, {})
-                if reason is None:
-                    candidates.add(selection)
-            selections = _selection_failures(
-                pristine, tests, work, candidates, timeout, driver, workers
+            reached = sum(bool(selection) for selection in probe.selections.values())
+            print(
+                f"probe: {reached} / {len(decisions)} targets reached in {probe_seconds:.1f} s",
+                flush=True,
             )
 
             def execute(pair):
@@ -1074,10 +891,9 @@ def run_mutations(
                     work / f"mutant-{index:03d}",
                     item,
                     timeout,
-                    result["ids"],
+                    list(probe.ids),
                     driver,
                     probe,
-                    selections,
                 )
 
             with ThreadPoolExecutor(max_workers=workers) as executor:

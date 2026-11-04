@@ -8,8 +8,8 @@ metric_version = "verification/1"
 
 [[entry]]
 subject = "tests:tests:executed"
-bound = 705
-reason = "measured after result reuse was retired (QF58b, 2026-10-30)"
+bound = 700
+reason = "measured after QF117 retired fixture classification, the plain unmutated run and the selection pre-runs, with their tests (2026-11-04)"
 
 [[entry]]
 subject = "exclusions:quality_gate/coverage_tool.py:no-cover"
