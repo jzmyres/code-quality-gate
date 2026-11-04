@@ -118,7 +118,7 @@ class ElispCrapTests(FixtureCase):
         result, document = self.run_json(*args)
         return result, document, self.check_by_id(document, "crap")
 
-    def test_evidence_is_explicitly_removed_after_crap(self) -> None:
+    def test_evidence_is_removed_with_the_run_directory(self) -> None:
         self.add_file("crap.toml", baseline_text([], check="crap", metric_version="elisp-edebug/1"))
         _result, document = self.run_evidence_check()
         self.assertEqual(self.check_by_id(document, "legacy-tests")["outcome"], "pass")

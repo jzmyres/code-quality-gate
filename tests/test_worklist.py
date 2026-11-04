@@ -12,13 +12,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import GATE, FixtureCase, PYTHON_TEST_HEADER, baseline_text, output
+from support import (
+    BASE_CONFIG, GATE, FixtureCase, PYTHON_TEST_HEADER, baseline_text, output,
+)
 from test_python_crap import crap_config
 from test_verification import (
     executed_entry, exclusion_entry, verification_baseline, verification_config,
 )
 
-from quality_gate import adapters, policy, worklist
+from quality_gate import adapters, checks, policy, worklist
+from test_check import SLEEP_STUB
 
 
 ALPHA = """def alpha(value):
@@ -197,71 +200,33 @@ def run_worklist(
     )
 
 
-def evidence_runner(
-    case: FixtureCase, *, fail_cleanup: bool = False
-) -> tuple[Path, Path]:
-    paths = case.base / "worklist-evidence-paths.jsonl"
-    runner = case.base / "worklist-evidence-runner.py"
-    failure = ""
-    if fail_cleanup:
-        failure = (
-            "    def cleanup():\n"
-            "        temporary._finalizer.detach()\n"
-            "        raise OSError('cleanup denied')\n"
-            "    temporary.cleanup = cleanup\n"
-        )
-    runner.write_text(
-        "import json, runpy, sys\n"
-        f"sys.path.insert(0, {str(case.gate)!r})\n"
-        "from quality_gate import checks\n"
-        "original = checks._new_evidence_directory\n"
-        "def record(directories, **options):\n"
-        "    temporary = original(directories, **options)\n"
-        f"    with open({str(paths)!r}, 'a', encoding='utf-8') as stream:\n"
-        "        stream.write(json.dumps(temporary.name) + '\\n')\n"
-        + failure
-        + "    return temporary\n"
-        "checks._new_evidence_directory = record\n"
-        f"runpy.run_path({str(case.gate / 'qg.py')!r}, run_name='__main__')\n",
-        encoding="utf-8",
-    )
-    return runner, paths
-
-
-def run_worklist_with_evidence(
-    case: FixtureCase, *args: str, fail_cleanup: bool = False
-) -> tuple[subprocess.CompletedProcess[str], list[Path]]:
-    runner, paths = evidence_runner(case, fail_cleanup=fail_cleanup)
-    prefix = case.python_prefix()
-    command = [
-        prefix[0], "-W", "error::ResourceWarning", *prefix[1:], str(runner),
-        "--repo", str(case.repo), "worklist", *args,
+def _run_directories(root: Path) -> list[Path]:
+    return [
+        path for path in root.iterdir() if path.name.startswith("qg-run-")
     ]
-    result = subprocess.run(
-        command, cwd=str(case.repo), env=case.env(case.default_tool_env()),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=120,
-    )
-    recorded = (
-        [Path(json.loads(line)) for line in paths.read_text(encoding="utf-8").splitlines()]
-        if paths.exists()
-        else []
-    )
-    return result, recorded
 
 
-def assert_evidence_removed(
-    case: FixtureCase,
-    result: subprocess.CompletedProcess[str],
-    directories: list[Path],
-) -> None:
-    case.assertTrue(directories, output(result))
-    case.assertTrue(
-        any(directory.name.startswith("qg-coverage-") for directory in directories),
-        directories,
+def slow_config() -> str:
+    return BASE_CONFIG.replace(
+        "checks = [\"smoke\"]", "checks = [\"slow\"]"
+    ).replace(
+        '[checks.smoke]\nadapter = "command"',
+        '[checks.slow]\nadapter = "sleep-stub"',
+    ).replace(
+        'run = ["python3", "-c", "print(1)"]\ntests_pattern = \'(\\d+)\'',
+        'sleep_seconds = 30\nbudget_seconds = 1\n'
+        'threshold = 0\nbaseline = "slow.toml"',
     )
-    for directory in directories:
-        case.assertFalse(directory.exists(), str(directory))
+
+
+def run_worklist_with_tmpdir(
+    case: FixtureCase, *args: str
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    root = case.base / "tmp"
+    root.mkdir()
+    environment = case.default_tool_env()
+    environment["TMPDIR"] = str(root)
+    return run_worklist(case, *args, env=environment), root
 
 
 def snapshot_tree(repo: Path) -> dict[str, bytes]:
@@ -332,25 +297,12 @@ class WorklistOrderTests(FixtureCase):
         self.assertGreater(rows[0]["churn_x_value"], rows[1]["churn_x_value"])
         self.assertEqual(f"{rows[0]['churn_x_value']:.1f}", f"{rows[1]['churn_x_value']:.1f}")
 
-    def test_python_crap_evidence_is_removed_explicitly(self) -> None:
-        result, directories = run_worklist_with_evidence(self, "--json", "crap")
+    def test_a_worklist_run_leaves_no_run_directory(self) -> None:
+        result, root = run_worklist_with_tmpdir(self, "--json", "crap")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertNotIn("ResourceWarning", result.stderr)
         self.assertNotIn("Implicitly cleaning up", result.stderr)
-        assert_evidence_removed(self, result, directories)
-
-    def test_cleanup_failure_is_reported_and_exits_one(self) -> None:
-        result, directories = run_worklist_with_evidence(
-            self, "--json", "crap", fail_cleanup=True
-        )
-        self.assertNotEqual(result.returncode, 0, output(result))
-        self.assertEqual(result.stdout, "")
-        self.assertIn("cannot remove evidence directory", result.stderr)
-        self.assertIn("cleanup denied", result.stderr)
-        self.assertTrue(directories, output(result))
-        for directory in directories:
-            self.assertIn(str(directory), result.stderr)
-            shutil.rmtree(directory, ignore_errors=True)
+        self.assertEqual(_run_directories(root), [])
 
 
 class WorklistElispTests(FixtureCase):
@@ -509,12 +461,12 @@ class WorklistUnreliableTests(FixtureCase):
         self.assertNotIn("CHURN", result.stdout)
         self.assertNotIn("pkg/alpha.py:alpha", result.stdout)
 
-    def test_failing_dependency_still_releases_its_evidence(self) -> None:
-        result, directories = run_worklist_with_evidence(self, "--json", "crap")
+    def test_a_failing_dependency_leaves_no_run_directory(self) -> None:
+        result, root = run_worklist_with_tmpdir(self, "--json", "crap")
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn("worklist: tests:", result.stderr)
         self.assertNotIn("ResourceWarning", result.stderr)
-        assert_evidence_removed(self, result, directories)
+        self.assertEqual(_run_directories(root), [])
 
 
 class WorklistGitFailureTests(FixtureCase):
@@ -1218,6 +1170,21 @@ class WorklistCopyTests(FixtureCase):
         self.assertNotIn("check: tests", result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(snapshot_tree(self.repo), before)
+
+
+class WorklistRunLimitTests(FixtureCase):
+    def test_a_stopped_selected_check_reports_the_run_limit(self) -> None:
+        root = self.base / "tmp"
+        root.mkdir()
+        self.write_config(slow_config())
+        with mock.patch.dict(adapters.ADAPTERS, {SLEEP_STUB.name: SLEEP_STUB}), \
+                mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
+            result = self.run_qg(
+                "worklist", "--json", "slow", env={"TMPDIR": str(root)}
+            )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("the run exceeded its 1 s limit", result.stderr)
+        self.assertEqual(_run_directories(root), [])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import io
 import json
 import signal
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -16,19 +17,21 @@ from unittest import mock
 from support import (
     BASE_CONFIG,
     GATE,
+    PYTHON_TEST_HEADER,
     FixtureCase,
+    baseline_text,
     output,
     sarif_report,
     stub_check_result,
     with_clones,
 )
+from test_python_crap import crap_config
 
 sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
 checks = importlib.import_module("quality_gate.checks")
 cli = importlib.import_module("quality_gate.cli")
 policy = importlib.import_module("quality_gate.policy")
-runner = importlib.import_module("quality_gate.runner")
 
 
 class _SleepSpec:
@@ -38,6 +41,16 @@ class _SleepSpec:
 
 
 def _parse_sleep(raw, root, path, full_key):
+    baseline = None
+    if "baseline" in raw:
+        baseline = root / policy._string(
+            raw, "baseline", path, f"{full_key}.baseline"
+        )
+    threshold = None
+    if "threshold" in raw:
+        threshold = policy._number(
+            raw, "threshold", path, f"{full_key}.threshold"
+        )
     return adapters.ParsedSpec(
         _SleepSpec(
             policy._integer(raw, "sleep_seconds", path, f"{full_key}.sleep_seconds"),
@@ -45,6 +58,8 @@ def _parse_sleep(raw, root, path, full_key):
         ),
         "sleep/1",
         ("tests",),
+        threshold=threshold,
+        baseline=baseline,
     )
 
 
@@ -62,7 +77,7 @@ def _run_sleep(context):
 
 SLEEP_STUB = adapters.AdapterDescriptor(
     "sleep-stub",
-    ("sleep_seconds", "budget_seconds"),
+    ("sleep_seconds", "budget_seconds", "baseline", "threshold"),
     _parse_sleep,
     _run_sleep,
     budget=lambda spec: spec.budget_seconds,
@@ -167,6 +182,24 @@ def _sleep_config(entries):
             "",
         ])
     return "\n".join(lines)
+
+
+def _run_directories(root: Path) -> list[Path]:
+    return [
+        path for path in root.iterdir() if path.name.startswith("qg-run-")
+    ]
+
+
+def _failing_run_directory_cleanup():
+    original = tempfile.TemporaryDirectory.cleanup
+
+    def cleanup(directory):
+        if Path(directory.name).name.startswith("qg-run-"):
+            directory._finalizer.detach()
+            raise OSError("denied")
+        return original(directory)
+
+    return mock.patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup)
 
 
 class CheckTests(FixtureCase):
@@ -389,153 +422,67 @@ class PartialRunArgumentTests(FixtureCase):
         self.assertNotIn("check: inventory", text)
 
 
-class EvidenceCleanupTests(FixtureCase):
-    def definition(self, identifier, requires=None):
-        return policy.CheckDef(
-            identifier, "fixture", 1, "enforced", "fixture/1", ("tests",),
-            SimpleNamespace(requires=requires), None, None,
+class RunDirectoryTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.temporary_root = self.base / "tmp"
+        self.temporary_root.mkdir()
+
+    def run_with_temporary(self, *args: str):
+        return self.run_qg(
+            *args, env={"TMPDIR": str(self.temporary_root)}
         )
 
-    def result(self, context, temporary=None):
-        return checks.CheckResult(
-            context.check.id, "check", 1, "enforced", "fixture", ("tests",),
-            "fixture/1", "pass", "completed", 0.0, 60,
-            temporary=temporary,
+    def test_a_passing_run_leaves_no_run_directory(self) -> None:
+        result = self.run_with_temporary("check")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(_run_directories(self.temporary_root), [])
+
+    def test_a_failing_run_leaves_no_run_directory(self) -> None:
+        self.write_config(
+            _two_check_config('["python3", "-c", "raise SystemExit(1)"]')
         )
+        result = self.run_with_temporary("check")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(_run_directories(self.temporary_root), [])
 
-    def produce(self, context):
-        temporary = context.temporary_directory(prefix="qg-evidence-", dir=self.base)
-        self.evidence = Path(temporary.name) / "evidence.txt"
-        self.evidence.write_text("evidence", encoding="utf-8")
-        return self.result(context, temporary)
+    def test_crap_reads_the_tests_evidence_during_the_run(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.write_config(crap_config())
+        self.add_file("pkg/one.py", "def one():\n    return 1\n")
+        self.add_file(
+            "tests/test_one.py",
+            PYTHON_TEST_HEADER
+            + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            "        from pkg.one import one\n"
+            "        self.assertEqual(one(), 1)\n",
+        )
+        self.add_file("quality-gate-crap.toml", baseline_text(
+            [], check="crap", metric_version="python-lines/1",
+        ))
+        environment = self.default_tool_env()
+        environment["TMPDIR"] = str(self.temporary_root)
+        result = self.run_qg("check", "--json", env=environment)
+        self.assertEqual(result.returncode, 0, output(result))
+        document = self.parse_json(result)
+        self.assertEqual(self.check_by_id(document, "tests")["outcome"], "pass")
+        crap = self.check_by_id(document, "crap")
+        self.assertEqual(crap["outcome"], "pass")
+        finding = {
+            item["subject"]: item for item in crap["findings"]
+        }["pkg/one.py:one"]
+        self.assertGreater(finding["measurement"]["executed"], 0)
+        self.assertEqual(_run_directories(self.temporary_root), [])
 
-    def run_checks(self, definitions, adapter, *, implicit_tests=False):
-        config = SimpleNamespace(checks={check.id: check for check in definitions})
-        descriptor = SimpleNamespace(run=adapter, budget=lambda spec: 60, requires_tests=implicit_tests)
-        with mock.patch.object(checks, "_check_descriptor", return_value=descriptor), \
-                contextlib.redirect_stdout(io.StringIO()):
-            return checks._run_policy_checks(self.repo, config, [], {}, 0)
-
-    def assert_removed(self):
-        self.assertFalse(self.evidence.parent.exists(), str(self.evidence.parent))
-
-    def test_evidence_lasts_through_all_consumers_and_is_removed_before_the_next_check(self):
-        definitions = [self.definition("producer"), self.definition("first", "producer"),
-                       self.definition("gap"), self.definition("last", "producer"),
-                       self.definition("unrelated")]
-
-        def adapter(context):
-            if context.check.id == "producer":
-                return self.produce(context)
-            if context.check.id == "unrelated":
-                self.assert_removed()
-            else:
-                self.assertEqual(self.evidence.read_text(encoding="utf-8"), "evidence")
-            return self.result(context)
-
-        results = self.run_checks(definitions, adapter)
-        self.assert_removed()
-        self.assertIsNone(results[0].temporary)
-
-    def test_evidence_with_no_consumers_is_removed_immediately(self):
-        def adapter(context):
-            if context.check.id == "producer":
-                return self.produce(context)
-            self.assert_removed()
-            return self.result(context)
-
-        self.run_checks([self.definition("producer"), self.definition("unrelated")], adapter)
-
-    def test_an_implicit_test_dependency_keeps_evidence_until_the_consumer_finishes(self):
-        def adapter(context):
-            if context.check.id == "producer":
-                return self.produce(context)
-            self.assertEqual(self.evidence.read_text(encoding="utf-8"), "evidence")
-            return self.result(context)
-
-        self.run_checks([self.definition("producer"), self.definition("consumer")], adapter,
-                        implicit_tests=True)
-        self.assert_removed()
-
-    def test_later_error_removes_evidence_waiting_for_a_consumer(self):
-        def adapter(context):
-            if context.check.id == "producer":
-                return self.produce(context)
-            self.assertTrue(self.evidence.exists())
-            raise policy.GateError("later check failed")
-
-        definitions = [self.definition("producer"), self.definition("error"),
-                       self.definition("consumer", "producer")]
-        with self.assertRaisesRegex(policy.GateError, "later check failed"):
-            self.run_checks(definitions, adapter)
-        self.assert_removed()
-
-    def test_error_before_an_adapter_returns_still_removes_its_directory(self):
-        def adapter(context):
-            self.produce(context)
-            raise policy.GateError("producer failed")
-
-        with self.assertRaisesRegex(policy.GateError, "producer failed"):
-            self.run_checks([self.definition("producer")], adapter)
-        self.assert_removed()
-
-    def assert_cleanup_failure_survives(self, ending):
-        def adapter(context):
-            result = self.produce(context)
-            self.addCleanup(result.temporary.cleanup)
-            result.temporary.cleanup = mock.Mock(side_effect=PermissionError("cleanup denied"))
-            result.diagnostics = runner.Diagnostics(
-                argv=["fixture"], exit_code=1, output_bytes=15,
-                output_tail="fixture output", error="original diagnostic",
-            )
-            if ending == "failure":
-                result.outcome = "fail"
-            return result
-
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            results = self.run_checks([self.definition("producer")], adapter)
-        document = results[0].to_json()
-        diagnostic = document["diagnostics"]["error"]
-        message = f"cannot remove evidence directory {self.evidence.parent}: cleanup denied"
-        self.assertIn(message, diagnostic)
-        self.assertEqual(diagnostic.count(message), 1)
-        self.assertIn(message, stderr.getvalue())
-        self.assertTrue(self.evidence.parent.is_dir())
-        expected = {
-            "success": ("pass", "completed"),
-            "failure": ("fail", "completed"),
-        }
-        self.assertEqual((document["outcome"], document["execution"]), expected[ending])
-        self.assertIn("original diagnostic", diagnostic)
-        self.assertEqual(document["diagnostics"]["argv"], ["fixture"])
-        self.assertEqual(document["diagnostics"]["exit_code"], 1)
-        self.assertEqual(document["diagnostics"]["output_tail"], "fixture output")
-
-    def test_cleanup_failure_preserves_completed_outcomes_and_diagnostics(self):
-        for ending in ("success", "failure"):
-            with self.subTest(ending=ending):
-                self.assert_cleanup_failure_survives(ending)
-
-    def test_cleanup_failure_is_reported_and_other_directories_are_still_removed(self):
-        paths = []
-
-        def adapter(context):
-            result = self.produce(context)
-            paths.append(self.evidence.parent)
-            if context.check.id == "producer":
-                self.addCleanup(result.temporary.cleanup)
-                result.temporary.cleanup = mock.Mock(side_effect=OSError("denied"))
-                result.diagnostics.error = "original diagnostic"
-            return result
-
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            results = self.run_checks([self.definition("producer"), self.definition("other")], adapter)
-        message = f"cannot remove evidence directory {paths[0]}: denied"
-        self.assertIn(message, stderr.getvalue())
-        self.assertIn(message, results[0].diagnostics.error)
-        self.assertIn("original diagnostic", results[0].diagnostics.error)
-        self.assertTrue(paths[0].is_dir())
-        self.assertFalse(paths[1].exists())
+    def test_a_failed_removal_is_an_error(self) -> None:
+        with _failing_run_directory_cleanup():
+            result = self.run_with_temporary("check")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("cannot remove the run directory", result.stderr)
+        directories = _run_directories(self.temporary_root)
+        self.assertEqual(len(directories), 1)
+        self.assertIn(str(directories[0]), result.stderr)
 
 
 class RunLimitTests(FixtureCase):
@@ -589,6 +536,33 @@ class RunLimitTests(FixtureCase):
         self.assertLess(time.monotonic() - started, 10)
         self.assertIn("1 s limit", stderr)
         self.assertNotIn("unselected", stdout)
+
+    def temporary_root(self) -> Path:
+        root = self.base / "tmp"
+        root.mkdir()
+        return root
+
+    def test_a_stopped_run_leaves_no_run_directory(self) -> None:
+        root = self.temporary_root()
+        self.write_config(_sleep_config([("sleep", 30, 1)]))
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
+            result = self.run_qg("check", env={"TMPDIR": str(root)})
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("the run exceeded its 1 s limit", result.stderr)
+        self.assertEqual(_run_directories(root), [])
+
+    def test_a_stopped_run_reports_a_failed_removal(self) -> None:
+        root = self.temporary_root()
+        self.write_config(_sleep_config([("sleep", 30, 1)]))
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0), \
+                _failing_run_directory_cleanup():
+            result = self.run_qg("check", env={"TMPDIR": str(root)})
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("the run exceeded its 1 s limit", result.stderr)
+        self.assertIn("cannot remove the run directory", result.stderr)
+        directories = _run_directories(root)
+        self.assertEqual(len(directories), 1)
+        self.assertIn(str(directories[0]), result.stderr)
 
     @staticmethod
     def _handler(_signum: int, _frame: object) -> None:

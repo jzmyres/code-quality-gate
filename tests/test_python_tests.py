@@ -902,16 +902,17 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
     def test_setup_returns_the_data_directory_and_prefix(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
+        evidence_dir = Path(temporary.name)
         with mock.patch.object(
             python_tests, "coverage_prefix", return_value=["prefix"]
         ) as prefix:
             setup = python_tests._tests_setup(
-                Path("/repo"), self.check, self.spec, 0.0, "check: tests", temporary
+                Path("/repo"), self.check, self.spec, 0.0, "check: tests", evidence_dir
             )
         assert not isinstance(setup, checks.CheckResult)
-        temporary, data_dir, python_prefix = setup
-        self.addCleanup(temporary.cleanup)
+        data_dir, python_prefix = setup
         self.assertTrue(data_dir.is_dir())
+        self.assertEqual(data_dir, evidence_dir / "data")
         self.assertEqual(python_prefix, ["prefix"])
         prefix.assert_called_once_with(Path("/repo"), data_dir)
 
@@ -922,7 +923,8 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             python_tests, "coverage_prefix", side_effect=error
         ), contextlib.redirect_stderr(io.StringIO()):
             setup = python_tests._tests_setup(
-                Path("/repo"), self.check, self.spec, 0.0, "check: tests", temporary
+                Path("/repo"), self.check, self.spec, 0.0, "check: tests",
+                Path(temporary.name),
             )
         assert isinstance(setup, checks.CheckResult)
         return setup
@@ -1058,7 +1060,8 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
     def test_evidence_builds_the_pass_result(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        data_dir = Path(temporary.name) / "data"
+        evidence_dir = Path(temporary.name)
+        data_dir = evidence_dir / "data"
         data_dir.mkdir()
         coverage_tool.write_coverage_config(data_dir, data_dir)
         with mock.patch.object(
@@ -1069,7 +1072,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 self.spec,
                 0.0,
                 "check: tests",
-                temporary,
+                evidence_dir,
                 data_dir,
                 data_dir,
                 3,
@@ -1083,13 +1086,12 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         self.assertEqual(result.tests_skipped, 1)
         self.assertEqual(
             result.evidence_path,
-            Path(temporary.name) / "combined" / ".coverage",
+            evidence_dir / "combined" / ".coverage",
         )
         self.assertEqual(result.adapter_data["coverage_config"], data_dir / "coverage.ini")
         self.assertEqual(
             result.adapter_data["coverage_settings"], coverage_tool.coverage_config_text(data_dir)
         )
-        self.assertIs(result.temporary, temporary)
         self.assertIn("passed (2 tests", stdout.getvalue())
 
 

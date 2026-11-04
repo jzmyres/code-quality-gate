@@ -289,11 +289,11 @@ def _tests_setup(
     spec: Any,
     start: float,
     prefix: str,
-    temporary: Any,
-) -> tuple[Any, Path, list[str]] | Any:
+    evidence_dir: Path,
+) -> tuple[Path, list[str]] | Any:
     from .checks import _tests_result
 
-    data_dir = Path(temporary.name) / "data"
+    data_dir = evidence_dir / "data"
     try:
         data_dir.mkdir()
         mark_step("coverage setup")
@@ -328,7 +328,7 @@ def _tests_setup(
             execution="error",
             diagnostics=Diagnostics(error=message),
         )
-    return temporary, data_dir, python_prefix
+    return data_dir, python_prefix
 
 
 def _tests_execution_failure(
@@ -429,7 +429,7 @@ def _tests_evidence(
     spec: Any,
     start: float,
     prefix: str,
-    temporary: Any,
+    evidence_dir: Path,
     root: Path,
     data_dir: Path,
     ran: int,
@@ -456,7 +456,7 @@ def _tests_evidence(
             diagnostics=Diagnostics(error=problem),
             configuration_error=True,
         )
-    combined_file = Path(temporary.name) / "combined" / ".coverage"
+    combined_file = evidence_dir / "combined" / ".coverage"
     config_file = coverage_config_path(data_dir)
     failure = _combine_tests_evidence(
         check,
@@ -481,7 +481,6 @@ def _tests_evidence(
         tests_skipped=skipped,
         evidence_path=combined_file,
         adapter_data={"coverage_config": config_file, "coverage_settings": settings},
-        temporary=temporary,
     )
     print(
         f"{prefix}: passed ({executed} tests, "
@@ -498,11 +497,11 @@ def _run_python_tests(context: Any) -> Any:
     spec = check.spec
     start = time.monotonic()
     deadline = start + spec.budget_seconds
-    temporary = context.temporary_directory(prefix="qg-coverage-")
-    setup = _tests_setup(root, check, spec, start, prefix, temporary)
+    evidence_dir = context.evidence_dir
+    setup = _tests_setup(root, check, spec, start, prefix, evidence_dir)
     if isinstance(setup, CheckResult):
         return setup
-    temporary, data_dir, python_prefix = setup
+    data_dir, python_prefix = setup
 
     command = expand_run(spec.run, python_prefix)
     environment = _test_environment(python_prefix)
@@ -544,7 +543,7 @@ def _run_python_tests(context: Any) -> Any:
         spec,
         start,
         prefix,
-        temporary,
+        evidence_dir,
         root,
         data_dir,
         ran,

@@ -298,11 +298,11 @@ negative or non-numeric count is invalid. It is `unsupported` when `tests_patter
 matches more than once (`ambiguous test summary`), `skipped_pattern` matches more than once
 (`ambiguous skipped summary`), a captured count is not a non-negative integer, or coverage is not
 installed. On `pass` the adapter combines the registered coverage datasets and keeps the combined data
-as the evidence for checks that require it. The core explicitly removes test evidence directories
-after their last dependent check, including when a check fails or the run limit stops the run, and
-reports cleanup failures as diagnostics. The `worklist` command follows the same rule for the checks
-it runs, and a cleanup failure makes it exit non-zero. Pattern matching runs in an interruptible child
-with its own budget.
+as the evidence for checks that require it. The core keeps one run directory for all check evidence
+and removes it when the run ends, including when a check fails or the run limit stops the run. A run
+directory that cannot be removed is an error (exit 2). The `worklist` command runs its checks through
+the same loop, so it uses the same run directory and run limit. Pattern matching runs in an
+interruptible child with its own budget.
 
 A completed run records the parsed run and skipped counts for verification, which reports them as
 its `tests:ID:executed` and `tests:ID:skipped` findings. It does not reconstruct individual test
@@ -717,8 +717,8 @@ and leaves `decision` reporting the gate evaluation. If a write itself fails, ea
 same request may already have completed. `--prune` with `--policy-from` is a usage error (exit 2)
 naming both options, before any check runs; `--prune` without `--policy-from` is unchanged.
 
-The decision is `error` (exit 2) for invalid policy, usage or configuration, or when the run exceeds
-its limit, `rejected` (exit 1) when
+The decision is `error` (exit 2) for invalid policy, usage or configuration, when the run exceeds
+its limit, or when the run directory cannot be removed, `rejected` (exit 1) when
 inventory, hygiene, any enforced check or any obligation is not satisfied, `partial` (exit 0) when a
 `--only` run's inventory, hygiene and every enforced check that ran are satisfied, and
 `accepted_with_exceptions` (exit 0) when every obligation and enforced check is satisfied but at least

@@ -9,7 +9,6 @@ import tempfile
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +47,10 @@ RATCHET_BUDGET_SECONDS = 600
 RUN_ALLOWANCE_SECONDS = 300
 
 
+class RunCleanupError(UsageError):
+    """The run directory could not be removed after the checks ran."""
+
+
 def _budget_detail(reason: str, start: float, budget: float) -> str:
     elapsed = time.monotonic() - start
     return f"{reason} (timeout; deadline: {budget:g} seconds; elapsed: {elapsed:.3f} seconds)"
@@ -80,8 +83,6 @@ class CheckResult:
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     evidence_path: Path | None = None
     adapter_data: Any = None
-    # Owned by the core until the last dependent check finishes.
-    temporary: Any = field(default=None, repr=False, compare=False)
     configuration_error: bool = False
     tool: dict[str, str] | None = None
     report_fields: dict[str, Any] = field(default_factory=dict)
@@ -414,40 +415,13 @@ def _adapter_runner(
     files: list[str],
     classes: dict[str, str],
     prefix: str,
+    evidence_dir: Path,
     prior: dict[str, CheckResult],
 ) -> CheckResult:
-    temporaries: list[Any] = []
     context = AdapterContext(
-        root, config, check, files, classes, prefix, prior,
-        partial(_new_evidence_directory, temporaries),
+        root, config, check, files, classes, prefix, prior, evidence_dir,
     )
-    result = None
-    try:
-        result = _check_descriptor(check).run(context)
-        return result
-    finally:
-        for temporary in temporaries:
-            if result is None or temporary is not result.temporary:
-                _cleanup_evidence(temporary, check.id, result)
-
-
-def _new_evidence_directory(temporaries: list[Any], **options: Any) -> Any:
-    temporary = tempfile.TemporaryDirectory(**options)
-    temporaries.append(temporary)
-    return temporary
-
-
-def _cleanup_evidence(temporary: Any, identifier: str, result: CheckResult | None) -> str | None:
-    try:
-        temporary.cleanup()
-    except Exception as error:
-        message = f"check: {identifier}: cannot remove evidence directory {temporary.name}: {error}"
-        print(message, file=sys.stderr)
-        if result is not None:
-            previous = result.diagnostics.error
-            result.diagnostics.error = f"{previous}; {message}" if previous else message
-        return message
-    return None
+    return _check_descriptor(check).run(context)
 
 
 def run_check(
@@ -458,13 +432,14 @@ def run_check(
     classes: dict[str, str],
     *,
     prefix: str,
+    evidence_dir: Path,
     prior: dict[str, CheckResult] | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
     start = time.monotonic()
     with check_deadline(check.id, start, _check_budget(check)):
         return _adapter_runner(
-            root, config, check, files, classes, prefix, prior or {}
+            root, config, check, files, classes, prefix, evidence_dir, prior or {}
         )
 
 
@@ -603,6 +578,21 @@ def _disarm_run_limit(previous: Any) -> None:
     signal.signal(signal.SIGALRM, previous)
 
 
+def _run_cleanup_message(directory: Any, error: OSError) -> str:
+    return f"check: cannot remove the run directory {directory.name}: {error}"
+
+
+def _remove_run_directory(directory: Any, *, report: bool = False) -> None:
+    try:
+        directory.cleanup()
+    except OSError as error:
+        message = _run_cleanup_message(directory, error)
+        if report:
+            print(message, file=sys.stderr)
+        else:
+            raise RunCleanupError(message) from error
+
+
 def _run_policy_checks(
     root: Path,
     config: Config,
@@ -615,7 +605,7 @@ def _run_policy_checks(
     selected_checks = [config.checks[identifier] for identifier in selected]
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
-    last_users = _evidence_last_users(selected_checks)
+    run_directory = tempfile.TemporaryDirectory(prefix="qg-run-")
     previous = _arm_run_limit(_run_limit(selected_checks))
     try:
         try:
@@ -630,6 +620,8 @@ def _run_policy_checks(
                     prior[check.id] = skipped
                     continue
                 print(f"check: {check.id} ({check.adapter})", flush=True)
+                evidence_dir = Path(run_directory.name) / check.id
+                evidence_dir.mkdir()
                 outcome = run_check(
                     root,
                     config,
@@ -637,46 +629,19 @@ def _run_policy_checks(
                     files,
                     classes,
                     prefix=f"check: {check.id}",
+                    evidence_dir=evidence_dir,
                     prior=prior,
                 )
                 results.append(outcome)
                 prior[check.id] = outcome
-                _release_evidence(results, last_users, check.id)
-        finally:
-            _release_evidence(results, last_users)
+        except BaseException:
+            _remove_run_directory(run_directory, report=True)
+            raise
+        else:
+            _remove_run_directory(run_directory)
     finally:
         _disarm_run_limit(previous)
     return results
-
-
-def _evidence_last_users(checks: Iterable[CheckDef]) -> dict[str, str]:
-    last_users: dict[str, str] = {}
-    prior: dict[str, CheckDef] = {}
-    for check in checks:
-        last_users[check.id] = check.id
-        dependencies = (
-            _test_check_dependencies(check, prior)
-            if _check_descriptor(check).requires_tests
-            else [getattr(check.spec, "requires", None)]
-        )
-        for identifier in dependencies:
-            if identifier is not None:
-                last_users[identifier] = check.id
-        prior[check.id] = check
-    return last_users
-
-
-def _release_evidence(
-    results: list[CheckResult], last_users: dict[str, str], finished: str | None = None,
-) -> list[str]:
-    cleanup_errors: list[str] = []
-    for result in results:
-        if result.temporary is not None and (finished is None or last_users[result.id] == finished):
-            temporary, result.temporary = result.temporary, None
-            message = _cleanup_evidence(temporary, result.id, result)
-            if message is not None:
-                cleanup_errors.append(message)
-    return cleanup_errors
 
 
 def _write_pruned(

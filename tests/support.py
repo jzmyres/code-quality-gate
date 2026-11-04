@@ -375,20 +375,21 @@ class FixtureCase(unittest.TestCase):
         return result, self.parse_json(result)
 
     def run_evidence_check(self) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
-        """Run real adapters with fatal resource warnings and record their evidence directories."""
+        """Run real adapters with fatal resource warnings and record the run directory."""
         paths = self.base / "evidence-paths.jsonl"
         runner = self.base / "evidence-runner.py"
         runner.write_text(
-            "import json, runpy, sys\n"
+            "import json, runpy, sys, tempfile\n"
+            "from pathlib import Path\n"
             f"sys.path.insert(0, {str(GATE)!r})\n"
-            "from quality_gate import checks\n"
-            "original = checks._new_evidence_directory\n"
-            "def record(directories, **options):\n"
-            "    temporary = original(directories, **options)\n"
-            f"    with open({str(paths)!r}, 'a', encoding='utf-8') as stream:\n"
-            "        stream.write(json.dumps(temporary.name) + '\\n')\n"
+            "original = tempfile.TemporaryDirectory\n"
+            "def record(*args, **options):\n"
+            "    temporary = original(*args, **options)\n"
+            "    if Path(temporary.name).name.startswith('qg-run-'):\n"
+            f"        with open({str(paths)!r}, 'a', encoding='utf-8') as stream:\n"
+            "            stream.write(json.dumps(temporary.name) + '\\n')\n"
             "    return temporary\n"
-            "checks._new_evidence_directory = record\n"
+            "tempfile.TemporaryDirectory = record\n"
             f"runpy.run_path({str(QG)!r}, run_name='__main__')\n",
             encoding="utf-8",
         )

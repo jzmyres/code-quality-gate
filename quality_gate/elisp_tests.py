@@ -295,7 +295,7 @@ def _temporary() -> tempfile.TemporaryDirectory[str]:
 
 
 def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any],
-            temporary: Any, evidence: Path) -> Any:
+            evidence: Path) -> Any:
     from .checks import _check_result, _tests_result
 
     check, prefix, spec = context.check, context.prefix, context.check.spec
@@ -308,8 +308,7 @@ def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any
                              diagnostics=diagnostics)
     reason = _verdict(document)
     result = _check_result(check, start, "fail" if reason else "pass", budget_seconds=spec.budget_seconds,
-                           diagnostics=diagnostics, reason=reason, evidence_path=evidence,
-                           temporary=temporary)
+                           diagnostics=diagnostics, reason=reason, evidence_path=evidence)
     apply_document(result, document)
     if reason:
         print(f"{prefix}: {reason} (Emacs {document['emacs_version']})", file=sys.stderr)
@@ -366,8 +365,7 @@ def run_tests(context: Any) -> Any:
     collision = _suite_collision(context, selected, start)
     if collision is not None:
         return collision
-    temporary = context.temporary_directory(prefix="qg-elisp-")
-    directory = Path(temporary.name)
+    directory = context.evidence_dir
     stage = _stage(directory)
     evidence = directory / "result.json"
     mark_step("Emacs test command")
@@ -383,4 +381,4 @@ def run_tests(context: Any) -> Any:
         reason = f"expected {error}; child exit {child.returncode}, execution {child.execution}"
         return _tests_result(context.check, spec, start, context.prefix, reason, outcome="unsupported",
                              execution=child.execution, diagnostics=child.diagnostics())
-    return _finish(context, start, child, document, temporary, evidence)
+    return _finish(context, start, child, document, evidence)

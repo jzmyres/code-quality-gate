@@ -247,6 +247,7 @@ class StubAdapterTests(unittest.TestCase):
             ["a.py"],
             {"a.py": "python"},
             prefix="check: stub",
+            evidence_dir=self.root,
         )
         self.assertEqual(result.outcome, "pass")
         self.assertEqual((result.tests_ran, result.tests_skipped), (4, 0))
@@ -270,11 +271,11 @@ class StubAdapterTests(unittest.TestCase):
         classes = {"a.py": "python"}
         stub = checks.run_check(
             self.root, config, config.checks["stub"], files, classes,
-            prefix="check: stub",
+            prefix="check: stub", evidence_dir=self.root,
         )
         verification = checks.run_check(
             self.root, config, config.checks["verification"], files, classes,
-            prefix="check: verification", prior={"stub": stub},
+            prefix="check: verification", evidence_dir=self.root, prior={"stub": stub},
         )
         self.assertEqual(verification.outcome, "pass", verification.reason)
         self.assertTrue(verification.is_satisfied())
@@ -286,7 +287,8 @@ class StubAdapterTests(unittest.TestCase):
     def test_any_adapter_can_report_its_tool_identity(self) -> None:
         config = self.config(STUB_CONFIG)
         result = run_stub(adapters.AdapterContext(
-            self.root, config, config.checks["stub"], [], {}, "stub", {}
+            self.root, config, config.checks["stub"], [], {}, "stub", {},
+            self.root / "evidence",
         ))
         self.assertNotIn("tool", result.to_json())
         result.tool = {"name": "fixture compiler", "version": "2.3"}
