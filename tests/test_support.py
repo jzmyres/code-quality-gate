@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -56,23 +58,28 @@ class InProcessRunQGTests(FixtureCase):
             'run = ["python3", "-c", "print(1)"]',
             'run = ["python3", "-c", "import sys; sys.exit(1)"]',
         )
+        # Each check line reports its own elapsed seconds ("(exit 0, 0.02s)"), which differ between any
+        # two runs, so only that field is normalized before the outputs are compared.
+        elapsed = re.compile(r", \d+\.\d+s\)")
+
+        def comparable(result: subprocess.CompletedProcess[str]) -> tuple[int, str, str]:
+            return (
+                result.returncode,
+                elapsed.sub(", Ns)", result.stdout),
+                elapsed.sub(", Ns)", result.stderr),
+            )
+
         for name, text in (("passing", BASE_CONFIG), ("failing", failing)):
             with self.subTest(check=name):
                 self.write_config(text)
                 in_process = self.run_qg("check")
-                process = self.run_qg_process("check")
-                self.assertEqual(
-                    (
-                        in_process.returncode,
-                        in_process.stdout,
-                        in_process.stderr,
-                    ),
-                    (
-                        process.returncode,
-                        process.stdout,
-                        process.stderr,
-                    ),
-                )
+                # The subject is the in-process call against a plain process, not the coverage wrapper:
+                # when the gate measures itself, QG_PYTHON's covrun.py lies inside the measured source
+                # and coverage warns on stderr that it was already imported.
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("QG_PYTHON", None)
+                    process = self.run_qg_process("check")
+                self.assertEqual(comparable(in_process), comparable(process))
 
 
 if __name__ == "__main__":
