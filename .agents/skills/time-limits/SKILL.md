@@ -2,7 +2,7 @@
 name: time-limits
 description: Checklist for changing the gate's run limit, per-check deadline, subprocess budgets or step names.
 verified: 2026-11-04
-commit: 3169f1d6d9a2
+commit: ec889cc63656
 paths: quality_gate/runner.py, quality_gate/checks.py, quality_gate/cli.py, quality_gate/worklist.py, quality_gate/python_tests.py, quality_gate/clones.py, quality_gate/verification.py, tests/test_check.py, tests/test_worklist.py, tests/test_runner.py, tests/test_command_checks.py, tests/test_python_tests.py, README.md, docs/SCHEMA.md
 ---
 
@@ -13,11 +13,12 @@ QF118 replaced supervised analysis workers with one run limit; there is no worke
 
 1. **Keep exactly two budgets.** The run limit is `checks._run_limit(selected_checks)`: the sum of
    `_check_budget(check)` over the checks that run plus `RUN_ALLOWANCE_SECONDS = 300`; `_run_policy_checks`
-   passes every configured check for a full run and the selected ids for `check --only`. A subprocess gets
-   `runner.remaining_budget(seconds)`, the smaller of its own seconds and the current check's remaining time,
-   and `runner._run_budget` sets its grace to 0 inside a check. The allowance is required: the timer starts
-   before every subprocess, so a limit equal to the budgets makes the run win over a hanging last check, and that
-   check must report `execution = "budget"` instead. Do not shrink or remove the allowance to make a test faster.
+   passes every configured check for a full run, the selected ids for `check --only` and the needed order for
+   the worklist. A subprocess gets `runner.remaining_budget(seconds)`, the smaller of its own seconds and the
+   current check's remaining time, and `runner._run_budget` sets its grace to 0 inside a check. The allowance
+   is required: the timer starts before every subprocess, so a limit equal to the budgets makes the run win
+   over a hanging last check, and that check must report `execution = "budget"` instead. Do not shrink or
+   remove the allowance to make a test faster.
 2. **Arm once, disarm last.** `checks._run_policy_checks` calls `_arm_run_limit` (saves the previous
    `SIGALRM` handler, sets `ITIMER_REAL`) before its loop and `_disarm_run_limit` (zero timer, restore handler)
    in the outer `finally`. The loop removes its one `qg-run-` directory in an inner `except`/`else` before that

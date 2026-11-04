@@ -2,8 +2,8 @@
 name: retire-adapter
 description: Checklist for removing an adapter with its registration, tests, mutation decisions and docs.
 verified: 2026-11-04
-commit: 3169f1d6d9a2
-paths: quality_gate/adapters.py, quality_gate/policy.py, quality_gate/clones.py, quality_gate/runner.py, tests/mutate_gate.py, tests/test_adapters.py, tests/test_policy.py, tests/test_runner.py, docs/SCHEMA.md, README.md, CLAUDE.md
+commit: ec889cc63656
+paths: quality_gate/adapters.py, quality_gate/policy.py, quality_gate/clones.py, quality_gate/runner.py, quality_gate/worklist.py, tests/mutate_gate.py, tests/test_adapters.py, tests/test_policy.py, tests/test_runner.py, tests/test_worklist.py, docs/SCHEMA.md, README.md, CLAUDE.md
 ---
 
 # Retiring an adapter
@@ -30,7 +30,10 @@ and the `git show archive/owners-2026-10-31:PATH` path must be checked in the la
    focused test; never add a CRAP baseline entry. Restoring code from before the retirement brings
    the same debt back: QF120 restored `runner._proc_group_member` from `561a044`, the gate scored it 8.1,
    and file-based subtests in `ProcGroupMemberTests` supplied the vanished, unreadable and short-line
-   branches its deleted tests used to reach.
+   branches its deleted tests used to reach. QF124 deleted the worklist copy tests and left
+   `worklist._worklist_report`'s `except (GateError, OSError)` handler at CRAP 6.1; a test raising each error
+   through a patched `_run_policy_checks` was the fix, not a baseline entry. A retained error handler counts as
+   code only the deleted tests covered.
 3. **Remove the adapter's mutation decisions.** `tests/mutate_gate.py` carried five owners `Decision`s; the list
    has 24 at this stamp, and the mutation report must match the list. Recount `DECISIONS` after the deletion.
 4. **Move a helper the removed module exported.** `clones._read_regular` and `_parent_fd` moved from

@@ -2,7 +2,7 @@
 name: trust-root-change
 description: Checklist for changing the gate's trusted directory, protected inputs, baseline merge or run identity.
 verified: 2026-11-04
-commit: 3169f1d6d9a2
+commit: ec889cc63656
 paths: docs/TRUST.md, docs/SCHEMA.md, quality-gate.toml, quality_gate/trust.py, quality_gate/cli.py, quality_gate/files.py, quality_gate/gate_result.py, quality_gate/checks.py, quality_gate/policy.py, quality_gate/covrun.py, quality_gate/payload.py, quality_gate/tools.py, quality_gate/worklist.py, tests/test_trust.py, tests/test_ratchet.py, tests/test_verification.py, tests/test_inventory.py
 ---
 
@@ -27,8 +27,8 @@ the probes below, but a new trust path needs its own adversarial test. Use this 
    changes tool behavior without touching a protected input.
 2. **One Git policy, no trusted input from the candidate's `.git`.** `files.git_argv` builds every command the
    gate runs on a candidate repository: `git --no-replace-objects -c safe.directory=ROOT -c
-   core.fsmonitor=false -C ROOT`; `trust._git`, `files._git` and `gate_result._git` call it, and `checks` and
-   `worklist` use it directly for inventory/hygiene argv, pack/clone and churn. `trust._TrustedTree` reads
+   core.fsmonitor=false -C ROOT`; `trust._git`, `files._git` and `gate_result._git` call it, `checks` uses it
+   directly for inventory/hygiene argv and `worklist` for churn. `trust._TrustedTree` reads
    `DIR` with no Git command; candidate inventory still runs `git ls-files`. A new bare `git` call or a
    hand-built argument list loses replacement-ref and fsmonitor isolation.
 3. **Candidate and trusted-tree reads are regular files.** `_open_candidate` opens with
