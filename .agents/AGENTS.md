@@ -17,10 +17,13 @@ each batch and reviewed before landing. Context for those agents, never rules: C
 
 - **Tests counted by the verification ratchet must not depend on the user running them.** CI runs as root, where
   `chmod 000` denies nothing; QF8 replaced that test with an in-process patch of
-  `quality_gate.payload.os.scandir` (QF11 moved the payload walk there). The baseline currently floors
-  `tests:tests:executed` at 705 and has no `skipped` entry, so a `skipIf`/`skipUnless` about root, permissions
-  or OS adds a skip and fails CI; patch the call instead.
-  [verified 2026-11-01 @ e4f98b7; paths: tests/test_tools.py, quality_gate/payload.py, quality_gate/verification.py, quality-gate-verification.toml, .github/workflows/check.yml]
+  `quality_gate.payload.os.scandir` (QF11 moved the payload walk there). The baseline floors
+  `tests:tests:executed` at 700 (QF117) and has no `skipped` entry, so a `skipIf`/`skipUnless` about root,
+  permissions or OS adds a skip and fails CI; patch the call instead. That floor is a `min` entry in a protected
+  baseline, so a candidate edit that lowers it is a loosening the trusted merge ignores; a change that deletes
+  tests must have `quality-gate-verification.toml` authorized (`--allow-protected`), or verification fails on
+  the trusted bound, as QF117's first gate run did with 700 against 705.
+  [verified 2026-11-04 @ f17841f57b84; paths: tests/test_tools.py, quality_gate/payload.py, quality_gate/verification.py, quality-gate-verification.toml, .github/workflows/check.yml]
 
 - **A CRAP baseline entry does not waive the spec's CRAP 6 for a changed function, and deleting tests can
   uncover helpers only they covered.** The baseline keeps the gate green while the spec still requires every
@@ -74,14 +77,14 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   `pruned_entries` then drops it. A measured `min` entry never resolves by itself; `_min_verdict` only handles a
   measured minimum. QF14 corrected `docs/SCHEMA.md` and README to say this. When changing resolution, docs or
   tests, probe a complete domain with an absent entry, not only measured findings.
-  [verified 2026-11-02 @ 85b72352531e; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
+  [verified 2026-11-04 @ f17841f57b84; paths: quality_gate/ratchet.py, docs/SCHEMA.md, README.md, tests/test_ratchet.py]
 
 - **Pruning a verification baseline tightens every measured entry in that check.** `ratchet._prune_entry`
   raises a `min` bound to the measurement, and verification makes `tests:*:executed` a `min` floor, so a prune
   raises that floor too. Keep the extra tightening after a prune, rerun `make -k check` after the baseline
   changes, and do not hand-revert it to the old floor. Use the prune to change an existing bound; a new
   exception still enters by hand with a reason.
-  [verified 2026-11-02 @ 85b72352531e; paths: quality_gate/ratchet.py, quality_gate/verification.py, quality-gate-verification.toml, tests/test_verification.py]
+  [verified 2026-11-04 @ f17841f57b84; paths: quality_gate/ratchet.py, quality_gate/verification.py, quality-gate-verification.toml, tests/test_verification.py]
 
 - **A `Finding` without `locations` downgrades `location_coverage` from `complete` to `partial`, and
   per-line locations number at `\n`.** `checks._incomplete_locations` scans `result.ratchet.findings`;
@@ -104,29 +107,27 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   carry the step name.
   [verified 2026-11-02 @ 85b72352531e; paths: quality_gate/checks.py, quality_gate/python_crap.py, quality_gate/elisp_crap.py, quality_gate/clones.py, quality_gate/verification.py, quality_gate/runner.py, tests/test_deadlines.py]
 
-- **The mutation runner's kill evidence comes from the marker file, and a selected run must first pass
-  unmutated.** `tests/mutate_gate.py:_instrument` writes JSON `loaded`, `imported`, `failure`/`error`,
-  `fixture` and `reached` events; `_reached_edits` injects `reached` at the same `_target_match` node
-  `mutate` replaces. `_TestResult.startTest` sets `QG_MUTATION_TEST` and `stopTest` restores it, so
-  child-process hits are attributed and a hit with no test is unattributed. Fixture classification is one
-  traceback-frame list (`_FIXTURE_FRAMES`): a failure is a fixture failure when its traceback names `setUp`,
-  `tearDown`, `asyncSetUp`, `asyncTearDown`, `_callSetUp`, `_callTearDown`, `_callCleanup`, `doCleanups`,
-  `setUpClass`, `tearDownClass`, `setUpModule`, `tearDownModule` or `doClassCleanups`. `_fixture_failure`
-  serves the parent `_TestResult.addFailure`/`addSubTest` and a copy in the child preamble
-  (`_qg_mutation_test_fixture`). unittest truncates a subtest traceback at its own context manager, so a
-  failing subtest also asks `_cleanup_call`, which matches only the cleanup frames. A recorded `fixture`
-  event is rejected by `_targeted` and `_full` as a non-kill. The review of 67a8929 found a gap: a helper
-  called from `setUp` whose subtest assertion fails has `setUp` only on the reporting stack
-  (`addSubTest > ... > helper > setUp > _callSetUp`), not in the traceback, and the fallback checks only
-  cleanup frames, so it still counts as a kill (deferred after QF109; check the whole fixture list there).
-  `_targeted` requires the selection in order with `loaded`/`imported`, no failure/error and no fixture
-  event; `_selection_failures` requires the same ids to pass unmutated; `_full` still requires the complete
-  baseline ids. A selected pass, no reach, an unattributed hit or a failed selection falls back to the full
-  suite. Keep these events, id checks, fixture rejection and the unmutated selection check when adding a
-  `Decision`, and cover a return-code-only subprocess assertion, an order-dependent selection, a child
-  setUp/tearDown/addCleanup failure, an async fixture, a lazy import and the helper-from-setUp subtest in
-  `tests/test_mutation.py`.
-  [verified 2026-11-02 @ 85b72352531e; paths: tests/mutate_gate.py, tests/test_mutation.py, README.md]
+- **The mutation runner's kill evidence is the probe's `reached` set, and a kill needs a test that passed
+  in the probe and does not pass on the mutant.** `tests/mutate_gate.py:_probe` copies the frozen tree once,
+  instruments every decision module (`_insert_reached` injects a `reached` call at the same `_target_match`
+  node `mutate` replaces) and runs the complete suite as the only unmutated run; `_run_suite` fails that probe
+  on a missing or invalid report, an exit inconsistent with the report, skipped or expected-failure tests, zero
+  tests, or any failure, and `run_mutations` then returns before a mutant runs. `_TestResult.startTest` and
+  `stopTest` set and restore `QG_MUTATION_TEST`, so a child-process hit is attributed to the test that started
+  it and a hit with no test is unattributed; `_probe_hits` keeps suite order and records unattributed names.
+  `_one` imports each mutant copy with `python3 -I` (`_import_check`) and reports `invalid` on a failed
+  import; no reaching test gives `survived` with "no test reached its target" and no suite run; unattributed
+  hits run the complete suite (`_full`, which requires the probe's exact IDs); otherwise `_targeted` runs
+  exactly the reaching tests in suite order with failfast. Any selected test that fails, errors or unexpectedly
+  succeeds is a kill, wherever its assertion sits; an order mismatch, timeout or bad report is `error` or
+  `timed out`. `_stable` reruns exactly the non-passing IDs on a fresh pristine copy: a repeat failure is
+  `unstable` and fails the run. QF117 deleted the plain unmutated run, `_selection_failures`, the
+  `loaded`/`imported`/`failure`/`error`/`fixture` events, the excepthook, the `TestResult` subclass hook and
+  all fixture-frame classification; do not reintroduce a mechanism that asks where a failure happened. Default
+  workers are 2. Keep `tests/test_mutation.py` covering body/setUp/tearDown/cleanup/subtest/child positions, an
+  error kill, an import failure, no reach, unattributed hits, a failing probe, exactly one unmutated run, an
+  order-dependent test and the worker default; the QF117 accept run reported 24/24 killed.
+  [verified 2026-11-04 @ f17841f57b84; paths: tests/mutate_gate.py, tests/test_mutation.py, README.md]
 
 - **One subject-direction rule feeds loading, evaluation, pruning and the trusted merge.**
   `ratchet.subject_direction` delegates to the adapter descriptor's `direction_for_subject`, which asks
@@ -149,19 +150,19 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   reports `outcome = "fail"` with reason "command exited N" and the output tail in diagnostics; zero executed
   tests is not a pass. Do not re-add parsing of `FAILED (...)`, `FAIL:`/`ERROR:` headings or fixture names;
   add the count to both adapters and a verification test instead.
-  [verified 2026-11-02 @ 85b72352531e; paths: quality_gate/python_tests.py, quality_gate/elisp_tests.py, quality_gate/verification.py, quality_gate/checks.py, tests/test_python_tests.py, tests/test_verification.py, docs/SCHEMA.md, README.md]
+  [verified 2026-11-04 @ f17841f57b84; paths: quality_gate/python_tests.py, quality_gate/elisp_tests.py, quality_gate/verification.py, quality_gate/checks.py, tests/test_python_tests.py, tests/test_verification.py, docs/SCHEMA.md, README.md]
 
 - **The clone check refuses inline jscpd ignore directives before it runs the tool, and its regression must
   show the bypass.** `clones._refuse_directives` is the "clone source scan" `analysis_step` inside
   `_prepare_clones`; it reads each selected file with the bounded reader (`clones._read_regular`, which moved
   from the removed `owners.py` in QF112) and raises a `GateError` naming the first file, line and directive
-  and the total count. The directive strings are built from `_IGNORE_PREFIX`, so neither the gate's sources
-  nor its tests contain them verbatim. A fixture proving the refusal must leave enough unique code outside
-  the ignored regions for an unrefused run to be `accepted` with zero clones: the first QF98 fixture left that
-  run `unsupported` ("jscpd ... analyzed no files"), and the review reproduced `accepted` only after giving
-  each file ~30 unique assignments. Before landing a refusal, remove it in a disposable copy and confirm the
-  bypass really passes.
-  [verified 2026-11-02 @ 85b72352531e; paths: quality_gate/clones.py, tests/test_clones.py, README.md]
+  and the total count. The directive strings are assembled from pieces in `clones.py` and
+  `tests/test_clones.py`, so no file holds a full directive verbatim. A fixture proving the refusal must
+  leave enough unique code outside the ignored regions for an unrefused run to be `accepted` with zero
+  clones: the first QF98 fixture left that run `unsupported` ("jscpd ... analyzed no files"), and the review
+  reproduced `accepted` only after giving each file ~30 unique assignments. Before landing a refusal,
+  remove it in a disposable copy and confirm the bypass really passes.
+  [verified 2026-11-04 @ f17841f57b84; paths: quality_gate/clones.py, tests/test_clones.py, README.md]
 
 - **Test evidence is released through one helper by both the check command and the worklist.**
   `checks._evidence_last_users` maps each result to its last dependent check; `_release_evidence` clears
@@ -171,7 +172,7 @@ each batch and reviewed before landing. Context for those agents, never rules: C
   its selected order, releases after each last user and again in a `finally`, and passes the messages out as
   a fourth list so `_worklist_report` exits 1. Leaving cleanup to the `TemporaryDirectory` finalizer only
   emits an implicit `ResourceWarning` and loses the failure.
-  [verified 2026-11-02 @ 85b72352531e; paths: quality_gate/checks.py, quality_gate/worklist.py, tests/test_worklist.py, README.md]
+  [verified 2026-11-04 @ f17841f57b84; paths: quality_gate/checks.py, quality_gate/worklist.py, tests/test_worklist.py, README.md]
 
 - **A refusal test must assert the refusal, and its removal demonstration must fail there.** A guard added to
   `cli.py` or `trust.py` is proven by a test that asserts exit 2, the message naming the option or path, and the
