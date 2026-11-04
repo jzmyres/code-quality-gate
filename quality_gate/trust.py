@@ -1016,4 +1016,9 @@ def prepare_trust(root: Path, value: str, allowed: list[str]) -> Trust:
         tempfile.TemporaryDirectory(prefix="qg-tree-"),
         tempfile.TemporaryDirectory(prefix="qg-merge-"),
     ]
-    return _prepare_source(root, source, temporary, allowed)
+    try:
+        return _prepare_source(root, source, temporary, allowed)
+    except BaseException:
+        for directory in reversed(temporary):
+            directory.cleanup()
+        raise

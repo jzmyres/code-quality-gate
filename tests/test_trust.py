@@ -762,7 +762,10 @@ class IdentityTrustTests(TrustCase):
             path.write_bytes(content)
         revision = self.directory_revision()
         self.fixture_runner = lambda: self.gate / "qg.py"
-        result, document = self.trust_json(revision)
+        result = self.run_qg_process(
+            "check", "--json", "--policy-from", revision
+        )
+        document = self.parse_json(result)
         self.assertEqual(result.returncode, 0, output(result))
         return document["trust"]
 
@@ -804,7 +807,10 @@ class IdentityTrustTests(TrustCase):
         ))
         revision = self.directory_revision()
         self.fixture_runner = lambda: self.gate / "qg.py"
-        result, document = self.trust_json(revision)
+        result = self.run_qg_process(
+            "check", "--json", "--policy-from", revision
+        )
+        document = self.parse_json(result)
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(document["decision"], "error")
         self.assertIn("gate file quality_gate/elisp/qg-elisp-child.el", document["error"])

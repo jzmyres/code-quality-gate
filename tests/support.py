@@ -1,6 +1,8 @@
 """Shared helpers for the code-quality-gate tests."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -8,9 +10,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 GATE = Path(__file__).resolve().parent.parent
 QG = GATE / "qg.py"
@@ -272,7 +276,7 @@ def sarif_location(location: tuple[str, int, int]) -> dict[str, Any]:
 
 
 class FixtureCase(unittest.TestCase):
-    """A disposable git repository, a disposable HOME, and qg.py subprocesses."""
+    """A disposable git repository, a disposable HOME, and the gate's command."""
 
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="qg-test-")
@@ -500,24 +504,67 @@ class FixtureCase(unittest.TestCase):
         )
         return runner
 
+    def gate_arguments(
+        self, args: tuple[str, ...], repo: Path | None, include_repo: bool
+    ) -> list[str]:
+        argv: list[str] = []
+        if include_repo:
+            argv.extend(["--repo", str(repo or self.repo)])
+        argv.extend(args)
+        return argv
+
     def run_qg(
-        self,
-        *args: str,
-        env: dict[str, str] | None = None,
-        cwd: Path | None = None,
-        repo: Path | None = None,
-        include_repo: bool = True,
-        timeout: int = 120,
+        self, *args: str, env: dict[str, str] | None = None, cwd: Path | None = None,
+        repo: Path | None = None, include_repo: bool = True, timeout: int = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        from quality_gate import cli, tools
+
+        argv = self.gate_arguments(args, repo, include_repo)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        previous_tempdir = tempfile.tempdir
+        tempfile.tempdir = None
+        try:
+            with contextlib.chdir(cwd or self.repo), mock.patch.dict(
+                os.environ, self.env(env), clear=True
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    if self.gate == GATE:
+                        code = cli.main(argv)
+                    else:
+                        with tools.lock_override(self.gate / "tools.lock.toml"):
+                            code = cli.main(argv)
+                except SystemExit as error:
+                    code = error.code if error.code is not None else 0
+                    if not isinstance(code, int):
+                        print(code, file=sys.stderr)
+                        code = 1
+                except Exception:
+                    traceback.print_exc()
+                    code = 1
+        finally:
+            tempfile.tempdir = previous_tempdir
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=code,
+            stdout=stdout.getvalue(),
+            stderr=stderr.getvalue(),
+        )
+
+    def run_qg_process(
+        self, *args: str, env: dict[str, str] | None = None, cwd: Path | None = None,
+        repo: Path | None = None, include_repo: bool = True, timeout: int = 120,
     ) -> subprocess.CompletedProcess[str]:
         program = (
             str(self.gate / "qg.py")
             if self.gate == GATE
             else str(self.fixture_runner())
         )
-        command = [*self.python_prefix(), program]
-        if include_repo:
-            command.extend(["--repo", str(repo or self.repo)])
-        command.extend(args)
+        command = [
+            *self.python_prefix(),
+            program,
+            *self.gate_arguments(args, repo, include_repo),
+        ]
         return subprocess.run(
             command,
             cwd=str(cwd or self.repo),

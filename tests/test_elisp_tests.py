@@ -6,8 +6,12 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 from support import GATE, FixtureCase, baseline_text, output
+
+from quality_gate import adapters
+from quality_gate import runner as gate_runner
 
 
 MODULE = """\
@@ -94,6 +98,22 @@ reason = "ignore rules"
 '''
 
 
+def _evidence_consumer_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    return adapters.ParsedSpec(SimpleNamespace(requires=raw["requires"]), "fixture/1", (),
+                               requires=raw["requires"])
+
+
+def _evidence_consumer_run(context):
+    import time
+    from quality_gate.checks import _check_result
+    check, prior = context.check, context.prior
+    evidence = prior[check.spec.requires].evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    return _check_result(check, time.monotonic(), "pass",
+                         measurement={"evidence": document})
+
+
 def executed_entry(bound: int) -> dict[str, object]:
     return {
         "subject": "tests:legacy-tests:executed",
@@ -151,26 +171,13 @@ tier = 1
 enforcement = "enforced"
 requires = "legacy-tests"
 ''')
-        gate = self.fixture_gate()
-        with (gate / "quality_gate/adapters.py").open("a", encoding="utf-8") as stream:
-            stream.write('''
-def _fixture_parse(raw, root, path, full_key):
-    from types import SimpleNamespace
-    return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "fixture/1", (), requires=raw["requires"])
-
-def _fixture_run(context):
-    check, prior = context.check, context.prior
-    import json, time
-    from .checks import _check_result
-    evidence = prior[check.spec.requires].evidence_path
-    document = json.loads(evidence.read_text(encoding="utf-8"))
-    return _check_result(check, time.monotonic(), "pass", measurement={"evidence": document})
-
-register_adapter(AdapterDescriptor("evidence_consumer", ("requires",), _fixture_parse, _fixture_run,
-                                   requires_adapter="elisp_tests"))
-''')
-        self.fixture_runner = lambda: gate / "qg.py"
-        result, document = self.run_json()
+        descriptor = adapters.AdapterDescriptor(
+            "evidence_consumer", ("requires",), _evidence_consumer_parse,
+            _evidence_consumer_run, requires_adapter="elisp_tests",
+        )
+        with mock.patch.dict(adapters.ADAPTERS, {"evidence_consumer": descriptor}):
+            result = self.run_qg("check", "--json")
+        document = self.parse_json(result)
         self.assertEqual(result.returncode, 0, output(result))
         measured = self.check_by_id(document, "legacy-tests")
         evidence = self.check_by_id(document, "consumer")["measurement"]["evidence"]
@@ -325,16 +332,11 @@ baseline = "crap.toml"
         for capture_limit in (None, 128):
             with self.subTest(capture_limit=capture_limit):
                 wrapper, log = self.version_probe(version)
-                if capture_limit is not None:
-                    gate = self.fixture_gate()
-                    runner = gate / "quality_gate/runner.py"
-                    text = runner.read_text(encoding="utf-8")
-                    runner.write_text(text.replace("capture_limit: int | None = CAPTURE_LIMIT",
-                                                   f"capture_limit: int | None = {capture_limit}"),
-                                      encoding="utf-8")
-                    self.fixture_runner = lambda gate=gate: gate / "qg.py"
                 shown = version[:128] + ("..." if capture_limit is None else "")
-                self.assert_probe_refused(wrapper, log, repr(shown), truncated=True)
+                overrides = ({} if capture_limit is None
+                             else {"capture_limit": capture_limit})
+                with mock.patch.dict(gate_runner.run.__kwdefaults__, overrides):
+                    self.assert_probe_refused(wrapper, log, repr(shown), truncated=True)
 
     def test_emacs_version_size_is_bounded_before_stripping_whitespace(self) -> None:
         for version in ("30.1" + " " * 125, " " * 125 + "30.1"):

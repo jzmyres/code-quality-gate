@@ -7,14 +7,18 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import GATE, FixtureCase, PYTHON_TEST_HEADER, baseline_text, output
 from test_python_crap import crap_config
 from test_verification import (
     executed_entry, exclusion_entry, verification_baseline, verification_config,
 )
+
+from quality_gate import adapters, policy, worklist
 
 
 ALPHA = """def alpha(value):
@@ -153,6 +157,36 @@ class = "elisp-suite"
 reason = "Emacs Lisp suite"
 '''
     return text + "\n" + extra
+
+
+def _bridge_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    return adapters.ParsedSpec(SimpleNamespace(requires=raw["requires"]), "bridge/1",
+                               ("tests",), requires=raw["requires"])
+
+
+def _bridge_run(context):
+    check, prior = context.check, context.prior
+    from quality_gate.checks import _check_result
+    required = prior[check.spec.requires]
+    return _check_result(check, time.monotonic(), required.outcome,
+                         tests_ran=required.tests_ran, tests_skipped=required.tests_skipped)
+
+
+def _fixture_command_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    return adapters.ParsedSpec(SimpleNamespace(launch=tuple(raw["launch"])), "fixture/1",
+                               ("tests",))
+
+
+def _fixture_command_run(context):
+    check = context.check
+    from quality_gate.checks import _check_result
+    from quality_gate.runner import run
+    started = time.monotonic()
+    child = run(check.spec.launch, cwd=context.root, budget_seconds=10)
+    return _check_result(check, started, "pass" if child.returncode == 0 else "fail",
+                         tests_ran=1, tests_skipped=0)
 
 
 def run_worklist(
@@ -721,27 +755,10 @@ class WorklistMinimumTests(FixtureCase):
         self.assertEqual(self.parse_json(result)["slack"][0]["value"], 3)
 
     def test_a_selected_producer_also_runs_its_own_prerequisite(self) -> None:
-        gate = self.fixture_gate()
-        adapters = gate / "quality_gate/adapters.py"
-        with adapters.open("a", encoding="utf-8") as stream:
-            stream.write('''
-def _bridge_parse(raw, root, path, full_key):
-    from types import SimpleNamespace
-    return ParsedSpec(SimpleNamespace(requires=raw["requires"]), "bridge/1", ("tests",),
-                      requires=raw["requires"])
-
-def _bridge_run(context):
-    check, prior = context.check, context.prior
-    import time
-    from .checks import _check_result
-    required = prior[check.spec.requires]
-    return _check_result(check, time.monotonic(), required.outcome,
-                         tests_ran=required.tests_ran, tests_skipped=required.tests_skipped)
-
-register_adapter(AdapterDescriptor("bridge", ("requires",), _bridge_parse, _bridge_run,
-                                   requires_adapter="python_tests"))
-''')
-        self.fixture_runner = lambda: gate / "qg.py"
+        descriptor = adapters.AdapterDescriptor(
+            "bridge", ("requires",), _bridge_parse, _bridge_run,
+            requires_adapter="python_tests",
+        )
         bridge = ('[checks.bridge]\nadapter = "bridge"\ntier = 1\n'
                   'enforcement = "enforced"\nrequires = "tests"\n\n')
         self.write_config(verification_config(requires="bridge").replace(
@@ -750,7 +767,8 @@ register_adapter(AdapterDescriptor("bridge", ("requires",), _bridge_parse, _brid
             {"subject": "tests:bridge:executed", "bound": 1, "reason": "bridge producer"},
             exclusion_entry("pkg/mod.py", "noqa", 2),
         ]))
-        result = run_worklist(self, "--json", "verification")
+        with mock.patch.dict(adapters.ADAPTERS, {"bridge": descriptor}):
+            result = run_worklist(self, "--json", "verification")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(self.parse_json(result)["slack"][0]["value"], 3)
         self.assertIn("check: tests (python_tests)", result.stderr)
@@ -993,32 +1011,17 @@ class WorklistOriginalArgumentTests(FixtureCase):
         self.assert_argument_refused(argument, check_id="verification")
 
     def test_new_adapter_command_field_through_an_alias_is_refused(self) -> None:
-        self.patch_runner('''
-from types import SimpleNamespace
-from quality_gate.adapters import AdapterDescriptor, ParsedSpec, register_adapter
-from quality_gate.checks import _check_result
-from quality_gate.runner import run
-import time
-
-def _fixture_parse(raw, root, path, key):
-    return ParsedSpec(SimpleNamespace(launch=tuple(raw["launch"])), "fixture/1", ("tests",))
-
-def _fixture_run(context):
-    root, check = context.root, context.check
-    start = time.monotonic()
-    child = run(check.spec.launch, cwd=root, budget_seconds=10)
-    return _check_result(check, start, "pass" if child.returncode == 0 else "fail",
-                         tests_ran=1, tests_skipped=0)
-
-register_adapter(AdapterDescriptor("fixture-command", ("launch", "tests_pattern", "skipped_pattern"),
-                                   _fixture_parse, _fixture_run, argument_fields=("launch",)))
-''')
+        descriptor = adapters.AdapterDescriptor(
+            "fixture-command", ("launch", "tests_pattern", "skipped_pattern"),
+            _fixture_command_parse, _fixture_command_run, argument_fields=("launch",),
+        )
         argument = str(self.alias / "tests/absolute_writer.py")
         text = verification_config().replace('adapter = "python_tests"', 'adapter = "fixture-command"')
         text = text.replace('run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]',
                             f'launch = {json.dumps(["python3", argument])}')
         self.write_config(text)
-        self.assert_argument_refused(argument, check_id="verification")
+        with mock.patch.dict(adapters.ADAPTERS, {"fixture-command": descriptor}):
+            self.assert_argument_refused(argument, check_id="verification")
 
     def test_absolute_paths_outside_repository_are_accepted(self) -> None:
         interpreter = shutil.which("python3")
@@ -1046,41 +1049,30 @@ register_adapter(AdapterDescriptor("fixture-command", ("launch", "tests_pattern"
             rf"[^\n]*{re.escape(error)}[^\n]*$",
         )
 
-    def patch_runner(self, code: str) -> None:
-        self.fixture_gate()
-        runner = FixtureCase.fixture_runner(self)
-        source = runner.read_text(encoding="utf-8")
-        runner.write_text(source.replace("runpy.run_path(", code + "\nrunpy.run_path(", 1),
-                          encoding="utf-8")
-        self.fixture_runner = lambda: runner
-
     def test_nul_argument_is_refused_before_any_check(self) -> None:
-        # Policy already rejects NUL; bypass that guard only in this fixture
+        # Policy already rejects NUL; bypass that guard only in this test
         # so the worklist's resolution boundary sees the decoded argument.
-        self.patch_runner("policy = importlib.import_module('quality_gate.policy')\n"
-                          "policy._argv_list = policy._string_list\n")
         path = str(self.base / "invalid\x00argument")
-        for argument in (path, f"--output={path}"):
-            with self.subTest(argument=argument):
-                self.assert_resolution_refused(argument, "embedded null")
-                self.assertIn(r"\u0000", (self.repo / "quality-gate.toml").read_text())
+        with mock.patch.object(policy, "_argv_list", policy._string_list):
+            for argument in (path, f"--output={path}"):
+                with self.subTest(argument=argument):
+                    self.assert_resolution_refused(argument, "embedded null")
+                    self.assertIn(r"\u0000", (self.repo / "quality-gate.toml").read_text())
 
     def test_resolution_errors_are_refused_before_any_check(self) -> None:
         path = str(self.base / "unresolvable")
-        for error in ("RuntimeError", "OSError"):
+        real_resolve = Path.resolve
+        for error in (RuntimeError, OSError):
             for argument in (path, f"--output={path}"):
-                with self.subTest(error=error, argument=argument):
-                    self.patch_runner(f'''
-from pathlib import Path
-from unittest.mock import patch
-_real_resolve = Path.resolve
-def _failing_resolve(path, *args, **kwargs):
-    if str(path) == {path!r}:
-        raise {error}("injected resolution failure")
-    return _real_resolve(path, *args, **kwargs)
-patch.object(Path, "resolve", _failing_resolve).start()
-''')
-                    self.assert_resolution_refused(argument, "injected resolution failure")
+                with self.subTest(error=error.__name__, argument=argument):
+                    def failing_resolve(target, *args, _error=error, **kwargs):
+                        if str(target) == path:
+                            raise _error("injected resolution failure")
+                        return real_resolve(target, *args, **kwargs)
+                    with mock.patch.object(Path, "resolve", failing_resolve):
+                        self.assert_resolution_refused(
+                            argument, "injected resolution failure"
+                        )
 
 
 class WorklistCopyTests(FixtureCase):
@@ -1187,13 +1179,10 @@ class WorklistCopyTests(FixtureCase):
 
     def test_missing_config_carry_over_reports_enumeration_difference(self) -> None:
         self.local_excludes_fixture(".git/local-excludes")
-        gate = self.fixture_gate()
-        module = gate / "quality_gate/worklist.py"
-        with module.open("a", encoding="utf-8") as stream:
-            stream.write("\n_copy_enumeration_config = lambda root, destination: None\n")
-        self.fixture_runner = lambda: gate / "qg.py"
         before = snapshot_tree(self.repo)
-        result = run_worklist(self, "--json", "crap")
+        with mock.patch.object(worklist, "_copy_enumeration_config",
+                               lambda root, destination: None):
+            result = run_worklist(self, "--json", "crap")
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn("copy inventory differs from original", result.stderr)
         self.assertIn("private-data", result.stderr)

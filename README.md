@@ -1008,9 +1008,25 @@ This repository gates itself with `quality-gate.toml`:
 `make check` is the single entry point and runs only `python3 -I qg.py check`; Ruff, the tests and
 CRAP are policy checks, so the Makefile does not duplicate them.
 
-The tests execute `qg.py` as a subprocess on disposable fixture git repositories. `tests/support.py`
-starts those subprocesses through `QG_PYTHON` when the gate exports it, so the gate's own Python
-programs are measured by the `crap` check. Clone-gate tests use a fake jscpd in a temporary
+The tests call the gate's command, `quality_gate.cli.main`, in-process on disposable fixture git
+repositories. `tests/support.py`'s `run_qg` sets `os.environ`, the working directory and
+stdout/stderr for the call, uses a fixture gate copy's lock through `tools.lock_override`, restores
+the temporary-directory cache and the run-limit signal handler, and turns an unexpected exception
+into exit 1 with its traceback. Tests start `qg.py` as a process through `run_qg_process` only
+where the property belongs to the process: the modified gate copies in `tests/test_trust.py`
+(`test_gate_new_extension_files_appear_in_identity_with_digests`,
+`test_gate_identity_excludes_bytecode_cache_directories` and
+`test_gate_elisp_helper_changed_during_check_is_an_identity_error`), whose subject is a gate run
+from another directory, and the equivalence test in `tests/test_support.py`, which runs both
+paths. A test that needs to patch the gate patches it in-process around `run_qg`; a
+`run_qg_process` call on a fixture gate copy starts the original `qg.py` through
+`fixture_runner`, so every gate it starts runs the measured `quality_gate` package. The
+evidence-cleanup helpers `run_evidence_check` and
+`run_worklist_with_evidence` start `qg.py` themselves to run it with fatal resource warnings, and
+`tests/test_python_crap.py`'s `test_settings_stay_canonical_after_validation` starts a modified
+gate copy directly. `QG_PYTHON` starts the `run_qg_process` and evidence-cleanup subprocesses when
+the gate exports it, so the gate's own Python programs are measured by the `crap` check. Clone-gate
+tests use a fake jscpd in a temporary
 `QG_TOOLS_DIR`; one test runs the real pinned jscpd and fails, rather than skipping, when the tool is
 not installed. Command-check tests use the real command; the real ruff test runs only when the pinned
 ruff binary exists and proves enforcement: an unused import is rejected with F401, then the repaired
