@@ -7,10 +7,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import zlib
 from dataclasses import replace
+from unittest import mock
 
 from support import (
     BASE_CONFIG,
@@ -750,6 +752,25 @@ class IdentityDecisionTests(unittest.TestCase):
         self.assertEqual(merged, [floor])
         self.assertEqual(ignored, ("stub-subject",))
         self.assertFalse(tightened)
+
+
+class PreparationCleanupTests(TrustCase):
+    def test_failed_preparation_removes_its_temporary_directories(self) -> None:
+        revision = self.directory_revision()
+        scratch = self.base / "scratch-tmp"
+        scratch.mkdir()
+        self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+        tempfile.tempdir = str(scratch)
+        with mock.patch.object(trust, "_prepare_source", side_effect=RuntimeError("injected")):
+            try:
+                prepare_trust(self.repo, revision, [])
+            except RuntimeError:
+                # The traceback still holds the failed call's locals here, so only an
+                # explicit cleanup can have removed its directories already.
+                remaining = sorted(path.name for path in scratch.iterdir())
+            else:
+                self.fail("preparation did not fail")
+        self.assertEqual(remaining, [])
 
 
 class IdentityTrustTests(TrustCase):
