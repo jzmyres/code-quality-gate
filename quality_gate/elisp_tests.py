@@ -19,7 +19,7 @@ from .policy import (
     _optional_string_list,
     _string,
 )
-from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
+from .runner import mark_step, run
 
 
 if TYPE_CHECKING:
@@ -94,8 +94,7 @@ def probe_version(context: Any) -> tuple[str | None, Any]:
     budget = adapter_for(context.check.adapter).budget(context.check.spec)
     mark_step("Emacs version check")
     child = run([spec.emacs, "-Q", "--batch", "--eval", "(princ emacs-version)"],
-                cwd=context.root, budget_seconds=remaining_budget(budget))
-    record_diagnostics(child.diagnostics())
+                cwd=context.root, budget_seconds=budget)
     reason = _version_reason(child, spec.emacs, ELISP_MINIMUM_VERSION)
     if reason is None:
         return child.combined_text.strip(), None
@@ -373,13 +372,13 @@ def run_tests(context: Any) -> Any:
     evidence = directory / "result.json"
     mark_step("Emacs test command")
     child = run(_command(spec, context.root, selected, stage, evidence), cwd=context.root,
-                budget_seconds=remaining_budget(spec.budget_seconds))
-    record_diagnostics(child.diagnostics())
+                budget_seconds=spec.budget_seconds)
     failure = _execution_failure(context, start, child)
     if failure is not None:
         return failure
     try:
-        document = analysis_step("Emacs result validation", _read_document, evidence, selected, version)
+        mark_step("Emacs result validation")
+        document = _read_document(evidence, selected, version)
     except ValueError as error:
         reason = f"expected {error}; child exit {child.returncode}, execution {child.execution}"
         return _tests_result(context.check, spec, start, context.prefix, reason, outcome="unsupported",

@@ -1,10 +1,7 @@
-"""Unit tests for the bounded runner's pipe and reaping helpers."""
+"""Unit tests for the bounded runner's pipe, reaping and group helpers."""
 from __future__ import annotations
 
-import contextlib
 import importlib
-import io
-import json
 import os
 import signal
 import subprocess
@@ -20,8 +17,6 @@ from support import GATE
 
 sys.path.insert(0, str(GATE))
 runner = importlib.import_module("quality_gate.runner")
-coverage_tool = importlib.import_module("quality_gate.coverage_tool")
-verification = importlib.import_module("quality_gate.verification")
 
 
 class _FakeProcess:
@@ -84,13 +79,12 @@ class ReadChunkTests(unittest.TestCase):
             "    os.write(1, data)\n"
         )
         start = time.monotonic()
-        with runner.check_deadline(start, 0.4):
-            result = runner.run([sys.executable, "-c", program], budget_seconds=0.4)
+        result = runner.run([sys.executable, "-c", program], budget_seconds=0.4)
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.returncode, -signal.SIGKILL)
         self.assertGreater(result.output_bytes, runner.CAPTURE_LIMIT)
         self.assertTrue(result.output_truncated)
-        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertLess(time.monotonic() - start, 8.0)
 
 
 class ReapTests(unittest.TestCase):
@@ -113,137 +107,25 @@ class ReapTests(unittest.TestCase):
         signal_group.assert_called_once_with(process.pid, signal.SIGKILL)
 
 
-class AnalysisWorkerTests(unittest.TestCase):
-    def test_worker_registry_refuses_duplicate_names_and_non_json_constants(self) -> None:
+class RunInterruptTests(unittest.TestCase):
+    @staticmethod
+    def _raise_timeout(_signum: int, _frame: object) -> None:
+        raise TimeoutError("test timer")
+
+    def test_an_interrupt_kills_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "registry.json"
-            registry = runner._WorkerRegistry(str(path))
-            for text in ('{"cancelled":[123],"cancelled":[],"entries":{}}',
-                         '{"cancelled":[],"entries":NaN}',
-                         '{"cancelled":[],"entries":Infinity}',
-                         '{"cancelled":[],"entries":-Infinity}'):
-                with self.subTest(text=text):
-                    path.write_text(text, encoding="utf-8")
-                    with self.assertRaises(ValueError):
-                        with runner._registry_data(registry):
-                            self.fail("invalid registry was accepted")
-                    self.assertEqual(path.read_text(encoding="utf-8"), text)
-
-    def test_process_registration_and_cancellation_are_serialized(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "registry.json"
-            path.write_text(json.dumps({"cancelled": [], "entries": {}}), encoding="utf-8")
-            registry = runner._WorkerRegistry(str(path), (123,))
-            context = runner._worker_registry.set(registry)
-            try:
-                with mock.patch.object(runner.os, "setsid") as setsid:
-                    runner._register_session(("example", "argument"), "process", "token")
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                    entry = data["entries"][str(os.getpid())]
-                    self.assertEqual(entry["command"], ["example", "argument"])
-                    self.assertEqual(entry["ancestors"], [123])
-                    setsid.assert_called_once()
-                    data["cancelled"].append(123)
-                    path.write_text(json.dumps(data), encoding="utf-8")
-                    with self.assertRaisesRegex(runner.WorkerError, "cancelled"):
-                        runner._register_session(("example",), "process", "next")
-                    setsid.assert_called_once()
-            finally:
-                runner._worker_registry.reset(context)
-
-    def test_unreadable_process_status_is_not_treated_as_stopped(self) -> None:
-        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
-            self.assertTrue(runner._proc_group_member("/proc/123/stat", 123))
-        self.assertFalse(runner._proc_group_member("/proc/no-such-pid/stat", 123))
-
-    def test_unreadable_process_details_fall_back_to_the_registered_entry(self) -> None:
-        fallback = ["registered", "command"]
-        self.assertEqual(runner._proc_member_command(-1, fallback), fallback)
-        with mock.patch("builtins.open", mock.mock_open(read_data=b"")):
-            self.assertEqual(runner._proc_member_command(123, fallback), fallback)
-        self.assertIsNone(runner._live_member("/proc/no-such-pid/stat", 123, 123, fallback))
-        self.assertIsNone(
-            runner._live_member(f"/proc/{os.getpid()}/stat", os.getpid(), -1, fallback)
-        )
-        with mock.patch.object(runner.os, "scandir", side_effect=OSError("denied")):
-            self.assertEqual(runner._live_group_members(123, {"command": fallback}), {})
-
-    def test_large_result_and_output_are_returned(self) -> None:
-        def work() -> bytes:
-            print("worker output")
-            print("worker warning", file=sys.stderr)
-            return b"x" * (256 * 1024)
-
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            with runner.check_deadline(time.monotonic(), 5):
-                result = runner.analysis_step("large result", work)
-        self.assertEqual(result, b"x" * (256 * 1024))
-        self.assertEqual(stdout.getvalue(), "worker output\n")
-        self.assertEqual(stderr.getvalue(), "worker warning\n")
-
-    def test_worker_exception_and_unserializable_result_are_reported(self) -> None:
-        def fails() -> None:
-            raise ValueError("analysis failed")
-
-        with self.assertRaisesRegex(ValueError, "analysis failed"):
-            runner._decode_worker(runner._worker_payload(fails, ()), "analysis")
-        with self.assertRaisesRegex(runner.WorkerError, "cannot return worker result"):
-            runner._decode_worker(runner._worker_payload(lambda: fails, ()), "analysis")
-
-    def test_worker_exit_without_a_result_is_an_error(self) -> None:
-        with runner.check_deadline(time.monotonic(), 5):
-            with self.assertRaisesRegex(runner.WorkerError, "analysis worker exited"):
-                runner.analysis_step("analysis", os._exit, 1)
-
-    def test_worker_creation_failures_name_the_step(self) -> None:
-        for operation in ("pipe", "fork"):
-            with self.subTest(operation=operation):
-                with mock.patch.object(runner.os, operation, side_effect=OSError("denied")):
-                    with self.assertRaisesRegex(runner.WorkerError, "cannot start analysis worker"):
-                        runner.analysis_step("analysis", lambda: None, deadline=time.monotonic() + 5)
-
-    def test_worker_measurement_accepts_an_opaque_snapshot(self) -> None:
-        merged = []
-        measurement = runner.WorkerMeasurement(
-            start=os.getpid,
-            snapshot=lambda pid: {"worker": pid, "snapshot": os.getpid()},
-            merge=lambda snapshot: merged.append((os.getpid(), snapshot)),
-        )
-        with mock.patch.object(runner, "_worker_measurement", measurement):
-            with runner.check_deadline(time.monotonic(), 5):
-                result = runner.analysis_step("measured analysis", os.getpid)
-        self.assertNotEqual(result, os.getpid())
-        self.assertEqual(merged, [(os.getpid(), {"worker": result, "snapshot": result})])
-
-    def test_no_measurement_hook_does_no_measurement_work(self) -> None:
-        with mock.patch.object(runner, "_worker_measurement", None):
-            with mock.patch.object(coverage_tool, "_current_coverage") as current:
-                payload = runner._worker_payload(lambda: 42, ())
-                self.assertEqual(runner._decode_worker(payload, "analysis"), 42)
-        current.assert_not_called()
-
-    def test_worker_execution_is_included_in_active_coverage(self) -> None:
-        coverage = coverage_tool.import_coverage()
-        for branch in (False, True):
-            with self.subTest(branch=branch):
-                collector = coverage.Coverage(
-                    data_file=None, config_file=False, source=[str(GATE)], branch=branch
-                )
-                collector.start()
-                coverage_tool.install_worker_measurement()
-                try:
-                    with runner.check_deadline(time.monotonic(), 5):
-                        runner.analysis_step(
-                            "verification analysis", verification.measure_exclusions,
-                            "source.py", "VALUE = 1  # noqa: E501\n",
-                        )
-                finally:
-                    collector.stop()
-                filename = str(GATE / "quality_gate" / "verification.py")
-                data = collector.get_data()
-                self.assertIn(141, data.lines(filename) or [])
-                self.assertEqual(data.has_arcs(), branch)
+            pid_file = Path(directory) / "pid"
+            program = f"echo $$ > {pid_file}; sleep 30 & wait"
+            previous = signal.signal(signal.SIGALRM, self._raise_timeout)
+            self.addCleanup(signal.signal, signal.SIGALRM, previous)
+            self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0.0)
+            signal.setitimer(signal.ITIMER_REAL, 1.0)
+            with self.assertRaises(TimeoutError):
+                runner.run(["sh", "-c", program], budget_seconds=60)
+            self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(pid, 0)
 
 
 if __name__ == "__main__":

@@ -11,12 +11,9 @@ import errno
 import os
 import stat
 import sys
-import warnings
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
-from . import runner
 from .json_input import load_json
 from .policy import GateError, UnsupportedError, UsageError
 from .tools import installed_tool_dir
@@ -255,67 +252,3 @@ def combine_coverage(
         raise GateError(
             f"cannot combine coverage data from {data_dir}: {error}"
         ) from error
-
-
-def _current_coverage() -> Any:
-    module = sys.modules.get("coverage")
-    return module.Coverage.current() if module is not None else None
-
-
-def _start_worker_coverage() -> Any:
-    current = _current_coverage()
-    if current is None:
-        return None
-    # A fork has its own memory. Record its real execution separately, then
-    # send it back to the already-active collector in the parent.
-    module = sys.modules["coverage"]
-    child = module.Coverage(
-        data_file=None,
-        config_file=False,
-        source=current.get_option("run:source"),
-        branch=current.get_option("run:branch"),
-        include=current.get_option("run:include"),
-        omit=current.get_option("run:omit"),
-    )
-    child.start()
-    return child
-
-
-def _finish_worker_coverage(child: Any) -> tuple[bool, dict[str, Any]] | None:
-    if child is None:
-        return None
-    child.stop()
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="No data was collected.*")
-        data = child.get_data()
-    return _coverage_snapshot(data)
-
-
-def _coverage_snapshot(data: Any) -> tuple[bool, dict[str, Any]] | None:
-    arcs = data.has_arcs()
-    recorded = {
-        name: (data.arcs(name) if arcs else data.lines(name))
-        for name in data.measured_files()
-    }
-    recorded = {name: lines for name, lines in recorded.items() if lines}
-    return (arcs, recorded) if recorded else None
-
-
-def _merge_worker_coverage(snapshot: tuple[bool, dict[str, Any]] | None) -> None:
-    if snapshot is None:
-        return
-    current = _current_coverage()
-    if current is None:
-        return
-    arcs, recorded = snapshot
-    if arcs:
-        current.get_data().add_arcs(recorded)
-    else:
-        current.get_data().add_lines(recorded)
-
-
-def install_worker_measurement() -> None:
-    """Forward forked workers' data to the gate process's active collector."""
-    runner.install_worker_measurement(runner.WorkerMeasurement(
-        _start_worker_coverage, _finish_worker_coverage, _merge_worker_coverage,
-    ))

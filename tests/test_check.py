@@ -5,18 +5,127 @@ import contextlib
 import importlib
 import io
 import json
+import signal
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from support import BASE_CONFIG, GATE, FixtureCase, output, sarif_report, with_clones
+from support import (
+    BASE_CONFIG,
+    GATE,
+    FixtureCase,
+    output,
+    sarif_report,
+    stub_check_result,
+    with_clones,
+)
 
 sys.path.insert(0, str(GATE))
+adapters = importlib.import_module("quality_gate.adapters")
 checks = importlib.import_module("quality_gate.checks")
+cli = importlib.import_module("quality_gate.cli")
 policy = importlib.import_module("quality_gate.policy")
 runner = importlib.import_module("quality_gate.runner")
+
+
+class _SleepSpec:
+    def __init__(self, sleep_seconds: int, budget_seconds: int) -> None:
+        self.sleep_seconds = sleep_seconds
+        self.budget_seconds = budget_seconds
+
+
+def _parse_sleep(raw, root, path, full_key):
+    return adapters.ParsedSpec(
+        _SleepSpec(
+            policy._integer(raw, "sleep_seconds", path, f"{full_key}.sleep_seconds"),
+            policy._integer(raw, "budget_seconds", path, f"{full_key}.budget_seconds"),
+        ),
+        "sleep/1",
+        ("tests",),
+    )
+
+
+def _run_sleep(context):
+    check = context.check
+    time.sleep(check.spec.sleep_seconds)
+    return stub_check_result(
+        check,
+        check.spec.budget_seconds,
+        measurement={"tests": 1},
+        tests_ran=1,
+        tests_skipped=0,
+    )
+
+
+SLEEP_STUB = adapters.AdapterDescriptor(
+    "sleep-stub",
+    ("sleep_seconds", "budget_seconds"),
+    _parse_sleep,
+    _run_sleep,
+    budget=lambda spec: spec.budget_seconds,
+)
+
+
+def _sleep_config(entries):
+    names = ", ".join(json.dumps(name) for name, _sleep, _budget in entries)
+    lines = [
+        "schema = 2",
+        "",
+        "[code]",
+        'patterns = ["*.py", "*.sh", "*.el"]',
+        'shebangs = ["sh", "bash", "python*"]',
+        "",
+        "[levels]",
+        "required_tiers = [1]",
+        "",
+        "[classes.python]",
+        "code = true",
+        'description = "Python source"',
+        f"checks = [{names}]",
+        "",
+        "[classes.doc]",
+        "code = false",
+        'description = "Documentation"',
+        "",
+        "[classes.config]",
+        "code = false",
+        'description = "Configuration"',
+        "",
+        "[[rule]]",
+        'pattern = "*.py"',
+        'class = "python"',
+        'reason = "Python source"',
+        "",
+        "[[rule]]",
+        'pattern = "*.md"',
+        'class = "doc"',
+        'reason = "Documentation"',
+        "",
+        "[[rule]]",
+        'pattern = "*.toml"',
+        'class = "config"',
+        'reason = "Configuration"',
+        "",
+        "[[rule]]",
+        'pattern = ".gitignore"',
+        'class = "config"',
+        'reason = "Ignore rules"',
+        "",
+    ]
+    for name, sleep, budget in entries:
+        lines.extend([
+            f"[checks.{name}]",
+            'adapter = "sleep-stub"',
+            "tier = 1",
+            'enforcement = "enforced"',
+            f"sleep_seconds = {sleep}",
+            f"budget_seconds = {budget}",
+            "",
+        ])
+    return "\n".join(lines)
 
 
 class CheckTests(FixtureCase):
@@ -246,55 +355,20 @@ class EvidenceCleanupTests(FixtureCase):
             self.run_checks([self.definition("producer")], adapter)
         self.assert_removed()
 
-    def test_budget_stop_removes_earlier_and_current_evidence(self):
-        paths = []
-
-        def adapter(context):
-            result = self.produce(context)
-            paths.append(self.evidence.parent)
-            if context.check.id == "budget":
-                raise runner.StepTimeout("fixture work")
-            return result
-
-        definitions = [self.definition("producer"), self.definition("budget", "producer")]
-        with contextlib.redirect_stderr(io.StringIO()):
-            results = self.run_checks(definitions, adapter)
-        self.assertEqual(results[1].execution, "budget")
-        self.assertTrue(all(not path.exists() for path in paths), paths)
-
-    def test_budget_expiring_after_the_adapter_returns_removes_its_evidence(self):
-        with mock.patch.object(checks, "check_time", side_effect=runner.StepTimeout("return")), \
-                contextlib.redirect_stderr(io.StringIO()):
-            results = self.run_checks([self.definition("producer")], self.produce)
-        self.assertEqual(results[0].execution, "budget")
-        self.assert_removed()
-
-    def assert_cleanup_failure_survives(self, ending, *, recorded_diagnostics=False,
-                                       retain_evidence=True):
+    def assert_cleanup_failure_survives(self, ending):
         def adapter(context):
             result = self.produce(context)
             self.addCleanup(result.temporary.cleanup)
             result.temporary.cleanup = mock.Mock(side_effect=PermissionError("cleanup denied"))
-            if not retain_evidence:
-                result.temporary = None
             result.diagnostics = runner.Diagnostics(
                 argv=["fixture"], exit_code=1, output_bytes=15,
                 output_tail="fixture output", error="original diagnostic",
             )
-            if recorded_diagnostics:
-                runner.record_diagnostics(result.diagnostics)
-            if ending == "timeout before return":
-                raise runner.StepTimeout("fixture work")
-            if ending == "worker error":
-                raise runner.WorkerError("fixture worker failed")
             if ending == "failure":
                 result.outcome = "fail"
             return result
 
-        # Fail check_time only after the adapter has returned its evidence.
-        check_time = runner.StepTimeout("adapter return") if ending == "timeout after return" else None
-        with mock.patch.object(checks, "check_time", side_effect=check_time), \
-                contextlib.redirect_stderr(io.StringIO()) as stderr:
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
             results = self.run_checks([self.definition("producer")], adapter)
         document = results[0].to_json()
         diagnostic = document["diagnostics"]["error"]
@@ -304,37 +378,14 @@ class EvidenceCleanupTests(FixtureCase):
         self.assertIn(message, stderr.getvalue())
         self.assertTrue(self.evidence.parent.is_dir())
         expected = {
-            "timeout before return": ("fail", "budget"),
-            "timeout after return": ("fail", "budget"),
-            "worker error": ("error", "error"),
             "success": ("pass", "completed"),
             "failure": ("fail", "completed"),
         }
         self.assertEqual((document["outcome"], document["execution"]), expected[ending])
-        if recorded_diagnostics or ending in ("success", "failure"):
-            self.assertIn("original diagnostic", diagnostic)
-            self.assertEqual(document["diagnostics"]["argv"], ["fixture"])
-            self.assertEqual(document["diagnostics"]["exit_code"], 1)
-            self.assertEqual(document["diagnostics"]["output_tail"], "fixture output")
-        else:
-            self.assertIn(document["reason"], diagnostic)
-
-    def test_cleanup_failure_survives_a_timeout_before_adapter_return(self):
-        self.assert_cleanup_failure_survives("timeout before return")
-
-    def test_cleanup_failure_survives_a_timeout_after_adapter_return(self):
-        self.assert_cleanup_failure_survives("timeout after return")
-
-    def test_cleanup_failure_survives_a_worker_error(self):
-        self.assert_cleanup_failure_survives("worker error")
-
-    def test_cleanup_failure_preserves_recorded_diagnostics(self):
-        for ending in ("timeout before return", "timeout after return", "worker error"):
-            for retained in (False, True):
-                with self.subTest(ending=ending, retained=retained):
-                    self.assert_cleanup_failure_survives(
-                        ending, recorded_diagnostics=True, retain_evidence=retained,
-                    )
+        self.assertIn("original diagnostic", diagnostic)
+        self.assertEqual(document["diagnostics"]["argv"], ["fixture"])
+        self.assertEqual(document["diagnostics"]["exit_code"], 1)
+        self.assertEqual(document["diagnostics"]["output_tail"], "fixture output")
 
     def test_cleanup_failure_preserves_completed_outcomes_and_diagnostics(self):
         for ending in ("success", "failure"):
@@ -361,6 +412,70 @@ class EvidenceCleanupTests(FixtureCase):
         self.assertIn("original diagnostic", results[0].diagnostics.error)
         self.assertTrue(paths[0].is_dir())
         self.assertFalse(paths[1].exists())
+
+
+class RunLimitTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        adapters.register_adapter(SLEEP_STUB)
+        self.addCleanup(adapters.remove_adapter, SLEEP_STUB.name)
+
+    def run_cli(self, *args: str) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["--repo", str(self.repo), *args])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_run_limit(self, entries, limit, step, allowance) -> None:
+        self.write_config(_sleep_config(entries))
+        started = time.monotonic()
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", allowance):
+            code, _stdout, stderr = self.run_cli("check")
+        self.assertEqual(code, 2, stderr)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn(f"{limit} s limit", stderr)
+        self.assertIn(f"during {step}: check setup", stderr)
+
+    def test_a_sleeping_check_ends_the_run_with_exit_two(self) -> None:
+        self.assert_run_limit([("sleep", 30, 1)], 1, "sleep", 0)
+
+    def test_a_run_timeout_writes_an_error_document(self) -> None:
+        self.write_config(_sleep_config([("sleep", 30, 1)]))
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
+            code, stdout, stderr = self.run_cli("check", "--json")
+        self.assertEqual(code, 2, stderr)
+        document = json.loads(stdout)
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("1 s limit", document["error"])
+
+    def test_the_limit_is_the_sum_of_the_checks_budgets_plus_the_allowance(self) -> None:
+        self.assert_run_limit(
+            [("first", 0, 1), ("second", 30, 2)], 4, "second", 1
+        )
+
+    @staticmethod
+    def _handler(_signum: int, _frame: object) -> None:
+        pass
+
+    def test_the_timer_and_handler_are_restored_after_a_run(self) -> None:
+        handler = self._handler
+        previous = signal.signal(signal.SIGALRM, handler)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0.0)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.write_config(_sleep_config([("quick", 0, 1)]))
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
+            code, _stdout, stderr = self.run_cli("check")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertIs(signal.getsignal(signal.SIGALRM), handler)
+
+        self.write_config(_sleep_config([("sleep", 30, 1)]))
+        with mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
+            code, _stdout, stderr = self.run_cli("check")
+        self.assertEqual(code, 2, stderr)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertIs(signal.getsignal(signal.SIGALRM), handler)
 
 
 if __name__ == "__main__":

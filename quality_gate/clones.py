@@ -20,14 +20,7 @@ from .policy import (
     _integer,
 )
 from .ratchet import Domain, Finding, Location, RatchetResult
-from .runner import (
-    Diagnostics,
-    analysis_step,
-    mark_step,
-    record_diagnostics,
-    remaining_budget,
-    run,
-)
+from .runner import Diagnostics, mark_step, run
 from .tools import tool_binary
 
 
@@ -512,15 +505,15 @@ def _run_jscpd(
     with tempfile.TemporaryDirectory(prefix="qg-clones-") as temporary:
         output = Path(temporary)
         config = output / "jscpd-config.json"
-        analysis_step("clone setup", _write_clone_config, config)
-        command = analysis_step(
-            "clone command preparation", _jscpd_command,
-            binary, files, min_tokens, max_bytes, output, config,
+        mark_step("clone setup")
+        _write_clone_config(config)
+        mark_step("clone command preparation")
+        command = _jscpd_command(
+            binary, files, min_tokens, max_bytes, output, config
         )
         mark_step("jscpd")
-        result = run(command, cwd=root, budget_seconds=remaining_budget(600))
+        result = run(command, cwd=root, budget_seconds=600)
         diagnostics = result.diagnostics()
-        record_diagnostics(diagnostics)
         _raise_jscpd_failure(result, diagnostics)
         sarif = output / "jscpd-report.sarif"
         json_report = output / "jscpd-report.json"
@@ -530,9 +523,8 @@ def _run_jscpd(
                 diagnostics=diagnostics,
             )
         try:
-            clones = analysis_step(
-                "clone report analysis", _parse_reports, json_report, sarif, root, files
-            )
+            mark_step("clone report analysis")
+            clones = _parse_reports(json_report, sarif, root, files)
         except UnsupportedError as error:
             raise CloneEvidenceError(
                 str(error),
@@ -652,8 +644,10 @@ def _prepare_clones(
     root: Path, files: list[str]
 ) -> tuple[Path | None, CloneMeasurement | None]:
     try:
-        binary = analysis_step("clone tool preparation", _jscpd_binary)
-        analysis_step("clone source scan", _refuse_directives, root, files)
+        mark_step("clone tool preparation")
+        binary = _jscpd_binary()
+        mark_step("clone source scan")
+        _refuse_directives(root, files)
     except UnsupportedError as error:
         return None, CloneMeasurement([], Diagnostics(), "error", str(error), True)
     except GateError as error:
@@ -684,8 +678,9 @@ def measure_clones(
         )
     except GateError as error:
         return CloneMeasurement([], Diagnostics(), "error", str(error), False)
+    mark_step("clone findings")
     return CloneMeasurement(
-        analysis_step("clone findings", _clone_findings, clones, files), diagnostics, execution
+        _clone_findings(clones, files), diagnostics, execution
     )
 
 
@@ -797,11 +792,11 @@ def _finish_clones(
     from .checks import _baseline_entries
 
     diagnostics = measurement.diagnostics
-    record_diagnostics(diagnostics)
     if measurement.error is not None:
         return _clone_failure(check, start, prefix, measurement)
     try:
-        entries = analysis_step("baseline loading", _baseline_entries, check)
+        mark_step("baseline loading")
+        entries = _baseline_entries(check)
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _clone_result(
@@ -827,12 +822,14 @@ def _clone_ratchet(
     from .checks import _evaluate_ratchet
 
     diagnostics = measurement.diagnostics
+    mark_step("clone domain analysis")
+    domain = _clone_domain(entries, selected, files)
     ratchet, failure = _evaluate_ratchet(
         measurement.findings,
         entries,
         check,
         prefix,
-        analysis_step("clone domain analysis", _clone_domain, entries, selected, files),
+        domain,
     )
     if ratchet is None:
         return _clone_result(

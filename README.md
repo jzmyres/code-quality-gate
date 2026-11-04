@@ -277,7 +277,7 @@ configuration before the test command starts, and every child consumes it instea
 Combination and CRAP analysis never read that file: they use the same canonical configuration held in
 memory, so a test that edits it cannot change which lines are excluded from the measurement. After the
 test command the gate opens the file without following symlinks or blocking, requires a regular file,
-and compares it with the canonical text within the check's deadline. A non-regular file or difference
+and compares it with the canonical text. A non-regular file or difference
 fails the tests check as a configuration error naming the file.
 Each coverage invocation registers itself under `registry/` in the data directory before it runs,
 naming the dataset it will write and the program it runs (the script path or `-m MODULE`, not its
@@ -299,10 +299,10 @@ matches more than once (`ambiguous test summary`), `skipped_pattern` matches mor
 (`ambiguous skipped summary`), a captured count is not a non-negative integer, or coverage is not
 installed. On `pass` the adapter combines the registered coverage datasets and keeps the combined data
 as the evidence for checks that require it. The core explicitly removes test evidence directories
-after their last dependent check, including when a check fails or exceeds its budget, and reports
-cleanup failures as diagnostics. The `worklist` command follows the same rule for the checks it
-runs, and a cleanup failure makes it exit non-zero. Pattern matching runs in an interruptible child
-bounded by the check's remaining budget, together with coverage combination.
+after their last dependent check, including when a check fails or the run limit stops the run, and
+reports cleanup failures as diagnostics. The `worklist` command follows the same rule for the checks
+it runs, and a cleanup failure makes it exit non-zero. Pattern matching runs in an interruptible child
+with its own budget.
 
 A completed run records the parsed run and skipped counts for verification, which reports them as
 its `tests:ID:executed` and `tests:ID:skipped` findings. It does not reconstruct individual test
@@ -591,27 +591,30 @@ a non-passing adapter verdict, null otherwise); a measuring check may also carry
 object (for example `{"tests": 12}`). Any adapter can report its measured tool identity as
 `tool`, an object with string `name` and `version` fields; it is absent when no identity is reported.
 
-`execution` is `completed`, `budget`, `signal` or `error`. `outcome` is the adapter's raw verdict:
-`pass`, `fail`, `unsupported` or `error`; later tier-3 adapters add `proved`, `no_counterexample` and
-`unknown`. `satisfied` is true when the policy obligation is met after baselines and enforcement: a
-finding inside a valid baseline keeps `outcome = "fail"` and sets `satisfied = true`. Advisory checks
-do not block the whole-tree judgement. Missing evidence is `unsupported`, never `pass`. Each check has one
-absolute deadline covering its preparation, command, output matching, coverage combination, analysis,
-baseline loading and ratchet evaluation. Command, Python test and Emacs Lisp checks use their configured budgets;
-clone, CRAP and verification checks each have 600 seconds. Synchronous analysis runs in supervised workers.
-Cancelling a worker stops it, every subprocess it started through the runner, and those subprocesses' process
-groups before cancellation returns. If a process cannot be stopped, the check reports an error naming its pid and
-command. An overrun reports `outcome = "fail"` and `execution = "budget"`, names the step, deadline and elapsed
-time, and retains the subprocess diagnostics collected so far.
+`execution` is `completed`, `budget` (a subprocess budget expired), `signal` or `error`.
+`outcome` is the adapter's raw verdict: `pass`, `fail`, `unsupported` or `error`; later
+tier-3 adapters add `proved`, `no_counterexample` and `unknown`. `satisfied` is true when the
+policy obligation is met after baselines and enforcement: a finding inside a valid baseline keeps
+`outcome = "fail"` and sets `satisfied = true`. Advisory checks do not block the whole-tree
+judgement. Missing evidence is `unsupported`, never `pass`. The policy checks have one wall-clock
+run limit: the sum of every check's configured budget (command, Python test and Emacs Lisp checks use
+their configured budgets; clone, CRAP and verification checks each have 600 seconds) plus a
+300-second allowance. The allowance covers in-process analysis over bounded input and keeps the
+backstop from racing a subprocess budget, which must end its check and never the run. The check loop
+arms one timer before the first check and restores the previous `SIGALRM` handler after the last,
+releasing test evidence in between. A run that exceeds the limit ends with `decision = "error"`
+(exit 2) and a message naming the limit, the current check and step; a subprocess still running at
+that point is killed with its process group.
 
 `diagnostics` carries `argv`, `exit_code` or `signal`, `output_bytes`, `output_tail` (at most 4 KiB),
 `output_truncated` and, when execution failed, `error`. Every subprocess the gate starts (git
-enumeration and identity, command checks, jscpd and test runs) uses one bounded runner: it starts its own
-process group, terminates the whole group and reaps it. At a check deadline it sends SIGTERM followed
-immediately by SIGKILL; subprocesses outside checks have a five-second grace before SIGKILL. Process
-termination and reaping can add a small amount of time after the deadline. Check output is captured up
-to 1 MiB; later bytes are counted and discarded. A consumer therefore
-never has to parse stderr to learn why a check failed.
+enumeration and identity, command checks, jscpd and test runs) uses one bounded runner: it starts in its
+own process group, is terminated at its own budget and is reaped. The budget is the smaller of the
+requested seconds and the current check's remaining time. At a check's budget it sends SIGTERM to the
+group followed immediately by SIGKILL; a subprocess outside a check has a five-second grace before
+SIGKILL. An interrupt that ends the run kills the group immediately. Termination and reaping can add a
+small amount of time after the budget. Check output is captured up to 1 MiB; later bytes are counted
+and discarded. A consumer therefore never has to parse stderr to learn why a check failed.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`, `locations` and `expired`; baseline
@@ -699,7 +702,8 @@ and leaves `decision` reporting the gate evaluation. If a write itself fails, ea
 same request may already have completed. `--prune` with `--policy-from` is a usage error (exit 2)
 naming both options, before any check runs; `--prune` without `--policy-from` is unchanged.
 
-The decision is `error` (exit 2) for invalid policy, usage or configuration, `rejected` (exit 1) when
+The decision is `error` (exit 2) for invalid policy, usage or configuration, or when the run exceeds
+its limit, `rejected` (exit 1) when
 inventory, hygiene, any enforced check or any obligation is not satisfied, `accepted_with_exceptions`
 (exit 0) when every obligation and enforced check is satisfied but at least one finding passes only through
 a baseline entry or an advisory check does not pass, and `accepted` (exit 0) otherwise. With `--json`,

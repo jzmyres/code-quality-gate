@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from support import GATE, baseline_text
+from support import GATE, baseline_text, stub_check_result
 
 sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
@@ -43,23 +43,8 @@ def parse_stub(
 
 def run_stub(context: adapters.AdapterContext) -> checks.CheckResult:
     check = context.check
-    count = check.spec.count
-    return checks.CheckResult(
-        id=check.id,
-        kind="check",
-        tier=check.tier,
-        enforcement=check.enforcement,
-        adapter=check.adapter,
-        evidence=check.evidence,
-        metric_version=check.metric_version,
-        outcome="pass",
-        execution="completed",
-        duration_seconds=0.0,
-        budget_seconds=600,
-        threshold=check.threshold,
-        baseline_path=check.baseline,
-        tests_ran=count,
-        tests_skipped=0,
+    return stub_check_result(
+        check, 600, tests_ran=check.spec.count, tests_skipped=0
     )
 
 

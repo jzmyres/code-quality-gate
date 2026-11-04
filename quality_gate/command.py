@@ -11,7 +11,7 @@ from . import output_patterns, policy
 from .policy import (
     DEFAULT_BUDGET_SECONDS, CheckDef, UnsupportedError, UsageError, _config_error, _integer, _string,
 )
-from .runner import Diagnostics, RunResult, analysis_step, mark_step, record_diagnostics, run
+from .runner import Diagnostics, RunResult, mark_step, run
 from .tools import current_tools, tool_binary
 
 
@@ -139,9 +139,8 @@ def _expanded_or_failure(
     start: float,
 ) -> tuple[list[str] | None, Any | None]:
     try:
-        expanded, unsupported = analysis_step(
-            "command preparation", _expand_run, check, selected
-        )
+        mark_step("command preparation")
+        expanded, unsupported = _expand_run(check, selected)
     except UsageError as error:
         return None, _command_failure(
             check,
@@ -263,8 +262,8 @@ def _command_test_fields(
 ) -> tuple[dict[str, Any], Any | None]:
     if spec.tests_pattern_re is None:
         return {}, None
-    ran, skipped, count_error = analysis_step(
-        "test count analysis", output_patterns.summarize_matches,
+    mark_step("test count analysis")
+    ran, skipped, count_error = output_patterns.summarize_matches(
         spec, matches.get("tests", []), matches.get("skipped", []),
     )
     if count_error is not None:
@@ -382,7 +381,6 @@ def _run_command(context: Any) -> Any:
         budget_seconds=max(0.0, deadline - time.monotonic()),
     )
     diagnostics = result.diagnostics()
-    record_diagnostics(diagnostics)
     failure = _termination_failure(
         check, spec, start, prefix, result, diagnostics
     )

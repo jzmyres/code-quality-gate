@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from .coverage_tool import coverage_config_data, import_coverage
 from .policy import CheckDef, GateError, UnsupportedError
 from .ratchet import Domain, Finding, Location
-from .runner import Diagnostics, StepTimeout, analysis_step
+from .runner import Diagnostics, mark_step
 
 
 if TYPE_CHECKING:
@@ -682,24 +682,15 @@ def _crap_measure(
     start: float,
     prefix: str,
 ) -> tuple[Any | None, Any | None]:
-    from .checks import RATCHET_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
+    from .checks import _ratchet_error, _ratchet_result
 
+    mark_step("CRAP analysis")
     try:
-        measurement = analysis_step(
-            "CRAP analysis", measure_crap,
+        measurement = measure_crap(
             root,
             selected,
             evidence_path,
             settings,
-            deadline=start + RATCHET_BUDGET_SECONDS,
-        )
-    except StepTimeout:
-        reason = _budget_detail(
-            "CRAP analysis exceeded the remaining budget", start, RATCHET_BUDGET_SECONDS
-        )
-        print(f"{prefix}: {reason}", file=sys.stderr)
-        return None, _ratchet_result(
-            check, start, "fail", execution="budget", reason=reason
         )
     except UnsupportedError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
@@ -737,8 +728,9 @@ def _run_python_crap(context: Any) -> Any:
         print(f"{prefix}: {reason}", file=sys.stderr)
         return _ratchet_result(check, start, "fail", reason=reason)
 
-    evidence_path, settings, failure_diagnostics, message = analysis_step(
-        "coverage evidence validation", _crap_required, prior, spec, prefix
+    mark_step("coverage evidence validation")
+    evidence_path, settings, failure_diagnostics, message = _crap_required(
+        prior, spec, prefix
     )
     if message is not None:
         return _ratchet_result(
@@ -776,7 +768,8 @@ def _run_python_crap(context: Any) -> Any:
         )
 
     try:
-        entries = analysis_step("baseline loading", _baseline_entries, check)
+        mark_step("baseline loading")
+        entries = _baseline_entries(check)
     except GateError as error:
         print(f"{prefix}: {error}", file=sys.stderr)
         return _ratchet_result(

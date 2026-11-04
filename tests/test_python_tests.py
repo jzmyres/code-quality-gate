@@ -851,44 +851,6 @@ class CoverageRegistryTests(unittest.TestCase):
         self.assertIn(".coverage.abc", message)
 
 
-class CoverageDeadlineTests(unittest.TestCase):
-    def test_a_combination_after_the_deadline_reports_budget(self) -> None:
-        spec = python_tests.PythonTestsSpec(
-            run=(),
-            tests_pattern="",
-            tests_pattern_re=re.compile(""),
-            skipped_pattern=None,
-            skipped_pattern_re=None,
-            budget_seconds=1,
-        )
-        check = policy.CheckDef(
-            id="tests",
-            adapter="python_tests",
-            tier=1,
-            enforcement="enforced",
-            metric_version="test-count/1",
-            evidence=("tests",),
-            spec=spec,
-            threshold=None,
-            baseline=None,
-        )
-        result = python_tests._combine_tests_evidence(
-            check,
-            spec,
-            0.0,
-            "check: tests",
-            "canonical settings",
-            Path("/nonexistent-data"),
-            Path("combined"),
-            runner.Diagnostics(),
-            0.0,
-        )
-        assert result is not None
-        self.assertEqual(result.execution, "budget")
-        self.assertEqual(result.outcome, "fail")
-        self.assertIn("coverage combination exceeded", result.reason)
-
-
 class PythonTestsCheckHelperTests(unittest.TestCase):
     def setUp(self) -> None:
         tests_pattern = r"^Ran ([0-9]+) tests? in"
@@ -1093,28 +1055,6 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         self.assertEqual(counts, (3, 1, 2))
         self.assertIsNone(failure)
 
-    def test_evidence_refuses_configuration_validation_after_the_deadline(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        data_dir = Path(temporary.name) / "data"
-        data_dir.mkdir()
-        coverage_tool.write_coverage_config(data_dir, data_dir)
-        with self.assertRaisesRegex(runner.StepTimeout, "coverage configuration validation"):
-            python_tests._tests_evidence(
-                self.check,
-                self.spec,
-                0.0,
-                "check: tests",
-                temporary,
-                data_dir,
-                data_dir,
-                1,
-                0,
-                1,
-                runner.Diagnostics(),
-                0.0,
-            )
-
     def test_evidence_builds_the_pass_result(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1136,7 +1076,6 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 1,
                 2,
                 runner.Diagnostics(),
-                time.monotonic() + 60,
             )
         self.assertEqual(result.outcome, "pass")
         self.assertEqual(result.measurement, {"tests": 2})

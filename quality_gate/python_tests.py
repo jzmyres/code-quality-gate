@@ -27,15 +27,7 @@ from .policy import (
     _config_error,
     _integer,
 )
-from .runner import (
-    Diagnostics,
-    RunResult,
-    StepTimeout,
-    analysis_step,
-    mark_step,
-    record_diagnostics,
-    run,
-)
+from .runner import Diagnostics, RunResult, mark_step, run
 from .tools import installed_tool
 
 
@@ -189,8 +181,8 @@ def _tests_summary(
                 diagnostics=diagnostics,
             ),
         )
-    ran, skipped, error = analysis_step(
-        "test count analysis", output_patterns.summarize_matches,
+    mark_step("test count analysis")
+    ran, skipped, error = output_patterns.summarize_matches(
         spec, matches.get("tests", []), matches.get("skipped", []),
     )
     return ran, skipped, error, None
@@ -272,21 +264,12 @@ def _combine_tests_evidence(
     data_dir: Path,
     combined_file: Path,
     diagnostics: Diagnostics,
-    deadline: float,
 ) -> Any | None:
     from .checks import _tests_result
 
-    reason = "coverage combination exceeded the remaining budget"
     try:
-        analysis_step(
-            "coverage combination", combine_coverage,
-            data_dir, combined_file, settings, deadline=deadline,
-        )
-    except StepTimeout:
-        return _tests_result(
-            check, spec, start, prefix, reason,
-            execution="budget", diagnostics=diagnostics,
-        )
+        mark_step("coverage combination")
+        combine_coverage(data_dir, combined_file, settings)
     except (UnsupportedError, GateError) as error:
         return _tests_result(
             check,
@@ -313,9 +296,8 @@ def _tests_setup(
     data_dir = Path(temporary.name) / "data"
     try:
         data_dir.mkdir()
-        python_prefix = analysis_step(
-            "coverage setup", coverage_prefix, root, data_dir
-        )
+        mark_step("coverage setup")
+        python_prefix = coverage_prefix(root, data_dir)
     except UnsupportedError as error:
         return _tests_result(
             check,
@@ -454,17 +436,14 @@ def _tests_evidence(
     skipped: int,
     executed: int,
     diagnostics: Diagnostics,
-    deadline: float,
 ) -> Any:
     from .checks import _check_result, _tests_result
 
     from .coverage_tool import _coverage_config_problem
 
     settings = coverage_config_text(root)
-    problem = analysis_step(
-        "coverage configuration validation", _coverage_config_problem,
-        data_dir, settings, deadline=deadline,
-    )
+    mark_step("coverage configuration validation")
+    problem = _coverage_config_problem(data_dir, settings)
     if problem is not None:
         return _tests_result(
             check,
@@ -488,7 +467,6 @@ def _tests_evidence(
         data_dir,
         combined_file,
         diagnostics,
-        deadline,
     )
     if failure is not None:
         return failure
@@ -536,7 +514,6 @@ def _run_python_tests(context: Any) -> Any:
         budget_seconds=max(0.0, deadline - time.monotonic()),
     )
     diagnostics = run_result.diagnostics()
-    record_diagnostics(diagnostics)
     combined = run_result.combined_text
     failure = _tests_execution_failure(
         check, spec, run_result, diagnostics, combined, prefix, start
@@ -574,5 +551,4 @@ def _run_python_tests(context: Any) -> Any:
         skipped,
         executed,
         diagnostics,
-        deadline,
     )

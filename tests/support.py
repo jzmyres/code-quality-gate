@@ -1,7 +1,6 @@
 """Shared helpers for the code-quality-gate tests."""
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import re
@@ -22,7 +21,6 @@ if str(GATE) not in sys.path:
     sys.path.insert(0, str(GATE))
 
 # The test process can itself run under covrun, just like the gate entry point.
-importlib.import_module("quality_gate.adapters").setup_process()
 
 BASE_CONFIG = """\
 schema = 2
@@ -655,3 +653,25 @@ class FixtureCase(unittest.TestCase):
 
 def output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
+
+
+def stub_check_result(check: Any, budget_seconds: int, **fields: Any) -> Any:
+    """The passing CheckResult a stub adapter returns for CHECK."""
+    from quality_gate import checks
+
+    return checks.CheckResult(
+        id=check.id,
+        kind="check",
+        tier=check.tier,
+        enforcement=check.enforcement,
+        adapter=check.adapter,
+        evidence=check.evidence,
+        metric_version=check.metric_version,
+        outcome="pass",
+        execution="completed",
+        duration_seconds=0.0,
+        budget_seconds=budget_seconds,
+        threshold=check.threshold,
+        baseline_path=check.baseline,
+        **fields,
+    )

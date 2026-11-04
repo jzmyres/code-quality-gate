@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from .coverage_tool import PRAGMA_NO_COVER
 from .policy import CheckDef, Config, GateError, _string
 from .ratchet import Domain, Finding, Location
-from .runner import Diagnostics, StepTimeout, analysis_step
+from .runner import Diagnostics, mark_step
 
 
 if TYPE_CHECKING:
@@ -280,9 +280,10 @@ def _verification_findings(
     start: float,
     prefix: str,
 ) -> Any:
-    from .checks import RATCHET_BUDGET_SECONDS, _budget_detail, _ratchet_error, _ratchet_result
+    from .checks import _ratchet_error, _ratchet_result
 
-    counts, problem = analysis_step("verification test counts", _verification_counts, check, prior)
+    mark_step("verification test counts")
+    counts, problem = _verification_counts(check, prior)
     if problem is not None:
         print(f"{prefix}: {problem}", file=sys.stderr)
         return _ratchet_result(
@@ -293,17 +294,9 @@ def _verification_findings(
             reason=problem,
         )
     assert counts is not None
+    mark_step("verification analysis")
     try:
-        return analysis_step(
-            "verification analysis", measure_verification, root, files, counts,
-            deadline=start + RATCHET_BUDGET_SECONDS,
-        )
-    except StepTimeout:
-        reason = _budget_detail(
-            "verification analysis exceeded the remaining budget", start, RATCHET_BUDGET_SECONDS
-        )
-        print(f"{prefix}: {reason}", file=sys.stderr)
-        return _ratchet_result(check, start, "fail", execution="budget", reason=reason)
+        return measure_verification(root, files, counts)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
 
@@ -320,12 +313,10 @@ def _verification_measurement(
 ) -> Any:
     from .checks import _select_files
 
-    selected, _names = analysis_step(
-        "file selection", _select_files, config, check, files, classes
-    )
-    python_files = analysis_step(
-        "Python file selection", _verification_files, selected
-    )
+    mark_step("file selection")
+    selected, _names = _select_files(config, check, files, classes)
+    mark_step("Python file selection")
+    python_files = _verification_files(selected)
     return _verification_findings(
         root, check, python_files, prior, start, prefix
     )
@@ -337,10 +328,8 @@ def _verification_entries(
     from .checks import _baseline_entries, _ratchet_error
 
     try:
-        return (
-            analysis_step("baseline loading", _baseline_entries, check),
-            None,
-        )
+        mark_step("baseline loading")
+        return (_baseline_entries(check), None)
     except GateError as error:
         return None, _ratchet_error(check, start, prefix, error)
 
@@ -357,9 +346,10 @@ def _verification_ratchet(
     if failure is not None:
         return failure
     assert entries is not None
+    mark_step("verification domain analysis")
+    domain = _verification_domain(findings)
     ratchet, failure = _evaluate_ratchet(
-        findings, entries, check, prefix,
-        analysis_step("verification domain analysis", _verification_domain, findings),
+        findings, entries, check, prefix, domain
     )
     if ratchet is None:
         return _ratchet_result(

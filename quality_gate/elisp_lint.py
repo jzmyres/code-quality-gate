@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
 from .json_input import load_json
-from .runner import analysis_step, mark_step, record_diagnostics, remaining_budget, run
+from .runner import mark_step, run
 
 
 if TYPE_CHECKING:
@@ -146,13 +146,13 @@ def _run_batch(context: Any, start: float, files: list[str], directory: Path,
     report.unlink(missing_ok=True)
     mark_step("Emacs lint command")
     child = run(_command(spec, mode, files, directory, report), cwd=context.root,
-                budget_seconds=remaining_budget(spec.budget_seconds))
-    record_diagnostics(child.diagnostics())
+                budget_seconds=spec.budget_seconds)
     failure = _execution_failure(context, start, child, version)
     if failure is not None:
         return None, child, failure
     try:
-        document = analysis_step("Emacs lint report validation", _read_document, report, files, mode, version)
+        mark_step("Emacs lint report validation")
+        document = _read_document(report, files, mode, version)
     except ValueError as error:
         reason = f"expected {error} for {files!r}; child exit {child.returncode}, execution {child.execution}"
         return None, child, _failure(context, start, reason, version=version, outcome="unsupported",
@@ -188,7 +188,8 @@ class _State:
 
 
 def _record_problem(context: Any, state: _State, document: dict[str, Any], child: Any) -> None:
-    problem = analysis_step("Emacs lint findings", _problem, context.check.adapter, document, child)
+    mark_step("Emacs lint findings")
+    problem = _problem(context.check.adapter, document, child)
     if problem is not None:
         state.problems.append(problem)
         state.diagnostics = child.diagnostics()

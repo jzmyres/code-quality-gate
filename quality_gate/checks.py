@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import signal
 import sys
 import tempfile
 import time
@@ -32,15 +33,18 @@ from .ratchet import (
 )
 from .runner import (
     Diagnostics,
-    StepTimeout,
-    WorkerError,
-    analysis_step,
+    RunTimeout,
     check_deadline,
-    check_time,
+    mark_step,
 )
 
 
 RATCHET_BUDGET_SECONDS = 600
+# In-process analysis over bounded input takes seconds, so this allowance keeps
+# the run's wall-clock backstop from racing a subprocess budget, which must end
+# its check and never the run.  The timer starts before every subprocess, so a
+# run limit of exactly the budgets would always win over a hanging last check.
+RUN_ALLOWANCE_SECONDS = 300
 
 
 def _budget_detail(reason: str, start: float, budget: float) -> str:
@@ -185,8 +189,6 @@ def _check_result(
     budget_seconds: int | None = None,
     **fields: Any,
 ) -> CheckResult:
-    if execution != "budget":
-        check_time()
     return CheckResult(
         id=check.id,
         kind="check",
@@ -213,21 +215,18 @@ def _evaluate_ratchet(
     domain: Domain,
 ) -> tuple[RatchetResult | None, str | None]:
     assert check.threshold is not None
+    mark_step("ratchet evaluation")
     try:
         return (
-            analysis_step(
-                "ratchet evaluation",
-                partial(
-                    evaluate,
-                    findings,
-                    entries,
-                    threshold=check.threshold,
-                    enforcement=check.enforcement,
-                    prefix=prefix,
-                    adapter=check.adapter,
-                    domain=domain,
-                    direction=check.direction,
-                ),
+            evaluate(
+                findings,
+                entries,
+                threshold=check.threshold,
+                enforcement=check.enforcement,
+                prefix=prefix,
+                adapter=check.adapter,
+                domain=domain,
+                direction=check.direction,
             ),
             None,
         )
@@ -245,9 +244,9 @@ def _adapter_selection(
     check = context.check
     spec = check.spec
     start = time.monotonic()
-    selected, names = analysis_step(
-        "file selection", _select_files, context.config, check,
-        context.files, context.classes,
+    mark_step("file selection")
+    selected, names = _select_files(
+        context.config, check, context.files, context.classes
     )
     return spec, start, selected, names
 
@@ -381,7 +380,6 @@ def _adapter_runner(
     classes: dict[str, str],
     prefix: str,
     prior: dict[str, CheckResult],
-    cleanup_errors: list[str],
 ) -> CheckResult:
     temporaries: list[Any] = []
     context = AdapterContext(
@@ -395,9 +393,7 @@ def _adapter_runner(
     finally:
         for temporary in temporaries:
             if result is None or temporary is not result.temporary:
-                message = _cleanup_evidence(temporary, check.id, result)
-                if message is not None:
-                    cleanup_errors.append(message)
+                _cleanup_evidence(temporary, check.id, result)
 
 
 def _new_evidence_directory(temporaries: list[Any], **options: Any) -> Any:
@@ -430,77 +426,15 @@ def run_check(
     prior: dict[str, CheckResult] | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
-    return _run_check_with_deadline(
-        root, config, check, files, classes, prefix, prior or {}
-    )
+    start = time.monotonic()
+    with check_deadline(check.id, start, _check_budget(check)):
+        return _adapter_runner(
+            root, config, check, files, classes, prefix, prior or {}
+        )
 
 
 def _check_budget(check: CheckDef) -> float:
     return _check_descriptor(check).budget(check.spec)
-
-
-def _run_check_with_deadline(
-    root: Path,
-    config: Config,
-    check: CheckDef,
-    files: list[str],
-    classes: dict[str, str],
-    prefix: str,
-    prior: dict[str, CheckResult],
-) -> CheckResult:
-    budget = _check_budget(check)
-    start = time.monotonic()
-    result = None
-    cleanup_errors: list[str] = []
-    with check_deadline(start, budget) as scope:
-        try:
-            result = _adapter_runner(
-                root, config, check, files, classes, prefix, prior, cleanup_errors
-            )
-            check_time()
-        except (StepTimeout, WorkerError) as error:
-            failure = error
-        else:
-            failure = None
-    if failure is None:
-        return result
-    if result is not None:
-        cleanup_errors.extend(_release_evidence([result], {}))
-    result = _deadline_failure(check, prefix, start, budget, scope.diagnostics, failure)
-    _carry_cleanup_errors(result, cleanup_errors)
-    return result
-
-
-def _carry_cleanup_errors(result: CheckResult, messages: list[str]) -> None:
-    for message in messages:
-        previous = result.diagnostics.error
-        if previous is None or message not in previous:
-            result.diagnostics.error = f"{previous}; {message}" if previous else message
-
-
-def _deadline_failure(
-    check: CheckDef,
-    prefix: str,
-    start: float,
-    budget: float,
-    diagnostics: Diagnostics | None,
-    failure: StepTimeout | WorkerError,
-) -> CheckResult:
-    if isinstance(failure, StepTimeout):
-        reason = _budget_detail(
-            f"{failure} exceeded the remaining budget", start, budget
-        )
-        execution = "budget"
-        outcome = "fail"
-    else:
-        reason = str(failure)
-        execution = "error"
-        outcome = "error"
-    print(f"{prefix}: {reason}", file=sys.stderr)
-    return _check_result(
-        check, start, outcome, execution=execution, budget_seconds=budget,
-        diagnostics=diagnostics or Diagnostics(error=reason), reason=reason,
-    )
 
 
 def _skipped(check: CheckDef) -> CheckResult:
@@ -613,6 +547,27 @@ def _prune_option_error(
     )
 
 
+def _run_limit(config: Config) -> float:
+    return (
+        sum(_check_budget(check) for check in config.checks.values())
+        + RUN_ALLOWANCE_SECONDS
+    )
+
+
+def _arm_run_limit(limit: float) -> Any:
+    def handler(_signum: int, _frame: Any) -> None:
+        raise RunTimeout(limit, RUN_ALLOWANCE_SECONDS)
+
+    previous = signal.signal(signal.SIGALRM, handler)
+    signal.setitimer(signal.ITIMER_REAL, limit)
+    return previous
+
+
+def _disarm_run_limit(previous: Any) -> None:
+    signal.setitimer(signal.ITIMER_REAL, 0.0)
+    signal.signal(signal.SIGALRM, previous)
+
+
 def _run_policy_checks(
     root: Path,
     config: Config,
@@ -623,32 +578,36 @@ def _run_policy_checks(
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
     last_users = _evidence_last_users(config.checks.values())
+    previous = _arm_run_limit(_run_limit(config))
     try:
-        for check in config.checks.values():
-            if inventory_code != 0:
-                print(
-                    f"check: {check.id}: skipped because inventory failed",
-                    file=sys.stderr,
+        try:
+            for check in config.checks.values():
+                if inventory_code != 0:
+                    print(
+                        f"check: {check.id}: skipped because inventory failed",
+                        file=sys.stderr,
+                    )
+                    skipped = _skipped(check)
+                    results.append(skipped)
+                    prior[check.id] = skipped
+                    continue
+                print(f"check: {check.id} ({check.adapter})", flush=True)
+                outcome = run_check(
+                    root,
+                    config,
+                    check,
+                    files,
+                    classes,
+                    prefix=f"check: {check.id}",
+                    prior=prior,
                 )
-                skipped = _skipped(check)
-                results.append(skipped)
-                prior[check.id] = skipped
-                continue
-            print(f"check: {check.id} ({check.adapter})", flush=True)
-            outcome = run_check(
-                root,
-                config,
-                check,
-                files,
-                classes,
-                prefix=f"check: {check.id}",
-                prior=prior,
-            )
-            results.append(outcome)
-            prior[check.id] = outcome
-            _release_evidence(results, last_users, check.id)
+                results.append(outcome)
+                prior[check.id] = outcome
+                _release_evidence(results, last_users, check.id)
+        finally:
+            _release_evidence(results, last_users)
     finally:
-        _release_evidence(results, last_users)
+        _disarm_run_limit(previous)
     return results
 
 

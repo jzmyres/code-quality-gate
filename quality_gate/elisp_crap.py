@@ -11,7 +11,7 @@ from .elisp_tests import _lisp_string, _temporary, probe_version
 from .json_input import load_json
 from .policy import GateError
 from .ratchet import Domain, Finding, Location
-from .runner import analysis_step, mark_step, record_diagnostics, run
+from .runner import mark_step, run
 
 
 if TYPE_CHECKING:
@@ -219,7 +219,8 @@ def _complexity_document(context: Any, selected: list[str], start: float, child:
     from .checks import _ratchet_error
 
     try:
-        document = analysis_step("Emacs complexity result", _read_result, result, selected)
+        mark_step("Emacs complexity result")
+        document = _read_result(result, selected)
     except GateError as error:
         if child.returncode != 0:
             return None, _child_failure(context, start, child)
@@ -241,7 +242,6 @@ def _complexity(context: Any, selected: list[str], start: float) -> tuple[Any, A
         child = run(_command(required.spec.emacs, context.root, selected, result,
                              context.check.spec.decision_rules),
                     cwd=context.root, budget_seconds=RATCHET_BUDGET_SECONDS)
-        record_diagnostics(child.diagnostics())
         if child.execution != "completed":
             return None, _child_failure(context, start, child)
         return _complexity_document(context, selected, start, child, result)
@@ -277,10 +277,12 @@ def _ratchet(context: Any, start: float, selected: list[str], findings: list[Fin
     from .checks import _baseline_entries, _evaluate_ratchet, _ratchet_error, _ratchet_result
 
     try:
-        entries = analysis_step("baseline loading", _baseline_entries, context.check)
+        mark_step("baseline loading")
+        entries = _baseline_entries(context.check)
     except GateError as error:
         return _ratchet_error(context.check, start, context.prefix, error)
-    domain = analysis_step("Elisp measured domain", _domain, selected, context.files, entries)
+    mark_step("Elisp measured domain")
+    domain = _domain(selected, context.files, entries)
     ratchet, failure = _evaluate_ratchet(findings, entries, context.check, context.prefix, domain)
     if ratchet is None:
         return _ratchet_result(context.check, start, failure or "error", reason=failure)
@@ -302,10 +304,12 @@ def _run_crap(context: Any) -> Any:
     from .checks import _adapter_selection, _class_text
 
     _spec, start, selected, names = _adapter_selection(context)
-    failure = analysis_step("Elisp coverage selection", selection_failure, context, start)
+    mark_step("Elisp coverage selection")
+    failure = selection_failure(context, start)
     if failure is not None:
         return failure
-    evidence, failure = analysis_step("Edebug evidence validation", _required, context, start)
+    mark_step("Edebug evidence validation")
+    evidence, failure = _required(context, start)
     if failure is not None:
         return failure
     if not selected:
@@ -314,7 +318,8 @@ def _run_crap(context: Any) -> Any:
     definitions, failure = _complexity(context, selected, start)
     if failure is not None:
         return failure
-    findings, failures = analysis_step("Elisp attribution", _analyse, context.root, definitions, evidence)
+    mark_step("Elisp attribution")
+    findings, failures = _analyse(context.root, definitions, evidence)
     if failures:
         return _failed_measurement(context, start, failures)
     return _ratchet(context, start, selected, findings)

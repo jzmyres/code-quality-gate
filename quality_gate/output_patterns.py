@@ -11,7 +11,7 @@ from typing import Any
 
 from .json_input import load_json
 from .policy import _config_error, _string
-from .runner import RunResult, analysis_step, mark_step, run
+from .runner import RunResult, mark_step, run
 
 
 REGEX_RUNNER = Path(__file__).with_name("regexrun.py")
@@ -84,7 +84,8 @@ def _pattern_matches(
     deadline = time.monotonic() + max(0.0, budget_seconds)
     with tempfile.TemporaryDirectory(prefix="qg-regex-") as temporary:
         job = Path(temporary) / "job.json"
-        analysis_step("output matching preparation", _write_pattern_job, job, patterns, text)
+        mark_step("output matching preparation")
+        _write_pattern_job(job, patterns, text)
         mark_step("output matching")
         result = run(
             [sys.executable, "-I", str(REGEX_RUNNER), str(job)],
@@ -93,7 +94,8 @@ def _pattern_matches(
     if result.execution != "completed" or result.returncode != 0:
         return None, result
     try:
-        return analysis_step("output matching analysis", load_json, result.stdout_text), result
+        mark_step("output matching analysis")
+        return load_json(result.stdout_text), result
     except ValueError:
         return None, result
 

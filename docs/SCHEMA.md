@@ -495,10 +495,11 @@ Check keys:
 * `id`, `kind` (`inventory`, `hygiene` or `check`), `tier` (null for
   built-ins), `enforcement`, `adapter`, `evidence` (array),
   `metric_version`.
-* `execution` - `completed`, `budget`, `signal` or `error`. It says how
-  the attempt to produce evidence ended, independently of its verdict. One
-  absolute deadline covers the command, pattern matching, coverage
-  combination and analysis; an overrun is `budget`.
+* `execution` - `completed`, `budget` (a subprocess budget expired),
+  `signal` or `error`. It says how the attempt to produce evidence ended,
+  independently of its verdict. A run that exceeds its overall limit (the sum
+  of the checks' configured budgets plus a 300-second allowance) produces a
+  decision error instead of a check result.
 * `outcome` - the adapter's raw verdict: `pass`, `fail`, `unsupported` or
   `error`. Tier 3 adapters later add `proved`, `no_counterexample` and
   `unknown`.
@@ -552,8 +553,8 @@ satisfied, but a baseline exception or a non-passing advisory check exists.
 `blocked` (exit 1, trust runs only) means an unauthorized protected path other
 than the policy, a baseline or the tools lock differs from the trusted
 directory; the checks still ran and are reported. `error` (exit 2) is invalid policy, usage,
-configuration, or a protected input, effective input, tool payload or gate
-file that changed during the run.
+configuration, a run that exceeds its limit, or a protected input, effective input, tool payload
+or gate file that changed during the run.
 
 `execution` does not change the decision: a budget or signal makes the raw
 outcome fail, and policy satisfaction then decides acceptance. A prune that is
