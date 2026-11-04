@@ -612,9 +612,11 @@ enumeration and identity, command checks, jscpd and test runs) uses one bounded 
 own process group, is terminated at its own budget and is reaped. The budget is the smaller of the
 requested seconds and the current check's remaining time. At a check's budget it sends SIGTERM to the
 group followed immediately by SIGKILL; a subprocess outside a check has a five-second grace before
-SIGKILL. An interrupt that ends the run kills the group immediately. Termination and reaping can add a
-small amount of time after the budget. Check output is captured up to 1 MiB; later bytes are counted
-and discarded. A consumer therefore never has to parse stderr to learn why a check failed.
+SIGKILL. An interrupt that ends the run kills the group immediately. A group whose remaining members
+are all zombies counts as stopped, because a zombie cannot run and a container's PID 1 may never reap
+it. Termination and reaping can add a small amount of time after the budget. Check output is captured
+up to 1 MiB; later bytes are counted and discarded. A consumer therefore never has to parse stderr to
+learn why a check failed.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`, `locations` and `expired`; baseline

@@ -20,6 +20,7 @@ import os
 import selectors
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -189,12 +190,36 @@ def _signal_group(pid: int, number: int) -> None:
         pass
 
 
+def _proc_group_member(path: str, group: int) -> bool:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            fields = stream.read().rpartition(")")[2].split()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return len(fields) < 3 or (fields[2] == str(group) and fields[0] not in ("Z", "X"))
+
+
+def _proc_group_running(pid: int) -> bool:
+    try:
+        with os.scandir("/proc") as entries:
+            return any(
+                _proc_group_member(f"{entry.path}/stat", pid)
+                for entry in entries if entry.name.isdigit()
+            )
+    except OSError:
+        return True
+
+
 def _group_alive(pid: int) -> bool:
     try:
         os.killpg(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return False
-    return True
+    except OSError:
+        return True
+    return _proc_group_running(pid) if sys.platform.startswith("linux") else True
 
 
 @dataclass
