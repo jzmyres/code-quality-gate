@@ -567,6 +567,16 @@ lock table accepts only `version`, `url`, `sha256`, `payload_sha256`, `binary` a
 other keys are configuration errors and a missing `payload_sha256` is a lock error. An existing install
 is kept only when its payload digest matches the lock; otherwise `tools fetch` replaces it.
 
+Once a payload matches its pinned digest, `tools fetch` removes every write bit from every directory and
+file in the tree and installs it read-only, and a matching existing install is made read-only the same
+way. Read and executable bits stay as the archive set them, so the payload digest does not change. A
+matching install is not downloaded again, so rerunning `tools fetch` hardens an existing cache without
+using the network. The payloads are read-only because the cache is shared: a process that imports from one,
+such as coverage, can otherwise leave bytecode files or a `__pycache__` directory behind as the cache's
+owner, and a later run as another user cannot read the altered tree. With the write bits removed, such a
+process cannot add files, and any install that still matches its pinned payload keeps working. Replacing a
+read-only install first restores the owner's write bit on the tree's directories and then removes it.
+
 Every later use of a tool recomputes the install's payload digest before the tool runs or is imported:
 Ruff and jscpd binaries, and the coverage package for collection and analysis. The coverage adapter
 passes the effective lock's coverage version and payload digest to `covrun.py`, which verifies the

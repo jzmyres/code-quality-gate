@@ -6,7 +6,9 @@ import hashlib
 import io
 import json
 import os
+import pwd
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -23,6 +25,28 @@ from quality_gate.policy import UnsupportedError
 from quality_gate.tools import lock_override, verify_tool_directory
 
 VERSION = "9.9.9"
+
+
+def restore_owner_write(directory: Path) -> None:
+    """Restore the owner's write bit on a fetched payload worth changing."""
+    for path in [directory, *directory.rglob("*")]:
+        if path.is_symlink():
+            continue
+        mode = path.lstat().st_mode
+        path.chmod(stat.S_IMODE(mode) | stat.S_IWUSR)
+
+
+def child_permissions(base: Path) -> dict[str, object]:
+    """Run the import child without root's bypass of the payload's modes."""
+    if os.geteuid() != 0:
+        return {}
+    account = pwd.getpwnam("nobody")
+    base.chmod(0o755)
+    return {
+        "user": account.pw_uid,
+        "group": account.pw_gid,
+        "extra_groups": [],
+    }
 
 
 class ToolsTests(FixtureCase):
@@ -124,6 +148,13 @@ class ToolsTests(FixtureCase):
 
     def sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def archive_lock(self, archive: Path) -> Path:
+        return self.write_lock(
+            archive.as_uri(),
+            self.sha256(archive),
+            payload=self.archive_payload(archive),
+        )
 
     def write_lock(
         self,
@@ -248,6 +279,71 @@ class ToolsTests(FixtureCase):
         binary = tools / f"jscpd-{VERSION}" / "jscpd"
         self.assertTrue(binary.stat().st_mode & 0o111)
 
+    def test_fetch_makes_the_payload_read_only(self) -> None:
+        archive = self.make_tarball()
+        tools, _result = self.fetch_ok(archive)
+        installation = tools / f"jscpd-{VERSION}"
+        for path in [installation, *installation.rglob("*")]:
+            self.assertFalse(path.lstat().st_mode & 0o222, str(path))
+        self.assertEqual(
+            self.payload_digest(installation), self.archive_payload(archive)
+        )
+
+    def test_an_import_cannot_write_into_a_fetched_payload(self) -> None:
+        wheel = self.make_wheel()
+        payload = self.archive_payload(
+            wheel, binary="pkg/__init__.py", archive_format="wheel"
+        )
+        lock = self.write_lock(
+            wheel.as_uri(),
+            self.sha256(wheel),
+            binary="pkg/__init__.py",
+            archive_format="wheel",
+            payload=payload,
+        )
+        tools = self.base / "tools"
+        previous_umask = os.umask(0o022)
+        try:
+            result = self.fetch(lock, tools)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(result.returncode, 0, output(result))
+        installation = tools / f"jscpd-{VERSION}"
+        entries = sorted(
+            str(path.relative_to(installation))
+            for path in installation.rglob("*")
+        )
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                "-s",
+                "-c",
+                "import sys; assert not sys.dont_write_bytecode; import pkg.mod",
+            ],
+            cwd=installation,
+            env=self.env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            **child_permissions(self.base),
+        )
+        self.assertEqual(child.returncode, 0, output(child))
+        self.assertEqual(
+            sorted(
+                str(path.relative_to(installation))
+                for path in installation.rglob("*")
+            ),
+            entries,
+        )
+        self.assertEqual(self.payload_digest(installation), payload)
+        with lock_override(lock):
+            self.assertEqual(
+                verify_tool_directory("jscpd", installation), installation
+            )
+
     def test_fetch_with_wrong_hash_installs_nothing(self) -> None:
         archive = self.make_tarball()
         lock = self.write_lock(archive.as_uri(), "0" * 64)
@@ -308,17 +404,25 @@ class ToolsTests(FixtureCase):
         binary.write_text("#!/bin/sh\necho fake\n", encoding="utf-8")
         binary.chmod(0o755)
         (destination / "LICENSE").write_text("MIT\n", encoding="utf-8")
+        payload = self.archive_payload(archive)
         lock = self.write_lock(
             (self.base / "missing.tar.gz").as_uri(),
             "0" * 64,
-            payload=self.archive_payload(archive),
+            payload=payload,
         )
-        result = self.fetch(lock, tools)
+        download = mock.Mock()
+        with mock.patch("quality_gate.tools._download", download):
+            result = self.fetch(lock, tools)
         self.assertEqual(result.returncode, 0, output(result))
+        download.assert_not_called()
         self.assertEqual(
             binary.read_text(encoding="utf-8"), "#!/bin/sh\necho fake\n"
         )
         self.assertIn("already installed", result.stdout)
+        self.assertIn("read-only", result.stdout)
+        for path in [destination, *destination.rglob("*")]:
+            self.assertFalse(path.lstat().st_mode & 0o222, str(path))
+        self.assertEqual(self.payload_digest(destination), payload)
 
     def test_fetch_replaces_an_existing_broken_install(self) -> None:
         archive = self.make_tarball()
@@ -341,6 +445,91 @@ class ToolsTests(FixtureCase):
             stale_binary.read_text(encoding="utf-8"),
             "#!/bin/sh\necho fake\n",
         )
+
+    def test_fetch_replaces_an_existing_install_file(self) -> None:
+        archive = self.make_tarball()
+        destination = self.base / "tools" / f"jscpd-{VERSION}"
+        destination.parent.mkdir()
+        destination.write_text("stale\n", encoding="utf-8")
+        _tools, _result = self.fetch_ok(archive)
+        self.assertEqual(
+            (destination / "jscpd").read_text(encoding="utf-8"),
+            "#!/bin/sh\necho fake\n",
+        )
+
+    def test_fetch_names_the_install_path_when_removal_fails(self) -> None:
+        archive = self.make_tarball()
+        tools = self.base / "tools"
+        destination = tools / f"jscpd-{VERSION}"
+        destination.mkdir(parents=True)
+        (destination / "stale.txt").write_text("stale\n", encoding="utf-8")
+        lock = self.write_lock(
+            archive.as_uri(),
+            self.sha256(archive),
+            payload=self.archive_payload(archive),
+        )
+        with mock.patch(
+            "quality_gate.tools._make_directories_writable",
+            side_effect=PermissionError("denied"),
+        ):
+            result = self.fetch(lock, tools)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn(f"cannot remove install at {destination}", text)
+        self.assertIn("denied", text)
+
+    def test_fetch_names_the_payload_path_when_hardening_fails(self) -> None:
+        archive = self.make_tarball()
+        lock = self.archive_lock(archive)
+        tools = self.base / "tools"
+        chmod = os.chmod
+
+        def fail_on_build(path: object, mode: int) -> None:
+            if Path(path).name == "build":
+                raise PermissionError("denied")
+            chmod(path, mode)
+
+        with mock.patch(
+            "quality_gate.tools.os.chmod", side_effect=fail_on_build
+        ):
+            result = self.fetch(lock, tools)
+        text = output(result)
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("cannot make payload at", text)
+        self.assertIn("build", text)
+        self.assertIn("denied", text)
+        self.assert_not_installed(tools)
+
+    def test_fetch_replaces_a_read_only_install_with_a_different_payload(
+        self,
+    ) -> None:
+        first = self.make_tarball(
+            files={
+                "jscpd": b"#!/bin/sh\necho first\n",
+                "LICENSE": b"first\n",
+            }
+        )
+        tools, _result = self.fetch_ok(first)
+        installation = tools / f"jscpd-{VERSION}"
+        second = self.make_tarball(
+            "second.tar.gz",
+            files={
+                "jscpd": b"#!/bin/sh\necho second\n",
+                "LICENSE": b"second\n",
+            },
+        )
+        payload = self.archive_payload(second)
+        lock = self.write_lock(
+            second.as_uri(), self.sha256(second), payload=payload
+        )
+        result = self.fetch(lock, tools)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(
+            (installation / "jscpd").read_text(encoding="utf-8"),
+            "#!/bin/sh\necho second\n",
+        )
+        self.assertEqual(self.payload_digest(installation), payload)
+        self.assertFalse(installation.stat().st_mode & 0o222)
 
     def test_fetch_allows_directory_members_and_nested_binary(self) -> None:
         archive = self.make_tarball(
@@ -607,6 +796,7 @@ class ToolsTests(FixtureCase):
         self.assertEqual(installed.read_bytes(), binary)
         with lock_override(lock):
             self.assertEqual(verify_tool_directory("jscpd", directory), directory)
+            restore_owner_write(directory)
             installed.write_bytes(b"changed")
             with self.assertRaisesRegex(UnsupportedError, "payload digest mismatch"):
                 verify_tool_directory("jscpd", directory)

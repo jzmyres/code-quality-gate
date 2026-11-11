@@ -515,12 +515,49 @@ def _install_target(tool: Tool, tools_root: Path) -> Path:
     return destination
 
 
+def _make_read_only(tool: Tool, directory: Path) -> None:
+    """Remove every write bit from a verified payload tree."""
+    try:
+        for path in [directory, *directory.rglob("*")]:
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode) or stat.S_ISREG(mode):
+                os.chmod(path, stat.S_IMODE(mode) & ~0o222)
+    except OSError as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: cannot make payload at "
+            f"{directory} read-only: {error}"
+        ) from error
+
+
+def _make_directories_writable(directory: Path) -> None:
+    """Restore the owner's write bit on a tree's directories before removal."""
+    for path in [directory, *directory.rglob("*")]:
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            os.chmod(path, stat.S_IMODE(mode) | stat.S_IWUSR)
+
+
+def _remove_install(destination: Path) -> None:
+    try:
+        if destination.is_symlink() or destination.is_file():
+            destination.unlink()
+        elif destination.is_dir():
+            _make_directories_writable(destination)
+            shutil.rmtree(destination)
+    except OSError as error:
+        raise GateError(
+            f"tools: cannot remove install at {destination}: {error}"
+        ) from error
+
+
 def _replace_destination(build: Path, destination: Path) -> None:
-    if destination.is_symlink() or destination.is_file():
-        destination.unlink()
-    elif destination.is_dir():
-        shutil.rmtree(destination)
+    _remove_install(destination)
+    mode = stat.S_IMODE(build.lstat().st_mode)
+    # Renaming a directory across parents needs its own write bit, so the
+    # payload root is writable only for the move and read-only afterwards.
+    os.chmod(build, mode | stat.S_IWUSR)
     os.replace(build, destination)
+    os.chmod(destination, mode & ~0o222)
 
 
 def _existing_payload_matches(tool: Tool, destination: Path) -> bool:
@@ -561,18 +598,21 @@ def _build_install(tool: Tool, temporary_path: Path) -> Path:
             f"mismatch: expected {tool.payload_sha256}, got {actual}; "
             "nothing installed"
         )
+    _make_read_only(tool, build)
     return build
 
 
 def _fetch_tool(tool: Tool, tools_root: Path) -> None:
     destination = _install_target(tool, tools_root)
     binary = _tool_binary(tool, tools_root)
-    if _existing_payload_matches(tool, destination):
-        print(
-            f"tools: {tool.name} {tool.version} already installed at {binary}"
-        )
-        return
     try:
+        if _existing_payload_matches(tool, destination):
+            _make_read_only(tool, destination)
+            print(
+                f"tools: {tool.name} {tool.version} already installed at "
+                f"{binary}; made the payload read-only"
+            )
+            return
         with tempfile.TemporaryDirectory(
             prefix=f".{tool.name}-{tool.version}-", dir=tools_root
         ) as temporary:
