@@ -31,6 +31,44 @@ The archived implementation can be inspected with
 The archived owners adapter can be inspected with
 `git show archive/owners-2026-10-31:PATH`.
 
+## Adopting the gate
+
+Any repository adopts the gate by meeting the same six-part protocol; this repository's own
+configuration is one instance of it, and the three examples below are the others.
+
+**Pin.** The gate is a submodule at a commit, so the revision a consumer uses is recorded in that
+consumer's own tree. The [quick start](#quick-start-in-a-consuming-repository) adds it and classifies
+its path.
+
+**Policy.** `quality-gate.toml` declares the classes and rules that classify every file, `[code]`
+detection, and one `[checks.ID]` table per check naming its adapter, tier, enforcement and that
+adapter's keys (for a measuring adapter, its threshold and baseline), while the baseline files hold
+the reasoned exceptions and `[protect]` adds further paths the trust root guards. The shape is in
+[Configuration](#configuration) and [`docs/SCHEMA.md`](docs/SCHEMA.md).
+
+**Tools.** `tools fetch` installs the pinned tools once, and every later run is offline and verifies
+each install before it is used. See [tools](#tools).
+
+**Run.** `python3 -I qg.py check` runs inventory, hygiene and every configured check in policy order,
+with `--json` for one result document and `--only` for a partial run; a caller that must not trust
+the candidate passes `--policy-from DIR` so the policy, baselines, tools lock and protected paths come
+from a trusted directory outside the candidate. See [check](#check) and [Trust root](#trust-root).
+
+**Result.** The run reports a decision, an exit code and, with `--json`, one machine-readable result
+document. See [Exit codes](#exit-codes) and [the result contract](docs/SCHEMA.md).
+
+**Languages.** A language plugs in through an adapter, or through the generic `command` adapter for
+any tool that reports its result through an exit status. See [Configuration](#configuration).
+
+The three consumers differ in language, in how `[code]` is detected, in their classes and checks, and
+in how each one invokes the gate.
+
+| Consumer | Language | `[code]` | Classes, then checks | How it runs the gate |
+| --- | --- | --- | --- | --- |
+| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` |
+| A shell and Python agent harness | Shell and Python | `*.py`, `*.sh`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `shell-tested`, `shell-sourced`, `shell-probe`, `config`, `build`, `doc`, `gate`; `ruff`, `shellcheck`, `json` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification` | A runner gates each candidate with `--policy-from` the last landed commit |
+| An Emacs Lisp editor configuration | Emacs Lisp, with shell helpers | Emacs Lisp sources and their shell helpers | `modules`, `tools`, `suites`, `startup`, `shell`, `config`, `data`, `docs`, `fixture`, `gate`; `emacs-tests`, `tooling-tests` (`elisp_tests`), `emacs-crap`, `tooling-crap` (`elisp_crap`), `elisp-compile`, `elisp-checkdoc`, `shellcheck` (`command`) | Ran beside its own older gate, recording parity first |
+
 ## Requirements
 
 * Python 3.12 or later (the command uses `tomllib` and coverage uses `sys.monitoring`).
