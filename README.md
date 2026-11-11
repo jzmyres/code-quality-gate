@@ -164,9 +164,9 @@ unknown class, so a Makefile can use it as the single source of file lists:
 
 `--policy-from DIR` classifies the working tree using the effective policy from an absolute path to
 a trusted directory outside the candidate, with the same protected-input validation as `check`. An
-unapproved policy edit is ignored; an unapproved change to another protected path blocks inventory
-before it prints a summary or file list. It uses the same blocked report as `check`, naming the path
-and the trusted and candidate file hashes. To use a reviewed replacement, pass `--allow-protected PATH`; repeat the option for
+unapproved change to any protected path, the policy included, blocks inventory before it prints a
+summary or file list. It uses the same blocked report as `check`, naming the path and the trusted and
+candidate file hashes. To use a reviewed replacement, pass `--allow-protected PATH`; repeat the option for
 multiple paths. The option requires `--policy-from`. Run the gate from a trusted copy outside the
 candidate, as described under [Trust root](#trust-root).
 
@@ -720,15 +720,18 @@ outside the candidate and make it read-only:
     git -C TRUSTED_REPO archive REV | tar -x -C DEST
     chmod -R a-w DEST
 
-An unauthorized candidate baseline edit can only tighten: a removed `max` entry takes effect, a
-removed `min` floor keeps the trusted entry, added or loosened entries are ignored, and a malformed
-candidate baseline keeps every trusted entry. Protected candidate files must be reached without
-following a symlink. The trusted directory compares files and globs only, so the caller checks a
-submodule pin. An unauthorized change to another protected path makes the decision `blocked` (exit 1),
-while `--allow-protected PATH` accepts a reviewed replacement and reports it as authorized. The gate
-records protected-input, tool-payload and gate-program identities before the checks and again after
-them, re-enumerating the protected scope (including ignored untracked files); an added, removed or
-changed protected path makes the decision `error` (exit 2). `--prune` with `--policy-from` is a
+A candidate cannot commit a protected change the trusted gate did not apply. An unauthorized
+candidate baseline edit can only tighten: a removed `max` entry takes effect, and a removed `min`
+floor keeps the trusted entry. A baseline that only tightens is `tightened` and does not block; one
+whose added or loosened entries, or malformed content, the run did not apply is `blocked` and lists
+those entries in `ignored_entries`. An unauthorized change to the policy, the tools lock or any other
+protected path makes the decision `blocked` (exit 1) too, naming the path, while `--allow-protected
+PATH` accepts a reviewed replacement and reports it as authorized. Protected candidate files must be
+reached without following a symlink. The trusted directory compares files and globs only, so the
+caller checks a submodule pin. The gate records protected-input, tool-payload and gate-program
+identities before the checks and again after them, re-enumerating the protected scope (including
+ignored untracked files); an added, removed or changed protected path makes the decision `error`
+(exit 2). `--prune` with `--policy-from` is a
 usage error (exit 2).
 It refuses to run from a gate program inside the candidate root. A trust result reports `trust.path`
 and `trust.digest`. The full contract is [`docs/TRUST.md`](docs/TRUST.md); the result fields are in

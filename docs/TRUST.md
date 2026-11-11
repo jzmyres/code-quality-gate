@@ -5,7 +5,8 @@ checking cannot measure that tree honestly: the same working tree can weaken
 the policy, add a baseline exception, raise a threshold, remove a check, change
 a tool pin, narrow test discovery or edit a script a check executes. The trust
 root makes the enforcement inputs come from a directory the caller extracted
-from a revision the candidate cannot change.
+from a revision the candidate cannot change. A candidate therefore cannot
+commit a protected change that the trusted gate did not apply.
 
 ```
 python3 -I qg.py check --policy-from DIR
@@ -109,14 +110,14 @@ directory:
 
 Baselines tighten only:
 
-* a candidate removal takes effect for a `max` entry, and is ignored for a
+* a candidate removal takes effect for a `max` entry, and does not for a
   `min` floor: the removed entry keeps the trusted bound;
 * an entry whose bound the candidate tightens takes effect (a lower `max`
   bound or a higher `min` bound, with an earlier expiry);
 * an entry the candidate adds, a bound it loosens, an expiry it later removes,
-  reasons it changes and metadata it changes are ignored, and the trusted entry
-  is used;
-* a candidate baseline that cannot be parsed is ignored in full, and every
+  reasons it changes and metadata it changes do not take effect, and the
+  trusted entry is used;
+* a candidate baseline that cannot be parsed does not take effect, and every
   trusted entry is used unchanged.
 
 Each entry and finding use the same `max` or `min` direction for their
@@ -125,10 +126,15 @@ configured `direction` decides it, including before any finding exists.
 
 The entry set used for the run is therefore the trusted entries with candidate
 removals of `max` entries and tightened bounds applied. The entries whose
-candidate form was ignored, including a removed `min` floor, are listed in the
-protected input's `ignored_entries`. A baseline that only tightens is
-`tightened`; one whose differences were all ignored is `ignored`; identical
-content is `unchanged`.
+candidate form the run did not apply, including a removed `min` floor, are
+listed in the protected input's `ignored_entries`.
+
+A baseline that only tightens the trusted entries is `tightened` and does not
+block the decision. Any other changed baseline is `blocked` (exit 1) and makes
+the decision `blocked`, naming the path: the candidate carries baseline
+content the run did not apply, either because the baseline cannot be parsed, so
+no candidate entry is applied, or because some candidate entries are listed in
+`ignored_entries`. Identical content is `unchanged`.
 
 ### Authorized paths
 
@@ -140,10 +146,11 @@ as written; the candidate is then the reviewed replacement.
 
 ### The policy file and the tools lock
 
-Unauthorized changes to the policy file and the tools lock are ignored:
-the trusted version is used. The checks therefore run the trusted checks,
-thresholds, classes, exemptions and pinned tool set, not the candidate's. The protected
-entry is reported as `ignored`.
+An unauthorized change to the policy file or the tools lock makes the decision
+`blocked` (exit 1), naming the path in the result and on stderr. The checks
+still run with the trusted version, so the report shows the trusted checks,
+thresholds, classes, exemptions and pinned tool set, not the candidate's, and
+the protected entry is reported as `blocked`.
 
 An authorized lock is the effective lock for the whole run. The coverage
 adapter passes that lock's coverage version and payload digest to each coverage
@@ -158,6 +165,9 @@ An unauthorized change to any other protected path makes the decision
 cannot substitute the trusted version of a file another program reads or executes
 (for example Ruff's configuration or a test runner), so it refuses to accept
 the run. The checks still run against the candidate and are reported in full.
+
+Every unauthorized protected change blocks in the same way. The gate never
+accepts a candidate whose content it did not apply.
 
 ## Prune under `--policy-from`
 
@@ -237,12 +247,14 @@ The source keys are `{"path": DIR, "digest": SHA256}`. The digest hashes, in
 sorted path order, each trusted file's repository-relative path, a NUL byte and
 the SHA-256 of its bytes, each followed by a newline.
 
-`status` is one of `unchanged`, `tightened`, `ignored`, `authorized` or
-`blocked`. Only baseline entries carry `ignored_entries`. The text report
-includes each protected file's trusted and candidate SHA-256. The result
-`decision` adds `blocked`; exit codes remain `0` for accepted results, `1`
-for `rejected`/blocked or a failed prune, and `2` for usage or configuration
-errors and an identity change. Without `--policy-from`, the result remains
+`status` is one of `unchanged`, `tightened`, `authorized` or `blocked`.
+A protected input whose candidate content the run did not apply reports
+`blocked` rather than the former `ignored`, so it blocks the decision.
+`ignored_entries` lists the subjects whose candidate entry the run did not
+apply. The text report includes each protected file's trusted and candidate
+SHA-256. The result `decision` adds `blocked`; exit codes remain `0`
+for accepted results, `1` for `rejected`/blocked or a failed prune, and `2`
+for usage or configuration errors and an identity change. Without `--policy-from`, the result remains
 schema 2 and has no `trust` key.
 
 ## Out of scope

@@ -27,19 +27,25 @@ class InventoryTrustTests(FixtureCase):
             '[classes.alternate]\ncode = true\ndescription = "Other Python"\n'
             'checks = ["smoke"]\n\n[classes.python]',
         )
+        self.trusted_config = config
         self.write_config(config)
         self.commit_all()
         self.revision = str(self.trusted_directory(
             self.git("rev-parse", "HEAD").stdout.strip()
         ))
-        self.write_config(
-            config.replace(
-                'pattern = "*.py"\nclass = "python"\nreason = "Python source"',
-                'pattern = "a.py"\nclass = "alternate"\nreason = "First source"\n'
-                '\n[[rule]]\npattern = "b.py"\nclass = "python"\n'
-                'reason = "Second source"',
-            )
+        self.candidate_config = config.replace(
+            'pattern = "*.py"\nclass = "python"\nreason = "Python source"',
+            'pattern = "a.py"\nclass = "alternate"\nreason = "First source"\n'
+            '\n[[rule]]\npattern = "b.py"\nclass = "python"\n'
+            'reason = "Second source"',
         )
+        self.write_config(self.candidate_config)
+
+    def restore_trusted_policy(self) -> None:
+        self.write_config(self.trusted_config)
+
+    def restore_candidate_policy(self) -> None:
+        self.write_config(self.candidate_config)
 
     @staticmethod
     def gate_messages(result: subprocess.CompletedProcess[str]) -> list[str]:
@@ -59,6 +65,7 @@ class InventoryTrustTests(FixtureCase):
 
     def test_policy_from_uses_trusted_classes_and_summary(self) -> None:
         candidate = self.run_qg("inventory", "--list", "python")
+        self.restore_trusted_policy()
         trusted = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision
         )
@@ -68,7 +75,9 @@ class InventoryTrustTests(FixtureCase):
         self.assertEqual(trusted.stdout, "a.py\nb.py\n")
         self.assertEqual(self.gate_messages(trusted), [])
 
+        self.restore_candidate_policy()
         candidate_summary = self.run_qg("inventory")
+        self.restore_trusted_policy()
         trusted_summary = self.run_qg("inventory", "--policy-from", self.revision)
         self.assertEqual(candidate_summary.returncode, 0, output(candidate_summary))
         self.assertEqual(candidate_summary.stdout, "inventory: 6 files match 5 rules\n")
@@ -76,9 +85,33 @@ class InventoryTrustTests(FixtureCase):
         self.assertEqual(trusted_summary.stdout, "inventory: 6 files match 4 rules\n")
         self.assertEqual(self.gate_messages(trusted_summary), [])
 
+    def test_unapproved_policy_edit_blocks_before_the_file_list(self) -> None:
+        for selection in ((), ("--list", "python"), ("--list", "candidate_only")):
+            with self.subTest(selection=selection):
+                result = self.run_qg(
+                    "inventory", *selection, "--policy-from", self.revision
+                )
+                self.assertEqual(result.returncode, 1, output(result))
+                self.assertEqual(result.stdout, "")
+                messages = self.gate_messages(result)
+                self.assertTrue(
+                    messages[0].startswith(
+                        "check: protected input quality-gate.toml:"
+                    ),
+                    messages,
+                )
+                self.assertEqual(
+                    messages[1],
+                    "check: blocked: protected input changed without "
+                    "--allow-protected: quality-gate.toml",
+                )
+
     def test_protected_change_blocks_until_authorized(self) -> None:
         self.add_file("ruff.toml", "line-length = 120\n")
-        check = self.run_qg("check", "--policy-from", self.revision)
+        check = self.run_qg(
+            "check", "--policy-from", self.revision,
+            "--allow-protected", "quality-gate.toml",
+        )
         self.assertEqual(check.returncode, 1, output(check))
         blocked = next(line for line in check.stderr.splitlines() if "check: blocked:" in line)
         self.assertIn("--allow-protected: ruff.toml", blocked)
@@ -89,18 +122,21 @@ class InventoryTrustTests(FixtureCase):
         for selection in ((), ("--list", "python")):
             with self.subTest(selection=selection):
                 result = self.run_qg(
-                    "inventory", *selection, "--policy-from", self.revision
+                    "inventory", *selection, "--policy-from", self.revision,
+                    "--allow-protected", "quality-gate.toml",
                 )
                 self.assertEqual(result.returncode, 1, output(result))
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(self.gate_messages(result), [detail, blocked])
 
+        self.restore_trusted_policy()
         trusted = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision,
             "--allow-protected", "./ruff.toml",
         )
         self.assertEqual(trusted.returncode, 0, output(trusted))
         self.assertEqual(trusted.stdout, "a.py\nb.py\n")
+        self.restore_candidate_policy()
         authorized = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision,
             "--allow-protected", "ruff.toml",
@@ -120,7 +156,11 @@ class InventoryTrustTests(FixtureCase):
                 self.assert_trust_error_matches_check(*args)
 
     def test_unrecognized_authorization_matches_check(self) -> None:
-        args = ("--policy-from", self.revision, "--allow-protected", "../outside")
+        self.restore_trusted_policy()
+        args = (
+            "--policy-from", self.revision,
+            "--allow-protected", "../outside",
+        )
         check = self.run_qg("check", *args)
         inventory = self.run_qg("inventory", "--list", "python", *args)
         self.assertEqual(check.returncode, 0, output(check))
@@ -133,8 +173,13 @@ class InventoryTrustTests(FixtureCase):
         trusted = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision
         )
-        self.assertEqual(trusted.returncode, 0, output(trusted))
-        self.assertEqual(trusted.stdout, "a.py\nb.py\n")
+        self.assertEqual(trusted.returncode, 1, output(trusted))
+        self.assertEqual(trusted.stdout, "")
+        self.assertEqual(
+            self.gate_messages(trusted)[-1],
+            "check: blocked: protected input changed without "
+            "--allow-protected: quality-gate.toml",
+        )
         authorized = self.run_qg(
             "inventory", "--policy-from", self.revision,
             "--allow-protected", "quality-gate.toml",
@@ -143,7 +188,7 @@ class InventoryTrustTests(FixtureCase):
         self.assertEqual(authorized.stdout, "")
         self.assertIn("valid TOML", authorized.stderr)
 
-    def test_unknown_class_uses_revision_classes(self) -> None:
+    def test_unapproved_class_edit_blocks_before_the_class_is_known(self) -> None:
         self.write_config(
             self.read_file("quality-gate.toml").replace(
                 "[classes.alternate]",
@@ -157,9 +202,20 @@ class InventoryTrustTests(FixtureCase):
         result = self.run_qg(
             "inventory", "--list", "candidate_only", "--policy-from", self.revision
         )
-        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.returncode, 1, output(result))
         self.assertEqual(result.stdout, "")
-        self.assertIn("unknown class 'candidate_only'", result.stderr)
+        self.assertEqual(
+            self.gate_messages(result)[-1],
+            "check: blocked: protected input changed without "
+            "--allow-protected: quality-gate.toml",
+        )
+        self.restore_trusted_policy()
+        unknown = self.run_qg(
+            "inventory", "--list", "candidate_only", "--policy-from", self.revision
+        )
+        self.assertEqual(unknown.returncode, 2, output(unknown))
+        self.assertEqual(unknown.stdout, "")
+        self.assertIn("unknown class 'candidate_only'", unknown.stderr)
 
     def test_protected_symlink_is_refused_like_check(self) -> None:
         target = self.base / "outside.toml"
@@ -187,6 +243,7 @@ class InventoryTrustTests(FixtureCase):
         }
         result = self.run_qg(
             "inventory", "--list", "python", "--policy-from", self.revision,
+            "--allow-protected", "quality-gate.toml",
             env=env,
         )
         self.assertEqual(result.returncode, 2, output(result))

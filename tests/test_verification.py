@@ -704,9 +704,18 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         ]))
         result, document = self.trust_json(revision, env=self.default_tool_env())
         self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["decision"], "blocked")
         entry = self.protected(document, BASELINE)
-        self.assertIn("exclusions:pkg/mod.py:file-suppression", entry["ignored_entries"])
+        self.assertEqual(entry["status"], "blocked")
+        self.assertEqual(
+            entry["ignored_entries"],
+            ["exclusions:pkg/mod.py:file-suppression"],
+        )
+        self.assertIn(
+            f"check: blocked: protected input changed without "
+            f"--allow-protected: {BASELINE}",
+            result.stderr,
+        )
         check = self.check_by_id(document, "verification")
         finding = self.finding(check, "exclusions:pkg/mod.py:file-suppression")
         self.assertEqual((finding["value"], finding["bound"]), (1, None))
@@ -865,7 +874,11 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         return str(self.trusted_directory(self.commit_revision()))
 
     def candidate(
-        self, revision: str, floor: int, ceiling: int
+        self,
+        revision: str,
+        floor: int,
+        ceiling: int,
+        decision: str = "rejected",
     ) -> dict[str, object]:
         self.add_file(
             BASELINE,
@@ -880,7 +893,7 @@ class VerificationTrustTests(FindingMixin, TrustCase):
             revision, env=self.default_tool_env()
         )
         self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["decision"], decision)
         return document
 
     def bounds(
@@ -904,7 +917,7 @@ class VerificationTrustTests(FindingMixin, TrustCase):
             (noqa_finding["value"], noqa_finding["bound"]), noqa
         )
 
-    def test_candidate_lowered_floor_and_raised_ceiling_are_ignored(
+    def test_candidate_lowered_floor_and_raised_ceiling_are_blocked(
         self,
     ) -> None:
         revision = self.prepare(
@@ -918,9 +931,9 @@ class VerificationTrustTests(FindingMixin, TrustCase):
             "    def test_0(self):\n"
             "        self.assertTrue(True)\n",
         )
-        document = self.candidate(revision, 1, 5)
+        document = self.candidate(revision, 1, 5, decision="blocked")
         entry = self.protected(document, BASELINE)
-        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual(entry["status"], "blocked")
         self.assertEqual(
             set(entry["ignored_entries"]),
             {
@@ -930,7 +943,7 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         )
         self.bounds(document, (1, 2), (3, 2))
 
-    def test_candidate_removed_floor_keeps_the_trusted_entry(self) -> None:
+    def test_candidate_removed_floor_keeps_the_trusted_entry_and_blocks(self) -> None:
         revision = self.prepare(tests=2, noqa=2, floor=2, ceiling=2)
         self.add_file(
             BASELINE,
@@ -938,15 +951,13 @@ class VerificationTrustTests(FindingMixin, TrustCase):
                 [exclusion_entry("pkg/mod.py", "noqa", 2)]
             ),
         )
-        result, document = self.trust_json(
-            revision, env=self.default_tool_env()
+        _result, document = self.blocked_run(
+            revision, self.default_tool_env()
         )
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(document["decision"], "accepted_with_exceptions")
         check = self.check_by_id(document, "verification")
         self.assertTrue(check["satisfied"])
         entry = self.protected(document, BASELINE)
-        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual(entry["status"], "blocked")
         self.assertEqual(
             entry["ignored_entries"], ["tests:tests:executed"]
         )

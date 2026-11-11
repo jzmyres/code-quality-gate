@@ -168,6 +168,72 @@ class TrustCase(FixtureCase):
             self.protected(document, "ruff.toml")["status"], "blocked"
         )
 
+    def assert_baseline_blocked(
+        self,
+        result: subprocess.CompletedProcess[str],
+        document: dict[str, object],
+        path: str,
+        ignored: list[str],
+    ) -> None:
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        entry = self.protected(document, path)
+        self.assertEqual(entry["status"], "blocked")
+        self.assertEqual(entry["ignored_entries"], ignored)
+        self.assertIn(
+            f"check: blocked: protected input changed without "
+            f"--allow-protected: {path}",
+            result.stderr,
+        )
+
+    def blocked_run(
+        self, revision: str, env: dict[str, str] | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        result, document = self.trust_json(revision, env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        return result, document
+
+    def assert_policy_edit_blocked(
+        self, revision: str, env: dict[str, str] | None = None
+    ) -> dict[str, object]:
+        result, document = self.trust_json(revision, env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        entry = self.protected(document, "quality-gate.toml")
+        self.assertEqual(entry["status"], "blocked")
+        self.assertIn(
+            "check: blocked: protected input changed without "
+            "--allow-protected: quality-gate.toml",
+            result.stderr,
+        )
+        return document
+
+    def assert_authorized_status(
+        self,
+        revision: str,
+        path: str,
+        env: dict[str, str] | None = None,
+        decision: str = "accepted",
+    ) -> dict[str, object]:
+        result, document = self.trust_json(
+            revision, "--allow-protected", path, env=env
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], decision)
+        self.assertEqual(self.protected(document, path)["status"], "authorized")
+        return document
+
+    def baseline_bound(
+        self, document: dict[str, object], name: str, subject: str
+    ) -> object:
+        check = self.check_by_id(document, name)
+        finding = next(
+            item for item in check["findings"]
+            if item["subject"] == subject
+        )
+        return finding["bound"]
+
     def assert_inventory_block_report(self, revision: str, *details: str) -> None:
         check = self.run_qg("check", "--policy-from", revision)
         self.assertEqual(check.returncode, 1, output(check))
@@ -208,7 +274,7 @@ class BaselineTrustTests(TrustCase):
         self.write_config(with_clones())
         self.add_file("b.py", "print('b')\n")
 
-    def test_added_baseline_entry_is_ignored(self) -> None:
+    def test_added_baseline_entry_is_blocked(self) -> None:
         self.empty_clones_baseline()
         revision = self.directory_revision()
         self.add_file(
@@ -218,26 +284,30 @@ class BaselineTrustTests(TrustCase):
             'reason = "candidate exception"\n',
         )
         result, document = self.trust_json(revision, env=self.clone_env())
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "rejected")
+        self.assert_baseline_blocked(
+            result, document, "quality-gate-clones.toml", ["fp1"]
+        )
         check = self.check_by_id(document, "clones")
         self.assertEqual(check["outcome"], "fail")
-        entry = self.protected(document, "quality-gate-clones.toml")
-        self.assertEqual(entry["status"], "ignored")
-        self.assertEqual(entry["ignored_entries"], ["fp1"])
+        self.assertEqual(check["resolved_baseline_entries"], [])
 
-    def test_raised_baseline_bound_is_ignored(self) -> None:
+    def test_raised_baseline_bound_is_blocked(self) -> None:
         self.write_clones_baseline()
         revision = self.directory_revision()
         self.write_clones_baseline(bound=5)
         result, document = self.trust_json(
             revision, env=self.clone_env(count=2)
         )
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "rejected")
-        entry = self.protected(document, "quality-gate-clones.toml")
-        self.assertEqual(entry["status"], "ignored")
-        self.assertEqual(entry["ignored_entries"], ["fp1"])
+        self.assert_baseline_blocked(
+            result, document, "quality-gate-clones.toml", ["fp1"]
+        )
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
+        self.assert_authorized_status(
+            revision,
+            "quality-gate-clones.toml",
+            self.clone_env(count=2),
+            "accepted_with_exceptions",
+        )
 
     def test_removed_baseline_entry_takes_effect(self) -> None:
         self.write_clones_baseline()
@@ -255,16 +325,79 @@ class BaselineTrustTests(TrustCase):
         )
         self.assert_clone_fails_tightened(result, document)
 
-    def test_malformed_candidate_baseline_keeps_trusted_entries(self) -> None:
+    def test_tightened_baseline_with_a_loosened_entry_is_blocked(self) -> None:
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text(
+                [
+                    {"subject": "fp1", "bound": 5, "reason": "reviewed"},
+                    {"subject": "fp2", "bound": 3, "reason": "reviewed"},
+                ]
+            ),
+        )
+        revision = self.directory_revision()
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text(
+                [
+                    {"subject": "fp1", "bound": 1, "reason": "reviewed"},
+                    {"subject": "fp2", "bound": 30, "reason": "reviewed"},
+                ]
+            ),
+        )
+        env = self.install_fake_jscpd(sarif_report([
+            ("fp1", [("a.py", 1, 8), ("b.py", 1, 8)]),
+            ("fp2", [("a.py", 1, 8), ("b.py", 1, 8)]),
+        ]))
+        result, document = self.trust_json(revision, env=env)
+        self.assert_baseline_blocked(
+            result, document, "quality-gate-clones.toml", ["fp2"]
+        )
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
+        self.assertEqual(self.baseline_bound(document, "clones", "fp2"), 3)
+
+    def test_authorized_baseline_replacements_pass(self) -> None:
+        self.write_clones_baseline()
+        revision = self.directory_revision()
+        self.write_clones_baseline(bound=5)
+        result, document = self.trust_json(
+            revision,
+            "--allow-protected",
+            "quality-gate-clones.toml",
+            env=self.clone_env(count=2),
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        entry = self.protected(document, "quality-gate-clones.toml")
+        self.assertEqual(entry["status"], "authorized")
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 5)
+
+    def test_authorized_malformed_baseline_is_a_usage_error(self) -> None:
+        self.write_clones_baseline(bound=5)
+        revision = self.directory_revision()
+        self.add_file("quality-gate-clones.toml", "not = [valid\n")
+        result = self.run_qg(
+            "check",
+            "--policy-from",
+            revision,
+            "--allow-protected",
+            "quality-gate-clones.toml",
+            env=self.clone_env(),
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("valid effective baseline", result.stderr)
+
+    def test_malformed_candidate_baseline_is_blocked(self) -> None:
         self.write_clones_baseline(bound=5)
         revision = self.directory_revision()
         self.add_file("quality-gate-clones.toml", "not = [valid\n")
         result, document = self.trust_json(revision, env=self.clone_env())
-        self.assertEqual(result.returncode, 0, output(result))
+        self.assert_baseline_blocked(
+            result, document, "quality-gate-clones.toml", []
+        )
         self.assertIn("candidate baseline ignored", result.stderr)
-        entry = self.protected(document, "quality-gate-clones.toml")
-        self.assertEqual(entry["status"], "ignored")
-        self.assertEqual(entry["ignored_entries"], [])
+        self.assertEqual(
+            self.baseline_bound(document, "clones", "fp1"), 5
+        )
         self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
 
 
@@ -332,7 +465,7 @@ class StubFloorTrustTests(TrustCase):
         item = next(
             item for item in prepared.protected if item.path == "floor.toml"
         )
-        self.assertEqual(item.status, "ignored")
+        self.assertEqual(item.status, "blocked")
         self.assertEqual(item.ignored_entries, ("floor-subject",))
 
     def test_candidate_omitting_a_floor_keeps_the_trusted_bound(self) -> None:
@@ -384,11 +517,17 @@ class PolicyTrustTests(TrustCase):
         revision = self.directory_revision()
         self.add_file("tools.lock.toml", "")
         result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(self.protected(document, "tools.lock.toml")["status"], "ignored")
-        self.assertEqual(document["trust"]["identity_before"]["tools"]["legacy"]["version"], "1")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(
+            document["trust"]["identity_before"]["tools"]["legacy"]["version"],
+            "1",
+        )
+        self.assertEqual(
+            self.protected(document, "tools.lock.toml")["status"], "blocked"
+        )
+        self.assert_authorized_status(revision, "tools.lock.toml")
 
-    def test_raised_policy_threshold_is_ignored(self) -> None:
+    def test_raised_policy_threshold_is_blocked(self) -> None:
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")
         self.add_file(
@@ -409,11 +548,9 @@ class PolicyTrustTests(TrustCase):
         self.write_config(crap_config())
         revision = self.directory_revision()
         self.write_config(crap_config(threshold=100))
-        result, document = self.trust_json(
-            revision, env=self.default_tool_env()
+        document = self.assert_policy_edit_blocked(
+            revision, self.default_tool_env()
         )
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(document["decision"], "rejected")
         check = self.check_by_id(document, "crap")
         self.assertEqual(check["outcome"], "fail")
         finding = next(
@@ -422,8 +559,15 @@ class PolicyTrustTests(TrustCase):
             if item["subject"] == "pkg/new.py:three"
         )
         self.assertEqual(finding["threshold"], 6.0)
-        entry = self.protected(document, "quality-gate.toml")
-        self.assertEqual(entry["status"], "ignored")
+        authorized_document = self.assert_authorized_status(
+            revision, "quality-gate.toml", self.default_tool_env()
+        )
+        authorized_finding = next(
+            item
+            for item in self.check_by_id(authorized_document, "crap")["findings"]
+            if item["subject"] == "pkg/new.py:three"
+        )
+        self.assertEqual(authorized_finding["threshold"], 100.0)
 
     def test_candidate_test_cannot_raise_merged_crap_baseline(self) -> None:
         (self.repo / "a.py").unlink()
@@ -518,18 +662,43 @@ class PolicyTrustTests(TrustCase):
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("cfg/ruff.toml", result.stderr)
 
-    def test_removed_check_is_ignored(self) -> None:
+    def test_removed_check_is_blocked(self) -> None:
         revision = self.directory_revision()
         self.write_config(
             BASE_CONFIG.replace('checks = ["smoke"]\n', "") + "\n"
         )
-        result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(document["decision"], "accepted")
+        document = self.assert_policy_edit_blocked(revision)
         check = self.check_by_id(document, "smoke")
         self.assertEqual(check["outcome"], "pass")
+
+    def test_authorized_removed_check_is_judged_by_the_candidate_policy(self) -> None:
+        revision = self.directory_revision()
+        self.write_config(
+            BASE_CONFIG.replace('checks = ["smoke"]\n', "") + "\n"
+        )
+        result, document = self.trust_json(
+            revision, "--allow-protected", "quality-gate.toml"
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
         entry = self.protected(document, "quality-gate.toml")
-        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual(entry["status"], "authorized")
+
+    def test_inventory_blocks_an_unapproved_policy_edit(self) -> None:
+        revision = self.directory_revision()
+        self.write_config(
+            BASE_CONFIG.replace('checks = ["smoke"]\n', "") + "\n"
+        )
+        result = self.run_qg(
+            "inventory", "--list", "python", "--policy-from", revision
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn(
+            "check: blocked: protected input changed without "
+            "--allow-protected: quality-gate.toml",
+            result.stderr,
+        )
 
     def test_unauthorized_protected_change_is_blocked(self) -> None:
         revision = self.trusted_ruff_directory()
@@ -620,15 +789,7 @@ class DirectoryTrustTests(TrustCase):
         self.change_ruff()
         result, document = self.trust_json(directory)
         self.assert_blocked(result, document)
-        authorized, authorized_document = self.trust_json(
-            directory, "--allow-protected", "ruff.toml"
-        )
-        self.assertEqual(authorized.returncode, 0, output(authorized))
-        self.assertEqual(authorized_document["decision"], "accepted")
-        self.assertEqual(
-            self.protected(authorized_document, "ruff.toml")["status"],
-            "authorized",
-        )
+        self.assert_authorized_status(directory, "ruff.toml")
 
     def test_directory_glob_skips_symlinks_inside_the_copy(self) -> None:
         self.write_config(with_protect(BASE_CONFIG, "*.md"))
@@ -1015,7 +1176,7 @@ class IdentityTrustTests(TrustCase):
         self.assertIn("tools", trust["identity_before"])
         self.assertIn("gate", trust["identity_before"])
 
-    def test_candidate_tools_lock_change_is_ignored(self) -> None:
+    def test_candidate_tools_lock_change_is_blocked(self) -> None:
         lock = (self.gate / "tools.lock.toml").read_text(encoding="utf-8")
         self.add_file("tools.lock.toml", lock)
         revision = self.directory_revision()
@@ -1026,10 +1187,16 @@ class IdentityTrustTests(TrustCase):
         self.assertNotEqual(lock, changed)
         self.add_file("tools.lock.toml", changed)
         result, document = self.trust_json(revision)
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(document["decision"], "accepted")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
         entry = self.protected(document, "tools.lock.toml")
-        self.assertEqual(entry["status"], "ignored")
+        self.assertEqual(entry["status"], "blocked")
+        self.assertIn(
+            "check: blocked: protected input changed without "
+            "--allow-protected: tools.lock.toml",
+            result.stderr,
+        )
+        self.assert_authorized_status(revision, "tools.lock.toml")
 
     def test_allow_protected_without_policy_from_exits_two(self) -> None:
         result = self.run_qg("check", "--allow-protected", "ruff.toml")

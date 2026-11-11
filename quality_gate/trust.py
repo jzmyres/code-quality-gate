@@ -414,9 +414,7 @@ def _declared_status(item: _Input, allowed: set[str]) -> str:
         return "unchanged"
     if item.path in allowed:
         return "authorized"
-    if item.kind == "other":
-        return "blocked"
-    return "ignored"
+    return "blocked"
 
 
 def _policy_baseline_names(data: dict[str, Any]) -> tuple[str, ...]:
@@ -471,7 +469,7 @@ def _policy_config(
         return rev_config, "unchanged"
     if POLICY_NAME in allowed:
         return load_config(root, validate_headers=False), "authorized"
-    return rev_config, "ignored"
+    return rev_config, "blocked"
 
 
 def _entries_from_bytes(
@@ -619,15 +617,13 @@ def _check_baseline_name(check: Any, config_root: Path) -> str | None:
 
 
 def _baseline_status(
-    item: _Input, tightened: bool, invalid: bool
+    item: _Input, tightened: bool, ignored: tuple[str, ...], invalid: bool
 ) -> str:
     if not _input_changed(item):
         return "unchanged"
-    if invalid:
-        return "ignored"
-    if tightened:
+    if tightened and not ignored and not invalid:
         return "tightened"
-    return "ignored"
+    return "blocked"
 
 
 def _merged_baseline(
@@ -650,7 +646,7 @@ def _merged_baseline(
         )
     return (
         merged,
-        _baseline_status(item, tightened, invalid),
+        _baseline_status(item, tightened, ignored, invalid),
         ignored,
     )
 
