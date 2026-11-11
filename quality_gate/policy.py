@@ -437,6 +437,7 @@ def _parse_check(
     path: Path,
     checks: dict[str, CheckDef],
     candidate_root: Path,
+    parse_candidate_inputs: bool = True,
 ) -> CheckDef:
     full_key = f"checks.{name}"
     if not name.strip():
@@ -444,7 +445,8 @@ def _parse_check(
     if not isinstance(raw, dict):
         raise _config_error(path, full_key, "a table", _describe(raw))
     descriptor, tier, enforcement = _check_header(raw, path, full_key)
-    parse_root = candidate_root if descriptor.parse_candidate_inputs else root
+    candidate = candidate_root if parse_candidate_inputs else None
+    parse_root: Path | None = candidate if descriptor.parse_candidate_inputs else root
     parts = descriptor.parse(raw, parse_root, path, full_key)
     direction = _parse_direction(raw, path, full_key)
     check = CheckDef(
@@ -465,14 +467,15 @@ def _parse_check(
 
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path, *, validate_headers: bool = True,
-    candidate_root: Path | None = None,
+    candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
 ) -> dict[str, CheckDef]:
     raw_checks = _optional_table(data, "checks", path, "checks")
     if raw_checks is None:
         return {}
     checks: dict[str, CheckDef] = {}
     for name, raw in raw_checks.items():
-        checks[name] = _parse_check(name, raw, root, path, checks, candidate_root or root)
+        checks[name] = _parse_check(name, raw, root, path, checks,
+                                    candidate_root or root, parse_candidate_inputs)
     _validate_baselines(checks, path, validate_headers=validate_headers)
     return checks
 
@@ -667,7 +670,7 @@ def _parse_protect(data: dict[str, Any], path: Path) -> tuple[str, ...]:
 
 def _config_from_data(
     root: Path, path: Path, data: dict[str, Any], *, validate_headers: bool = True,
-    candidate_root: Path | None = None,
+    candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
 ) -> Config:
     _check_keys(data, TOP_LEVEL_KEYS, path, "")
     schema = _declared_schema(data, path)
@@ -680,7 +683,9 @@ def _config_from_data(
     classes = _parse_classes(data, path)
     rules = _parse_rules(data, path)
     max_bytes = _parse_hygiene(data, path)
-    checks = _parse_checks(data, root, path, validate_headers=validate_headers, candidate_root=candidate_root)
+    checks = _parse_checks(data, root, path, validate_headers=validate_headers,
+                           candidate_root=candidate_root,
+                           parse_candidate_inputs=parse_candidate_inputs)
     required_tiers = _parse_levels(data, path)
     not_applicable = _parse_not_applicable(data, classes, path)
     protect_paths = _parse_protect(data, path)
@@ -701,7 +706,9 @@ def _config_from_data(
     )
 
 
-def load_config(root: Path, *, validate_headers: bool = True, candidate_root: Path | None = None) -> Config:
+def load_config(root: Path, *, validate_headers: bool = True,
+                candidate_root: Path | None = None,
+                parse_candidate_inputs: bool = True) -> Config:
     path = root / "quality-gate.toml"
     try:
         with path.open("rb") as stream:
@@ -717,4 +724,5 @@ def load_config(root: Path, *, validate_headers: bool = True, candidate_root: Pa
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise ConfigError(f"{path}: expected valid TOML, got {error}") from error
     return _config_from_data(root, path, data, validate_headers=validate_headers,
-                             candidate_root=candidate_root)
+                             candidate_root=candidate_root,
+                             parse_candidate_inputs=parse_candidate_inputs)

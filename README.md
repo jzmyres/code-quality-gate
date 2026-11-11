@@ -777,11 +777,12 @@ added or loosened entries, or malformed content, the run did not apply is `block
 unapplied entries in `ignored_entries`, and so is a byte change with identical entries, such as a
 comment, which has none. An unauthorized change to the policy, the tools lock or any other
 protected path makes the decision `blocked` (exit 1) too, naming the path, while `--allow-protected
-PATH` accepts a reviewed replacement and reports it as authorized. Protected candidate files must be
-reached without following a symlink. The trusted directory compares files and globs only, so the
-caller checks a submodule pin. The gate records protected-input, tool-payload and gate-program
-identities before the checks and again after them, re-enumerating the protected scope (including
-ignored untracked files); an added, removed or changed protected path makes the decision `error`
+PATH` accepts a reviewed replacement and reports it as authorized. With an authorized policy, only that
+policy is checked against the candidate's files; the trusted policy then sets only the protected scope.
+Protected candidate files must be reached without following a symlink. The trusted directory compares
+files and globs only, so the caller checks a submodule pin. The gate records protected-input, tool-payload
+and gate-program identities before the checks and again after them, re-enumerating the protected scope
+(including ignored untracked files); an added, removed or changed protected path makes the decision `error`
 (exit 2). `--prune` with `--policy-from` is a
 usage error (exit 2).
 It refuses to run from a gate program inside the candidate root. A trust result reports `trust.path`

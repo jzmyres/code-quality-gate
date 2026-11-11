@@ -39,7 +39,7 @@ class ElispTestsSpec:
 
 
 def _elisp_tests_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
+    raw: dict[str, Any], root: Path | None, path: Path, full_key: str
 ) -> ParsedSpec:
     from .adapters import ParsedSpec
 
@@ -123,7 +123,9 @@ def _safe_relative(value: str, target: Path) -> bool:
     return bool(value.strip()) and "\0" not in value and not target.is_absolute() and ".." not in target.parts
 
 
-def _relative_path(root: Path, value: str, path: Path, key: str, kind: str) -> None:
+def _relative_path(root: Path | None, value: str, path: Path, key: str, kind: str) -> None:
+    if root is None:
+        return
     target = Path(value)
     if not _safe_relative(value, target):
         raise _config_error(path, key, f"a repository-relative {kind}", repr(value))
@@ -135,7 +137,9 @@ def _relative_path(root: Path, value: str, path: Path, key: str, kind: str) -> N
         raise _config_error(path, key, f"a {kind}", f"{value!r} is missing or not a {kind}")
 
 
-def _common_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> tuple[tuple[str, ...], str, int]:
+def _common_spec(
+    raw: dict[str, Any], root: Path | None, path: Path, key: str
+) -> tuple[tuple[str, ...], str, int]:
     load_path = _optional_string_list(raw, "load_path", path, f"{key}.load_path")
     for index, directory in enumerate(load_path):
         _relative_path(root, directory, path, f"{key}.load_path[{index}]", "directory")
@@ -147,7 +151,7 @@ def _common_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> tuple
     return load_path, emacs, budget
 
 
-def parse_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ElispTestsSpec:
+def parse_spec(raw: dict[str, Any], root: Path | None, path: Path, key: str) -> ElispTestsSpec:
     suite = _string(raw, "suite", path, f"{key}.suite")
     _relative_path(root, suite, path, f"{key}.suite", "regular file")
     return ElispTestsSpec(suite, *_common_spec(raw, root, path, key))

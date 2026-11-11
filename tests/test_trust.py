@@ -25,6 +25,7 @@ from support import (
     with_clones,
 )
 from test_adapters import FLOOR_CONFIG, FLOOR_STUB
+from test_elisp_tests import MODULE, SUITE, config as elisp_tests_config
 from test_python_crap import crap_config
 
 from quality_gate import adapters, ratchet, trust
@@ -850,6 +851,103 @@ class PolicyTrustTests(TrustCase):
         self.change_ruff()
         result, document = self.trust_json(revision)
         self.assert_blocked(result, document)
+
+
+class RenamedSuiteTrustTests(TrustCase):
+    """An authorized policy alone validates a renamed elisp_tests suite."""
+
+    OLD_SUITE = "tests/suite.el"
+    NEW_SUITE = "tests/renamed.el"
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.add_file("src/core.el", MODULE)
+        self.add_file(self.OLD_SUITE, SUITE)
+        self.write_config(elisp_tests_config())
+        self.directory = self.directory_revision()
+
+    def rename_suite(
+        self,
+        suite: str = NEW_SUITE,
+        *,
+        add_suite: bool = True,
+        keep_old: bool = False,
+        update_policy: bool = True,
+    ) -> None:
+        if add_suite:
+            self.add_file(suite, SUITE)
+        if not keep_old:
+            (self.repo / self.OLD_SUITE).unlink()
+        if update_policy:
+            self.write_config(
+                elisp_tests_config().replace(
+                    f'suite = "{self.OLD_SUITE}"', f'suite = "{suite}"'
+                )
+            )
+
+    def inventory(
+        self, *args: str
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_qg(
+            "inventory", "--policy-from", self.directory, *args
+        )
+
+    def assert_suite_refused(
+        self, result: subprocess.CompletedProcess[str], suite: str
+    ) -> None:
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn("checks.legacy-tests.suite", result.stderr)
+        self.assertIn(suite, result.stderr)
+        self.assertIn("missing", result.stderr)
+
+    def test_authorized_rename_uses_the_candidate_policy(self) -> None:
+        self.rename_suite()
+        result = self.inventory("--allow-protected", "quality-gate.toml")
+        self.assertEqual(result.returncode, 0, output(result))
+        prepared = prepare_trust(
+            self.repo, self.directory, ["quality-gate.toml"]
+        )
+        self.addCleanup(prepared.close)
+        self.assertEqual(
+            prepared.config.checks["legacy-tests"].spec.suite,
+            self.NEW_SUITE,
+        )
+        entry = next(
+            item
+            for item in prepared.protected
+            if item.path == "quality-gate.toml"
+        )
+        self.assertEqual(entry.status, "authorized")
+
+    def test_unauthorized_rename_refuses_the_trusted_suite(self) -> None:
+        self.rename_suite()
+        self.assert_suite_refused(self.inventory(), self.OLD_SUITE)
+
+    def test_unchanged_policy_with_a_missing_suite_still_exits_two(self) -> None:
+        (self.repo / self.OLD_SUITE).unlink()
+        self.assert_suite_refused(self.inventory(), self.OLD_SUITE)
+
+    def test_authorized_policy_naming_a_missing_suite_exits_two(self) -> None:
+        self.rename_suite("tests/missing.el", add_suite=False)
+        self.assert_suite_refused(
+            self.inventory("--allow-protected", "quality-gate.toml"),
+            "tests/missing.el",
+        )
+
+    def test_authorized_rename_keeps_the_protected_scope(self) -> None:
+        self.rename_suite(keep_old=True)
+        present = prepare_trust(
+            self.repo, self.directory, ["quality-gate.toml"]
+        )
+        self.addCleanup(present.close)
+        (self.repo / self.OLD_SUITE).unlink()
+        removed = prepare_trust(
+            self.repo, self.directory, ["quality-gate.toml"]
+        )
+        self.addCleanup(removed.close)
+        self.assertEqual(present.protected, removed.protected)
 
 
 class DirectoryTrustTests(TrustCase):

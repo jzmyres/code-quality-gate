@@ -22,14 +22,14 @@ class ElispLintSpec:
 
 
 def _elisp_lint_spec(
-    raw: dict[str, Any], root: Path, path: Path, full_key: str
+    raw: dict[str, Any], root: Path | None, path: Path, full_key: str
 ) -> ParsedSpec:
     from .adapters import ParsedSpec
 
     return ParsedSpec(parse_spec(raw, root, path, full_key), "elisp-lint/1", ("static",))
 
 
-def parse_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ElispLintSpec:
+def parse_spec(raw: dict[str, Any], root: Path | None, path: Path, key: str) -> ElispLintSpec:
     """Parse and validate the shared compile and checkdoc configuration."""
     return ElispLintSpec(*_common_spec(raw, root, path, key))
 

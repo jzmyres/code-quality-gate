@@ -468,13 +468,12 @@ def _materialize(
 def _policy_config(
     root: Path,
     rev_config: Config,
-    inputs: dict[str, _Input],
-    allowed: set[str],
+    item: _Input,
+    authorized: bool,
 ) -> tuple[Config, str]:
-    item = inputs[POLICY_NAME]
     if not _input_changed(item):
         return rev_config, "unchanged"
-    if POLICY_NAME in allowed:
+    if authorized:
         return load_config(root, validate_headers=False), "authorized"
     return rev_config, "blocked"
 
@@ -941,12 +940,21 @@ def _prepare_source(
     allowed: list[str],
 ) -> Trust:
     policy_root = Path(temporary[0].name)
-    _materialize(policy_root, root, source, _rev_policy_bytes(root, source))
-    rev_config = load_config(policy_root, candidate_root=root)
-    inputs = _protected_inputs(root, source, rev_config)
+    policy = _rev_policy_bytes(root, source)
+    _materialize(policy_root, root, source, policy)
     allowed_paths = {_normalise(path) for path in allowed}
+    authorized = (
+        _sha256(policy) != _sha256(_candidate_bytes(root, POLICY_NAME))
+        and POLICY_NAME in allowed_paths
+    )
+    rev_config = load_config(
+        policy_root,
+        candidate_root=root,
+        parse_candidate_inputs=not authorized,
+    )
+    inputs = _protected_inputs(root, source, rev_config)
     config, policy_status = _policy_config(
-        root, rev_config, inputs, allowed_paths
+        root, rev_config, inputs[POLICY_NAME], authorized
     )
     config, baseline_statuses, ignored = _apply_baselines(
         root,
