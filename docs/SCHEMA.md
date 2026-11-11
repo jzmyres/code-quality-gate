@@ -478,11 +478,11 @@ A `--policy-from` result adds one `trust` object and declares schema 3:
   repository-relative; `rev_sha256` and `candidate_sha256` are lowercase
   SHA-256 hex or null when the file is absent (in `identity_after`, `refused`
   means the candidate file could not be read safely). `status` is `unchanged`,
-  `tightened`, `authorized` or `blocked`; a protected input whose candidate
-  content the run did not apply reports `blocked` rather than the former
-  `ignored`, and blocks the decision. A baseline the run did not apply also
-  carries `ignored_entries`, the subjects whose candidate entry was not
-  applied.
+  `tightened`, `authorized` or `blocked`; an unauthorized changed protected
+  input reports `blocked` and blocks the decision. Every baseline carries
+  `ignored_entries`, the subjects whose candidate entry the run did not apply;
+  it is empty for an unchanged or authorized baseline and for a blocked
+  baseline whose bytes changed while its entries did not.
 * `identity_before` and `identity_after` record `DIR`'s path as `revision`,
   each protected input's file SHA-256 values, the effective policy, tool lock,
   tool pins and each in-memory baseline under `effective_inputs`, every pinned
@@ -560,9 +560,12 @@ hygiene or any enforced check that ran is not satisfied, and `partial` (exit
 check is satisfied, but a baseline exception or a non-passing advisory check
 exists.
 `blocked` (exit 1, trust runs only) means an unauthorized protected input
-differs from the trusted directory and the run did not apply the candidate
-content, whether that is the policy, a baseline, the tools lock or another
-protected path; the checks still ran and are reported. `error` (exit 2) is invalid policy, usage,
+differs from the trusted directory: the policy, the tools lock or another
+protected path, or a baseline whose candidate entries are not all at least as
+strict as the trusted ones, or whose bytes changed while its entries did not.
+For the policy and a baseline the run reports the trusted version it applied; a
+check that reads another protected path reads the candidate's file. The checks
+still ran and are reported. `error` (exit 2) is invalid policy, usage,
 configuration, a run that exceeds its limit, or a protected input, effective input, tool payload
 or gate file that changed during the run.
 

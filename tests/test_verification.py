@@ -943,6 +943,28 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         )
         self.bounds(document, (1, 2), (3, 2))
 
+    def test_candidate_lowered_floor_with_an_earlier_expiry_is_blocked(
+        self,
+    ) -> None:
+        revision = self.prepare(tests=2, noqa=2, floor=2, ceiling=2)
+        self.add_file(
+            BASELINE,
+            verification_baseline(
+                [
+                    {**executed_entry(0), "expires": "2099-12-31"},
+                    exclusion_entry("pkg/mod.py", "noqa", 2),
+                ]
+            ),
+        )
+        _result, document = self.blocked_run(
+            revision, self.default_tool_env()
+        )
+        self.assertEqual(
+            self.protected(document, BASELINE)["ignored_entries"],
+            ["tests:tests:executed"],
+        )
+        self.bounds(document, (2, 2), (2, 2))
+
     def test_candidate_removed_floor_keeps_the_trusted_entry_and_blocks(self) -> None:
         revision = self.prepare(tests=2, noqa=2, floor=2, ceiling=2)
         self.add_file(

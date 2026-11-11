@@ -113,7 +113,8 @@ Baselines tighten only:
 * a candidate removal takes effect for a `max` entry, and does not for a
   `min` floor: the removed entry keeps the trusted bound;
 * an entry whose bound the candidate tightens takes effect (a lower `max`
-  bound or a higher `min` bound, with an earlier expiry);
+  bound or a higher `min` bound), together with every other field the candidate
+  left at least as strict (an earlier expiry);
 * an entry the candidate adds, a bound it loosens, an expiry it later removes,
   reasons it changes and metadata it changes do not take effect, and the
   trusted entry is used;
@@ -125,16 +126,21 @@ subject. The adapter's per-subject rule, descriptor default or check's
 configured `direction` decides it, including before any finding exists.
 
 The entry set used for the run is therefore the trusted entries with candidate
-removals of `max` entries and tightened bounds applied. The entries whose
-candidate form the run did not apply, including a removed `min` floor, are
-listed in the protected input's `ignored_entries`.
+removals of `max` entries and tightened bounds applied. Merged fields are taken
+per field, so an entry the candidate tightens in its bound and loosens in its
+expiry yields the tighter bound and the trusted expiry. The entries whose
+candidate form the run did not apply, including a removed `min` floor and any
+entry whose merged form differs from the candidate's in any field, are listed
+in the protected input's `ignored_entries`.
 
-A baseline that only tightens the trusted entries is `tightened` and does not
-block the decision. Any other changed baseline is `blocked` (exit 1) and makes
-the decision `blocked`, naming the path: the candidate carries baseline
-content the run did not apply, either because the baseline cannot be parsed, so
-no candidate entry is applied, or because some candidate entries are listed in
-`ignored_entries`. Identical content is `unchanged`.
+A baseline whose every candidate entry is at least as strict as its trusted
+entry in every field is `tightened` and does not block the decision. Every
+other changed baseline is `blocked` (exit 1) and makes the decision
+`blocked`, naming the path. That covers three cases: the baseline cannot be
+parsed, so no candidate entry is applied; some candidate entries are listed in
+`ignored_entries`; or the file bytes differ while the entries are identical
+(a comment or a reordering), which is blocked with an empty `ignored_entries`.
+Identical content is `unchanged`.
 
 ### Authorized paths
 
@@ -164,10 +170,9 @@ An unauthorized change to any other protected path makes the decision
 `blocked` (exit 1), naming the path in the result and on stderr. The gate
 cannot substitute the trusted version of a file another program reads or executes
 (for example Ruff's configuration or a test runner), so it refuses to accept
-the run. The checks still run against the candidate and are reported in full.
-
-Every unauthorized protected change blocks in the same way. The gate never
-accepts a candidate whose content it did not apply.
+the run: the check that reads such a file reads the candidate's version, and
+the gate never accepts a candidate whose protected content the trusted gate did
+not apply. The checks still run against the candidate and are reported in full.
 
 ## Prune under `--policy-from`
 
@@ -248,11 +253,12 @@ sorted path order, each trusted file's repository-relative path, a NUL byte and
 the SHA-256 of its bytes, each followed by a newline.
 
 `status` is one of `unchanged`, `tightened`, `authorized` or `blocked`.
-A protected input whose candidate content the run did not apply reports
-`blocked` rather than the former `ignored`, so it blocks the decision.
-`ignored_entries` lists the subjects whose candidate entry the run did not
-apply. The text report includes each protected file's trusted and candidate
-SHA-256. The result `decision` adds `blocked`; exit codes remain `0`
+An unauthorized changed protected input reports `blocked`, so it blocks the
+decision. Every baseline carries `ignored_entries`, the subjects whose
+candidate entry the run did not apply, and it is empty for an unchanged or
+authorized baseline. The text report includes each protected file's trusted
+and candidate SHA-256, and a blocked baseline names the unapplied subjects
+before its status. The result `decision` adds `blocked`; exit codes remain `0`
 for accepted results, `1` for `rejected`/blocked or a failed prune, and `2`
 for usage or configuration errors and an identity change. Without `--policy-from`, the result remains
 schema 2 and has no `trust` key.

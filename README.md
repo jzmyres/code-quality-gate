@@ -722,9 +722,12 @@ outside the candidate and make it read-only:
 
 A candidate cannot commit a protected change the trusted gate did not apply. An unauthorized
 candidate baseline edit can only tighten: a removed `max` entry takes effect, and a removed `min`
-floor keeps the trusted entry. A baseline that only tightens is `tightened` and does not block; one
-whose added or loosened entries, or malformed content, the run did not apply is `blocked` and lists
-those entries in `ignored_entries`. An unauthorized change to the policy, the tools lock or any other
+floor keeps the trusted entry. An entry that tightens one field and loosens another takes effect only
+in the tightened field, so the loosened part is not applied. A baseline whose every candidate entry is
+at least as strict as its trusted entry in every field is `tightened` and does not block; one whose
+added or loosened entries, or malformed content, the run did not apply is `blocked` and lists the
+unapplied entries in `ignored_entries`, and so is a byte change with identical entries, such as a
+comment, which has none. An unauthorized change to the policy, the tools lock or any other
 protected path makes the decision `blocked` (exit 1) too, naming the path, while `--allow-protected
 PATH` accepts a reviewed replacement and reports it as authorized. Protected candidate files must be
 reached without following a symlink. The trusted directory compares files and globs only, so the

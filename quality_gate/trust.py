@@ -62,11 +62,18 @@ def _file_description(sha256: str | None) -> str:
     return f"file {sha256}" if sha256 is not None else "missing -"
 
 
+def _not_applied(item: ProtectedInput) -> str:
+    if not item.ignored_entries:
+        return ""
+    return "; not applied: " + ", ".join(item.ignored_entries)
+
+
 def _report_blocked_detail(item: ProtectedInput) -> None:
     print(
         f"check: protected input {item.path}: REV "
         f"{_file_description(item.rev_sha256)}; candidate "
-        f"{_file_description(item.candidate_sha256)}; {item.status}",
+        f"{_file_description(item.candidate_sha256)}"
+        f"{_not_applied(item)}; {item.status}",
         file=sys.stderr,
     )
 
@@ -523,7 +530,7 @@ def _candidate_entries(
         return _entries_from_bytes(temporary, "candidate", raw, check), False
     except GateError as error:
         print(
-            f"check: {relative}: candidate baseline ignored: {error}",
+            f"check: {relative}: candidate baseline not applied: {error}",
             file=sys.stderr,
         )
         return [], True
@@ -537,37 +544,17 @@ def _tighter_expiry(
     return candidate
 
 
-def _entry_differs(entry: BaselineEntry, candidate: BaselineEntry) -> bool:
-    return (
-        entry.bound != candidate.bound
-        or entry.reason != candidate.reason
-        or entry.expires != candidate.expires
-        or entry.extras != candidate.extras
-    )
-
-
-def _ignored_parts(entry: BaselineEntry, chosen: BaselineEntry) -> bool:
-    return (
-        chosen.reason != entry.reason
-        or chosen.extras != entry.extras
-        or chosen.expires != _tighter_expiry(entry.expires, chosen.expires)
-    )
-
-
 def _merge_entry(
     entry: BaselineEntry,
     chosen: BaselineEntry,
     direction: str = "max",
 ) -> tuple[BaselineEntry, bool, bool]:
-    expires = _tighter_expiry(entry.expires, chosen.expires)
-    bound = tighter_bound(entry.bound, chosen.bound, direction)
-    if bound != entry.bound or expires != entry.expires:
-        return (
-            replace(entry, bound=bound, expires=expires),
-            True,
-            _ignored_parts(entry, chosen),
-        )
-    return entry, False, _entry_differs(entry, chosen)
+    merged = replace(
+        entry,
+        bound=tighter_bound(entry.bound, chosen.bound, direction),
+        expires=_tighter_expiry(entry.expires, chosen.expires),
+    )
+    return merged, merged != entry, merged != chosen
 
 
 def _merge_revision_entry(

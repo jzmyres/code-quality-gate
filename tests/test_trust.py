@@ -131,20 +131,19 @@ class TrustCase(FixtureCase):
         self,
         bound: int = 1,
         reason: str = "reviewed mirror",
-    ) -> None:
-        self.add_file(
-            "quality-gate-clones.toml",
-            baseline_text(
-                [
-                    {
-                        "subject": "fp1",
-                        "bound": bound,
-                        "files": list(CLONE_FILES),
-                        "reason": reason,
-                    }
-                ]
-            ),
-        )
+        expires: str | None = None,
+    ) -> str:
+        entry: dict[str, object] = {
+            "subject": "fp1",
+            "bound": bound,
+            "files": list(CLONE_FILES),
+            "reason": reason,
+        }
+        if expires is not None:
+            entry["expires"] = expires
+        text = baseline_text([entry])
+        self.add_file("quality-gate-clones.toml", text)
+        return text
 
     def empty_clones_baseline(self) -> None:
         self.add_file("quality-gate-clones.toml", CLONES_HEADER)
@@ -325,36 +324,113 @@ class BaselineTrustTests(TrustCase):
         )
         self.assert_clone_fails_tightened(result, document)
 
-    def test_tightened_baseline_with_a_loosened_entry_is_blocked(self) -> None:
-        self.add_file(
-            "quality-gate-clones.toml",
-            baseline_text(
-                [
-                    {"subject": "fp1", "bound": 5, "reason": "reviewed"},
-                    {"subject": "fp2", "bound": 3, "reason": "reviewed"},
-                ]
-            ),
-        )
+    def test_earlier_expiry_on_a_loosened_bound_is_blocked(self) -> None:
+        self.write_clones_baseline()
         revision = self.directory_revision()
+        self.write_clones_baseline(bound=1000, expires="2099-12-31")
+        result, document = self.trust_json(revision, env=self.clone_env())
+        self.assert_baseline_blocked(
+            result, document, "quality-gate-clones.toml", ["fp1"]
+        )
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
+
+    def test_earlier_expiry_alone_is_tightened(self) -> None:
+        self.write_clones_baseline()
+        revision = self.directory_revision()
+        self.write_clones_baseline(expires="2099-12-31")
+        result, document = self.trust_json(revision, env=self.clone_env())
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted_with_exceptions")
+        entry = self.protected(document, "quality-gate-clones.toml")
+        self.assertEqual(entry["status"], "tightened")
+        self.assertEqual(entry["ignored_entries"], [])
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
+
+    def test_blocked_report_names_the_unapplied_subject(self) -> None:
+        self.write_clones_baseline()
+        revision = self.directory_revision()
+        self.write_clones_baseline(bound=1000, expires="2099-12-31")
+        result = self.run_qg(
+            "check", "--policy-from", revision, env=self.clone_env()
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        detail = next(
+            line for line in result.stderr.splitlines()
+            if line.startswith(
+                "check: protected input quality-gate-clones.toml:"
+            )
+        )
+        self.assertTrue(detail.endswith("; not applied: fp1; blocked"), detail)
+
+    def test_authorized_added_entry_is_applied(self) -> None:
+        self.empty_clones_baseline()
+        revision = self.directory_revision()
+        self.write_clones_baseline()
+        document = self.assert_authorized_status(
+            revision,
+            "quality-gate-clones.toml",
+            self.clone_env(),
+            "accepted_with_exceptions",
+        )
+        entry = self.protected(document, "quality-gate-clones.toml")
+        self.assertEqual(entry["ignored_entries"], [])
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
+
+    def write_two_entry_baseline(self, first: int, second: int) -> None:
         self.add_file(
             "quality-gate-clones.toml",
             baseline_text(
                 [
-                    {"subject": "fp1", "bound": 1, "reason": "reviewed"},
-                    {"subject": "fp2", "bound": 30, "reason": "reviewed"},
+                    {"subject": "fp1", "bound": first, "reason": "reviewed"},
+                    {"subject": "fp2", "bound": second, "reason": "reviewed"},
                 ]
             ),
         )
+
+    def tightened_and_loosened_baseline(
+        self,
+    ) -> tuple[str, dict[str, str]]:
+        self.write_two_entry_baseline(5, 3)
+        revision = self.directory_revision()
+        self.write_two_entry_baseline(1, 30)
         env = self.install_fake_jscpd(sarif_report([
             ("fp1", [("a.py", 1, 8), ("b.py", 1, 8)]),
             ("fp2", [("a.py", 1, 8), ("b.py", 1, 8)]),
         ]))
+        return revision, env
+
+    def test_authorized_tighten_and_loosen_are_applied(self) -> None:
+        revision, env = self.tightened_and_loosened_baseline()
+        document = self.assert_authorized_status(
+            revision,
+            "quality-gate-clones.toml",
+            env,
+            "accepted_with_exceptions",
+        )
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
+        self.assertEqual(self.baseline_bound(document, "clones", "fp2"), 30)
+
+    def test_tightened_baseline_with_a_loosened_entry_is_blocked(self) -> None:
+        revision, env = self.tightened_and_loosened_baseline()
         result, document = self.trust_json(revision, env=env)
         self.assert_baseline_blocked(
             result, document, "quality-gate-clones.toml", ["fp2"]
         )
         self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
         self.assertEqual(self.baseline_bound(document, "clones", "fp2"), 3)
+
+    def test_identical_entries_with_a_changed_comment_are_blocked(self) -> None:
+        text = self.write_clones_baseline()
+        revision = self.directory_revision()
+        self.add_file(
+            "quality-gate-clones.toml",
+            text.replace("[[entry]]", "# reviewed mirror\n[[entry]]"),
+        )
+        result, document = self.trust_json(revision, env=self.clone_env())
+        self.assert_baseline_blocked(
+            result, document, "quality-gate-clones.toml", []
+        )
+        self.assertEqual(self.baseline_bound(document, "clones", "fp1"), 1)
 
     def test_authorized_baseline_replacements_pass(self) -> None:
         self.write_clones_baseline()
@@ -394,7 +470,7 @@ class BaselineTrustTests(TrustCase):
         self.assert_baseline_blocked(
             result, document, "quality-gate-clones.toml", []
         )
-        self.assertIn("candidate baseline ignored", result.stderr)
+        self.assertIn("candidate baseline not applied", result.stderr)
         self.assertEqual(
             self.baseline_bound(document, "clones", "fp1"), 5
         )
@@ -473,6 +549,18 @@ class StubFloorTrustTests(TrustCase):
         prepared = prepare_trust(self.repo, self.directory, [])
         self.addCleanup(prepared.close)
         self.assert_floor_retained(prepared)
+
+    def test_authorized_removed_floor_takes_effect(self) -> None:
+        prepared = prepare_trust(self.repo, self.directory, ["floor.toml"])
+        self.addCleanup(prepared.close)
+        self.assertEqual(
+            prepared.config.checks["floor"].effective_baseline, ()
+        )
+        item = next(
+            item for item in prepared.protected if item.path == "floor.toml"
+        )
+        self.assertEqual(item.status, "authorized")
+        self.assertEqual(item.ignored_entries, ())
 
     def test_all_minimum_kinds_keep_floor_with_max_configured_default(self) -> None:
         descriptor = replace(
