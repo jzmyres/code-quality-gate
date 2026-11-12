@@ -91,11 +91,6 @@ class = "doc"
 reason = "documentation and plans"
 
 [[rule]]
-pattern = ".agents/**"
-class = "doc"
-reason = "implementer agents' learned memory, written by the runner's reflection step"
-
-[[rule]]
 pattern = ".gitignore"
 class = "config"
 reason = "repository ignore rules"

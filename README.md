@@ -30,6 +30,8 @@ The archived implementation can be inspected with
 `git show archive/result-reuse-2026-10-30:PATH`, or by checking out that tag.
 The archived owners adapter can be inspected with
 `git show archive/owners-2026-10-31:PATH`.
+The agent learned memory can be restored with
+`git checkout archive/learned-memory-2026-11-11 -- .agents`.
 
 ## Adopting the gate
 
@@ -126,9 +128,6 @@ or the policy's configured `direction` when no descriptor default is set. This s
 only source of direction for loading, merging, evaluation and pruning. For example, verification's
 rule identifies executed-test subjects as minimum floors before findings exist, so the trusted
 baseline merge can preserve them even under a maximum default.
-
-The implementer agents' learned memory lives in `.agents/AGENTS.md`, written by the runner's
-reflection step after each batch and reviewed before landing.
 
 ## Quick start in a consuming repository
 
