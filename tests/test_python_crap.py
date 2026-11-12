@@ -4,7 +4,6 @@ from __future__ import annotations
 import configparser
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +17,7 @@ from support import (
     PYTHON_TEST_HEADER,
     FixtureCase,
     baseline_text,
+    copy_tree_writable,
     output,
 )
 
@@ -1126,7 +1126,7 @@ class CoverageConfigurationAttackTests(FixtureCase):
         installation = coverage_installation()
         tools = self.base / "tools"
         disposable = tools / installation.name
-        shutil.copytree(installation, disposable)
+        copy_tree_writable(installation, disposable)
         self.add_covering_test(False)
         self.add_file(
             "tests/test_tamper.py",

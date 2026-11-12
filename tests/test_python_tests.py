@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from support import (
     PYTHON_COMMON_RULE_LINES,
     PYTHON_TEST_HEADER,
     FixtureCase,
+    copy_tree_writable,
     output,
 )
 
@@ -90,6 +92,44 @@ def tests_config(
     )
     lines.extend(PYTHON_COMMON_RULE_LINES)
     return "\n".join(lines)
+
+
+class CopyTreeWritableTests(unittest.TestCase):
+    def test_a_read_only_tree_is_copied_writable_without_touching_the_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qg-copy-") as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            nested = source / "nested"
+            nested.mkdir(parents=True)
+            files = [source / "top.txt", nested / "nested.txt"]
+            for path in files:
+                path.write_text(path.name, encoding="utf-8")
+            for path in (source, nested):
+                path.chmod(0o555)
+            for path in files:
+                path.chmod(0o444)
+            source_paths = (source, nested, *files)
+            source_modes = {
+                path: stat.S_IMODE(path.lstat().st_mode) for path in source_paths
+            }
+            destination = base / "destination"
+            try:
+                copy_tree_writable(source, destination)
+                for path in [destination, *destination.rglob("*")]:
+                    self.assertTrue(
+                        stat.S_IMODE(path.lstat().st_mode) & stat.S_IWUSR,
+                        path,
+                    )
+                self.assertEqual(
+                    {
+                        path: stat.S_IMODE(path.lstat().st_mode)
+                        for path in source_paths
+                    },
+                    source_modes,
+                )
+            finally:
+                for path in (source, nested):
+                    path.chmod(stat.S_IMODE(path.lstat().st_mode) | stat.S_IWUSR)
 
 
 class PythonTestsTests(FixtureCase):
@@ -388,7 +428,7 @@ class AuthorizedCoverageTests(FixtureCase):
         source = coverage_tool.coverage_installation()
         tools = self.base / "tools"
         destination = tools / source.name
-        shutil.copytree(source, destination, symlinks=True)
+        copy_tree_writable(source, destination)
         (destination / "authorized-upgrade.txt").write_text(
             "authorized\n", encoding="utf-8"
         )
@@ -475,7 +515,7 @@ class CovrunTests(unittest.TestCase):
 
     def tampered(self, name: str, sentinel_name: str) -> tuple[Path, Path, Path]:
         destination = self.base / name / self.coverage_dir.name
-        shutil.copytree(self.coverage_dir, destination, symlinks=True)
+        copy_tree_writable(self.coverage_dir, destination)
         init = destination / "coverage" / "__init__.py"
         init.write_text(init.read_text() + "TAMPERED = 1\n", encoding="utf-8")
         sentinel = self.base / sentinel_name

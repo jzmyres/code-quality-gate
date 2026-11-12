@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -273,6 +274,16 @@ def sarif_location(location: tuple[str, int, int]) -> dict[str, Any]:
             "region": {"startLine": start, "endLine": end},
         }
     }
+
+
+def copy_tree_writable(source: Path, destination: Path) -> Path:
+    """Copy a payload tree and restore its owner's write bit where needed."""
+    shutil.copytree(source, destination, symlinks=True)
+    for path in [destination, *destination.rglob("*")]:
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode) or stat.S_ISREG(mode):
+            os.chmod(path, stat.S_IMODE(mode) | stat.S_IWUSR)
+    return destination
 
 
 class FixtureCase(unittest.TestCase):
