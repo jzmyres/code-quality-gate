@@ -1165,6 +1165,11 @@ Both installations are cached by image, architecture, version and digest. Every 
 runtime versions before running checks; the standalone Python assertion includes the patch version.
 The workflow itself is proven only by the CI run after landing, which the designer checks.
 
+The job setup (packages, pinned runtimes and cache restores) runs as the container's root. Each job
+then creates an unprivileged `gate` user and gives it ownership of the checkout and `QG_TOOLS_DIR`;
+fetching pinned tools, the gate and the mutation run as that user through `runuser`. A restored
+tools cache keeps its modes and changes only ownership, so read-only payloads stay read-only.
+
 The check matrix restores the pinned tools cache keyed on the environment name, architecture and
 `tools.lock.toml`, fetches any missing tools (including the coverage wheel), and runs `make -k check`:
 Ruff, clones, the test suite under coverage, Python CRAP and the Emacs Lisp checks. The separate

@@ -105,19 +105,24 @@ jobs:
           emacs -Q --batch --eval '(unless (equal emacs-version (getenv "EXPECTED_EMACS")) (kill-emacs 1))'
           python3 -c 'import os, sys; expected = os.environ["EXPECTED_PYTHON"]; actual = ".".join(map(str, sys.version_info[:len(expected.split("."))])); assert actual == expected, (expected, actual)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Restore pinned tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.QG_TOOLS_DIR }}
           key: ${{ matrix.name }}-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
+      - name: Create unprivileged user
+        run: |
+          useradd --create-home --user-group gate
+          mkdir -p "$QG_TOOLS_DIR"
+          chown -R gate:gate "$GITHUB_WORKSPACE" "$QG_TOOLS_DIR"
       - name: Fetch pinned tools
-        run: python3 -I qg.py tools fetch
+        run: runuser -u gate -- python3 -I qg.py tools fetch
+      - name: Show the unprivileged user
+        run: runuser -u gate -- id -un
       - name: Run the gate
         # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
         timeout-minutes: 60
-        run: make -k check
+        run: runuser -u gate -- make -k check
 
   mutation:
     runs-on: ubuntu-latest
@@ -136,17 +141,22 @@ jobs:
           emacs -Q --batch --eval '(unless (equal emacs-version (getenv "EMACS_VERSION")) (kill-emacs 1))'
           python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Restore pinned tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.QG_TOOLS_DIR }}
           key: debian13-${{ runner.arch }}-${{ hashFiles('tools.lock.toml') }}
+      - name: Create unprivileged user
+        run: |
+          useradd --create-home --user-group gate
+          mkdir -p "$QG_TOOLS_DIR"
+          chown -R gate:gate "$GITHUB_WORKSPACE" "$QG_TOOLS_DIR"
       - name: Fetch pinned tools
-        run: python3 -I qg.py tools fetch
+        run: runuser -u gate -- python3 -I qg.py tools fetch
+      - name: Show the unprivileged user
+        run: runuser -u gate -- id -un
       - name: Mutation-test gate decisions
         # Each mutant first runs the tests that reach its target; the full suite confirms survivors and unattributed or unreached cases.
         # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
         timeout-minutes: 120
-        run: make mutation
+        run: runuser -u gate -- make mutation
