@@ -949,6 +949,101 @@ class RenamedSuiteTrustTests(TrustCase):
         self.addCleanup(removed.close)
         self.assertEqual(present.protected, removed.protected)
 
+    def arrange_decision_case(
+        self,
+        policy_changed: bool,
+        trusted_suite: bool,
+        candidate_suite: bool,
+    ) -> None:
+        self.write_config(
+            elisp_tests_config().replace(
+                f'suite = "{self.OLD_SUITE}"',
+                f'suite = "{self.NEW_SUITE}"',
+            )
+            if policy_changed
+            else elisp_tests_config()
+        )
+        suites = [(self.OLD_SUITE, trusted_suite)]
+        if policy_changed:
+            suites.append((self.NEW_SUITE, candidate_suite))
+        for path, present in suites:
+            if present:
+                self.add_file(path, SUITE)
+            elif (self.repo / path).exists():
+                (self.repo / path).unlink()
+        if not policy_changed and (self.repo / self.NEW_SUITE).exists():
+            (self.repo / self.NEW_SUITE).unlink()
+
+    def test_policy_decision_covers_the_whole_input_table(self) -> None:
+        cases: list[dict[str, object]] = []
+        for authorized in (False, True):
+            for suite in (False, True):
+                cases.append({
+                    "policy": "unchanged",
+                    "authorized": authorized,
+                    "trusted_suite": suite,
+                    "candidate_suite": suite,
+                    "exit": 0 if suite else 2,
+                    "status": "unchanged" if suite else None,
+                    "names": None if suite else self.OLD_SUITE,
+                })
+        for authorized in (False, True):
+            for trusted_suite in (False, True):
+                for candidate_suite in (False, True):
+                    if not authorized:
+                        allowed = trusted_suite
+                        status = "blocked" if allowed else None
+                        names = (
+                            "quality-gate.toml" if allowed else self.OLD_SUITE
+                        )
+                    else:
+                        allowed = candidate_suite
+                        status = "authorized" if allowed else None
+                        names = None if allowed else self.NEW_SUITE
+                    cases.append({
+                        "policy": "changed",
+                        "authorized": authorized,
+                        "trusted_suite": trusted_suite,
+                        "candidate_suite": candidate_suite,
+                        "exit": (1 if not authorized else 0) if allowed else 2,
+                        "status": status,
+                        "names": names,
+                    })
+        self.assertEqual(len(cases), 12)
+        for case in cases:
+            with self.subTest(
+                policy=case["policy"],
+                authorized=case["authorized"],
+                trusted_suite=case["trusted_suite"],
+                candidate_suite=case["candidate_suite"],
+            ):
+                self.arrange_decision_case(
+                    case["policy"] == "changed",
+                    bool(case["trusted_suite"]),
+                    bool(case["candidate_suite"]),
+                )
+                authorization = (
+                    ("--allow-protected", "quality-gate.toml")
+                    if case["authorized"] else ()
+                )
+                result = self.inventory(*authorization)
+                self.assertEqual(result.returncode, case["exit"], output(result))
+                if case["status"] is not None:
+                    prepared = prepare_trust(
+                        self.repo,
+                        self.directory,
+                        ["quality-gate.toml"] if case["authorized"] else [],
+                    )
+                    self.addCleanup(prepared.close)
+                    entry = next(
+                        item
+                        for item in prepared.protected
+                        if item.path == "quality-gate.toml"
+                    )
+                    self.assertEqual(entry.status, case["status"])
+                if case["names"] is not None:
+                    self.assertIn(str(case["names"]), result.stderr)
+
 
 class DirectoryTrustTests(TrustCase):
     def test_loosened_baseline_is_rejected(self) -> None:
