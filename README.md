@@ -404,13 +404,17 @@ authorized coverage upgrade.
 Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
 directly in the caller's temporary directory with a short `qg-t-` prefix, so the caller's `TMPDIR`
 never reaches the suite and the added path stays short. After the command exits, the gate lists every
-path left under that directory, relative to it and sorted. Any path left fails the check with
-`N temporary paths left after the suite: PATH, ...`, naming the count and the first ten paths
-(`path` is singular when N is 1); a command that failed for another reason reports both reasons.
-The gate removes the directory whether the suite passed or failed, restoring the owner's read, write
-and search bits on every directory before removing its contents. A listing or removal that still
-fails is a decision error naming the directory and the operating-system error; it is never ignored.
-No policy key enables or disables this rule.
+path left under that directory, relative to it and sorted. A path list holds one path for each entry
+left directly in the directory, plus one for each file and each directory inside a left directory at
+any depth, so a left directory counts itself and everything under it. Any path left fails the check,
+naming the entries left directly in the directory, each with its path count, and the total:
+`87 entries (109 paths) left in the suite's TMPDIR: a-dir (17 paths), b.el, ...` lists at most ten
+entries, sorted, then `and N more`; an entry with one path is named without a count, and `entry`
+and `path` are singular when their count is 1. A command that failed for another reason reports
+both reasons. The gate removes the directory whether the suite passed or failed, restoring the
+owner's read, write and search bits on every directory before removing its contents. A listing or
+removal that still fails is a decision error naming the directory and the operating-system error;
+it is never ignored. No policy key enables or disables this rule.
 
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:
@@ -491,12 +495,13 @@ a valid result, at least one executed test (`selected - skipped`), and no unexpe
 
 `elisp_tests` gives its suite the same temporary-directory rule as `python_tests`: `TMPDIR` is a
 fresh gate-owned directory created in the caller's temporary directory with the same short prefix,
-and every path left under it after the child exits fails the check with
-`N temporary paths left after the suite: PATH, ...`, naming the count and the first ten sorted
-relative paths (`path` is singular when N is 1). A child that failed for another reason reports both
-reasons. The directory is removed afterwards, with every directory given the owner's read, write and
-search bits first; a listing or removal that still fails is a decision error naming the directory
-and the operating-system error.
+and every path left under it after the child exits fails the check with the same message,
+`87 entries (109 paths) left in the suite's TMPDIR: a-dir (17 paths), b.el, ...`, counting and listing
+the entries left directly in the directory as `python_tests` does: ten sorted entries at most, then
+`and N more`, with a count for an entry holding more than one path. A child that failed for another
+reason reports both reasons. The directory is removed afterwards, with every directory given the
+owner's read, write and search bits first; a listing or removal that still fails is a decision error
+naming the directory and the operating-system error.
 
 A failed test names the test and its printed ERT condition. Zero executed tests, a missing or repeated
 batch call, errors instrumenting a file or loading the suite, and an expired budget fail the check;
@@ -1129,7 +1134,10 @@ Notes:
   identifies its missing `tests_pattern`. Without `requires` every earlier test-producing check is used. It
   measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
   lines, inline `# noqa` comments and file-wide lint suppressions for the selected Python files, without
-  running the tests again. An empty Python selection has nothing to scan, but the test counts still come
+  running the tests again. A selected file is Python when its name ends in `.py`, or when it is a
+  regular file whose shebang interpreter is `python` or `python3` (as `env` and its options resolve),
+  so an executable Python program without the suffix is measured too. Any other selected file stays out
+  of the scan. An empty Python selection has nothing to scan, but the test counts still come
   from every producer; without valid producer results the counts are not measured and the check is
   unsupported. File-wide directives
   are counted separately as `exclusions:FILE:file-suppression`: Ruff's `# ruff: noqa`, with or without

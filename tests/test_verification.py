@@ -375,6 +375,46 @@ class VerificationTests(FindingMixin, FixtureCase):
                     [(2, 2)],
                 )
 
+    def add_rule(self, pattern: str, class_name: str = "python") -> None:
+        self.write_config(
+            verification_config()
+            + f'\n[[rule]]\npattern = "{pattern}"\n'
+            + f'class = "{class_name}"\nreason = "selected program"\n'
+        )
+
+    def test_a_python_program_without_the_suffix_is_scanned(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "program",
+            "#!/usr/bin/env python3\nimport os  # noqa: F401\nVALUE = 1\n",
+        )
+        self.add_rule("program")
+        result, _document, check = self.failed_verification()
+        finding = self.finding(check, "exclusions:program:noqa")
+        self.assertEqual(finding["value"], 1)
+        self.assertEqual(finding["bound"], None)
+        self.assertIn("exclusions:program:noqa", result.stderr)
+
+    def test_a_selected_shell_script_is_not_scanned(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "harness.sh",
+            "#!/bin/sh\n# noqa: E501\nVALUE=1\n",
+        )
+        self.add_rule("harness.sh")
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse(
+            [
+                item["subject"]
+                for item in check["findings"]
+                if "harness.sh" in item["subject"]
+            ],
+            output(result),
+        )
+
     def test_added_noqa_comment_fails(self) -> None:
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])

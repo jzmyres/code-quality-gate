@@ -200,7 +200,7 @@ requires = "legacy-tests"
                       "(ert-deftest temporary () (make-temp-file \"qg-left-\"))\n"
                       "(ert-run-tests-batch-and-exit t)\n")
         _result, check = self.assert_outcome(
-            "fail", "1 temporary path left after the suite:", "qg-left-"
+            "fail", "1 entry (1 path) left in the suite's TMPDIR:", "qg-left-"
         )
         self.assertIn("qg-left-", check["reason"])
 
@@ -220,7 +220,7 @@ requires = "legacy-tests"
                       "(ert-run-tests-batch-and-exit t)\n")
         _result, check = self.assert_outcome(
             "fail", "deliberate",
-            "1 temporary path left after the suite:", "qg-left-",
+            "1 entry (1 path) left in the suite's TMPDIR:", "qg-left-",
         )
         self.assertIn("deliberate", check["reason"])
         self.assertIn("qg-left-", check["reason"])
@@ -238,10 +238,11 @@ requires = "legacy-tests"
                       "(insert (getenv \"TMPDIR\")))))\n"
                       "(ert-run-tests-batch-and-exit t)\n")
         _result, check = self.assert_outcome(
-            "fail", "2 temporary paths left after the suite:",
-            "qg-read-only-", "evidence",
+            "fail",
+            "1 entry (2 paths) left in the suite's TMPDIR: qg-read-only-",
+            "(2 paths)",
         )
-        assert_temporary_failure(self, check, marker, "evidence")
+        assert_temporary_failure(self, check, marker, "qg-read-only-")
 
     def test_an_unreadable_temporary_subtree_fails_closed_and_names_its_path(self) -> None:
         marker = self.base / "unreadable-tmpdir"

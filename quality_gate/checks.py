@@ -653,13 +653,39 @@ def _temporary_paths(directory: Path) -> list[str]:
     return sorted(paths)
 
 
+def _temporary_count(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _temporary_entries(paths: list[str]) -> list[tuple[str, int]]:
+    """The entries PATHS left in the suite's TMPDIR, with their path counts."""
+    counts: dict[str, int] = {}
+    for relative in paths:
+        entry = relative.split(os.sep, 1)[0]
+        counts[entry] = counts.get(entry, 0) + 1
+    return sorted(counts.items())
+
+
+def _temporary_entry_text(name: str, count: int) -> str:
+    if count == 1:
+        return name
+    return f"{name} ({_temporary_count(count, 'path', 'paths')})"
+
+
 def _temporary_reason(paths: list[str]) -> str | None:
     if len(paths) > 0:
-        count = len(paths)
-        shown = ", ".join(paths[:TEMPORARY_PATH_LIMIT])
+        entries = _temporary_entries(paths)
+        shown = ", ".join(
+            _temporary_entry_text(name, count)
+            for name, count in entries[:TEMPORARY_PATH_LIMIT]
+        )
+        more = len(entries) - TEMPORARY_PATH_LIMIT
+        if more > 0:
+            shown = f"{shown}, and {more} more"
         return (
-            f"{count} temporary path{'s' if count != 1 else ''} "
-            f"left after the suite: {shown}"
+            f"{_temporary_count(len(entries), 'entry', 'entries')} "
+            f"({_temporary_count(len(paths), 'path', 'paths')}) "
+            f"left in the suite's TMPDIR: {shown}"
         )
     return None
 

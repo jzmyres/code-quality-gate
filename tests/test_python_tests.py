@@ -222,7 +222,7 @@ class PythonTestsTests(FixtureCase):
             "        os.close(descriptor)\n",
         )
         _result, check = self.failed_tests(
-            "1 temporary path left after the suite:", "qg-left-"
+            "1 entry (1 path) left in the suite's TMPDIR:", "qg-left-"
         )
         self.assertIn("qg-left-", check["reason"])
 
@@ -249,7 +249,7 @@ class PythonTestsTests(FixtureCase):
         )
         _result, check = self.failed_tests(
             "command exited 1",
-            "1 temporary path left after the suite:",
+            "1 entry (1 path) left in the suite's TMPDIR:",
             "qg-left-",
         )
         self.assertIn("command exited 1", check["reason"])
@@ -271,9 +271,34 @@ class PythonTestsTests(FixtureCase):
             "        directory.chmod(0o555)\n",
         )
         _result, check = self.failed_tests(
-            "2 temporary paths left after the suite:", "qg-read-only-", "evidence"
+            "1 entry (2 paths) left in the suite's TMPDIR: qg-read-only-",
+            "(2 paths)",
         )
-        assert_temporary_failure(self, check, marker, "evidence")
+        assert_temporary_failure(self, check, marker, "qg-read-only-")
+
+    def test_the_reason_counts_entries_and_their_paths(self) -> None:
+        self.add_test(
+            "test_temporary",
+            "    def test_left(self):\n"
+            "        import os\n"
+            "        import pathlib\n"
+            "        temporary = pathlib.Path(os.environ['TMPDIR'])\n"
+            "        held = temporary / 'a-dir'\n"
+            "        held.mkdir()\n"
+            "        for name in ('one', 'two', 'three'):\n"
+            "            (held / name).write_text('')\n"
+            "        (temporary / 'b.el').write_text('')\n"
+            "        (temporary / 'c.txt').write_text('')\n",
+        )
+        _result, check = self.failed_tests(
+            "3 entries (6 paths) left in the suite's TMPDIR: "
+            "a-dir (4 paths), b.el, c.txt"
+        )
+        self.assertEqual(
+            check["reason"],
+            "3 entries (6 paths) left in the suite's TMPDIR: "
+            "a-dir (4 paths), b.el, c.txt",
+        )
 
     def test_an_unreadable_temporary_subtree_fails_closed_and_names_its_path(self) -> None:
         marker = self.base / "unreadable-tmpdir"
@@ -1072,7 +1097,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             self.assertIn("coverage.ini", unreadable)
             self.assertIn("denied", unreadable)
 
-    def test_eleven_temporary_paths_report_the_sorted_first_ten(self) -> None:
+    def test_more_entries_than_the_limit_end_with_and_n_more(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             names = [f"left-{index:02d}" for index in range(11)]
@@ -1093,8 +1118,9 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
         self.assertEqual(paths, sorted(names))
         self.assertEqual(
             checks._temporary_reason(paths),
-            "11 temporary paths left after the suite: "
-            + ", ".join(sorted(names)[:10]),
+            "11 entries (11 paths) left in the suite's TMPDIR: "
+            + ", ".join(sorted(names)[: checks.TEMPORARY_PATH_LIMIT])
+            + ", and 1 more",
         )
 
     def test_temporary_cleanup_failure_is_reported_with_its_path(self) -> None:

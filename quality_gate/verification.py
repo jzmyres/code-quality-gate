@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .coverage_tool import PRAGMA_NO_COVER
+from .files import _regular_interpreter
 from .policy import CheckDef, Config, GateError, _string
 from .ratchet import Domain, Finding, Location
 from .runner import Diagnostics, mark_step
@@ -261,8 +262,24 @@ def _verification_counts(
     return counts, None
 
 
-def _verification_files(selected: list[str]) -> list[str]:
-    return [relative for relative in selected if relative.endswith(".py")]
+PYTHON_INTERPRETERS = ("python", "python3")
+
+
+def _is_python_program(root: Path, relative: str) -> bool:
+    if relative.endswith(".py"):
+        return True
+    try:
+        interpreter = _regular_interpreter(root / relative)
+    except OSError as error:
+        raise GateError(f"cannot read shebang of {relative}: {error}") from error
+    return interpreter in PYTHON_INTERPRETERS
+
+
+def _verification_files(root: Path, selected: list[str]) -> list[str]:
+    return [
+        relative for relative in selected
+        if _is_python_program(root, relative)
+    ]
 
 
 def _verification_domain(findings: list[Any]) -> Domain:
@@ -311,12 +328,15 @@ def _verification_measurement(
     start: float,
     prefix: str,
 ) -> Any:
-    from .checks import _select_files
+    from .checks import _ratchet_error, _select_files
 
     mark_step("file selection")
     selected, _names = _select_files(config, check, files, classes)
     mark_step("Python file selection")
-    python_files = _verification_files(selected)
+    try:
+        python_files = _verification_files(root, selected)
+    except GateError as error:
+        return _ratchet_error(check, start, prefix, error)
     return _verification_findings(
         root, check, python_files, prior, start, prefix
     )
