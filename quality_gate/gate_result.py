@@ -127,35 +127,14 @@ def _unsatisfied(result: Any | None) -> bool:
     return result is not None and not result.is_satisfied()
 
 
-def _prior_checks(config: Any, identifier: str) -> dict[str, Any]:
-    """The configured checks declared before IDENTIFIER."""
-    prior: dict[str, Any] = {}
-    for check_id, check in config.checks.items():
-        if check_id == identifier:
-            break
-        prior[check_id] = check
-    return prior
-
-
-def _check_dependencies(config: Any, identifier: str) -> list[str]:
-    """The checks IDENTIFIER depends on, as the gate runs it."""
-    from .adapters import adapter_for
-    from .checks import _test_check_dependencies
-
-    check = config.checks[identifier]
-    requires = getattr(check.spec, "requires", None)
-    descriptor = adapter_for(check.adapter)
-    if requires is None and not getattr(descriptor, "requires_tests", False):
-        return []
-    return _test_check_dependencies(check, _prior_checks(config, identifier))
-
-
 def _root_causes(
     config: Any, identifier: str, by_id: dict[str, Any]
 ) -> list[str]:
     """The root check ids an unsatisfied check's failure comes from."""
+    from .checks import _required
+
     roots: set[str] = set()
-    for required in _check_dependencies(config, identifier):
+    for required in _required(config, config.checks[identifier]):
         if _unsatisfied(by_id.get(required)):
             roots.update(_root_causes(config, required, by_id))
     if not roots:
@@ -193,12 +172,12 @@ def _obligation_causes(
     required: tuple[str, ...],
 ) -> list[str] | None:
     """An unsatisfied obligation's root causes, or null when it is a policy gap."""
-    roots: list[str] = []
+    roots: set[str] = set()
     for candidate in _candidate_checks(class_def, by_id, required):
         if by_id[candidate].is_satisfied():
             return None
-        roots.extend(_root_causes(config, candidate, by_id))
-    return list(dict.fromkeys(roots)) or None
+        roots.update(_root_causes(config, candidate, by_id))
+    return [check_id for check_id in config.checks if check_id in roots] or None
 
 
 def _obligation_entry(

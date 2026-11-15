@@ -27,6 +27,7 @@ from support import (
     assert_gate_temporary_directory,
     assert_temporary_failure,
     assert_temporary_listing_error,
+    baseline_text,
     copy_tree_writable,
     long_temporary_directory,
     output,
@@ -526,6 +527,10 @@ class PythonTestsTests(FixtureCase):
             'requires = "tests"\n'
             "threshold = 6\n"
             'baseline = "quality-gate-crap.toml"\n'
+        )
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
         )
         self.write_config(config)
         before = self.payload_digest(destination)

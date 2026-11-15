@@ -105,8 +105,7 @@ class CloneGateTests(FixtureCase):
                 baseline=baseline,
             )
         )
-        if entries is not None:
-            self.add_file(baseline, baseline_text(entries))
+        self.add_file(baseline, baseline_text(entries or []))
         return self.install_fake_jscpd(
             sarif_report(clones), **(fake or {})
         )
@@ -303,6 +302,10 @@ class CloneGateTests(FixtureCase):
 
     def test_ignore_directives_fail_before_clone_evidence(self) -> None:
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text([], check="clones"),
+        )
         (self.repo / "a.py").unlink()
         self.add_file(
             "first.py",
@@ -341,6 +344,10 @@ class CloneGateTests(FixtureCase):
 
     def test_clean_pair_of_real_sources_passes(self) -> None:
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text([], check="clones"),
+        )
         (self.repo / "a.py").unlink()
         self.add_file("first.py", DUPLICATE_FUNCTION)
         self.add_file(
@@ -417,6 +424,10 @@ class CloneGateTests(FixtureCase):
                 "[code]",
                 "[hygiene]\nmax_bytes = 12345\n\n[code]",
             )
+        )
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text([], check="clones"),
         )
         env = self.install_fake_jscpd(
             sarif_report([]), args_file=args_file
@@ -559,22 +570,33 @@ class CloneGateTests(FixtureCase):
         entry = self.single_baseline("fp1", "deliberate mirror")
         self.assertEqual(entry["files"], ["a.py", "b.py"])
 
-    def test_prune_removes_an_empty_baseline(self) -> None:
+    def test_prune_to_an_empty_baseline_keeps_the_file(self) -> None:
         env = self.clone_env(
             [],
             [{"fingerprint": "fp-old", "reason": "gone"}],
         )
         result = self.run_qg("check", "--prune", "clones", env=env)
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertFalse((self.repo / "quality-gate-clones.toml").exists())
-        self.assertIn("baseline removed", result.stdout)
-
-    def test_prune_with_absent_baseline_creates_nothing(self) -> None:
-        env = self.clone_env([])
-        result = self.run_qg("check", "--prune", "clones", env=env)
+        self.assertIn("baseline is now empty", result.stdout)
+        loaded = tomllib.loads(self.read_file("quality-gate-clones.toml"))
+        self.assertEqual(loaded["check"], "clones")
+        self.assertEqual(loaded["metric_version"], "jscpd-clone-occurrences/1")
+        self.assertNotIn("entry", loaded)
+        result = self.run_qg("check", env=env)
         self.assertEqual(result.returncode, 0, output(result))
+
+    def test_prune_with_an_absent_baseline_key_creates_nothing(self) -> None:
+        self.write_config(
+            with_clones().replace(
+                'baseline = "quality-gate-clones.toml"\n', ""
+            )
+        )
+        env = self.install_fake_jscpd(sarif_report([]))
+        result = self.run_qg("check", "--prune", "clones", env=env)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("no baseline to prune", result.stderr)
         self.assertFalse((self.repo / "quality-gate-clones.toml").exists())
-        self.assertNotIn("baseline removed", result.stdout)
+        self.assertNotIn("baseline is now empty", result.stdout)
 
     def test_prune_never_adds_or_raises_an_entry(self) -> None:
         env = self.repeated_clone_env(
@@ -607,11 +629,19 @@ class CloneGateTests(FixtureCase):
 
     def test_missing_tool_names_tools_fetch(self) -> None:
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text([], check="clones"),
+        )
         env = {"QG_TOOLS_DIR": str(self.base / "empty-tools")}
         self.clone_failure(env, "tools fetch")
 
     def test_no_files_in_clone_classes_fails(self) -> None:
         self.write_config(with_clones(classes='["empty"]'))
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text([], check="clones"),
+        )
         self.clone_failure({}, "no files selected")
 
     def test_expired_entry_no_longer_covers(self) -> None:
@@ -800,6 +830,10 @@ enforcement = "enforced"
 run = ["python3", "-c", "print('Ran 1 test in 0.001s')"]
 tests_pattern = "^Ran (\\\\d+) tests? in"
 """
+        )
+        self.add_file(
+            "quality-gate-clones.toml",
+            baseline_text([], check="clones"),
         )
         (self.repo / "a.py").unlink()
         (self.repo / "README.md").unlink()

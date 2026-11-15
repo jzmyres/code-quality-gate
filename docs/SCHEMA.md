@@ -176,8 +176,9 @@ Rules:
   uses every earlier check with that evidence. A reference to a check that
   produces no tests is a configuration error naming its id and adapter;
   for a command it also identifies the missing `tests_pattern`.
-* A baseline path must be used by exactly one check. Two checks naming the
-  same resolved path is a configuration error.
+* A baseline path must name an existing file and must be used by exactly one
+  check. A key naming a missing file, or two checks naming the same resolved
+  path, is a configuration error naming the check, the key and the path.
 * Every class named by a rule and every check named by a class must exist.
   Every code class must list at least one check.
 * `[[not_applicable]]` entries are the explicit, reasoned exemption for a
@@ -335,6 +336,11 @@ expires = 2026-12-31
 * Each extra metadata key declared by the adapter descriptor (for example clone
   `files`) is a list of strings and is preserved by `--prune`. Empty-reason
   diagnostics list present, nonempty extras in the descriptor's declared order.
+* A `baseline` key in the policy must name an existing file; one naming a
+  missing file is a configuration error when the policy loads, naming the
+  check, the key and the path. A check with no debt has no key. A consumer
+  whose policy still names a missing file must first update to a gate where
+  the key is optional, then delete the key, and only then take this version.
 * An absent baseline means no exception is accepted. An existing file with
   only the header is allowed. A `max` metric without an entry passes at or
   below its threshold. A `min` metric needs an entry: without one it is
@@ -348,7 +354,9 @@ measured `min` entry never resolves by itself; prune raises its floor to the
 measured value. Any subject absent from a completely measured domain resolves
 and is pruned, whatever its direction. An entry outside the domain is reported
 as `unmeasured` and kept; prune never drops it. A clone entry naming a file
-deleted from the repository resolves.
+deleted from the repository resolves. A baseline whose entries all resolve
+keeps its header and no entries, and prune reports that it is now empty; the
+policy's `baseline` key and the file are then deleted by hand.
 
 ## Result: `check --json`
 
@@ -565,9 +573,10 @@ A failed check is a **consequence** when the gate itself can name its cause: its
 `requires` check is unsatisfied, or, without `requires`, a check it measures tests
 from is unsatisfied (a test-measuring check depends on every earlier check that
 produces `tests` evidence). A chain resolves to its roots, deduplicated in summary
-order. An unsatisfied obligation is a consequence when at least one of the class's
-checks declares the tier's required evidence and every such candidate check is
-unsatisfied; its `caused_by` is the roots of every candidate. An obligation with no candidate
+order, which is the order of the checks in the policy. An unsatisfied obligation is a
+consequence when at least one of the class's checks declares the tier's required
+evidence and every such candidate check is unsatisfied; its `caused_by` is the roots
+of every candidate, in the same policy order. An obligation with no candidate
 check is a root, because that is a policy gap. Every other failure is a root.
 The rule is decided from the policy and the results' `satisfied` status, never
 from message text.

@@ -829,6 +829,9 @@ class WorklistRunLimitTests(FixtureCase):
         root = self.base / "tmp"
         root.mkdir()
         self.write_config(slow_config())
+        self.add_file(
+            "slow.toml", 'check = "slow"\nmetric_version = "sleep/1"\n'
+        )
         with mock.patch.dict(adapters.ADAPTERS, {SLEEP_STUB.name: SLEEP_STUB}), \
                 mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
             result = self.run_qg(

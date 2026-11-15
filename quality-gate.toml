@@ -114,13 +114,11 @@ adapter = "clones"
 tier = 1
 enforcement = "enforced"
 min_tokens = 50
-baseline = "quality-gate-clones.toml"
 
 [checks.source-chars]
 adapter = "source_chars"
 tier = 1
 enforcement = "enforced"
-baseline = "quality-gate-source-chars.toml"
 
 [checks.tests]
 adapter = "python_tests"
@@ -158,7 +156,6 @@ tier = 1
 enforcement = "enforced"
 requires = "elisp-tests"
 threshold = 6
-baseline = "quality-gate-elisp-crap.toml"
 
 [checks.elisp-compile]
 adapter = "elisp_compile"

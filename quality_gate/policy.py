@@ -612,6 +612,13 @@ def _validate_baselines(
                 f"{check.baseline} is also used by checks.{owner}",
             )
         owners[key] = name
+        if not check.baseline.exists():
+            raise _config_error(
+                path,
+                f"checks.{name}.baseline",
+                "an existing baseline file or no baseline key",
+                f"{check.baseline} does not exist",
+            )
         if validate_headers:
             _check_baseline_header(check.baseline, name, check)
 

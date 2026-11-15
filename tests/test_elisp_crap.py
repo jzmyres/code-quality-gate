@@ -112,6 +112,10 @@ class ElispCrapTests(FixtureCase):
         for path, contents in (("src/core.el", MODULE), ("tests/suite.el", SUITE)):
             self.add_file(path, contents)
         (self.repo / "a.py").unlink()
+        self.add_file(
+            "crap.toml",
+            baseline_text([], check="crap", metric_version="elisp-edebug/1"),
+        )
         self.write_config(crap_config())
 
     def run_crap(self, *args: str):

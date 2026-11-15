@@ -385,6 +385,15 @@ class ResultTests(FixtureCase):
         lock = self.base / "bad-lock.toml"
         lock.write_text('[jscpd]\nversion = "5.4.1"\n', encoding="utf-8")
         for name, text in self.adapter_configs().items():
+            self.add_file(
+                "quality-gate-clones.toml", baseline_text([], check="clones")
+            )
+            self.add_file(
+                "crap.toml",
+                baseline_text(
+                    [], check="crap", metric_version="python-lines/1"
+                ),
+            )
             with self.subTest(adapter=name):
                 self.write_config(text)
                 stdout = io.StringIO()
@@ -445,6 +454,10 @@ class FailureCauseTests(FixtureCase):
     def crap_setup(self) -> None:
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
+        )
         self.write_config(crap_config())
 
     def add_crap_failure(self) -> None:
@@ -607,6 +620,56 @@ class FailureCauseTests(FixtureCase):
             if item["class"] == "python"
         )
         self.assertIsNone(obligation["caused_by"])
+
+    def test_a_check_with_two_roots_keeps_policy_order(self) -> None:
+        self.write_config(_policy_with(
+            ("z", "a", "verification"),
+            [
+                _tests_command_block("z", "raise SystemExit(1)"),
+                _tests_command_block("a", "raise SystemExit(1)"),
+                _verification_block("verification.toml"),
+            ],
+        ))
+        self.add_file(
+            "verification.toml",
+            'check = "verification"\nmetric_version = "verification/1"\n',
+        )
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn(
+            "check: consequences (verification because z, a; "
+            "obligation python tier 1 because z, a)\n",
+            result.stderr,
+        )
+        self.assertEqual(
+            self.check_by_id(document, "verification")["caused_by"],
+            ["z", "a"],
+        )
+
+    def test_an_obligation_lists_its_causes_in_policy_order(self) -> None:
+        self.write_config(_policy_with(
+            ("c", "b", "a", "d"),
+            [
+                _tests_command_block("a", "raise SystemExit(1)"),
+                _test_chain_block("b", "a"),
+                _command_block("d", "raise SystemExit(1)"),
+                _test_chain_block("c", "d"),
+            ],
+        ))
+        result, document = self.run_with_test_chain()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("check: failed (a, d)\n", result.stderr)
+        self.assertIn(
+            "check: consequences (b because a; c because d; "
+            "obligation python tier 1 because a, d)\n",
+            result.stderr,
+        )
+        obligations = [
+            item for item in document["obligations"]
+            if item["class"] == "python"
+        ]
+        self.assertEqual(len(obligations), 1)
+        self.assertEqual(obligations[0]["caused_by"], ["a", "d"])
 
     def test_multiple_roots_are_deduplicated_in_summary_order(self) -> None:
         self.write_config(_policy_with(

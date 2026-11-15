@@ -411,6 +411,29 @@ class BaselineFileTests(unittest.TestCase):
         self.assertEqual(entries[0].expires, datetime.date(2999, 1, 1))
         self.assertEqual(entries[0].extras["files"], ["a.py", "b.py"])
 
+    def test_a_missing_baseline_file_is_an_error_naming_its_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.toml"
+            with self.assertRaises(policy.GateError) as raised:
+                ratchet.load_baseline(
+                    path, check_id="metric", metric_version="metric/1"
+                )
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("cannot read baseline", str(raised.exception))
+
+    def test_an_empty_baseline_round_trips_as_no_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            text = ratchet.write_baseline(
+                path, [], check_id="metric", metric_version="metric/1"
+            )
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), text.decode())
+            entries = ratchet.load_baseline(
+                path, check_id="metric", metric_version="metric/1"
+            )
+        self.assertEqual(entries, [])
+
     def test_header_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "baseline.toml"

@@ -258,8 +258,9 @@ invalid evidence such as a missing report or a source-count mismatch.
 `check --prune clones` lowers each surviving bound in the `clones` check to the measured occurrence count
 and drops resolved entries. It never adds an entry and never raises a bound, and it refuses (exit 1,
 writing nothing) while that
-check fails. Add a new exception by hand, with a reason. A baseline that would be empty is removed
-instead of written.
+check fails. Add a new exception by hand, with a reason. A baseline whose entries all resolve keeps
+its header and no entries, and prune prints that the baseline is now empty, so the check's `baseline`
+key and file can then be deleted by hand.
 
 ### Source-character checks
 
@@ -272,7 +273,7 @@ instead of written.
     include_untracked = true            # used when scope = "changed"
     allow = ["tab", "lf", "crlf", "form-feed-at-line-start"]
     deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
-    baseline = "quality-gate-source-chars.toml"
+    baseline = "quality-gate-source-chars.toml"  # optional; must name an existing file
 
 `source-chars` reads the files of every class that lists it and scans their actual characters. Only a
 regular file is read: a tracked symlink, FIFO, socket or device is reported as `PATH:not-scanned` and is
@@ -318,7 +319,7 @@ with an explicit escape or remove it.
     token_kinds = ["definition", "string"]
     scan_classes = ["python", "test", "config", "build", "doc"]
     exclude_paths = ["VERIFICATION.md", "plans/**", "archive/**", "CHANGELOG*"]
-    baseline = "quality-gate-removal-symmetry.toml"
+    baseline = "quality-gate-removal-symmetry.toml"  # optional; must name an existing file
 
 `removal-symmetry` reads the files of every class that lists it, takes the tokens the diff from
 `base` removed, and searches the current tree for each one. A removing path is classified from the
@@ -550,7 +551,7 @@ version in the generic `tool` object in JSON and in the human output.
     enforcement = "enforced"
     requires = "tests"                    # an earlier python_tests check id
     threshold = 6                         # optional; finite; this is the default
-    baseline = "quality-gate-crap.toml"   # the file may not exist yet
+    baseline = "quality-gate-crap.toml"   # optional; must name an existing file
 
 `python_crap` measures every function in the files of the classes that list it. `requires` must name a
 `python_tests` check declared earlier in the policy; an unknown, later or different-adapter reference is
@@ -609,7 +610,7 @@ excluded by `# pragma: no cover` inside the measured span). An added pragma is t
     enforcement = "enforced"
     requires = "legacy-tests"                  # an earlier elisp_tests check id
     threshold = 6                              # optional; finite; this is the default
-    baseline = "quality-gate-crap-legacy.toml" # the file may not exist yet
+    baseline = "quality-gate-crap-legacy.toml" # optional; must name an existing file
 
 `requires` must name an `elisp_tests` check declared earlier. Every file selected by this CRAP
 check must belong to a class that also lists the required test check, so that it was instrumented.
@@ -749,7 +750,8 @@ unsatisfied obligation for which at least one of the class's checks declares the
 evidence and every such candidate check is unsatisfied. A check's dependency is its `requires`
 check; a test-measuring check without `requires` depends on every earlier check that produces
 `tests` evidence. An obligation with no candidate check is a root, because that is a policy gap.
-Chains resolve to their roots, and a consequence can name several, deduplicated in summary order.
+Chains resolve to their roots, and a consequence can name several, deduplicated in summary order:
+the order of the checks in the policy.
 The rule is decided from the policy and the results' satisfied status, never from message text.
 The summary line `check: failed (...)` names the roots in the usual order. When consequences exist, the next line is
 `check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry is spelled as the
@@ -938,8 +940,9 @@ commit is a candidate input until its submodule path is handled by the caller. S
 * `1` - a check failed, an obligation was unsatisfied, a missing tool made a check unsupported, a
   baseline was malformed, a requested prune was refused or failed, or a trust run is `blocked` by an
   unauthorized protected path;
-* `2` - missing or invalid configuration (including a baseline header that does not match the policy or
-  two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
+* `2` - missing or invalid configuration (including a `baseline` key naming a file that does not
+  exist, a baseline header that does not match the policy, or two checks sharing a baseline path),
+  invalid command line, a repository that is not the top level of a
   git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
   `--policy-from` trusted directory, a trusted directory inside the candidate, a gate program inside
   the candidate, a protected input, tool payload or gate file that changed during the run, or a run or
@@ -992,7 +995,7 @@ and the allowed keys. The complete shape is:
     tier = 1
     enforcement = "enforced"
     min_tokens = 50                       # optional; this is the default
-    baseline = "quality-gate-clones.toml"
+    baseline = "quality-gate-clones.toml" # optional; must name an existing file
 
     [checks.source-chars]
     adapter = "source_chars"
@@ -1003,7 +1006,7 @@ and the allowed keys. The complete shape is:
     include_untracked = true              # optional; used with changed
     # allow = ["tab", "lf", "crlf", "form-feed-at-line-start"]
     # deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
-    baseline = "quality-gate-source-chars.toml"
+    baseline = "quality-gate-source-chars.toml"  # optional; must name an existing file
 
     [checks.removal-symmetry]
     adapter = "removal_symmetry"
@@ -1016,7 +1019,7 @@ and the allowed keys. The complete shape is:
     token_kinds = ["definition", "string"]  # optional; this is the fixed pair
     scan_classes = ["python", "test", "config", "build", "doc"]
     exclude_paths = ["VERIFICATION.md", "plans/**", "archive/**", "CHANGELOG*"]
-    baseline = "quality-gate-removal-symmetry.toml"
+    baseline = "quality-gate-removal-symmetry.toml"  # optional; must name an existing file
 
     [checks.tests]
     adapter = "python_tests"
@@ -1033,14 +1036,14 @@ and the allowed keys. The complete shape is:
     enforcement = "enforced"
     requires = "tests"                    # an earlier python_tests check id
     threshold = 6                         # optional; finite; this is the default
-    baseline = "quality-gate-crap.toml"
+    baseline = "quality-gate-crap.toml"   # optional; must name an existing file
 
     [checks.verification]
     adapter = "verification"
     tier = 1
     enforcement = "enforced"
     requires = "tests"                    # optional; an earlier test-producing check
-    baseline = "quality-gate-verification.toml"
+    baseline = "quality-gate-verification.toml"  # optional; must name an existing file
 
     [protect]                             # optional; used only with --policy-from
     paths = ["ruff.toml", "Makefile", ".github/workflows/*.yml"]
@@ -1088,14 +1091,14 @@ Notes:
   none executed. Its recorded ran and skipped counts are available to verification.
 * A clone check's files come from the classes that list it. Clone baselines use the generic ratchet
   format below; the old top-level `[clones]` table and the old `[[clone]]` baseline are gone.
-* A `source_chars` check may name a `baseline` path; without one it accepts no baseline
-  entries. Its files come from the classes that list it. The character table is fixed; `allow` and
-  `deny` may restate it but cannot change it. `scope` defaults
+* A `source_chars` check may name a `baseline` path, which must exist; without one it accepts no
+  baseline entries. Its files come from the classes that list it. The character table is fixed;
+  `allow` and `deny` may restate it but cannot change it. `scope` defaults
   to `all`; `changed` uses `base` (default `HEAD^`) and includes untracked files unless
   `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`.
-* A `removal_symmetry` check may name a `baseline` path; without one it accepts no baseline
-  entries. Its files come from the classes that list it and supply the diff scope; a removing path
-  is classified by rule from the diff's old path, so a
+* A `removal_symmetry` check may name a `baseline` path, which must exist; without one it accepts
+  no baseline entries. Its files come from the classes that list it and supply the diff scope; a
+  removing path is classified by rule from the diff's old path, so a
   deleted file still contributes its removals. `scan_classes` is the search domain (all classes
   when omitted), and `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults
   to `HEAD^`; `min_token_chars` defaults to 16; `search_untracked = false` removes untracked
@@ -1106,18 +1109,19 @@ Notes:
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
   with one group. Its `{python}` token and `QG_PYTHON` export are described above.
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the
-  policy, and may name a `baseline` path; without one it accepts no baseline entries. Its
-  `threshold` defaults to 6 and must be finite. Its files come from the classes that list it.
+  policy, and may name a `baseline` path, which must exist; without one it accepts no baseline
+  entries. Its `threshold` defaults to 6 and must be finite. Its files come from the classes that
+  list it.
 * An `elisp_tests` check needs a repository-relative `suite` file; `load_path`, `emacs` and
   `budget_seconds` are optional. Its measured files come from the classes that list it.
 * `elisp_compile` and `elisp_checkdoc` select files from the classes that list them. Their `load_path`,
   `emacs` and `budget_seconds` settings are optional and independent for each check.
 * An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and may name a
-  `baseline` path; without one it accepts no baseline entries. Its `threshold` defaults to 6 and
-  must be finite. Every selected file's class must list both checks.
-* A `verification` check may name a `baseline` path; without one it accepts no baseline
-  entries. Its optional `requires` names an earlier check with `tests` evidence: `python_tests`,
-  `elisp_tests`, or a `command` with `tests_pattern`.
+  `baseline` path, which must exist; without one it accepts no baseline entries. Its `threshold`
+  defaults to 6 and must be finite. Every selected file's class must list both checks.
+* A `verification` check may name a `baseline` path, which must exist; without one it accepts no
+  baseline entries. Its optional `requires` names an earlier check with `tests` evidence:
+  `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.
   A reference to a check without test evidence is a configuration error; for a command the error
   identifies its missing `tests_pattern`. Without `requires` every earlier test-producing check is used. It
   measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
@@ -1163,6 +1167,11 @@ check's identity and then holds `[[entry]]` tables:
   mismatched header is a configuration error; migration is a hand edit.
 * Two checks may not name the same baseline path, including `./PATH` aliases. That is a configuration
   error, because pruning one would drop the other's subjects.
+* A `baseline` key must name a real file; one naming a missing file is a configuration error when
+  the policy loads, naming the check, the key and the path. A check with no debt has no `baseline`
+  key, so a refusal means the path is wrong rather than the debt gone. A consumer whose policy still
+  names a missing file must first update to a gate where the key is optional, then delete the key,
+  and only then take this version. An existing file may start with only its header.
 * `subject` identifies the measured thing (a clone fingerprint, a Python function identity, or a file's
   `PATH:<module>` outside-function subject).
 * `bound` is the largest value a `max` entry accepts and the smallest value a `min` entry
@@ -1204,8 +1213,9 @@ was not selected stays unmeasured.
 
 `--prune` tightens each bound to the measured value (lowers a `max` ceiling, raises a `min` floor)
 and drops resolved entries. It never weakens a bound or adds an entry, and it refuses (exit 1, writing
-nothing) while that check is not satisfied. A new exception enters a baseline only by hand, with a
-reason. Because the clone fingerprint covers the clone's
+nothing) while that check is not satisfied. A baseline whose entries all resolve keeps its header and
+no entries, and prune says the baseline is now empty. A new exception enters a baseline only by hand,
+with a reason. Because the clone fingerprint covers the clone's
 token sequence, changing the duplicated code makes the old entry resolve and the new clone fail until a
 human accepts it.
 

@@ -237,6 +237,26 @@ class CheckTests(FixtureCase):
             (self.repo / "quality-gate-clones.toml").exists()
         )
 
+    def test_a_check_without_a_baseline_key_still_fails_on_a_finding(self) -> None:
+        self.write_config(with_clones().replace(
+            'baseline = "quality-gate-clones.toml"\n', ""
+        ))
+        self.add_file("b.py", "print('b')\n")
+        env = self.install_fake_jscpd(
+            sarif_report([("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])])
+        )
+        result, document = self.run_json(env=env)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn("new clone fp1", result.stderr)
+        check = self.check_by_id(document, "clones")
+        self.assertEqual(check["outcome"], "fail")
+        self.assertFalse(check["satisfied"])
+        self.assertEqual(len(check["findings"]), 1)
+        finding = check["findings"][0]
+        self.assertEqual(finding["subject"], "fp1")
+        self.assertIsNone(finding["bound"])
+        self.assertTrue(finding["blocking"])
+
     def test_prune_exit_rejects_refusal_even_when_the_gate_was_accepted(self) -> None:
         self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": False}), 1)
         self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": True}), 0)
@@ -282,6 +302,9 @@ class CheckTests(FixtureCase):
 
     def test_check_runs_clones_when_configured(self) -> None:
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml", baseline_text([], check="clones")
+        )
         env = self.install_fake_jscpd(sarif_report([]))
         result = self.run_qg("check", env=env)
         text = output(result)
@@ -299,6 +322,9 @@ class CheckTests(FixtureCase):
 
     def test_check_reports_clone_failure(self) -> None:
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml", baseline_text([], check="clones")
+        )
         env = self.install_fake_jscpd(
             sarif_report([("fp1", [("a.py", 1, 8), ("b.py", 1, 8)])])
         )
@@ -307,6 +333,9 @@ class CheckTests(FixtureCase):
 
     def test_check_reports_missing_tool(self) -> None:
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml", baseline_text([], check="clones")
+        )
         env = {"QG_TOOLS_DIR": str(self.base / "empty-tools")}
         self.check_failure(env, "tools fetch", "check: failed (clones)")
 
@@ -351,6 +380,9 @@ class CheckTests(FixtureCase):
     def test_check_skips_clones_when_inventory_fails(self) -> None:
         self.add_file("mystery.txt", "x\n")
         self.write_config(with_clones())
+        self.add_file(
+            "quality-gate-clones.toml", baseline_text([], check="clones")
+        )
         env = {"QG_TOOLS_DIR": str(self.base / "empty-tools")}
         self.check_failure(
             env,

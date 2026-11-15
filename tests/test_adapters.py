@@ -245,7 +245,6 @@ class StubAdapterTests(unittest.TestCase):
         self.assertEqual(ratchet._display_number(2.5, "stub"), "2.50")
 
     def test_verification_uses_every_adapter_that_produces_tests(self) -> None:
-        config = self.config(VERIFICATION_CONFIG)
         (self.root / "verification.toml").write_text(
             baseline_text(
                 [{
@@ -258,6 +257,7 @@ class StubAdapterTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        config = self.config(VERIFICATION_CONFIG)
         files = ["a.py"]
         classes = {"a.py": "python"}
         stub = checks.run_check(
@@ -285,13 +285,13 @@ class StubAdapterTests(unittest.TestCase):
         self.assertEqual(checks._baseline_entries(check), [])
 
     def test_built_in_adapter_with_an_existing_baseline_loads_it(self) -> None:
-        config = self.config(with_clones())
         (self.root / "quality-gate-clones.toml").write_text(
             baseline_text(
                 [{"subject": "fp1", "bound": 1, "reason": "reviewed"}]
             ),
             encoding="utf-8",
         )
+        config = self.config(with_clones())
         entries = checks._baseline_entries(config.checks["clones"])
         self.assertEqual(
             [(entry.subject, entry.bound, entry.reason) for entry in entries],

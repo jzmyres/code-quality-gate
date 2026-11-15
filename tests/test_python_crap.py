@@ -95,6 +95,10 @@ class PythonCrapTests(FixtureCase):
         super().setUp()
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
+        )
         self.write_config(crap_config())
 
     def add_tests(self, body: str, name: str = "test_sample") -> None:
@@ -910,6 +914,10 @@ class CoverageConfigurationAttackTests(FixtureCase):
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")
         self.add_file("pkg/risky.py", RISKY_SOURCE)
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
+        )
         self.write_config(crap_config(threshold=8))
         self.fixture_gate()
 

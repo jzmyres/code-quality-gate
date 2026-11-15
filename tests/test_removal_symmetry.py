@@ -68,6 +68,7 @@ def token_entry(subject: str, bound: int = 1) -> dict[str, Any]:
 class RemovalSymmetryCheckTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
+        self.add_file(BASELINE, removal_baseline([]))
         self.write_config(removal_config())
 
     def run_removal_check(self) -> tuple[Any, dict[str, Any], dict[str, Any]]:

@@ -388,8 +388,7 @@ def _tests_result(
 def _test_check_dependencies(
     check: CheckDef, prior: Mapping[str, CheckResult | CheckDef]
 ) -> list[str]:
-    spec = check.spec
-    requires = getattr(spec, "requires", None)
+    requires = check.spec.requires
     if requires is not None:
         return [requires]
     return [
@@ -785,22 +784,22 @@ def _write_pruned(
     result: CheckResult,
     destination: Path,
 ) -> tuple[bool, str | None]:
-    existed = destination.exists()
     try:
         assert result.ratchet is not None
+        entries = pruned_entries(result.ratchet)
         write_baseline(
             destination,
-            pruned_entries(result.ratchet),
+            entries,
             check_id=check.id,
             metric_version=check.metric_version,
         )
     except GateError as error:
         print(f"check: {check.id}: {error}", file=sys.stderr)
         return False, str(error)
-    if destination.exists():
+    if entries:
         print(f"check: {check.id}: baseline updated at {destination}")
-    elif existed:
-        print(f"check: {check.id}: baseline removed at {destination}")
+    else:
+        print(f"check: {check.id}: baseline is now empty at {destination}")
     return True, None
 
 

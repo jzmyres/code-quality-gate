@@ -1,9 +1,14 @@
 """Tests for the policy schema and inventory obligations."""
 from __future__ import annotations
 
+import importlib
+import sys
 import unittest
 
-from support import BASE_CONFIG, FixtureCase, output
+from support import BASE_CONFIG, GATE, FixtureCase, output, with_clones
+
+sys.path.insert(0, str(GATE))
+policy = importlib.import_module("quality_gate.policy")
 
 
 class PolicyTests(FixtureCase):
@@ -377,6 +382,10 @@ class PolicyTests(FixtureCase):
         )
 
     def test_two_checks_may_not_share_a_baseline_path(self) -> None:
+        self.add_file(
+            "shared.toml",
+            'check = "one"\nmetric_version = "jscpd-clone-occurrences/1"\n',
+        )
         self.config_error(
             BASE_CONFIG
             + '\n[checks.one]\nadapter = "clones"\ntier = 1\n'
@@ -387,6 +396,33 @@ class PolicyTests(FixtureCase):
             "shared.toml",
             "checks.one",
         )
+
+    def test_baseline_key_naming_a_missing_file_is_a_configuration_error(
+        self,
+    ) -> None:
+        message = self.config_error(
+            with_clones(),
+            "checks.clones.baseline",
+            "quality-gate-clones.toml",
+            "does not exist",
+        )
+        self.assertIn("existing baseline file", message)
+
+    def test_baseline_key_naming_an_existing_file_loads(self) -> None:
+        self.add_file(
+            "quality-gate-clones.toml",
+            'check = "clones"\n'
+            'metric_version = "jscpd-clone-occurrences/1"\n',
+        )
+        self.write_config(with_clones())
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
+
+    def test_this_repository_policy_loads(self) -> None:
+        config = policy.load_config(GATE)
+        for identifier in ("clones", "source-chars", "elisp-crap"):
+            with self.subTest(check=identifier):
+                self.assertIsNone(config.checks[identifier].baseline)
 
     def test_check_direction_defaults_to_max_and_accepts_min(self) -> None:
         self.write_config(BASE_CONFIG)

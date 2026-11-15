@@ -652,6 +652,10 @@ class PolicyTrustTests(TrustCase):
             "    def test_ok(self):\n"
             "        self.assertTrue(True)\n",
         )
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
+        )
         self.write_config(crap_config())
         revision = self.directory_revision()
         self.write_config(crap_config(threshold=100))

@@ -183,12 +183,10 @@ def _date_value(value: object) -> datetime.date | None:
     return None
 
 
-def _read_baseline(path: Path) -> dict[str, Any] | None:
+def _read_baseline(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as stream:
             return tomllib.load(stream)
-    except FileNotFoundError:
-        return None
     except OSError as error:
         raise GateError(f"cannot read baseline {path}: {error}") from error
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
@@ -326,8 +324,6 @@ def load_baseline(
     direction: str = "max",
 ) -> list[BaselineEntry]:
     data = _read_baseline(path)
-    if data is None:
-        return []
     for key in data:
         if key not in ("check", "metric_version", "entry"):
             raise GateError(
@@ -394,15 +390,7 @@ def write_baseline(
     *,
     check_id: str,
     metric_version: str,
-) -> bytes | None:
-    if not entries:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise GateError(f"cannot remove empty baseline {path}: {error}") from error
-        return None
+) -> bytes:
     lines = [
         f"check = {_toml_value(check_id)}",
         f"metric_version = {_toml_value(metric_version)}",

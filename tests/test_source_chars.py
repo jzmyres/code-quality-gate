@@ -178,6 +178,7 @@ class MeasurementTests(FixtureCase):
 class SourceCharsCheckTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
+        self.add_file(BASELINE, source_chars_baseline([]))
         self.write_config(source_chars_config())
 
     def run_source_check(self) -> tuple[Any, dict[str, Any], dict[str, Any]]:
