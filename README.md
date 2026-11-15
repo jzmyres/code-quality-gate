@@ -1135,11 +1135,12 @@ Notes:
   measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
   lines, inline `# noqa` comments and file-wide lint suppressions for the selected Python files, without
   running the tests again. A selected file is Python when its name ends in `.py`, or when it is a
-  regular file whose shebang interpreter is `python` or `python3` (as `env` and its options resolve),
-  so an executable Python program without the suffix is measured too. Any other selected file stays out
-  of the scan. An empty Python selection has nothing to scan, but the test counts still come
-  from every producer; without valid producer results the counts are not measured and the check is
-  unsupported. File-wide directives
+  regular file whose shebang interpreter is `python`, `python3` or `python3.N` for one or more
+  digits N (as `env` and its options resolve), so an executable Python program without the suffix
+  is measured too; `python3-config` and `pythonw` are not Python interpreters here. Any other
+  selected file stays out of the scan. An empty Python selection has nothing to scan, but the test
+  counts still come from every producer; without valid producer results the counts are not measured
+  and the check is unsupported. File-wide directives
   are counted separately as `exclusions:FILE:file-suppression`: Ruff's `# ruff: noqa`, with or without
   codes, `# ruff: file-ignore[...]`, Flake8's `# flake8: noqa` forms, and isort's `# isort: skip_file`
   (also recognized by Ruff). Directives are recognized in comment tokens, so text inside strings does

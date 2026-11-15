@@ -375,11 +375,21 @@ class VerificationTests(FindingMixin, FixtureCase):
                     [(2, 2)],
                 )
 
-    def add_rule(self, pattern: str, class_name: str = "python") -> None:
+    def add_rule(
+        self,
+        *patterns: str,
+        class_name: str = "python",
+        shebangs: str = '["python*"]',
+    ) -> None:
         self.write_config(
-            verification_config()
-            + f'\n[[rule]]\npattern = "{pattern}"\n'
-            + f'class = "{class_name}"\nreason = "selected program"\n'
+            verification_config().replace(
+                'shebangs = ["python*"]', f"shebangs = {shebangs}"
+            )
+            + "".join(
+                f'\n[[rule]]\npattern = "{pattern}"\n'
+                f'class = "{class_name}"\nreason = "selected program"\n'
+                for pattern in patterns
+            )
         )
 
     def test_a_python_program_without_the_suffix_is_scanned(self) -> None:
@@ -395,6 +405,26 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(finding["value"], 1)
         self.assertEqual(finding["bound"], None)
         self.assertIn("exclusions:program:noqa", result.stderr)
+
+    def test_a_versioned_python_interpreter_is_scanned(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "direct",
+            "#!/usr/bin/python3.12\nimport os  # noqa: F401\nVALUE = 1\n",
+        )
+        self.add_file(
+            "through-env",
+            "#!/usr/bin/env python3.13\nimport os  # noqa: F401\nVALUE = 1\n",
+        )
+        self.add_rule("direct", "through-env")
+        result, _document, check = self.failed_verification()
+        for relative in ("direct", "through-env"):
+            with self.subTest(relative=relative):
+                finding = self.finding(check, f"exclusions:{relative}:noqa")
+                self.assertEqual(finding["value"], 1)
+                self.assertEqual(finding["bound"], None)
+                self.assertIn(f"exclusions:{relative}:noqa", result.stderr)
 
     def test_a_selected_shell_script_is_not_scanned(self) -> None:
         self.add_tests(1)
@@ -414,6 +444,47 @@ class VerificationTests(FindingMixin, FixtureCase):
             ],
             output(result),
         )
+
+    def test_a_config_interpreter_is_not_a_python_program(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "configure",
+            "#!/usr/bin/env python3-config\nimport os  # noqa: F401\nVALUE = 1\n",
+        )
+        self.add_file(
+            "windowed",
+            "#!/usr/bin/env pythonw\nimport os  # noqa: F401\nVALUE = 1\n",
+        )
+        self.add_rule("configure", "windowed")
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse(
+            [
+                item["subject"]
+                for item in check["findings"]
+                if "configure" in item["subject"] or "windowed" in item["subject"]
+            ],
+            output(result),
+        )
+
+    def test_an_unreadable_selected_program_is_an_error_naming_it(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads any file, so a mode cannot make one unreadable")
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        program = self.add_file(
+            "program",
+            "#!/usr/bin/env python3.12\nVALUE = 1  # noqa: E501\n",
+        )
+        program.chmod(0o000)
+        self.addCleanup(program.chmod, 0o644)
+        self.add_rule("program", shebangs="[]")
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("cannot read shebang of program", check["reason"])
+        self.assertIn("cannot read shebang of program", result.stderr)
 
     def test_added_noqa_comment_fails(self) -> None:
         self.add_tests(1)

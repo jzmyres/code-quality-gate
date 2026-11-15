@@ -262,7 +262,7 @@ def _verification_counts(
     return counts, None
 
 
-PYTHON_INTERPRETERS = ("python", "python3")
+PYTHON_INTERPRETER = re.compile(r"python(?:3(?:\.[0-9]+)?)?")
 
 
 def _is_python_program(root: Path, relative: str) -> bool:
@@ -272,7 +272,10 @@ def _is_python_program(root: Path, relative: str) -> bool:
         interpreter = _regular_interpreter(root / relative)
     except OSError as error:
         raise GateError(f"cannot read shebang of {relative}: {error}") from error
-    return interpreter in PYTHON_INTERPRETERS
+    return (
+        interpreter is not None
+        and PYTHON_INTERPRETER.fullmatch(interpreter) is not None
+    )
 
 
 def _verification_files(root: Path, selected: list[str]) -> list[str]:
