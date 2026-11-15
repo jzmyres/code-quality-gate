@@ -95,6 +95,7 @@ supported-adapter registry, `files.py` resolves the repository and runs inventor
 `elisp_lint.py` and `elisp/qg-elisp-lint.el` run byte compilation and checkdoc,
 `verification.py` measures test counts and source exclusions,
 `source_chars.py` rejects invisible control characters in selected source,
+`removal_symmetry.py` reports removed definitions and strings that tests or docs still retain,
 `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
@@ -300,6 +301,57 @@ A file that does not decode as UTF-8 is a finding, never a pass. It uses the sub
 `PATH:decode`, reports the first invalid byte offset and its line and column, and can be baselined
 like any other subject. Do not baseline a bare CR that changes line-ending behaviour: replace it
 with an explicit escape or remove it.
+
+### Removed-token checks
+
+    [checks.removal-symmetry]
+    adapter = "removal_symmetry"
+    tier = 1
+    enforcement = "advisory"
+    scope = "changed"                   # all | changed
+    base = "HEAD^"                      # used when scope = "changed"
+    include_untracked = true
+    min_token_chars = 16
+    token_kinds = ["definition", "string"]
+    scan_classes = ["python", "test", "config", "build", "doc"]
+    exclude_paths = ["VERIFICATION.md", "plans/**", "archive/**", "CHANGELOG*"]
+    baseline = "quality-gate-removal-symmetry.toml"
+
+`removal-symmetry` reads the files of every class that lists it, takes the tokens the diff from
+`base` removed, and searches the current tree for each one. A definition is Elisp `defun`,
+`defsubst`, `defmacro`, `cl-defun`, `defvar`, `defconst` or `defcustom`, or Python `def`,
+`async def`, `class` or a module-level assignment; its name is matched on identifier boundaries. A
+string token is a single-line literal of at least `min_token_chars` characters, with its quote
+delimiters removed; escape sequences are not normalized. `token_kinds` may restate `definition` and
+`string` but cannot change that pair. Multi-line strings are not extracted.
+
+`scan_classes` is the search domain, so tests and docs can be searched even when they do not list the
+check themselves; when omitted, every class is searched. `exclude_paths` are `fnmatch` globs
+applied to both the parsed removals and the search tree; history notes, plans and changelogs belong
+there or in the baseline. The baseline file itself is never searched. With `scope = "changed"` only
+removals from files of classes that list the check are parsed; `scope = "all"` parses the whole
+diff. Both search the same `scan_classes` domain.
+`include_untracked = false` removes untracked files from that domain. An invalid base and a missing
+or undecodable scanned file are configuration errors, never passes.
+
+Each finding has a `subject` of `TOKEN@PATH`, a `value` equal to the number of remaining
+occurrences, a `location` of `PATH:LINE` for the first occurrence, and a `measurement` containing
+the token, its kind, the removing files and every occurrence. The threshold is `0`, so a justified
+remaining copy needs a baseline entry with a reason:
+
+    check = "removal-symmetry"
+    metric_version = "removal-symmetry/1"
+
+    [[entry]]
+    subject = "allow this window with@tests/test_agent_usage.py"
+    bound = 1
+    reason = "fixture intentionally exercises the old prompt; removing it would lose the negative case"
+
+The check ships `advisory`: it reports its findings with `outcome = "fail"`, but the gate decision
+is `accepted_with_exceptions` and the exit status stays `0`. It may be promoted to `enforced` only
+after replaying a commit range measures its false-positive rate and the designer decides that rate is
+acceptable. Record the measured rate and that decision with the promotion; do not pick an enforcement
+setting from one commit.
 
 ### Python tests
 
@@ -904,6 +956,19 @@ and the allowed keys. The complete shape is:
     # deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
     baseline = "quality-gate-source-chars.toml"
 
+    [checks.removal-symmetry]
+    adapter = "removal_symmetry"
+    tier = 1
+    enforcement = "advisory"
+    scope = "changed"                     # optional; all or changed
+    base = "HEAD^"                        # optional; used with changed
+    include_untracked = true              # optional
+    min_token_chars = 16                  # optional
+    token_kinds = ["definition", "string"]  # optional; this is the fixed pair
+    scan_classes = ["python", "test", "config", "build", "doc"]
+    exclude_paths = ["VERIFICATION.md", "plans/**", "archive/**", "CHANGELOG*"]
+    baseline = "quality-gate-removal-symmetry.toml"
+
     [checks.tests]
     adapter = "python_tests"
     tier = 1
@@ -978,6 +1043,11 @@ Notes:
   character table is fixed; `allow` and `deny` may restate it but cannot change it. `scope` defaults
   to `all`; `changed` uses `base` (default `HEAD^`) and includes untracked files unless
   `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`.
+* A `removal_symmetry` check needs a `baseline` path. Its files come from the classes that list it and
+  supply the diff scope; `scan_classes` is the search domain (all classes when omitted), and
+  `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults to `HEAD^`;
+  `min_token_chars` defaults to 16. `token_kinds` is the fixed pair `definition` and `string`. The
+  check ships advisory, so its findings are reported but never fail the gate.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
   with one group. Its `{python}` token and `QG_PYTHON` export are described above.
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the

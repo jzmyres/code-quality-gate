@@ -293,6 +293,30 @@ def _ratchet_result(
     )
 
 
+def _finish_ratchet(
+    check: CheckDef,
+    findings: list[Any],
+    entries: list[Any],
+    prefix: str,
+    start: float,
+    domain: Domain,
+    noun: str,
+) -> CheckResult:
+    ratchet, failure = _evaluate_ratchet(
+        findings, entries, check, prefix, domain
+    )
+    outcome = ratchet.outcome if ratchet is not None else (failure or "error")
+    result = _ratchet_result(
+        check, start, outcome, ratchet=ratchet, reason=failure
+    )
+    if ratchet is not None and ratchet.satisfied:
+        print(
+            f"{prefix}: {len(findings)} {noun} subjects within baseline",
+            flush=True,
+        )
+    return result
+
+
 def _ratchet_budget_reason(reason: str | None, execution: str, start: float) -> str | None:
     if execution == "budget" and reason is not None and "deadline:" not in reason:
         return _budget_detail(reason, start, RATCHET_BUDGET_SECONDS)

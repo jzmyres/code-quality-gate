@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .files import _git
-from .policy import ConfigError, GateError, _boolean, _string, _string_list
+from .policy import (
+    ConfigError,
+    GateError,
+    _optional_boolean,
+    _optional_string,
+    _string,
+    _string_list,
+)
 from .ratchet import Domain, Finding, Location
 from .runner import mark_step
 
@@ -34,22 +41,6 @@ class SourceCharsSpec:
     scope: str
     base: str
     include_untracked: bool
-
-
-def _optional_string(
-    raw: dict[str, Any], key: str, default: str, path: Path, full_key: str
-) -> str:
-    if key not in raw:
-        return default
-    return _string(raw, key, path, f"{full_key}.{key}")
-
-
-def _optional_boolean(
-    raw: dict[str, Any], key: str, default: bool, path: Path, full_key: str
-) -> bool:
-    if key not in raw:
-        return default
-    return _boolean(raw, key, path, f"{full_key}.{key}")
 
 
 def _scope(raw: dict[str, Any], path: Path, full_key: str) -> str:
@@ -329,26 +320,16 @@ def _source_chars_ratchet(
     prefix: str,
     start: float,
 ) -> Any:
-    from .checks import _evaluate_ratchet, _ratchet_result
+    from .checks import _finish_ratchet
 
     mark_step("source character domain analysis")
     domain = Domain.of_subjects(
         _domain_subjects(selected),
         "the selected source files and code points",
     )
-    ratchet, failure = _evaluate_ratchet(
-        findings, entries, check, prefix, domain
+    return _finish_ratchet(
+        check, findings, entries, prefix, start, domain, "character"
     )
-    outcome = ratchet.outcome if ratchet is not None else (failure or "error")
-    result = _ratchet_result(
-        check, start, outcome, ratchet=ratchet, reason=failure
-    )
-    if ratchet is not None and ratchet.satisfied:
-        print(
-            f"{prefix}: {len(findings)} character subjects within baseline",
-            flush=True,
-        )
-    return result
 
 
 def _run_source_chars(context: Any) -> Any:

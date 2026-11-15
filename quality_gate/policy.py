@@ -200,6 +200,22 @@ def _boolean(parent: dict[str, Any], key: str, path: Path, full_key: str) -> boo
     return value
 
 
+def _optional_string(
+    parent: dict[str, Any], key: str, default: str, path: Path, full_key: str
+) -> str:
+    if key not in parent:
+        return default
+    return _string(parent, key, path, f"{full_key}.{key}")
+
+
+def _optional_boolean(
+    parent: dict[str, Any], key: str, default: bool, path: Path, full_key: str
+) -> bool:
+    if key not in parent:
+        return default
+    return _boolean(parent, key, path, f"{full_key}.{key}")
+
+
 def _integer(
     parent: dict[str, Any],
     key: str,

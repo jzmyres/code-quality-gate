@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from . import (
     clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests,
-    ratchet, source_chars, verification,
+    ratchet, removal_symmetry, source_chars, verification,
 )
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -168,6 +168,18 @@ register_adapter(AdapterDescriptor(
     source_chars._run_source_chars,
     location_coverage="complete",
     subject_noun="character",
+    failure_wording="occurrences",
+))
+register_adapter(AdapterDescriptor(
+    "removal_symmetry",
+    (
+        "scope", "base", "include_untracked", "min_token_chars", "token_kinds",
+        "scan_classes", "exclude_paths", "baseline",
+    ),
+    removal_symmetry._removal_symmetry_spec,
+    removal_symmetry._run_removal_symmetry,
+    location_coverage="complete",
+    subject_noun="removed token",
     failure_wording="occurrences",
 ))
 register_adapter(AdapterDescriptor(
