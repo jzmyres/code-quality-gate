@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (
-    clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests,
-    ratchet, removal_symmetry, source_chars, verification,
+    clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_shape,
+    python_tests, ratchet, removal_symmetry, source_chars, verification,
 )
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -225,6 +225,16 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",
+))
+register_adapter(AdapterDescriptor(
+    "python_shape",
+    (
+        "scope", "base", "max_chain", "clone_min_tokens", "clone_similarity",
+        "crap_check",
+    ),
+    python_shape._python_shape_spec,
+    python_shape._run_python_shape,
+    location_coverage="complete",
 ))
 register_adapter(AdapterDescriptor(
     "elisp_crap",

@@ -607,6 +607,81 @@ Each finding carries `measurement`: `cc`, `statements`, `executed` and `excluded
 excluded by `# pragma: no cover` inside the measured span). An added pragma is therefore visible in
 `check --json`. The metric version is `python-lines/1`.
 
+### Python function shape
+
+    [checks.shape]
+    adapter = "python_shape"
+    tier = 1
+    enforcement = "enforced"
+    scope = "changed"                     # changed or tree
+    base = "HEAD"                         # required; the diff base
+    crap_check = "crap"                   # required; the id of a python_crap check
+    max_chain = 6                         # optional; this is the default
+    clone_min_tokens = 30                 # optional; 20-49; this is the default
+    clone_similarity = 0.95               # optional; 0.5-1.0; this is the default
+
+`python_shape` refuses a change that meets a CRAP threshold by fragmenting a function or shattering
+a duplicate. One parse of the selected production files feeds four structural rules, and every
+finding is enforced with no `baseline` key and no suppression: the check's threshold is `0` and each
+finding has value `1`, so any finding fails the check. The four rules are:
+
+* **CPF**, CRAP-payoff fragmentation. A function present before and after in a changed file has
+  complexity above the CRAP limit before and at most it after, and the commit adds a helper whose
+  only call site is inside that function and which no test references. The CRAP limit is the
+  `threshold` of the check named by `crap_check`, so the limit has one source.
+* **PTW-SU**, pass-through wrapper, single-use, untested. An added function's body, after an
+  optional docstring, is exactly one call (or `return CALL`, with or without `await`) that forwards
+  each of its own parameters exactly once and whose other values are constants, the callee is not
+  its own parameter, and the function has exactly one call site and no direct test. A method's
+  leading `self` or `cls` is not a parameter.
+* **SCC**, single-caller chain. Among the added functions, an edge `f -> g` exists when `g`'s only
+  call site is inside `f`; a chain deeper than `max_chain` fails, naming every function in it.
+* **LTC**, lower-threshold token clone. Two functions added by the same commit, both production and
+  neither an ancestor of the other, whose bodies share a normalised token run of
+  `clone_min_tokens` to 49 tokens at similarity at least `clone_similarity`. Tokenising the body
+  excludes the docstring and the signature, normalises identifiers to `ID`, numbers to `N` and
+  strings to `S`, and keeps keywords and operators; an f-string's data is not structure. The upper
+  bound keeps the rule in the gap the 50-token clone check does not cover.
+
+A test file is a path with a `tests/` component, a `test_*.py` name or a `*_test.py` name. Test
+files are excluded from every rule's scope, and a function is a "direct test" of a name only when a
+test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` class) names it.
+
+`scope = "changed"` evaluates only the functions the diff adds or changes, and reads the before tree
+only for CPF. `scope = "tree"` evaluates every function of the selected production files; CPF is not
+a tree property, so it still compares against `base` (a clean tree with `base = "HEAD"` has no CPF
+finding). A change the commit does not touch is never failed. A missing or invalid input is a
+configuration error, never a skipped rule: unknown keys, a `scope` other than `changed` or `tree`, a
+missing or non-existent `base`, `max_chain` below 1, `clone_min_tokens` outside 20-49,
+`clone_similarity` outside 0.5-1.0, and a `crap_check` naming no check or a check that is not a
+`python_crap` check are all rejected. An unparsable changed file or a path Git still quotes is an
+error naming it.
+
+The shapes the rules accept are deliberate. A single-use helper with a direct test passes CPF and
+PTW-SU; a helper with two call sites passes them too. A refactor that moves decisions into a data
+table adds no single-use helper, so CPF does not fire. A tested decision function plus a thin effect
+adapter is accepted when the adapter has a direct test or a second caller. That is the QF12 shape:
+its helpers are directly tested, so CPF reports nothing.
+
+Each finding's `subject` names the rule, the functions and the measured values, and the expected
+limit. The human report adds the check id and the location:
+
+    check: shape: CPF pkg/app.py:process CC 7 -> 2, helper pkg/app.py:_step (1 call site, no direct test; limit 6 CC; expected the helper to have a direct test or a second caller, or the function to stay unsplit): value 1 exceeds threshold 0 at pkg/app.py:1-5
+    check: shape: PTW-SU pkg/app.py:render_json -> json.dumps (forwards data, 2 constants, 1 call site, no direct test; limit 1 call site with no direct test; expected a direct test, a second caller, or no wrapper): value 1 exceeds threshold 0 at pkg/app.py:8-9
+    check: shape: SCC chain depth 7: pkg/chain.py:run -> pkg/chain.py:_chain_1 -> pkg/chain.py:_chain_2 -> pkg/chain.py:_chain_3 -> pkg/chain.py:_chain_4 -> pkg/chain.py:_chain_5 -> pkg/chain.py:_chain_6 (limit 6; expected at most 6 consecutive single-caller functions): value 1 exceeds threshold 0 at pkg/chain.py:1-3
+    check: shape: LTC pkg/app.py:chip_class <-> pkg/app.py:lane_class (34 normalised tokens, similarity 1.00; limit 30-49 tokens at similarity 0.95; expected no duplicated run below the clone detector's 50-token minimum): value 1 exceeds threshold 0 at pkg/app.py:1-4
+
+The `measurement` carries the measured values per rule: `rule`, `file`, `name`, `caller`, `helper`,
+`call_sites`, `direct_test`, `callee`, `forwarded`, `constants`, `cc_before`, `cc_after`, `limit`,
+`chain_depth`, `chain`, `longest`, `ratio` and `tokens`. The check reports
+`{"functions": N, "added": M}` in its measurement, so a run shows how much it measured. The metric
+version is `python-shape/1`. The adapter itself is 92 functions, scores at most CC 5, and passes all
+four rules over its own source; its highest CRAP measured over its test module is 5.4.
+
+This repository's own `quality-gate.toml` does not enable `python_shape`: the landing check runs the
+gate program at the base revision, which rejects an adapter it does not know. A later item enables
+it.
+
 ### Emacs Lisp CRAP
 
     [checks.legacy-crap]
@@ -1046,6 +1121,17 @@ and the allowed keys. The complete shape is:
     threshold = 6                         # optional; finite; this is the default
     baseline = "quality-gate-crap.toml"   # optional; must name an existing file
 
+    [checks.shape]
+    adapter = "python_shape"
+    tier = 1
+    enforcement = "enforced"
+    scope = "changed"                     # optional; changed or tree
+    base = "HEAD"                         # required; the diff base
+    crap_check = "crap"                   # required; the id of a python_crap check
+    max_chain = 6                         # optional; this is the default
+    clone_min_tokens = 30                 # optional; 20-49; this is the default
+    clone_similarity = 0.95               # optional; 0.5-1.0; this is the default
+
     [checks.verification]
     adapter = "verification"
     tier = 1
@@ -1127,6 +1213,11 @@ Notes:
 * An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and may name a
   `baseline` path, which must exist; without one it accepts no baseline entries. Its `threshold`
   defaults to 6 and must be finite. Every selected file's class must list both checks.
+* A `python_shape` check takes no `baseline` key: every finding is enforced. It requires `base`
+  and `crap_check`, and accepts `scope` (`changed` or `tree`, default `changed`), `max_chain`
+  (default 6), `clone_min_tokens` (20-49, default 30) and `clone_similarity` (0.5-1.0, default
+  0.95). Its files come from the classes that list it, minus test files, and CPF's limit is the
+  `threshold` of the `python_crap` check `crap_check` names.
 * A `verification` check may name a `baseline` path, which must exist; without one it accepts no
   baseline entries. Its optional `requires` names an earlier check with `tests` evidence:
   `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.

@@ -147,6 +147,11 @@ Rules:
   `executed = ran - skipped`, and zero executed tests fail.
 * `python_crap.requires` names an earlier `python_tests` check. Anything else
   is a configuration error.
+* `python_shape` requires `base` and `crap_check`, and has no `baseline` key. `scope`
+  is `changed` or `tree`; `crap_check` names a `python_crap` check whose `threshold`
+  is CPF's limit; `max_chain` is an integer of at least 1; `clone_min_tokens` is 20-49;
+  `clone_similarity` is a finite number in [0.5, 1.0]. An unknown or invalid value is a
+  configuration error, never a skipped rule.
 * `elisp_crap.requires` names an earlier `elisp_tests` check. Every file selected
   for CRAP must belong to a class that also lists that test check.
 * `elisp_crap.decision_rules` is an optional table overriding the
@@ -209,6 +214,7 @@ The same `tests` evidence identifies producers for verification and its
 | `elisp_checkdoc` | `static` |
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
+| `python_shape` | `duplication` |
 | `elisp_crap` | `crap` |
 | `verification` | none |
 
