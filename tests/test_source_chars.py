@@ -107,6 +107,23 @@ class MeasurementTests(FixtureCase):
         )
         self.assertEqual(len(finding.locations), 2)
 
+    def test_rejected_range_boundaries_are_exact(self) -> None:
+        rejected = ("\u0080", "\u009f", "\u202a", "\u2069")
+        allowed = ("\u00a0", "\u2065")
+        for character in rejected:
+            with self.subTest(rejected=character):
+                findings = self.findings_for(character.encode("utf-8"))
+                self.assertEqual(len(findings), 1, findings)
+                self.assertEqual(
+                    findings[0].subject,
+                    f"pkg/mod.py:U+{ord(character):04X}",
+                )
+        for character in allowed:
+            with self.subTest(allowed=character):
+                self.assertEqual(
+                    self.findings_for(character.encode("utf-8")), []
+                )
+
     def test_allowed_characters_are_not_findings(self) -> None:
         data = (
             b"tab\there\n"
@@ -140,6 +157,25 @@ class MeasurementTests(FixtureCase):
     def test_unreadable_file_is_an_error_not_a_pass(self) -> None:
         with self.assertRaises(GateError):
             measure_source_chars(self.repo, ["missing.py"])
+
+    def test_a_symlink_out_of_the_tree_is_not_scanned_and_not_read(self) -> None:
+        outside = self.base / "outside.py"
+        outside.write_bytes(b"MARKER = 1\x1b\n")
+        (self.repo / "pkg").mkdir()
+        (self.repo / "pkg" / "link.py").symlink_to(outside)
+        self.commit_all()
+        findings = measure_source_chars(self.repo, ["pkg/link.py"])
+        self.assertEqual(len(findings), 1, findings)
+        finding = findings[0]
+        self.assertEqual(finding.subject, "pkg/link.py:not-scanned")
+        self.assertEqual(finding.value, 1)
+        self.assertEqual(finding.location, "pkg/link.py")
+        self.assertEqual(finding.measurement, {"path": "pkg/link.py"})
+        self.assertIsNone(finding.locations)
+        # The outside file holds an ESC marker: reading it would report it.
+        self.assertNotIn(
+            "U+001B", "".join(item.subject for item in findings)
+        )
 
 
 class SourceCharsCheckTests(FixtureCase):
@@ -240,6 +276,39 @@ class SourceCharsCheckTests(FixtureCase):
         self.assertEqual(document["decision"], "accepted_with_exceptions")
         finding = self.finding(check, "pkg/mod.py:decode")
         self.assertTrue(finding["covered_by_baseline"])
+
+    def test_a_tracked_symlink_to_a_directory_is_reported_not_an_error(self) -> None:
+        (self.repo / "pkg").mkdir()
+        (self.repo / "pkg" / "link.py").symlink_to(self.repo / "pkg")
+        self.commit_all()
+        result, document, check = self.run_source_check()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "fail")
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ["pkg/link.py:not-scanned"],
+        )
+        self.assertEqual(document["decision"], "rejected")
+
+    def test_a_not_scanned_file_keeps_its_character_baseline_unmeasured(self) -> None:
+        outside = self.base / "outside.py"
+        outside.write_bytes(b"MARKER = 1\x1b\n")
+        (self.repo / "pkg").mkdir()
+        (self.repo / "pkg" / "link.py").symlink_to(outside)
+        self.add_file(
+            BASELINE,
+            source_chars_baseline([
+                character_entry("pkg/link.py:not-scanned"),
+                character_entry("pkg/link.py:U+001B"),
+            ]),
+        )
+        result, _document, check = self.run_source_check()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["unmeasured_baseline_entries"], ["pkg/link.py:U+001B"])
+        self.assertEqual(check["resolved_baseline_entries"], [])
+        self.assertTrue(
+            self.finding(check, "pkg/link.py:not-scanned")["covered_by_baseline"]
+        )
 
     def test_baseline_bound_rejects_an_increased_count(self) -> None:
         self.add_file("pkg/mod.py", b"\x00\x00\n")

@@ -1,12 +1,14 @@
 """Source-character lint: reject invisible control characters in source."""
 from __future__ import annotations
 
+import bisect
+import re
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .clones import _read_regular
 from .files import _git
 from .policy import (
     ConfigError,
@@ -33,6 +35,19 @@ _SUBJECT_CODES = (
     + tuple(range(0x80, 0xA0))
     + tuple(range(0x202A, 0x202F))
     + tuple(range(0x2066, 0x206A))
+)
+# One table for the rejected characters: the C0 controls except TAB, LF and
+# the two contextual ones, DEL, the C1 controls and the bidi controls.  A form
+# feed is rejected unless it starts a line; a CR is rejected unless it is part
+# of CRLF.  Data that does not decode is scanned as bytes, where only the
+# ASCII controls are meaningful and a column is a byte.
+_CONTEXT = r"|(?<=[^\n])\x0c|\r(?!\n)"
+_REJECTED = re.compile(
+    r"[\x00-\x08\x0b\x0e-\x1f\x7f\x80-\x9f\u202a-\u202e\u2066-\u2069]"
+    + _CONTEXT
+)
+_REJECTED_BYTES = re.compile(
+    rb"[\x00-\x08\x0b\x0e-\x1f\x7f]" + _CONTEXT.encode()
 )
 
 
@@ -94,130 +109,65 @@ def _source_chars_spec(
     )
 
 
-def _line_break_length(codes: list[int], index: int) -> int:
-    code = codes[index]
-    if code == 0x0A:
-        return 1
-    if code == 0x0D and index + 1 < len(codes) and codes[index + 1] == 0x0A:
-        return 2
-    return 0
-
-
-def _positions(codes: list[int]) -> Iterator[tuple[int, int, int]]:
-    line = 1
-    column = 1
-    index = 0
-    while index < len(codes):
-        length = _line_break_length(codes, index)
-        if length:
-            index += length
-            line += 1
-            column = 1
-            continue
-        yield line, column, codes[index]
-        index += 1
-        column += 1
-
-
-def _other_control(code: int) -> bool:
-    if code < 0x20:
-        return True
-    if code == 0x7F:
-        return True
-    if 0x80 <= code <= 0x9F:
-        return True
-    return 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069
-
-
-def _rejected(code: int, column: int) -> bool:
-    if code == 0x0C:
-        return column != 1
-    if code == 0x09:
-        return False
-    return _other_control(code)
-
-
-def _control_positions(codes: list[int]) -> Iterator[tuple[int, int, int]]:
-    for line, column, code in _positions(codes):
-        if _rejected(code, column):
-            yield line, column, code
-
-
-def _ascii_control(code: int) -> bool:
-    return code < 0x20 or code == 0x7F
-
-
-def _byte_control_positions(codes: list[int]) -> Iterator[tuple[int, int, int]]:
-    for line, column, code in _positions(codes):
-        if _ascii_control(code) and _rejected(code, column):
-            yield line, column, code
-
-
 def _label(code: int) -> str:
     return f"U+{code:04X}"
 
 
-def _occurrence(
-    relative: str, line: int, column: int, label: str
-) -> dict[str, Any]:
-    return {
-        "path": relative,
-        "line": line,
-        "column": column,
-        "codepoint": label,
-    }
+def _subject(relative: str, name: str) -> str:
+    return f"{relative}:{name}"
+
+
+def _line_starts(text: str | bytes) -> list[int]:
+    """The offset of each line, preceded by -1 so line 1 starts there."""
+    newline = ord("\n") if isinstance(text, bytes) else "\n"
+    return [-1] + [index for index, value in enumerate(text) if value == newline]
+
+
+def _rejected_findings(
+    relative: str, text: str | bytes, pattern: re.Pattern[Any]
+) -> list[Finding]:
+    """One finding per rejected code point, counting every occurrence."""
+    starts = _line_starts(text)
+    grouped: dict[int, list[tuple[int, int]]] = {}
+    for match in pattern.finditer(text):
+        start = match.start()
+        value = text[start]
+        code = value if isinstance(value, int) else ord(value)
+        line = bisect.bisect_left(starts, start)
+        grouped.setdefault(code, []).append((line, start - starts[line - 1]))
+    return [
+        _finding(relative, code, positions)
+        for code, positions in grouped.items()
+    ]
 
 
 def _finding(
     relative: str, code: int, positions: list[tuple[int, int]]
 ) -> Finding:
     label = _label(code)
-    first_line, first_column = positions[0]
     occurrences = [
-        _occurrence(relative, line, column, label)
+        {"path": relative, "line": line, "column": column, "codepoint": label}
         for line, column in positions
     ]
+    first_line, first_column = positions[0]
     return Finding(
-        f"{relative}:{label}",
-        len(positions),
+        _subject(relative, label),
+        len(occurrences),
         f"{relative}:{first_line}:{first_column}",
-        measurement={
-            "path": relative,
-            "line": first_line,
-            "column": first_column,
-            "codepoint": label,
-            "occurrences": occurrences,
-        },
+        measurement={**occurrences[0], "occurrences": occurrences},
         locations=tuple(
             Location(relative, line, line) for line, _column in positions
         ),
     )
 
 
-def _group_findings(
-    relative: str, positions: Iterator[tuple[int, int, int]]
-) -> list[Finding]:
-    grouped: dict[int, list[tuple[int, int]]] = {}
-    for line, column, code in positions:
-        grouped.setdefault(code, []).append((line, column))
-    return [
-        _finding(relative, code, occurrences)
-        for code, occurrences in grouped.items()
-    ]
-
-
-def _control_findings(relative: str, codes: list[int]) -> list[Finding]:
-    return _group_findings(relative, _control_positions(codes))
-
-
 def _decode_finding(
     relative: str, data: bytes, error: UnicodeDecodeError
 ) -> Finding:
-    prefix = data[: error.start]
-    line = prefix.count(b"\n") + 1
-    column = error.start - prefix.rfind(b"\n")
+    line = data.count(b"\n", 0, error.start) + 1
+    column = error.start - data.rfind(b"\n", 0, error.start)
     return Finding(
-        f"{relative}:decode",
+        _subject(relative, "decode"),
         1,
         f"{relative}:byte {error.start}",
         measurement={
@@ -231,43 +181,67 @@ def _decode_finding(
     )
 
 
-def _decode_findings(
-    relative: str, data: bytes, error: UnicodeDecodeError
-) -> list[Finding]:
-    findings = _group_findings(
-        relative, _byte_control_positions(list(data))
+def _not_scanned_finding(relative: str) -> Finding:
+    """A path the scan never read: there is no line to point at."""
+    return Finding(
+        _subject(relative, "not-scanned"),
+        1,
+        relative,
+        measurement={"path": relative},
+        locations=None,
+        kind="not-scanned",
     )
-    findings.append(_decode_finding(relative, data, error))
-    return findings
 
 
 def _file_findings(relative: str, data: bytes) -> list[Finding]:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as error:
-        return _decode_findings(relative, data, error)
-    return _control_findings(relative, [ord(character) for character in text])
+        return [
+            *_rejected_findings(relative, data, _REJECTED_BYTES),
+            _decode_finding(relative, data, error),
+        ]
+    return _rejected_findings(relative, text, _REJECTED)
 
 
 def measure_source_chars(root: Path, files: list[str]) -> list[Finding]:
     findings: list[Finding] = []
     for relative in files:
-        try:
-            data = (root / relative).read_bytes()
-        except OSError as error:
-            raise GateError(f"cannot read {relative}: {error}") from error
-        findings.extend(_file_findings(relative, data))
+        data = _read_regular(root, relative)
+        if data is None:
+            findings.append(_not_scanned_finding(relative))
+        else:
+            findings.extend(_file_findings(relative, data))
     findings.sort(key=lambda item: item.subject)
     return findings
 
 
-def _domain_subjects(files: list[str]) -> list[str]:
+def _unscanned(findings: list[Finding]) -> set[str]:
+    return {
+        finding.location
+        for finding in findings
+        if finding.kind == "not-scanned"
+    }
+
+
+def _domain_subjects(files: list[str], unscanned: set[str]) -> list[str]:
+    """The subjects the scan covered; a file it never read covers only itself.
+
+    A file that was not read cannot prove a character absent, so its
+    character subjects stay outside the domain and their baseline entries
+    are reported unmeasured and kept instead of resolved.
+    """
     subjects: list[str] = []
     for relative in files:
+        if relative in unscanned:
+            subjects.append(_subject(relative, "not-scanned"))
+            continue
         subjects.extend(
-            f"{relative}:U+{code:04X}" for code in _SUBJECT_CODES
+            _subject(relative, _label(code)) for code in _SUBJECT_CODES
         )
-        subjects.append(f"{relative}:decode")
+        subjects.extend(
+            (_subject(relative, "decode"), _subject(relative, "not-scanned"))
+        )
     return subjects
 
 
@@ -312,28 +286,8 @@ def _source_chars_measurement(context: Any) -> tuple[list[str], list[Finding]]:
     return selected, measure_source_chars(context.root, selected)
 
 
-def _source_chars_ratchet(
-    check: Any,
-    findings: list[Finding],
-    entries: list[Any],
-    selected: list[str],
-    prefix: str,
-    start: float,
-) -> Any:
-    from .checks import _finish_ratchet
-
-    mark_step("source character domain analysis")
-    domain = Domain.of_subjects(
-        _domain_subjects(selected),
-        "the selected source files and code points",
-    )
-    return _finish_ratchet(
-        check, findings, entries, prefix, start, domain, "character"
-    )
-
-
 def _run_source_chars(context: Any) -> Any:
-    from .checks import _baseline_entries, _ratchet_error
+    from .checks import _baseline_entries, _finish_ratchet, _ratchet_error
 
     check = context.check
     start = time.monotonic()
@@ -346,6 +300,11 @@ def _run_source_chars(context: Any) -> Any:
         entries = _baseline_entries(check)
     except GateError as error:
         return _ratchet_error(check, start, context.prefix, error)
-    return _source_chars_ratchet(
-        check, findings, entries, selected, context.prefix, start
+    mark_step("source character domain analysis")
+    domain = Domain.of_subjects(
+        _domain_subjects(selected, _unscanned(findings)),
+        "the selected source files and code points",
+    )
+    return _finish_ratchet(
+        check, findings, entries, context.prefix, start, domain, "character"
     )

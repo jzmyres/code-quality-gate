@@ -274,7 +274,9 @@ instead of written.
     deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
     baseline = "quality-gate-source-chars.toml"
 
-`source-chars` reads the files of every class that lists it and scans their actual characters.
+`source-chars` reads the files of every class that lists it and scans their actual characters. Only a
+regular file is read: a tracked symlink, FIFO, socket or device is reported as `PATH:not-scanned` and is
+never followed and never read, and that subject gates like any other.
 The table is fixed: TAB, LF, and CR only as part of CRLF are allowed; a form feed is allowed only at
 the start of a line as an Emacs page separator. NUL and the other C0 controls, bare CR, ESC, DEL,
 C1 controls (`U+0080`–`U+009F`), and bidi controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`) are
@@ -286,8 +288,9 @@ when enabled, untracked files. An invalid base is a check error, never a pass.
 
 Each finding has a `subject` of `PATH:U+XXXX`, a `value` equal to the number of occurrences, a
 `location` of `PATH:LINE:COLUMN` for the first occurrence, and a `measurement` containing that same
-path, line, column and code point plus every occurrence. The threshold is `0`, so a new subject needs
-a baseline entry with a reason:
+path, line, column and code point plus every occurrence. A `PATH:not-scanned` finding has the path as
+its `location` and no line, and its `measurement` holds only that path. The threshold is `0`, so a new
+subject needs a baseline entry with a reason:
 
     check = "source-chars"
     metric_version = "source-chars/1"
