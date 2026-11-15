@@ -16,34 +16,37 @@ paths = ["ruff.toml"]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "tests", "crap", "verification"]
+checks = ["ruff", "clones", "tests", "crap", "verification", "source-chars"]
 
 [classes.test]
 code = true
 description = "Python tests that execute the gate on fixture repositories"
-checks = ["ruff", "clones", "tests", "verification"]
+checks = ["ruff", "clones", "tests", "verification", "source-chars"]
 
 [classes.elisp]
 code = true
 description = "Emacs Lisp measurement helpers, measured by the gate's own Elisp checks"
-checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc"]
+checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars"]
 
 [classes.elisp-suite]
 code = true
 description = "The ERT suite that exercises the Emacs Lisp helpers"
-checks = ["elisp-compile", "elisp-checkdoc"]
+checks = ["elisp-compile", "elisp-checkdoc", "source-chars"]
 
 [classes.config]
 code = false
 description = "Configuration, lock files and ignore rules"
+checks = ["source-chars"]
 
 [classes.build]
 code = false
 description = "Self-check orchestration"
+checks = ["source-chars"]
 
 [classes.doc]
 code = false
 description = "Documentation and plans"
+checks = ["source-chars"]
 
 [[rule]]
 pattern = "qg.py"
@@ -112,6 +115,12 @@ tier = 1
 enforcement = "enforced"
 min_tokens = 50
 baseline = "quality-gate-clones.toml"
+
+[checks.source-chars]
+adapter = "source_chars"
+tier = 1
+enforcement = "enforced"
+baseline = "quality-gate-source-chars.toml"
 
 [checks.tests]
 adapter = "python_tests"
