@@ -85,7 +85,11 @@ class AdapterDescriptor:
         return self.default_direction or configured
 
 
-def _baseline(raw: dict[str, Any], root: Path, path: Path, full_key: str) -> Path:
+def _baseline(
+    raw: dict[str, Any], root: Path, path: Path, full_key: str
+) -> Path | None:
+    if "baseline" not in raw:
+        return None
     name = _string(raw, "baseline", path, f"{full_key}.baseline")
     baseline = Path(name)
     if not baseline.is_absolute():

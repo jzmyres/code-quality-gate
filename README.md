@@ -744,12 +744,14 @@ as skipped and the combined check still fails; hygiene still runs. Configuration
 any check starts.
 
 A rejected run's stderr summary lists only its **root** failures. A failure is a consequence when the
-gate itself can name its cause: an unsatisfied check whose `requires` check is unsatisfied, or an
+gate itself can name its cause: an unsatisfied check whose dependency is unsatisfied, or an
 unsatisfied obligation for which at least one of the class's checks declares the tier's required
-evidence and every such candidate check is unsatisfied. An obligation with no candidate check is a root,
-because that is a policy gap. Chains resolve to their root, and the rule is decided from the policy and
-the results' satisfied status, never from message text. The summary line
-`check: failed (...)` names the roots in the usual order. When consequences exist, the next line is
+evidence and every such candidate check is unsatisfied. A check's dependency is its `requires`
+check; a test-measuring check without `requires` depends on every earlier check that produces
+`tests` evidence. An obligation with no candidate check is a root, because that is a policy gap.
+Chains resolve to their roots, and a consequence can name several, deduplicated in summary order.
+The rule is decided from the policy and the results' satisfied status, never from message text.
+The summary line `check: failed (...)` names the roots in the usual order. When consequences exist, the next line is
 `check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry is spelled as the
 summary spells it and `CAUSE` is a root check id. A consequence still rejects and still exits 1.
 
@@ -1086,12 +1088,14 @@ Notes:
   none executed. Its recorded ran and skipped counts are available to verification.
 * A clone check's files come from the classes that list it. Clone baselines use the generic ratchet
   format below; the old top-level `[clones]` table and the old `[[clone]]` baseline are gone.
-* A `source_chars` check needs a `baseline` path. Its files come from the classes that list it. The
-  character table is fixed; `allow` and `deny` may restate it but cannot change it. `scope` defaults
+* A `source_chars` check may name a `baseline` path; without one it accepts no baseline
+  entries. Its files come from the classes that list it. The character table is fixed; `allow` and
+  `deny` may restate it but cannot change it. `scope` defaults
   to `all`; `changed` uses `base` (default `HEAD^`) and includes untracked files unless
   `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`.
-* A `removal_symmetry` check needs a `baseline` path. Its files come from the classes that list it and
-  supply the diff scope; a removing path is classified by rule from the diff's old path, so a
+* A `removal_symmetry` check may name a `baseline` path; without one it accepts no baseline
+  entries. Its files come from the classes that list it and supply the diff scope; a removing path
+  is classified by rule from the diff's old path, so a
   deleted file still contributes its removals. `scan_classes` is the search domain (all classes
   when omitted), and `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults
   to `HEAD^`; `min_token_chars` defaults to 16; `search_untracked = false` removes untracked
@@ -1102,16 +1106,18 @@ Notes:
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
   with one group. Its `{python}` token and `QG_PYTHON` export are described above.
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the
-  policy, and a `baseline` path. Its `threshold` defaults to 6 and must be finite. Its files come from
-  the classes that list it.
+  policy, and may name a `baseline` path; without one it accepts no baseline entries. Its
+  `threshold` defaults to 6 and must be finite. Its files come from the classes that list it.
 * An `elisp_tests` check needs a repository-relative `suite` file; `load_path`, `emacs` and
   `budget_seconds` are optional. Its measured files come from the classes that list it.
 * `elisp_compile` and `elisp_checkdoc` select files from the classes that list them. Their `load_path`,
   `emacs` and `budget_seconds` settings are optional and independent for each check.
-* An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and a `baseline` path.
-  Its `threshold` defaults to 6 and must be finite. Every selected file's class must list both checks.
-* A `verification` check needs a `baseline` path. Its optional `requires` names an earlier check with
-  `tests` evidence: `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.
+* An `elisp_crap` check needs `requires`, naming an earlier `elisp_tests` check, and may name a
+  `baseline` path; without one it accepts no baseline entries. Its `threshold` defaults to 6 and
+  must be finite. Every selected file's class must list both checks.
+* A `verification` check may name a `baseline` path; without one it accepts no baseline
+  entries. Its optional `requires` names an earlier check with `tests` evidence: `python_tests`,
+  `elisp_tests`, or a `command` with `tests_pattern`.
   A reference to a check without test evidence is a configuration error; for a command the error
   identifies its missing `tests_pattern`. Without `requires` every earlier test-producing check is used. It
   measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
@@ -1139,8 +1145,9 @@ Notes:
 
 An adapter that measures subjects returns findings with a `subject`, a numeric `value` and a
 `location`. The policy gives the check's `threshold` (clones use `0`, so the value is the number of
-extra occurrences) and, for measuring adapters, a `baseline` path. A baseline begins with the check's
-identity and then holds `[[entry]]` tables:
+extra occurrences) and, for measuring adapters, an optional `baseline` path. A check with no debt
+needs no `baseline` key: without it the check accepts no baseline entries. A baseline begins with the
+check's identity and then holds `[[entry]]` tables:
 
     check = "clones"
     metric_version = "jscpd-clone-occurrences/1"

@@ -596,6 +596,23 @@ class StubFloorTrustTests(TrustCase):
                     self.assertEqual(ratchet.pruned_entries(result)[0].bound, value)
 
 
+class NoBaselineTrustTests(TrustCase):
+    def test_a_check_without_a_baseline_has_no_protected_baseline(self) -> None:
+        self.write_config(with_clones().replace(
+            'baseline = "quality-gate-clones.toml"\n', ""
+        ))
+        directory = self.directory_revision()
+        prepared = prepare_trust(self.repo, directory, [])
+        self.addCleanup(prepared.close)
+        check = prepared.config.checks["clones"]
+        self.assertIsNone(check.baseline)
+        self.assertIsNone(check.effective_baseline)
+        self.assertFalse(any(
+            item.path == "quality-gate-clones.toml"
+            for item in prepared.protected
+        ))
+
+
 class PolicyTrustTests(TrustCase):
     def test_historical_package_lock_remains_usable(self) -> None:
         lock = (

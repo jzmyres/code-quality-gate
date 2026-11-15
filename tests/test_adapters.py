@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import GATE, baseline_text, stub_check_result
+from support import GATE, baseline_text, stub_check_result, with_clones
 
 sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
@@ -273,6 +273,29 @@ class StubAdapterTests(unittest.TestCase):
         self.assertIn(
             "tests:stub:executed",
             [finding.subject for finding in verification.findings],
+        )
+
+    def test_built_in_adapter_without_a_baseline_accepts_no_entries(self) -> None:
+        text = with_clones().replace(
+            'baseline = "quality-gate-clones.toml"\n', ""
+        )
+        config = self.config(text)
+        check = config.checks["clones"]
+        self.assertIsNone(check.baseline)
+        self.assertEqual(checks._baseline_entries(check), [])
+
+    def test_built_in_adapter_with_an_existing_baseline_loads_it(self) -> None:
+        config = self.config(with_clones())
+        (self.root / "quality-gate-clones.toml").write_text(
+            baseline_text(
+                [{"subject": "fp1", "bound": 1, "reason": "reviewed"}]
+            ),
+            encoding="utf-8",
+        )
+        entries = checks._baseline_entries(config.checks["clones"])
+        self.assertEqual(
+            [(entry.subject, entry.bound, entry.reason) for entry in entries],
+            [("fp1", 1, "reviewed")],
         )
 
     def test_any_adapter_can_report_its_tool_identity(self) -> None:

@@ -80,6 +80,52 @@ def _chain_block(identifier: str, requires: str) -> str:
     ])
 
 
+def _parse_test_chain(raw, root, path, full_key):
+    requires = policy._string(raw, "requires", path, f"{full_key}.requires")
+    return adapters.ParsedSpec(
+        SimpleNamespace(requires=requires), "chain/1", ("tests",),
+        requires=requires,
+    )
+
+
+TEST_CHAIN_STUB = adapters.AdapterDescriptor(
+    "test-chain-stub", ("requires",), _parse_test_chain, _run_chain,
+)
+
+
+def _test_chain_block(identifier: str, requires: str) -> str:
+    return "\n".join([
+        f"[checks.{identifier}]",
+        'adapter = "test-chain-stub"',
+        "tier = 1",
+        'enforcement = "enforced"',
+        f'requires = "{requires}"',
+    ])
+
+
+def _tests_command_block(
+    identifier: str, source: str, enforcement: str = "enforced"
+) -> str:
+    return "\n".join([
+        f"[checks.{identifier}]",
+        'adapter = "command"',
+        "tier = 1",
+        f'enforcement = "{enforcement}"',
+        f"run = {json.dumps(['python3', '-c', source])}",
+        "tests_pattern = '^Ran ([0-9]+) tests? in'",
+    ])
+
+
+def _verification_block(baseline: str) -> str:
+    return "\n".join([
+        "[checks.verification]",
+        'adapter = "verification"',
+        "tier = 1",
+        'enforcement = "enforced"',
+        f'baseline = "{baseline}"',
+    ])
+
+
 class ResultTests(FixtureCase):
     def test_json_has_every_documented_field(self) -> None:
         self.commit_all()
@@ -390,6 +436,12 @@ class FailureCauseTests(FixtureCase):
             "        self.assertTrue(False)\n",
         )
 
+    def run_with_test_chain(self):
+        with mock.patch.dict(
+            adapters.ADAPTERS, {TEST_CHAIN_STUB.name: TEST_CHAIN_STUB}
+        ):
+            return self.run_json()
+
     def crap_setup(self) -> None:
         (self.repo / "a.py").unlink()
         self.add_file("pkg/__init__.py", "")
@@ -468,6 +520,130 @@ class FailureCauseTests(FixtureCase):
         self.assertIsNone(self.check_by_id(document, "a")["caused_by"])
         self.assertEqual(self.check_by_id(document, "b")["caused_by"], ["a"])
         self.assertEqual(self.check_by_id(document, "c")["caused_by"], ["a"])
+
+    def test_implicit_verification_dependency_is_a_consequence_of_the_suite(
+        self,
+    ) -> None:
+        self.write_config(_policy_with(
+            ("tests", "verification"),
+            [
+                _tests_command_block("tests", "print('no test summary')"),
+                _verification_block("verification.toml"),
+            ],
+        ))
+        self.add_file(
+            "verification.toml",
+            'check = "verification"\nmetric_version = "verification/1"\n',
+        )
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn("check: failed (tests)\n", result.stderr)
+        self.assertIn(
+            "check: consequences (verification because tests; "
+            "obligation python tier 1 because tests)\n",
+            result.stderr,
+        )
+        self.assertNotIn("check: failed (tests, verification)", result.stderr)
+        self.assertEqual(
+            self.check_by_id(document, "verification")["caused_by"], ["tests"]
+        )
+        obligation = next(
+            item for item in document["obligations"]
+            if item["class"] == "python"
+        )
+        self.assertEqual(obligation["caused_by"], ["tests"])
+
+    def test_an_obligation_whose_candidate_is_a_consequence_names_the_root(
+        self,
+    ) -> None:
+        self.write_config(_policy_with(
+            ("root", "dependent"),
+            [
+                _command_block("root", "raise SystemExit(1)"),
+                _test_chain_block("dependent", "root"),
+            ],
+        ))
+        result, document = self.run_with_test_chain()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn("check: failed (root)\n", result.stderr)
+        self.assertIn(
+            "check: consequences (dependent because root; "
+            "obligation python tier 1 because root)\n",
+            result.stderr,
+        )
+        self.assertEqual(
+            self.check_by_id(document, "dependent")["caused_by"], ["root"]
+        )
+        obligation = next(
+            item for item in document["obligations"]
+            if item["class"] == "python"
+        )
+        self.assertEqual(obligation["caused_by"], ["root"])
+
+    def test_an_obligation_with_a_satisfied_candidate_is_a_root(self) -> None:
+        self.write_config(_policy_with(
+            ("zero", "failed"),
+            [
+                _tests_command_block(
+                    "zero", "print('Ran 0 tests in 0.1s')", "advisory"
+                ),
+                _tests_command_block(
+                    "failed", "raise SystemExit(1)"
+                ),
+            ],
+        ))
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn(
+            "check: failed (failed, obligation python tier 1)\n",
+            result.stderr,
+        )
+        self.assertNotIn("obligation python tier 1 because", result.stderr)
+        obligation = next(
+            item for item in document["obligations"]
+            if item["class"] == "python"
+        )
+        self.assertIsNone(obligation["caused_by"])
+
+    def test_multiple_roots_are_deduplicated_in_summary_order(self) -> None:
+        self.write_config(_policy_with(
+            ("a", "b", "d", "c", "verification"),
+            [
+                _tests_command_block("a", "raise SystemExit(1)"),
+                _test_chain_block("b", "a"),
+                _command_block("d", "raise SystemExit(1)"),
+                _test_chain_block("c", "d"),
+                _verification_block("verification.toml"),
+            ],
+        ))
+        self.add_file(
+            "verification.toml",
+            'check = "verification"\nmetric_version = "verification/1"\n',
+        )
+        result, document = self.run_with_test_chain()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn("check: failed (a, d)\n", result.stderr)
+        self.assertIn(
+            "check: consequences (b because a; c because d; "
+            "verification because a, d; "
+            "obligation python tier 1 because a, d)\n",
+            result.stderr,
+        )
+        self.assertEqual(self.check_by_id(document, "b")["caused_by"], ["a"])
+        self.assertEqual(self.check_by_id(document, "c")["caused_by"], ["d"])
+        self.assertEqual(
+            self.check_by_id(document, "verification")["caused_by"],
+            ["a", "d"],
+        )
+        obligation = next(
+            item for item in document["obligations"]
+            if item["class"] == "python"
+        )
+        self.assertEqual(obligation["caused_by"], ["a", "d"])
 
 
 if __name__ == "__main__":

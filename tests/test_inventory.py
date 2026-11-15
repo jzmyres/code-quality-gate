@@ -944,7 +944,7 @@ class InventoryTests(FixtureCase):
         self.assertIn("checks.bad.min_tokens", text)
         self.assertIn(">= 1", text)
 
-    def test_check_missing_baseline_exits_2(self) -> None:
+    def test_check_without_baseline_is_accepted(self) -> None:
         self.write_config(
             BASE_CONFIG
             + '\n[checks.bad]\nadapter = "clones"\ntier = 1\n'
@@ -952,9 +952,8 @@ class InventoryTests(FixtureCase):
         )
         result = self.run_qg("inventory")
         text = output(result)
-        self.assertEqual(result.returncode, 2, text)
-        self.assertIn("checks.bad.baseline", text)
-        self.assertIn("missing", text)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertNotIn("checks.bad.baseline", text)
 
     def test_check_unknown_key_exits_2(self) -> None:
         self.write_config(

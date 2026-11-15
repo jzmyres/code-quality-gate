@@ -173,7 +173,8 @@ def _class_text(names: list[str]) -> str:
 def _baseline_entries(check: CheckDef) -> list[BaselineEntry]:
     if check.effective_baseline is not None:
         return list(check.effective_baseline)
-    assert check.baseline is not None
+    if check.baseline is None:
+        return []
     descriptor = adapter_for(check.adapter)
     extras = descriptor.extras if descriptor is not None else ()
     return load_baseline(
@@ -388,8 +389,9 @@ def _test_check_dependencies(
     check: CheckDef, prior: Mapping[str, CheckResult | CheckDef]
 ) -> list[str]:
     spec = check.spec
-    if spec.requires is not None:
-        return [spec.requires]
+    requires = getattr(spec, "requires", None)
+    if requires is not None:
+        return [requires]
     return [
         identifier
         for identifier, result in prior.items()

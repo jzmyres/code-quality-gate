@@ -123,25 +123,44 @@ def _candidate_checks(
     ]
 
 
-def _required_check(config: Any, identifier: str) -> str | None:
-    check = config.checks.get(identifier)
-    return None if check is None else getattr(check.spec, "requires", None)
-
-
 def _unsatisfied(result: Any | None) -> bool:
     return result is not None and not result.is_satisfied()
+
+
+def _prior_checks(config: Any, identifier: str) -> dict[str, Any]:
+    """The configured checks declared before IDENTIFIER."""
+    prior: dict[str, Any] = {}
+    for check_id, check in config.checks.items():
+        if check_id == identifier:
+            break
+        prior[check_id] = check
+    return prior
+
+
+def _check_dependencies(config: Any, identifier: str) -> list[str]:
+    """The checks IDENTIFIER depends on, as the gate runs it."""
+    from .adapters import adapter_for
+    from .checks import _test_check_dependencies
+
+    check = config.checks[identifier]
+    requires = getattr(check.spec, "requires", None)
+    descriptor = adapter_for(check.adapter)
+    if requires is None and not getattr(descriptor, "requires_tests", False):
+        return []
+    return _test_check_dependencies(check, _prior_checks(config, identifier))
 
 
 def _root_causes(
     config: Any, identifier: str, by_id: dict[str, Any]
 ) -> list[str]:
     """The root check ids an unsatisfied check's failure comes from."""
-    current = identifier
-    while True:
-        required = _required_check(config, current)
-        if required is None or not _unsatisfied(by_id.get(required)):
-            return [current]
-        current = required
+    roots: set[str] = set()
+    for required in _check_dependencies(config, identifier):
+        if _unsatisfied(by_id.get(required)):
+            roots.update(_root_causes(config, required, by_id))
+    if not roots:
+        return [identifier]
+    return [check_id for check_id in config.checks if check_id in roots]
 
 
 def _check_causes(

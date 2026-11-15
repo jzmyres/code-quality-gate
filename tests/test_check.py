@@ -226,6 +226,17 @@ class CheckTests(FixtureCase):
             self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(marker.read_text(encoding="utf-8"), "xx")
 
+    def test_prune_without_a_baseline_key_writes_no_file(self) -> None:
+        self.write_config(with_clones().replace(
+            'baseline = "quality-gate-clones.toml"\n', ""
+        ))
+        result = self.run_qg("check", "--prune", "clones")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("check: clones: no baseline to prune", result.stderr)
+        self.assertFalse(
+            (self.repo / "quality-gate-clones.toml").exists()
+        )
+
     def test_prune_exit_rejects_refusal_even_when_the_gate_was_accepted(self) -> None:
         self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": False}), 1)
         self.assertEqual(checks._decision_exit_code("accepted", "clones", {"performed": True}), 0)

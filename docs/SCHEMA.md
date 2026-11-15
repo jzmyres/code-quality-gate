@@ -562,10 +562,12 @@ obligation's consequence, or null for a root and for a satisfied entry.
 ### Roots and consequences
 
 A failed check is a **consequence** when the gate itself can name its cause: its
-`requires` check is unsatisfied. A chain resolves to its roots. An unsatisfied
-obligation is a consequence when at least one of the class's checks declares the
-tier's required evidence and every such candidate check is unsatisfied; its
-`caused_by` is the roots of every candidate. An obligation with no candidate
+`requires` check is unsatisfied, or, without `requires`, a check it measures tests
+from is unsatisfied (a test-measuring check depends on every earlier check that
+produces `tests` evidence). A chain resolves to its roots, deduplicated in summary
+order. An unsatisfied obligation is a consequence when at least one of the class's
+checks declares the tier's required evidence and every such candidate check is
+unsatisfied; its `caused_by` is the roots of every candidate. An obligation with no candidate
 check is a root, because that is a policy gap. Every other failure is a root.
 The rule is decided from the policy and the results' `satisfied` status, never
 from message text.
