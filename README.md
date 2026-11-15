@@ -93,8 +93,9 @@ supported-adapter registry, `files.py` resolves the repository and runs inventor
 `elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `elisp_crap.py` and
 `elisp/qg-elisp-complexity.el` join that coverage with the Emacs Lisp default or policy decision rules,
 `elisp_lint.py` and `elisp/qg-elisp-lint.el` run byte compilation and checkdoc,
-`verification.py` measures test counts and source
-exclusions, `coverage_tool.py` loads and combines the pinned wheel's data,
+`verification.py` measures test counts and source exclusions,
+`source_chars.py` rejects invisible control characters in selected source,
+`coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
 `--policy-from` protected inputs, effective inputs and run identity, and `cli.py` holds the
@@ -258,6 +259,47 @@ and drops resolved entries. It never adds an entry and never raises a bound, and
 writing nothing) while that
 check fails. Add a new exception by hand, with a reason. A baseline that would be empty is removed
 instead of written.
+
+### Source-character checks
+
+    [checks.source-chars]
+    adapter = "source_chars"
+    tier = 1
+    enforcement = "enforced"
+    scope = "all"                       # all | changed
+    base = "HEAD^"                      # used when scope = "changed"
+    include_untracked = true            # used when scope = "changed"
+    allow = ["tab", "lf", "crlf", "form-feed-at-line-start"]
+    deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
+    baseline = "quality-gate-source-chars.toml"
+
+`source-chars` reads the files of every class that lists it and scans their actual characters.
+The table is fixed: TAB, LF, and CR only as part of CRLF are allowed; a form feed is allowed only at
+the start of a line as an Emacs page separator. NUL and the other C0 controls, bare CR, ESC, DEL,
+C1 controls (`U+0080`–`U+009F`), and bidi controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`) are
+rejected. The two-character escape `\r` is text, not a CR byte, and is not flagged. `allow` and `deny`
+name the standard table and may be omitted; any other values are a configuration error, so the table
+cannot be tuned to one case. `scope = "all"` is the default and scans the whole selected tree; the
+scan is cheap enough for every run. `scope = "changed"` limits it to files changed from `base` and,
+when enabled, untracked files. An invalid base is a check error, never a pass.
+
+Each finding has a `subject` of `PATH:U+XXXX`, a `value` equal to the number of occurrences, a
+`location` of `PATH:LINE:COLUMN` for the first occurrence, and a `measurement` containing that same
+path, line, column and code point plus every occurrence. The threshold is `0`, so a new subject needs
+a baseline entry with a reason:
+
+    check = "source-chars"
+    metric_version = "source-chars/1"
+
+    [[entry]]
+    subject = "tests/fixtures/page-break.el:U+000C"
+    bound = 2
+    reason = "Emacs page separators in a fixture, not control data"
+
+A file that does not decode as UTF-8 is a finding, never a pass. It uses the subject
+`PATH:decode`, reports the first invalid byte offset and its line and column, and can be baselined
+like any other subject. Do not baseline a bare CR that changes line-ending behaviour: replace it
+with an explicit escape or remove it.
 
 ### Python tests
 
@@ -851,6 +893,17 @@ and the allowed keys. The complete shape is:
     min_tokens = 50                       # optional; this is the default
     baseline = "quality-gate-clones.toml"
 
+    [checks.source-chars]
+    adapter = "source_chars"
+    tier = 1
+    enforcement = "enforced"
+    scope = "all"                         # optional; all or changed
+    base = "HEAD^"                        # optional; used with changed
+    include_untracked = true              # optional; used with changed
+    # allow = ["tab", "lf", "crlf", "form-feed-at-line-start"]
+    # deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
+    baseline = "quality-gate-source-chars.toml"
+
     [checks.tests]
     adapter = "python_tests"
     tier = 1
@@ -921,6 +974,10 @@ Notes:
   none executed. Its recorded ran and skipped counts are available to verification.
 * A clone check's files come from the classes that list it. Clone baselines use the generic ratchet
   format below; the old top-level `[clones]` table and the old `[[clone]]` baseline are gone.
+* A `source_chars` check needs a `baseline` path. Its files come from the classes that list it. The
+  character table is fixed; `allow` and `deny` may restate it but cannot change it. `scope` defaults
+  to `all`; `changed` uses `base` (default `HEAD^`) and includes untracked files unless
+  `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
   with one group. Its `{python}` token and `QG_PYTHON` export are described above.
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the

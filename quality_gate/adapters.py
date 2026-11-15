@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from . import (
     clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_tests,
-    ratchet, verification,
+    ratchet, source_chars, verification,
 )
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -160,6 +160,15 @@ register_adapter(AdapterDescriptor(
     subject_noun="clone",
     failure_wording="occurrences",
     extras=("files",),
+))
+register_adapter(AdapterDescriptor(
+    "source_chars",
+    ("scope", "base", "include_untracked", "allow", "deny", "baseline"),
+    source_chars._source_chars_spec,
+    source_chars._run_source_chars,
+    location_coverage="complete",
+    subject_noun="character",
+    failure_wording="occurrences",
 ))
 register_adapter(AdapterDescriptor(
     "python_tests",
