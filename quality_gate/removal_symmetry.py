@@ -9,15 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .files import _git
+from .files import _git, _untracked_files
 from .policy import (
-    ConfigError,
     GateError,
+    Rule,
     _integer,
+    _names,
     _optional_boolean,
     _optional_string,
     _optional_string_list,
-    _string,
+    _scope,
     _string_list,
 )
 from .ratchet import Domain, Finding, Location
@@ -44,35 +45,11 @@ _ELISP_DEF = re.compile(
 class RemovalSymmetrySpec:
     scope: str
     base: str
-    include_untracked: bool
+    search_untracked: bool
     min_token_chars: int
     token_kinds: tuple[str, ...]
     scan_classes: tuple[str, ...] | None
     exclude_paths: tuple[str, ...]
-
-
-def _scope(raw: dict[str, Any], path: Path, full_key: str) -> str:
-    if "scope" not in raw:
-        return "changed"
-    scope = _string(raw, "scope", path, f"{full_key}.scope")
-    if scope not in ("all", "changed"):
-        raise ConfigError(
-            f"{path}: {full_key}.scope: expected one of all, changed; "
-            f"got {scope!r}"
-        )
-    return scope
-
-
-def _token_kinds(raw: dict[str, Any], path: Path, full_key: str) -> tuple[str, ...]:
-    if "token_kinds" not in raw:
-        return TOKEN_KINDS
-    values = _string_list(raw, "token_kinds", path, f"{full_key}.token_kinds")
-    if set(values) != set(TOKEN_KINDS) or len(values) != len(TOKEN_KINDS):
-        raise ConfigError(
-            f"{path}: {full_key}.token_kinds: expected exactly "
-            f"{', '.join(TOKEN_KINDS)}; got {', '.join(values) or 'nothing'}"
-        )
-    return TOKEN_KINDS
 
 
 def _scan_classes(
@@ -88,11 +65,12 @@ def _removal_symmetry_spec(
 ) -> ParsedSpec:
     from .adapters import ParsedSpec, _baseline
 
+    _names(raw, "token_kinds", TOKEN_KINDS, path, full_key)
     baseline = _baseline(raw, root, path, full_key)
     spec = RemovalSymmetrySpec(
-        _scope(raw, path, full_key),
+        _scope(raw, path, full_key, "changed"),
         _optional_string(raw, "base", "HEAD^", path, full_key),
-        _optional_boolean(raw, "include_untracked", True, path, full_key),
+        _optional_boolean(raw, "search_untracked", True, path, full_key),
         _integer(
             raw,
             "min_token_chars",
@@ -101,7 +79,7 @@ def _removal_symmetry_spec(
             default=DEFAULT_MIN_TOKEN_CHARS,
             minimum=1,
         ),
-        _token_kinds(raw, path, full_key),
+        TOKEN_KINDS,
         _scan_classes(raw, path, full_key),
         _optional_string_list(
             raw, "exclude_paths", path, f"{full_key}.exclude_paths"
@@ -116,29 +94,42 @@ def _removal_symmetry_spec(
     )
 
 
-def _diff_path(raw: str) -> str | None:
+def _diff_path(raw: str, prefix: str) -> str | None:
     if raw == "/dev/null":
         return None
-    return raw.removeprefix("a/")
+    if raw.startswith('"'):
+        raise GateError(
+            f"removal-symmetry diff: quoted path {raw}; "
+            "expected an unquoted path"
+        )
+    return raw.removeprefix(prefix)
 
 
-def _section_path(lines: list[str]) -> str | None:
+def _section_paths(lines: list[str]) -> tuple[str | None, str | None]:
+    old: str | None = None
+    new: str | None = None
     for line in lines:
+        if line.startswith("@@"):
+            break
         if line.startswith("--- "):
-            return _diff_path(line[4:])
-    return None
+            old = _diff_path(line[4:], "a/")
+        elif line.startswith("+++ "):
+            new = _diff_path(line[4:], "b/")
+    return old, new
 
 
-def _removed_lines(diff: str) -> Iterator[tuple[str | None, str]]:
+def _diff_lines(
+    diff: str,
+) -> Iterator[tuple[str, str | None, str | None, str]]:
     for block in diff.split("\ndiff --git "):
         lines = block.splitlines()
-        path = _section_path(lines)
+        old, new = _section_paths(lines)
         in_hunk = False
         for line in lines:
             if line.startswith("@@"):
                 in_hunk = True
-            elif in_hunk and line.startswith("-"):
-                yield path, line[1:]
+            elif in_hunk and line[:1] in ("-", "+"):
+                yield line[0], old, new, line[1:]
 
 
 def _string_end(text: str, start: int, delimiter: str) -> int | None:
@@ -166,7 +157,7 @@ def _string_contents(line: str) -> Iterator[str]:
         if end is None:
             index = start
             continue
-        yield line[start:end]
+        yield line[start:end].replace('\\"', '"').replace("\\'", "'")
         index = end + len(delimiter)
 
 
@@ -191,14 +182,28 @@ def _line_tokens(
             yield "string", token
 
 
-def _source_allowed(
-    path: str | None, allowed: set[str] | None, spec: RemovalSymmetrySpec
+def _class_matches(
+    path: str, class_names: set[str] | None, rules: tuple[Rule, ...]
 ) -> bool:
-    if path is None or (allowed is not None and path not in allowed):
+    if class_names is None:
+        return True
+    return any(
+        rule.class_name in class_names
+        and fnmatch.fnmatchcase(path, rule.pattern)
+        for rule in rules
+    )
+
+
+def _source_allowed(
+    path: str | None,
+    class_names: set[str] | None,
+    rules: tuple[Rule, ...],
+    spec: RemovalSymmetrySpec,
+) -> bool:
+    if path is None:
         return False
-    return not any(
-        fnmatch.fnmatchcase(path, pattern)
-        for pattern in spec.exclude_paths
+    return _class_matches(path, class_names, rules) and not _scan_excluded(
+        path, None, spec
     )
 
 
@@ -214,24 +219,47 @@ def _collect_tokens(
         tokens.setdefault((kind, token), set()).add(path)
 
 
-def _removed_tokens(
-    root: Path, spec: RemovalSymmetrySpec, allowed: set[str] | None
-) -> list[tuple[str, str, tuple[str, ...]]]:
+def _diff_token_maps(
+    root: Path,
+    spec: RemovalSymmetrySpec,
+    class_names: set[str] | None,
+    rules: tuple[Rule, ...],
+) -> tuple[
+    dict[tuple[str, str], set[str]], dict[tuple[str, str], set[str]]
+]:
     diff = _git(
         root,
         [
+            "-c", "core.quotePath=false",
             "diff", "--unified=0", "--no-color", "--no-ext-diff",
+            "--src-prefix=a/", "--dst-prefix=b/",
             spec.base, "--",
         ],
         "removal-symmetry diff",
     )
-    tokens: dict[tuple[str, str], set[str]] = {}
-    for path, line in _removed_lines(diff.decode("utf-8", "surrogateescape")):
-        if _source_allowed(path, allowed, spec):
-            _collect_tokens(tokens, path, line, spec)
+    removed: dict[tuple[str, str], set[str]] = {}
+    added: dict[tuple[str, str], set[str]] = {}
+    for marker, old, new, line in _diff_lines(
+        diff.decode("utf-8", "surrogateescape")
+    ):
+        if marker == "+":
+            _collect_tokens(added, new or "", line, spec)
+        elif _source_allowed(old, class_names, rules, spec):
+            _collect_tokens(removed, old, line, spec)
+    return removed, added
+
+
+def _removed_tokens(
+    root: Path,
+    spec: RemovalSymmetrySpec,
+    class_names: set[str] | None,
+    rules: tuple[Rule, ...],
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    removed, added = _diff_token_maps(root, spec, class_names, rules)
     return [
         (kind, token, tuple(sorted(paths)))
-        for (kind, token), paths in sorted(tokens.items())
+        for (kind, token), paths in sorted(removed.items())
+        if (kind, token) not in added
     ]
 
 
@@ -242,19 +270,6 @@ def _baseline_relative(root: Path, baseline: Path | None) -> str | None:
         return baseline.relative_to(root).as_posix()
     except ValueError:
         return None
-
-
-def _untracked_files(root: Path) -> set[str]:
-    raw = _git(
-        root,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-        "removal-symmetry untracked selection",
-    )
-    return {
-        name
-        for name in raw.decode("utf-8", "surrogateescape").split("\0")
-        if name
-    }
 
 
 def _scan_class_names(context: Any, spec: RemovalSymmetrySpec) -> set[str]:
@@ -295,24 +310,27 @@ def _scan_files(context: Any, spec: RemovalSymmetrySpec) -> list[str]:
     selected = _selected_scan_files(
         context, spec, _scan_class_names(context, spec)
     )
-    if spec.include_untracked:
+    if spec.search_untracked:
         return selected
-    untracked = _untracked_files(context.root)
+    untracked = set(_untracked_files(context.root))
     return [relative for relative in selected if relative not in untracked]
 
 
-def _read_files(root: Path, files: list[str]) -> list[tuple[str, str]]:
+def _read_files(
+    root: Path, files: list[str]
+) -> tuple[list[tuple[str, str]], list[str]]:
     contents: list[tuple[str, str]] = []
+    unmeasured: list[str] = []
     for relative in files:
         try:
-            data = (root / relative).read_bytes()
-            text = data.decode("utf-8")
+            text = (root / relative).read_bytes().decode("utf-8")
         except OSError as error:
             raise GateError(f"cannot read {relative}: {error}") from error
-        except UnicodeDecodeError as error:
-            raise GateError(f"cannot read {relative} as UTF-8: {error}") from error
+        except UnicodeDecodeError:
+            unmeasured.append(relative)
+            continue
         contents.append((relative, text))
-    return contents
+    return contents, unmeasured
 
 
 def _definition_starts(token: str, text: str) -> Iterator[int]:
@@ -389,13 +407,25 @@ def _token_findings(
     return findings
 
 
+def _not_measured_finding(relative: str) -> Finding:
+    return Finding(
+        f"{relative}:not-measured",
+        1,
+        relative,
+        measurement={"path": relative},
+        locations=None,
+        kind="not-measured",
+    )
+
+
 def measure_removal_symmetry(
     root: Path,
     spec: RemovalSymmetrySpec,
-    allowed: set[str] | None,
+    class_names: set[str] | None,
+    rules: tuple[Rule, ...],
     contents: list[tuple[str, str]],
 ) -> tuple[list[tuple[str, str, tuple[str, ...]]], list[Finding]]:
-    tokens = _removed_tokens(root, spec, allowed)
+    tokens = _removed_tokens(root, spec, class_names, rules)
     findings = [
         finding
         for kind, token, removed_from in tokens
@@ -407,53 +437,46 @@ def measure_removal_symmetry(
 
 def _measurement(
     context: Any,
-) -> tuple[list[tuple[str, str, tuple[str, ...]]], list[str], list[Finding]]:
+) -> tuple[
+    list[tuple[str, str, tuple[str, ...]]],
+    list[str],
+    list[str],
+    list[Finding],
+]:
     from .checks import _select_files
 
     mark_step("file selection")
-    selected, _class_names = _select_files(
+    _selected, check_classes = _select_files(
         context.config, context.check, context.files, context.classes
     )
     spec = context.check.spec
     scan_files = _scan_files(context, spec)
-    contents = _read_files(context.root, scan_files)
-    allowed = None if spec.scope == "all" else set(selected)
+    contents, unmeasured = _read_files(context.root, scan_files)
+    class_names = None if spec.scope == "all" else set(check_classes)
     mark_step("removed-token scan")
     tokens, findings = measure_removal_symmetry(
-        context.root, spec, allowed, contents
+        context.root, spec, class_names, context.config.rules, contents
     )
-    return tokens, scan_files, findings
+    findings.extend(map(_not_measured_finding, unmeasured))
+    findings.sort(key=lambda item: item.subject)
+    return tokens, scan_files, unmeasured, findings
 
 
 def _domain_subjects(
-    tokens: list[tuple[str, str, tuple[str, ...]]], scan_files: list[str]
-) -> list[str]:
-    return [
-        f"{token}@{relative}"
-        for _kind, token, _removed_from in tokens
-        for relative in scan_files
-    ]
-
-
-def _removal_symmetry_ratchet(
-    check: Any,
     tokens: list[tuple[str, str, tuple[str, ...]]],
     scan_files: list[str],
-    findings: list[Finding],
-    entries: list[Any],
-    prefix: str,
-    start: float,
-) -> Any:
-    from .checks import _finish_ratchet
-
-    mark_step("removal-symmetry domain analysis")
-    domain = Domain.of_subjects(
-        _domain_subjects(tokens, scan_files),
-        "the removed tokens and selected scan files",
-    )
-    return _finish_ratchet(
-        check, findings, entries, prefix, start, domain, "removed-token"
-    )
+    unmeasured: list[str],
+) -> list[str]:
+    unscanned = set(unmeasured)
+    subjects: list[str] = []
+    for relative in scan_files:
+        if relative in unscanned:
+            subjects.append(f"{relative}:not-measured")
+        else:
+            subjects.extend(
+                f"{token}@{relative}" for _kind, token, _ in tokens
+            )
+    return subjects
 
 
 def _configuration_error(
@@ -467,12 +490,12 @@ def _configuration_error(
 
 
 def _run_removal_symmetry(context: Any) -> Any:
-    from .checks import _baseline_entries, _ratchet_error
+    from .checks import _baseline_entries, _finish_ratchet, _ratchet_error
 
     check = context.check
     start = time.monotonic()
     try:
-        tokens, scan_files, findings = _measurement(context)
+        tokens, scan_files, unmeasured, findings = _measurement(context)
     except GateError as error:
         return _configuration_error(check, start, context.prefix, error)
     mark_step("baseline loading")
@@ -480,6 +503,11 @@ def _run_removal_symmetry(context: Any) -> Any:
         entries = _baseline_entries(check)
     except GateError as error:
         return _ratchet_error(check, start, context.prefix, error)
-    return _removal_symmetry_ratchet(
-        check, tokens, scan_files, findings, entries, context.prefix, start
+    mark_step("removal-symmetry domain analysis")
+    domain = Domain.of_subjects(
+        _domain_subjects(tokens, scan_files, unmeasured),
+        "the removed tokens and selected scan files",
+    )
+    return _finish_ratchet(
+        check, findings, entries, context.prefix, start, domain, "removed-token"
     )

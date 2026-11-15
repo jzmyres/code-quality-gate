@@ -191,6 +191,37 @@ def _optional_string_list(
     return _string_list(parent, key, path, full_key)
 
 
+def _scope(
+    raw: dict[str, Any], path: Path, full_key: str, default: str
+) -> str:
+    if "scope" not in raw:
+        return default
+    scope = _string(raw, "scope", path, f"{full_key}.scope")
+    if scope not in ("all", "changed"):
+        raise ConfigError(
+            f"{path}: {full_key}.scope: expected one of all, changed; "
+            f"got {scope!r}"
+        )
+    return scope
+
+
+def _names(
+    raw: dict[str, Any],
+    key: str,
+    expected: tuple[str, ...],
+    path: Path,
+    full_key: str,
+) -> None:
+    if key not in raw:
+        return
+    values = _string_list(raw, key, path, f"{full_key}.{key}")
+    if set(values) != set(expected) or len(values) != len(expected):
+        raise ConfigError(
+            f"{path}: {full_key}.{key}: expected exactly "
+            f"{', '.join(expected)}; got {', '.join(values) or 'nothing'}"
+        )
+
+
 def _boolean(parent: dict[str, Any], key: str, path: Path, full_key: str) -> bool:
     if key not in parent:
         raise _config_error(path, full_key, "a boolean", "missing")

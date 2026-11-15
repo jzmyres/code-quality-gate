@@ -9,14 +9,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .clones import _read_regular
-from .files import _git
+from .files import _git, _split_nul, _untracked_files
 from .policy import (
-    ConfigError,
     GateError,
+    _names,
     _optional_boolean,
     _optional_string,
-    _string,
-    _string_list,
+    _scope,
 )
 from .ratchet import Domain, Finding, Location
 from .runner import mark_step
@@ -58,35 +57,6 @@ class SourceCharsSpec:
     include_untracked: bool
 
 
-def _scope(raw: dict[str, Any], path: Path, full_key: str) -> str:
-    if "scope" not in raw:
-        return "all"
-    scope = _string(raw, "scope", path, f"{full_key}.scope")
-    if scope not in ("all", "changed"):
-        raise ConfigError(
-            f"{path}: {full_key}.scope: expected one of all, changed; "
-            f"got {scope!r}"
-        )
-    return scope
-
-
-def _names(
-    raw: dict[str, Any],
-    key: str,
-    expected: tuple[str, ...],
-    path: Path,
-    full_key: str,
-) -> None:
-    if key not in raw:
-        return
-    values = _string_list(raw, key, path, f"{full_key}.{key}")
-    if set(values) != set(expected) or len(values) != len(expected):
-        raise ConfigError(
-            f"{path}: {full_key}.{key}: expected exactly "
-            f"{', '.join(expected)}; got {', '.join(values) or 'nothing'}"
-        )
-
-
 def _source_chars_spec(
     raw: dict[str, Any], root: Path, path: Path, full_key: str
 ) -> ParsedSpec:
@@ -96,7 +66,7 @@ def _source_chars_spec(
     _names(raw, "deny", DENY_NAMES, path, full_key)
     baseline = _baseline(raw, root, path, full_key)
     spec = SourceCharsSpec(
-        _scope(raw, path, full_key),
+        _scope(raw, path, full_key, "all"),
         _optional_string(raw, "base", "HEAD^", path, full_key),
         _optional_boolean(raw, "include_untracked", True, path, full_key),
     )
@@ -245,14 +215,6 @@ def _domain_subjects(files: list[str], unscanned: set[str]) -> list[str]:
     return subjects
 
 
-def _split_nul(raw: bytes) -> list[str]:
-    return [
-        name
-        for name in raw.decode("utf-8", "surrogateescape").split("\0")
-        if name
-    ]
-
-
 def _changed_files(root: Path, spec: SourceCharsSpec) -> list[str]:
     raw = _git(
         root,
@@ -262,12 +224,7 @@ def _changed_files(root: Path, spec: SourceCharsSpec) -> list[str]:
     )
     names = _split_nul(raw)
     if spec.include_untracked:
-        untracked = _git(
-            root,
-            ["ls-files", "--others", "--exclude-standard", "-z"],
-            "source-character untracked selection",
-        )
-        names.extend(_split_nul(untracked))
+        names.extend(_untracked_files(root))
     return list(dict.fromkeys(names))
 
 

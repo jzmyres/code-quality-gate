@@ -313,7 +313,7 @@ with an explicit escape or remove it.
     enforcement = "advisory"
     scope = "changed"                   # all | changed
     base = "HEAD^"                      # used when scope = "changed"
-    include_untracked = true
+    search_untracked = true
     min_token_chars = 16
     token_kinds = ["definition", "string"]
     scan_classes = ["python", "test", "config", "build", "doc"]
@@ -321,11 +321,14 @@ with an explicit escape or remove it.
     baseline = "quality-gate-removal-symmetry.toml"
 
 `removal-symmetry` reads the files of every class that lists it, takes the tokens the diff from
-`base` removed, and searches the current tree for each one. A definition is Elisp `defun`,
-`defsubst`, `defmacro`, `cl-defun`, `defvar`, `defconst` or `defcustom`, or Python `def`,
-`async def`, `class` or a module-level assignment; its name is matched on identifier boundaries. A
-string token is a single-line literal of at least `min_token_chars` characters, with its quote
-delimiters removed; escape sequences are not normalized. `token_kinds` may restate `definition` and
+`base` removed, and searches the current tree for each one. A removing path is classified from the
+diff's old path by the same rules, so a file the commit deleted still contributes its removals even
+though it is absent from the search tree. Tokens the same diff adds anywhere are not removed tokens
+and produce no finding. A definition is Elisp `defun`, `defsubst`, `defmacro`, `cl-defun`,
+`defvar`, `defconst` or `defcustom`, or Python `def`, `async def`, `class` or a module-level
+assignment; its name is matched on identifier boundaries. A string token is a single-line literal of
+at least `min_token_chars` characters, with its quote delimiters removed and escaped quotes
+unescaped; other escape sequences are not normalized. `token_kinds` may restate `definition` and
 `string` but cannot change that pair. Multi-line strings are not extracted.
 
 `scan_classes` is the search domain, so tests and docs can be searched even when they do not list the
@@ -333,9 +336,12 @@ check themselves; when omitted, every class is searched. `exclude_paths` are `fn
 applied to both the parsed removals and the search tree; history notes, plans and changelogs belong
 there or in the baseline. The baseline file itself is never searched. With `scope = "changed"` only
 removals from files of classes that list the check are parsed; `scope = "all"` parses the whole
-diff. Both search the same `scan_classes` domain.
-`include_untracked = false` removes untracked files from that domain. An invalid base and a missing
-or undecodable scanned file are configuration errors, never passes.
+diff. Both search the same `scan_classes` domain. `search_untracked = false` removes untracked
+files from that domain. The diff runs with fixed `a/` and `b/` prefixes and `core.quotePath=false`,
+so `diff.mnemonicPrefix` and non-ASCII paths do not change the result; a path Git still quotes is a
+configuration error naming it. An invalid base and a missing scanned file are configuration errors,
+never passes. A scanned file that does not decode as UTF-8 is reported as `PATH:not-measured` and the
+check still completes.
 
 Each finding has a `subject` of `TOKEN@PATH`, a `value` equal to the number of remaining
 occurrences, a `location` of `PATH:LINE` for the first occurrence, and a `measurement` containing
@@ -350,11 +356,12 @@ remaining copy needs a baseline entry with a reason:
     bound = 1
     reason = "fixture intentionally exercises the old prompt; removing it would lose the negative case"
 
-The check ships `advisory`: it reports its findings with `outcome = "fail"`, but the gate decision
-is `accepted_with_exceptions` and the exit status stays `0`. It may be promoted to `enforced` only
-after replaying a commit range measures its false-positive rate and the designer decides that rate is
-acceptable. Record the measured rate and that decision with the promotion; do not pick an enforcement
-setting from one commit.
+With `enforcement = "advisory"` (the shipped setting) it reports its findings with
+`outcome = "fail"`, but the gate decision is `accepted_with_exceptions` and the exit status stays
+`0`. With `enforcement = "enforced"` an uncovered finding rejects the gate. It may be promoted to
+`enforced` only after replaying a commit range measures its false-positive rate and the designer
+decides that rate is acceptable. Record the measured rate and that decision with the promotion; do
+not pick an enforcement setting from one commit.
 
 ### Python tests
 
@@ -987,7 +994,7 @@ and the allowed keys. The complete shape is:
     enforcement = "advisory"
     scope = "changed"                     # optional; all or changed
     base = "HEAD^"                        # optional; used with changed
-    include_untracked = true              # optional
+    search_untracked = true               # optional
     min_token_chars = 16                  # optional
     token_kinds = ["definition", "string"]  # optional; this is the fixed pair
     scan_classes = ["python", "test", "config", "build", "doc"]
@@ -1069,10 +1076,14 @@ Notes:
   to `all`; `changed` uses `base` (default `HEAD^`) and includes untracked files unless
   `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`.
 * A `removal_symmetry` check needs a `baseline` path. Its files come from the classes that list it and
-  supply the diff scope; `scan_classes` is the search domain (all classes when omitted), and
-  `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults to `HEAD^`;
-  `min_token_chars` defaults to 16. `token_kinds` is the fixed pair `definition` and `string`. The
-  check ships advisory, so its findings are reported but never fail the gate.
+  supply the diff scope; a removing path is classified by rule from the diff's old path, so a
+  deleted file still contributes its removals. `scan_classes` is the search domain (all classes
+  when omitted), and `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults
+  to `HEAD^`; `min_token_chars` defaults to 16; `search_untracked = false` removes untracked
+  files from the search domain. `token_kinds` is the fixed pair `definition` and `string`. Tokens
+  the same diff adds anywhere are not reported. The check ships advisory: with
+  `enforcement = "advisory"` its findings are reported but never fail the gate; with `enforced`
+  an uncovered finding rejects the gate.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
   with one group. Its `{python}` token and `QG_PYTHON` export are described above.
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the

@@ -15,26 +15,36 @@ from support import (
 
 BASELINE = "quality-gate-removal-symmetry.toml"
 METRIC_VERSION = "removal-symmetry/1"
+ELISP_RULE = (
+    "\n[[rule]]\n"
+    'pattern = "*.el"\n'
+    'class = "python"\n'
+    'reason = "Elisp source"\n'
+)
 
 
 def removal_config(
     *,
     enforcement: str = "advisory",
-    include_untracked: bool = True,
+    search_untracked: bool = True,
+    base: str = "HEAD^",
+    scope: str | None = "changed",
+    scan_classes: str = '["python", "doc", "config"]',
     extra: str = "",
 ) -> str:
     text = _add_check_to_class(BASE_CONFIG, "python", "removal-symmetry")
+    scope_line = "" if scope is None else f'scope = "{scope}"\n'
     return text + (
         "\n[checks.removal-symmetry]\n"
         'adapter = "removal_symmetry"\n'
         "tier = 1\n"
         f'enforcement = "{enforcement}"\n'
-        'scope = "changed"\n'
-        'base = "HEAD^"\n'
-        f"include_untracked = {str(include_untracked).lower()}\n"
+        f"{scope_line}"
+        f'base = "{base}"\n'
+        f"search_untracked = {str(search_untracked).lower()}\n"
         "min_token_chars = 16\n"
         'token_kinds = ["definition", "string"]\n'
-        'scan_classes = ["python", "doc", "config"]\n'
+        f"scan_classes = {scan_classes}\n"
         'exclude_paths = ["plans/**"]\n'
         f'baseline = "{BASELINE}"\n'
         f"{extra}"
@@ -138,7 +148,7 @@ class RemovalSymmetryCheckTests(FixtureCase):
         )
 
     def test_untracked_files_are_not_searched_when_disabled(self) -> None:
-        self.write_config(removal_config(include_untracked=False))
+        self.write_config(removal_config(search_untracked=False))
         token = "untracked message text"
         self.add_file("pkg/mod.py", f'MESSAGE = "{token}"\n')
         self.commit_all()
@@ -189,6 +199,217 @@ class RemovalSymmetryCheckTests(FixtureCase):
         self.assertTrue(check["satisfied"])
         self.assertEqual(document["decision"], "accepted_with_exceptions")
         self.finding(check, "stale_function@tests/test_mod.py")
+
+    def test_scope_all_parses_removals_outside_the_listed_classes(self) -> None:
+        self.write_config(removal_config(scope="all", scan_classes='["doc"]'))
+        token = "scope all removed token"
+        self.add_file("README.md", f'# fixture\n\nPROMPT = "{token}"\n')
+        self.add_file("docs/other.md", f"# other\n\n{token}\n")
+        self.commit_all()
+        self.add_file("README.md", "# fixture\n")
+        self.commit_all()
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            [f"{token}@docs/other.md"],
+        )
+
+    def test_a_deleted_file_still_contributes_its_removals(self) -> None:
+        self.write_config(removal_config(scope=None))
+        self.add_file("pkg/gone.py", "def deleted_helper():\n    return 1\n")
+        self.add_file(
+            "tests/test_mod.py",
+            "def test_it():\n    assert deleted_helper() == 1\n",
+        )
+        self.commit_all()
+        (self.repo / "pkg/gone.py").unlink()
+        self.commit_all()
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ["deleted_helper@tests/test_mod.py"],
+        )
+
+    def test_an_edited_definition_line_is_not_reported(self) -> None:
+        self.add_file(
+            "pkg/mod.py", "def kept_helper(value):\n    return value\n"
+        )
+        self.add_file(
+            "tests/test_mod.py",
+            "def test_it():\n    assert kept_helper(1) == 1\n",
+        )
+        self.commit_all()
+        self.add_file(
+            "pkg/mod.py",
+            "def kept_helper(value, extra):\n    return value\n",
+        )
+        self.commit_all()
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_an_added_annotation_is_not_reported(self) -> None:
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        self.commit_all()
+        self.add_file("pkg/mod.py", "VALUE: int = 1\n")
+        self.commit_all()
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_a_function_moved_to_another_file_is_not_reported(self) -> None:
+        self.add_file("pkg/mod.py", "def moved_helper():\n    return 1\n")
+        self.add_file(
+            "tests/test_mod.py", "def test_it():\n    moved_helper()\n"
+        )
+        self.commit_all()
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        self.add_file("pkg/other.py", "def moved_helper():\n    return 1\n")
+        self.commit_all()
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_an_elisp_definition_is_reported(self) -> None:
+        self.write_config(removal_config(extra=ELISP_RULE))
+        self.add_file("pkg/mod.el", "(defun old-helper ()\n  nil)\n")
+        self.add_file("README.md", "# fixture\n\nold-helper\n")
+        self.commit_all()
+        self.add_file("pkg/mod.el", "(defun new-helper ()\n  nil)\n")
+        self.commit_all()
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ["old-helper@README.md"],
+        )
+
+    def test_a_definition_matches_only_on_identifier_boundaries(self) -> None:
+        self.add_file("pkg/mod.py", "def mark():\n    return 1\n")
+        self.add_file("README.md", "# fixture\n\nmarker\n")
+        self.commit_all()
+        self.remove_product()
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_scan_classes_limit_the_search_domain(self) -> None:
+        self.write_config(removal_config(scan_classes='["python"]'))
+        token = "only in documentation text"
+        self.add_file("pkg/mod.py", f'MESSAGE = "{token}"\n')
+        self.add_file("README.md", f"# fixture\n\n{token}\n")
+        self.commit_all()
+        self.remove_product()
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_the_baseline_file_is_not_searched(self) -> None:
+        self.add_file("pkg/mod.py", "def ghost_token():\n    return 1\n")
+        self.commit_all()
+        self.remove_product()
+        self.add_file(
+            BASELINE,
+            removal_baseline([token_entry("ghost_token@tests/test_mod.py")]),
+        )
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_excluded_paths_contribute_no_removals(self) -> None:
+        token = "planned obsolete text"
+        self.add_file("plans/gone.py", f'MESSAGE = "{token}"\n')
+        self.add_file("README.md", f"# fixture\n\n{token}\n")
+        self.commit_all()
+        self.add_file("plans/gone.py", "VALUE = 1\n")
+        self.commit_all()
+
+        self.assertEqual(self.findings_after_removal()["findings"], [])
+
+    def test_a_token_exactly_at_min_token_chars_is_a_finding(self) -> None:
+        token = "1234567890123456"
+        self.add_file("pkg/mod.py", f'MESSAGE = "{token}"\n')
+        self.add_file("README.md", f"# fixture\n\n{token}\n")
+        self.commit_all()
+        self.remove_product()
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            [f"{token}@README.md"],
+        )
+
+    def test_an_invalid_base_is_a_configuration_error(self) -> None:
+        self.write_config(removal_config(base="not-a-revision"))
+
+        result, document, check = self.run_removal_check()
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("not-a-revision", document["error"])
+        self.assertEqual(check["outcome"], "error")
+
+    def test_diff_mnemonic_prefix_does_not_hide_a_finding(self) -> None:
+        self.git("config", "diff.mnemonicPrefix", "true")
+        self.install_removed_definition("mnemonic_helper", "mnemonic_helper()")
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ["mnemonic_helper@tests/test_mod.py"],
+        )
+
+    def test_a_non_ascii_path_still_gives_its_finding(self) -> None:
+        self.add_file("pkg/café.py", "def nonascii_helper():\n    return 1\n")
+        self.add_file(
+            "tests/test_mod.py", "def test_it():\n    nonascii_helper()\n"
+        )
+        self.commit_all()
+        self.add_file("pkg/café.py", "VALUE = 1\n")
+        self.commit_all()
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ["nonascii_helper@tests/test_mod.py"],
+        )
+
+    def test_an_undecodable_scanned_file_is_reported_not_measured(self) -> None:
+        self.add_file("pkg/mod.py", "def binary_helper():\n    return 1\n")
+        self.add_file(
+            "tests/test_mod.py", "def test_it():\n    binary_helper()\n"
+        )
+        self.add_file("docs/binary.md", b"# fixture\n\xff\n")
+        self.commit_all()
+        self.remove_product()
+
+        check = self.findings_after_removal()
+        subjects = [item["subject"] for item in check["findings"]]
+        self.assertIn("binary_helper@tests/test_mod.py", subjects)
+        self.assertIn("docs/binary.md:not-measured", subjects)
+
+    def test_an_escaped_quote_matches_its_unescaped_form(self) -> None:
+        self.add_file(
+            "pkg/mod.py", 'MESSAGE = "say \\"hello\\" to the window"\n'
+        )
+        self.add_file(
+            "README.md", '# fixture\n\nsay "hello" to the window\n'
+        )
+        self.commit_all()
+        self.remove_product()
+
+        check = self.findings_after_removal()
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ['say "hello" to the window@README.md'],
+        )
+
+    def test_a_still_quoted_path_is_a_configuration_error(self) -> None:
+        self.add_file('pkg/odd"name.py', "VALUE = 1\n")
+        self.commit_all()
+        self.add_file('pkg/odd"name.py', "VALUE = 2\n")
+        self.commit_all()
+
+        result, document, check = self.run_removal_check()
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn('pkg/odd\\"name.py', document["error"])
+        self.assertEqual(check["outcome"], "error")
 
 
 if __name__ == "__main__":

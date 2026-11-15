@@ -124,16 +124,30 @@ def _staged_entries(root: Path) -> list[GitFile]:
     return entries
 
 
-def _untracked_entries(root: Path) -> list[GitFile]:
-    raw = _git(
-        root,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-        "file enumeration",
-    )
+def _split_nul(raw: bytes) -> list[str]:
     return [
-        GitFile(name, None)
+        name
         for name in raw.decode("utf-8", "surrogateescape").split("\0")
         if name
+    ]
+
+
+def _untracked_files(
+    root: Path, what: str = "untracked-file selection"
+) -> list[str]:
+    return _split_nul(
+        _git(
+            root,
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            what,
+        )
+    )
+
+
+def _untracked_entries(root: Path) -> list[GitFile]:
+    return [
+        GitFile(name, None)
+        for name in _untracked_files(root, "file enumeration")
     ]
 
 

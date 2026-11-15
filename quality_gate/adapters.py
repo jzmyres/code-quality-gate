@@ -173,7 +173,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "removal_symmetry",
     (
-        "scope", "base", "include_untracked", "min_token_chars", "token_kinds",
+        "scope", "base", "search_untracked", "min_token_chars", "token_kinds",
         "scan_classes", "exclude_paths", "baseline",
     ),
     removal_symmetry._removal_symmetry_spec,
