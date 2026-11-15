@@ -1437,7 +1437,7 @@ class IdentityTrustTests(TrustCase):
         revision = self.directory_revision()
         result, document = self.trust_json(revision)
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(document["schema"], 3)
+        self.assertEqual(document["schema"], 4)
         trust = document["trust"]
         self.assertEqual(trust["path"], revision)
         self.assertNotIn("policy_from", trust)

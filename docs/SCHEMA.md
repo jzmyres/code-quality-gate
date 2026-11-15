@@ -1,16 +1,18 @@
-# Schema reference (version 2, with trust result version 3)
+# Schema reference (policy version 2, result version 3, trust result version 4)
 
 This is the authoritative contract for the gate's policy, baseline and result
 formats. The files in `plans/` are historical records; where they disagree with
 this document, this document wins. The trust-root semantics behind
 `--policy-from` are specified in [`TRUST.md`](TRUST.md).
 
-Version 2 is a breaking change from version 1: policy files declare
-`schema = 2`, result documents declare `schema = 2`, baselines begin with the
-check identity header, and the result separates execution, the adapter's raw
-outcome and policy satisfaction. A result produced with `--policy-from` adds a
-`trust` object and declares `schema = 3`; a result without it remains version
-2 and has no `trust` key.
+Policy version 2 is a breaking change from version 1: policy files declare
+`schema = 2`, baselines begin with the check identity header, and the result
+separates execution, the adapter's raw outcome and policy satisfaction. Result
+documents declare `schema = 3`, which adds `caused_by` to every check and every
+obligation, naming the root check ids a failure follows from or null for a root
+and for a satisfied entry. A result produced with `--policy-from` adds a
+`trust` object and declares `schema = 4`; a result without it is schema 3 and
+has no `trust` key.
 
 ## Policy: `quality-gate.toml`
 
@@ -352,7 +354,7 @@ deleted from the repository resolves.
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "gate_version": "f1d0810...",
   "revision": "8dbb703...",
   "dirty": false,
@@ -370,6 +372,7 @@ deleted from the repository resolves.
       "execution": "completed",
       "outcome": "pass",
       "satisfied": true,
+      "caused_by": null,
       "duration_seconds": 12.5,
       "budget_seconds": 900,
       "diagnostics": {
@@ -395,6 +398,7 @@ deleted from the repository resolves.
       "status": "satisfied",
       "required": ["tests"],
       "checks": ["tests"],
+      "caused_by": null,
       "reason": null
     }
   ],
@@ -408,7 +412,7 @@ deleted from the repository resolves.
 
 Top-level keys:
 
-* `schema` - `2`, or `3` when a `trust` object is present.
+* `schema` - `3`, or `4` when a `trust` object is present.
 * `gate_version` - the gate's own revision, or `unknown: ...`.
 * `revision`, `dirty` - the consumer's HEAD (or null) and worktree state.
 * `policy_sha256` - the effective policy file's SHA-256, or null. With
@@ -428,11 +432,11 @@ Top-level keys:
 
 ### Trust object
 
-A `--policy-from` result adds one `trust` object and declares schema 3:
+A `--policy-from` result adds one `trust` object and declares schema 4:
 
 ```json
 {
-  "schema": 3,
+  "schema": 4,
   "trust": {
     "path": "/trusted/tree",
     "digest": "9e12...",
@@ -513,6 +517,8 @@ Check keys:
   enforcement. A baseline-covered violation keeps `outcome = "fail"` and sets
   `satisfied = true`. An advisory check does not block the whole-tree
   judgement.
+* `caused_by` - the root check ids this failure follows from, or null for a
+  root and for a satisfied entry; see [Roots and consequences](#roots-and-consequences).
 * `duration_seconds`, `budget_seconds` (null for built-ins).
 * `diagnostics` - `argv` (array or null), `exit_code` (integer or null),
   `signal` (integer or null), `output_bytes`, `output_tail` (at most 4 KiB),
@@ -550,7 +556,25 @@ stop points) and `hits` (reached stop points); their metric version is `elisp-ed
 
 Obligation status is `satisfied`, `exempted` (with `reason`) or
 `unsatisfied`. `required` names the evidence the tier needs; `checks` names
-the checks that counted.
+the checks that counted. `caused_by` is the root check ids of an unsatisfied
+obligation's consequence, or null for a root and for a satisfied entry.
+
+### Roots and consequences
+
+A failed check is a **consequence** when the gate itself can name its cause: its
+`requires` check is unsatisfied. A chain resolves to its roots. An unsatisfied
+obligation is a consequence when at least one of the class's checks declares the
+tier's required evidence and every such candidate check is unsatisfied; its
+`caused_by` is the roots of every candidate. An obligation with no candidate
+check is a root, because that is a policy gap. Every other failure is a root.
+The rule is decided from the policy and the results' `satisfied` status, never
+from message text.
+
+The stderr summary's `check: failed (...)` line lists only root failures, in
+the existing order. When consequences exist, the next line is
+`check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry
+is spelled as the summary spells it: a check id or `obligation CLASS tier
+TIER`. A consequence still rejects and still exits 1.
 
 The decision is `rejected` when inventory or hygiene fails, when an enforced
 check is not satisfied, or when any obligation is `unsatisfied`. A
@@ -669,7 +693,7 @@ exit 1 and write no document.
 ## Versions and superseded proposals
 
 * Policy: `schema = 2`.
-* Result: `schema = 2`; `schema = 3` when `--policy-from` adds `trust`.
+* Result: `schema = 3`; `schema = 4` when `--policy-from` adds `trust`.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Worklist result: `schema = 1`.

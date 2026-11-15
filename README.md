@@ -19,9 +19,9 @@ The gate is deliberately narrow. It owns the orchestration no maintained tool ow
   measured subject outside its threshold only with a non-empty reason and an optional expiry;
 * **tools** - external tools are pinned by version, URL, archive SHA-256 and payload SHA-256,
   and fetched explicitly;
-* **result** - `check --json` writes one machine-readable schema-2 result that separates execution,
+* **result** - `check --json` writes one machine-readable schema-3 result that separates execution,
   the adapter's raw outcome and policy satisfaction, and carries diagnostics, obligations and prune
-  reporting; `--policy-from` adds a `trust` object and result schema 3.
+  reporting; `--policy-from` adds a `trust` object and result schema 4.
 
 Tier 1 includes Python and Emacs Lisp tests and per-function CRAP scores. Emacs Lisp CRAP uses
 the Edebug coverage collected by the test adapter.
@@ -743,6 +743,16 @@ prints progress on stdout and failures on stderr. When inventory fails, configur
 as skipped and the combined check still fails; hygiene still runs. Configuration errors exit 2 before
 any check starts.
 
+A rejected run's stderr summary lists only its **root** failures. A failure is a consequence when the
+gate itself can name its cause: an unsatisfied check whose `requires` check is unsatisfied, or an
+unsatisfied obligation for which at least one of the class's checks declares the tier's required
+evidence and every such candidate check is unsatisfied. An obligation with no candidate check is a root,
+because that is a policy gap. Chains resolve to their root, and the rule is decided from the policy and
+the results' satisfied status, never from message text. The summary line
+`check: failed (...)` names the roots in the usual order. When consequences exist, the next line is
+`check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry is spelled as the
+summary spells it and `CAUSE` is a root check id. A consequence still rejects and still exits 1.
+
 `check --only CHECK [CHECK ...]` runs inventory and hygiene, then exactly those checks and the checks
 they require, in policy order. Nothing else runs. An unknown or repeated check id is a usage error
 (exit 2) naming it, before any check runs. A partial run never prunes and never runs under a trusted
@@ -751,7 +761,7 @@ options, before any check runs. A partial run is never a verdict on the tree; us
 that.
 
 `check --json` writes exactly one JSON result to stdout and sends all human-readable lines to stderr.
-The result schema is `2`; a `--policy-from` result is schema `3` and adds `trust` (see below). Its
+The result schema is `3`; a `--policy-from` result is schema `4` and adds `trust` (see below). Its
 top-level keys are `schema`, `gate_version`, `revision`, `dirty`, `policy_sha256`, `decision`,
 `checks`, `obligations` and `prune`; a `decision = "error"` document also has `error`, and a
 `check --only` document has `selected`.
@@ -759,7 +769,7 @@ top-level keys are `schema`, `gate_version`, `revision`, `dirty`, `policy_sha256
 `checks` contains inventory, hygiene and every configured check, in that order. Each check has `id`,
 `kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
 `evidence` (the evidence names the adapter produces), `metric_version`, `execution`, `outcome`,
-`satisfied`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
+`satisfied`, `caused_by`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
 `resolved_baseline_entries`, `unmeasured_baseline_entries`, `location_coverage` and `reason` (a structured explanation of
 a non-passing adapter verdict, null otherwise); a measuring check may also carry a `measurement`
 object (for example `{"tests": 12}`). Any adapter can report its measured tool identity as
@@ -852,11 +862,16 @@ array of `{path, start_line, end_line}` ranges, or null when its locations are i
 
 `obligations` has one entry per code class and required tier with `class`, `tier`, `status`
 (`satisfied`, `exempted` or `unsatisfied`), `required` (the evidence names the tier demands), `checks`
-(the checks that counted) and `reason` (for an exemption; otherwise null). Tier 1 needs a satisfied
+(the checks that counted), `caused_by` (see below) and `reason` (for an exemption; otherwise null).
+Tier 1 needs a satisfied
 enforced check producing `tests` evidence with at least one executed test, so a lint-only class leaves
 tier 1 unsatisfied and rejects. Tier 2 needs `properties` or `fuzzing`; tiers 3 and 4 reserve
 `bounded` and `proof`. No version-2 adapter produces those evidence names yet, so a required tier above
 1 is exempted by a `[[not_applicable]]` entry until its adapter lands.
+
+Every check and every obligation carries `caused_by`: the list of root check ids for a consequence, or
+null for a root and for a satisfied entry. A satisfied check has null there even when it has a
+`requires` check.
 
 `prune` reports `requested` (the supplied ids or `all`), `performed` and `reason`. Repeat
 `--prune ID` to tighten several baselines in one run, or use `--prune all` to select every configured
@@ -1248,7 +1263,7 @@ fixture is accepted, including files whose names contain a space and begin with 
 tests use fixture tarballs and wheels with `file://` URLs, including wrong hashes, unknown keys, unsafe
 archive members, payload mismatches and destinations outside the tools directory, and prove that a
 tampered Ruff or coverage install is `unsupported` before it runs and that a full run leaves the coverage
-install unchanged. Contract tests cover schema-2 typing,
+install unchanged. Contract tests cover result typing,
 obligations and exemptions, diagnostics, baseline identity and domain rules, prune reporting and
 round-trips, the bounded runner's group kill and output cap, JSON usage errors, and the trust root's
 baseline, policy, protected-path, prune and identity rules.
@@ -1355,8 +1370,8 @@ Reproduce it locally with the same tools cache:
 
 The core gate is deliberately language-agnostic; adapters measure and the core decides. Tier 1 now
 includes the Python and Emacs Lisp tests and CRAP adapters described above. The policy and baseline contract is fixed
-at schema 2 (a trust result adds schema 3) so M4 (tier 2 properties/fuzzing) and M5 (tiers 3/4
-bounded/proof) add adapters without reworking the core.
+at policy schema 2 (result schema 3, or 4 with a trust object) so M4 (tier 2 properties/fuzzing) and
+M5 (tiers 3/4 bounded/proof) add adapters without reworking the core.
 
 Every layer uses the same rule: a new exception is a hand-written baseline entry with a reason, and
 pruning only removes resolved entries or tightens bounds.

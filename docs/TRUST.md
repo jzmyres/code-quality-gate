@@ -214,11 +214,11 @@ is encoded directly. The same encoding is used for the `tool pins` digest.
 
 ## Result document
 
-A trust run writes result `schema = 3` and adds:
+A trust run writes result `schema = 4` and adds:
 
 ```json
 {
-  "schema": 3,
+  "schema": 4,
   "trust": {
     "path": "/trusted/tree",
     "digest": "9e12...",
@@ -261,7 +261,7 @@ and candidate SHA-256, and a blocked baseline names the unapplied subjects
 before its status. The result `decision` adds `blocked`; exit codes remain `0`
 for accepted results, `1` for `rejected`/blocked or a failed prune, and `2`
 for usage or configuration errors and an identity change. Without `--policy-from`, the result remains
-schema 2 and has no `trust` key.
+schema 3 and has no `trust` key.
 
 ## Out of scope
 

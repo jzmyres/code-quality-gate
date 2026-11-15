@@ -30,7 +30,7 @@ from .tools import Tool, _default_lock_path, _tool_payload_digest, _tools_dir, l
 
 POLICY_NAME = "quality-gate.toml"
 LOCK_NAME = "tools.lock.toml"
-RESULT_SCHEMA = 3
+RESULT_SCHEMA = 4
 
 
 @dataclass(frozen=True)

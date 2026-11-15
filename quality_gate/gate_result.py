@@ -109,7 +109,81 @@ def _counted_checks(
     ]
 
 
+def _candidate_checks(
+    class_def: Any,
+    by_id: dict[str, Any],
+    required: tuple[str, ...],
+) -> list[str]:
+    """The class's checks that declare the tier's required evidence."""
+    return [
+        check_id
+        for check_id in class_def.checks
+        if (result := by_id.get(check_id)) is not None
+        and any(name in required for name in result.evidence)
+    ]
+
+
+def _required_check(config: Any, identifier: str) -> str | None:
+    check = config.checks.get(identifier)
+    return None if check is None else getattr(check.spec, "requires", None)
+
+
+def _unsatisfied(result: Any | None) -> bool:
+    return result is not None and not result.is_satisfied()
+
+
+def _root_causes(
+    config: Any, identifier: str, by_id: dict[str, Any]
+) -> list[str]:
+    """The root check ids an unsatisfied check's failure comes from."""
+    current = identifier
+    while True:
+        required = _required_check(config, current)
+        if required is None or not _unsatisfied(by_id.get(required)):
+            return [current]
+        current = required
+
+
+def _check_causes(
+    config: Any, identifier: str, by_id: dict[str, Any]
+) -> list[str] | None:
+    """A check's root causes: ids for a consequence, null for a root."""
+    roots = _root_causes(config, identifier, by_id)
+    return None if roots == [identifier] else roots
+
+
+def check_causes(
+    config: Any, results: Iterable[Any]
+) -> dict[str, list[str] | None]:
+    """Every check's caused_by value, null for a root or a satisfied entry."""
+    by_id = {result.id: result for result in results}
+    return {
+        identifier: (
+            _check_causes(config, identifier, by_id)
+            if identifier in config.checks and not result.is_satisfied()
+            else None
+        )
+        for identifier, result in by_id.items()
+    }
+
+
+def _obligation_causes(
+    config: Any,
+    class_def: Any,
+    by_id: dict[str, Any],
+    required: tuple[str, ...],
+) -> list[str] | None:
+    """An unsatisfied obligation's root causes, or null when it is a policy gap."""
+    roots: list[str] = []
+    for candidate in _candidate_checks(class_def, by_id, required):
+        if by_id[candidate].is_satisfied():
+            return None
+        roots.extend(_root_causes(config, candidate, by_id))
+    return list(dict.fromkeys(roots)) or None
+
+
 def _obligation_entry(
+    config: Any,
     class_name: str,
     tier: int,
     class_def: Any,
@@ -123,6 +197,7 @@ def _obligation_entry(
         "status": "unsatisfied",
         "required": list(required),
         "checks": [],
+        "caused_by": None,
         "reason": None,
     }
     if (class_name, tier) in reasons:
@@ -133,6 +208,10 @@ def _obligation_entry(
     entry["checks"] = counted
     if counted:
         entry["status"] = "satisfied"
+        return entry
+    entry["caused_by"] = _obligation_causes(
+        config, class_def, by_id, required
+    )
     return entry
 
 
@@ -146,7 +225,7 @@ def obligations(config: Any, results: Iterable[Any]) -> list[dict[str, Any]]:
     tiers = sorted(set(config.required_tiers))
     return [
         _obligation_entry(
-            class_name, tier, class_def, by_id, reasons
+            config, class_name, tier, class_def, by_id, reasons
         )
         for class_name, class_def in config.classes.items()
         if class_def.code
@@ -220,7 +299,7 @@ def error_document(
     prune: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema": 2,
+        "schema": 3,
         "gate_version": gate_version(),
         "revision": consumer_revision(root) if root is not None else None,
         "dirty": consumer_dirty(root) if root is not None else None,

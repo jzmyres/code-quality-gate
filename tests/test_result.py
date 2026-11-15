@@ -8,6 +8,7 @@ import io
 import json
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from support import (
@@ -19,9 +20,64 @@ from support import (
     sarif_report,
     with_clones,
 )
+from support import PYTHON_TEST_HEADER, stub_check_result
+from test_python_crap import crap_config
 
 sys.path.insert(0, str(GATE))
+adapters = importlib.import_module("quality_gate.adapters")
 cli = importlib.import_module("quality_gate.cli")
+policy = importlib.import_module("quality_gate.policy")
+
+
+def _parse_chain(raw, root, path, full_key):
+    requires = policy._string(raw, "requires", path, f"{full_key}.requires")
+    return adapters.ParsedSpec(
+        SimpleNamespace(requires=requires), "chain/1", ("static",),
+        requires=requires,
+    )
+
+
+def _run_chain(context):
+    result = stub_check_result(context.check, 60)
+    required = context.check.spec.requires
+    if not context.prior[required].is_satisfied():
+        result.outcome = "unsupported"
+        result.reason = f"{required} did not pass"
+    return result
+
+
+CHAIN_STUB = adapters.AdapterDescriptor(
+    "chain-stub", ("requires",), _parse_chain, _run_chain,
+)
+
+
+def _policy_with(names: tuple[str, ...], blocks: list[str]) -> str:
+    """BASE_CONFIG's python class, running exactly NAMES and BLOCKS."""
+    listed = ", ".join(json.dumps(name) for name in names)
+    text = BASE_CONFIG.replace(
+        'checks = ["smoke"]', f"checks = [{listed}]"
+    )
+    return text + "\n\n" + "\n\n".join(blocks) + "\n"
+
+
+def _command_block(identifier: str, source: str) -> str:
+    return "\n".join([
+        f"[checks.{identifier}]",
+        'adapter = "command"',
+        "tier = 1",
+        'enforcement = "enforced"',
+        f"run = {json.dumps(['python3', '-c', source])}",
+    ])
+
+
+def _chain_block(identifier: str, requires: str) -> str:
+    return "\n".join([
+        f"[checks.{identifier}]",
+        'adapter = "chain-stub"',
+        "tier = 1",
+        'enforcement = "enforced"',
+        f'requires = "{requires}"',
+    ])
 
 
 class ResultTests(FixtureCase):
@@ -42,7 +98,7 @@ class ResultTests(FixtureCase):
             "prune",
         ):
             self.assertIn(key, document)
-        self.assertEqual(document["schema"], 2)
+        self.assertEqual(document["schema"], 3)
         self.assertEqual(document["decision"], "accepted")
         self.assertFalse(document["dirty"])
         self.assertEqual(
@@ -66,6 +122,7 @@ class ResultTests(FixtureCase):
             "execution",
             "outcome",
             "satisfied",
+            "caused_by",
             "duration_seconds",
             "budget_seconds",
             "diagnostics",
@@ -81,6 +138,7 @@ class ResultTests(FixtureCase):
         self.assertEqual(check["execution"], "completed")
         self.assertEqual(check["outcome"], "pass")
         self.assertTrue(check["satisfied"])
+        self.assertIsNone(check["caused_by"])
         self.assertIsInstance(check["duration_seconds"], float)
         self.assertEqual(check["budget_seconds"], 600)
         diagnostics = check["diagnostics"]
@@ -104,6 +162,7 @@ class ResultTests(FixtureCase):
             self.assertEqual(builtin["outcome"], "pass")
             self.assertTrue(builtin["satisfied"])
         obligation = document["obligations"][0]
+        self.assertIsNone(obligation["caused_by"])
         self.assertEqual(obligation["class"], "python")
         self.assertEqual(obligation["tier"], 1)
         self.assertEqual(obligation["status"], "satisfied")
@@ -146,9 +205,11 @@ class ResultTests(FixtureCase):
         obligation = document["obligations"][0]
         self.assertEqual(obligation["status"], "unsatisfied")
         self.assertEqual(obligation["checks"], [])
+        self.assertIsNone(obligation["caused_by"])
         self.assertIn(
-            "obligation python tier 1", result.stderr
+            "check: failed (obligation python tier 1)", result.stderr
         )
+        self.assertNotIn("check: consequences", result.stderr)
 
     def test_advisory_failure_is_accepted_with_exceptions(self) -> None:
         self.write_config(
@@ -231,7 +292,7 @@ class ResultTests(FixtureCase):
         result = self.run_qg("check", "--json", "--unknown-option")
         self.assertEqual(result.returncode, 2, output(result))
         document = self.parse_json(result)
-        self.assertEqual(document["schema"], 2)
+        self.assertEqual(document["schema"], 3)
         self.assertEqual(document["decision"], "error")
         self.assertEqual(document["checks"], [])
         self.assertEqual(document["obligations"], [])
@@ -306,6 +367,107 @@ class ResultTests(FixtureCase):
         document = self.parse_json(result)
         check = self.check_by_id(document, "clones")
         self.assertEqual(check["resolved_baseline_entries"], ["gone"])
+
+
+class FailureCauseTests(FixtureCase):
+    """A rejected check names its root failures and reports consequences apart."""
+
+    def add_passing_test(self) -> None:
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER
+            + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+
+    def add_failing_test(self) -> None:
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER
+            + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_bad(self):\n"
+            "        self.assertTrue(False)\n",
+        )
+
+    def crap_setup(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.add_file("pkg/__init__.py", "")
+        self.write_config(crap_config())
+
+    def add_crap_failure(self) -> None:
+        self.add_file(
+            "pkg/three.py",
+            "def three(value):\n"
+            "    if value:\n"
+            "        if value > 1:\n"
+            "            return 1\n"
+            "    return 2\n",
+        )
+
+    def test_a_failing_suite_reports_only_itself_and_crap_as_its_consequence(
+        self,
+    ) -> None:
+        self.crap_setup()
+        self.add_failing_test()
+        result, document = self.run_json(env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn("check: failed (tests)\n", result.stderr)
+        self.assertIn(
+            "check: consequences (crap because tests; "
+            "obligation python tier 1 because tests; "
+            "obligation test tier 1 because tests)\n",
+            result.stderr,
+        )
+        self.assertIsNone(self.check_by_id(document, "tests")["caused_by"])
+        self.assertEqual(
+            self.check_by_id(document, "crap")["caused_by"], ["tests"]
+        )
+        obligation = next(
+            item for item in document["obligations"]
+            if item["class"] == "python"
+        )
+        self.assertEqual(obligation["status"], "unsatisfied")
+        self.assertEqual(obligation["caused_by"], ["tests"])
+        self.assertEqual(document["schema"], 3)
+
+    def test_a_failing_crap_with_a_passing_suite_is_a_root(self) -> None:
+        self.crap_setup()
+        self.add_passing_test()
+        self.add_crap_failure()
+        result, document = self.run_json(env=self.default_tool_env())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn("check: failed (crap)", result.stderr)
+        self.assertNotIn("check: consequences", result.stderr)
+        self.assertIsNone(self.check_by_id(document, "crap")["caused_by"])
+        self.assertIsNone(self.check_by_id(document, "tests")["caused_by"])
+
+    def test_a_two_step_chain_resolves_to_its_root(self) -> None:
+        self.write_config(_policy_with(
+            ("a", "b", "c"),
+            [
+                _command_block("a", "raise SystemExit(1)"),
+                _chain_block("b", "a"),
+                _chain_block("c", "b"),
+            ],
+        ))
+        with mock.patch.dict(
+            adapters.ADAPTERS, {CHAIN_STUB.name: CHAIN_STUB}
+        ):
+            result, document = self.run_json()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertIn(
+            "check: failed (a, obligation python tier 1)\n", result.stderr
+        )
+        self.assertIn(
+            "check: consequences (b because a; c because a)", result.stderr
+        )
+        self.assertIsNone(self.check_by_id(document, "a")["caused_by"])
+        self.assertEqual(self.check_by_id(document, "b")["caused_by"], ["a"])
+        self.assertEqual(self.check_by_id(document, "c")["caused_by"], ["a"])
 
 
 if __name__ == "__main__":

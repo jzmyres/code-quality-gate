@@ -249,7 +249,11 @@ class CheckTests(FixtureCase):
         self.assertIn("inventory: mystery.txt", text)
         self.assertIn("hygiene: 5 files within", text)
         self.assertIn("skipped because inventory failed", text)
-        self.assertIn("check: failed (inventory, smoke, obligation python tier 1)", text)
+        self.assertIn("check: failed (inventory, smoke)", text)
+        self.assertIn(
+            "check: consequences (obligation python tier 1 because smoke)",
+            text,
+        )
 
     def test_check_reports_hygiene_failure(self) -> None:
         self.write_config(
@@ -301,7 +305,11 @@ class CheckTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("file enumeration failed", text)
-        self.assertIn("check: failed (inventory, hygiene, smoke, obligation python tier 1)", text)
+        self.assertIn("check: failed (inventory, hygiene, smoke)", text)
+        self.assertIn(
+            "check: consequences (obligation python tier 1 because smoke)",
+            text,
+        )
 
     def test_check_with_missing_config_exits_2(self) -> None:
         self.config_path.unlink()
@@ -336,7 +344,8 @@ class CheckTests(FixtureCase):
         self.check_failure(
             env,
             "check: clones: skipped because inventory failed",
-            "check: failed (inventory, smoke, clones, obligation python tier 1)",
+            "check: failed (inventory, smoke, clones)",
+            "check: consequences (obligation python tier 1 because smoke)",
         )
 
 

@@ -81,6 +81,7 @@ class CheckResult:
     tests_ran: int | None = None
     tests_skipped: int | None = None
     satisfied: bool | None = None
+    caused_by: list[str] | None = None
     reason: str | None = None
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     evidence_path: Path | None = None
@@ -108,6 +109,7 @@ class CheckResult:
             "execution": self.execution,
             "outcome": self.outcome,
             "satisfied": self.is_satisfied(),
+            "caused_by": self.caused_by,
             "duration_seconds": round(self.duration_seconds, 6),
             "budget_seconds": self.budget_seconds,
             "diagnostics": self.diagnostics.to_json(),
@@ -905,16 +907,44 @@ def _failed_check_ids(results: list[CheckResult]) -> list[str]:
     return _builtin_failures(results) + _enforced_failures(results)
 
 
-def _failure_names(
+def _failure_entries(
     results: list[CheckResult], obligations: list[dict[str, Any]]
-) -> list[str]:
-    failed = _failed_check_ids(results)
-    failed.extend(
-        f"obligation {item['class']} tier {item['tier']}"
+) -> list[tuple[str, list[str] | None]]:
+    """Every reported failure, with its root checks or null when it is a root."""
+    by_id = {result.id: result for result in results}
+    entries = [
+        (identifier, by_id[identifier].caused_by)
+        for identifier in _failed_check_ids(results)
+    ]
+    entries.extend(
+        (f"obligation {item['class']} tier {item['tier']}", item["caused_by"])
         for item in obligations
         if item["status"] == "unsatisfied"
     )
-    return failed
+    return entries
+
+
+def _rejection_lines(
+    results: list[CheckResult], obligations: list[dict[str, Any]]
+) -> list[str]:
+    """The rejection summary, then a consequences line when there is one."""
+    entries = _failure_entries(results, obligations)
+    roots = [name for name, caused_by in entries if caused_by is None]
+    consequences = [
+        f"{name} because {', '.join(caused_by)}"
+        for name, caused_by in entries
+        if caused_by is not None
+    ]
+    lines = [f"check: failed ({', '.join(roots)})"]
+    if consequences:
+        lines.append(f"check: consequences ({'; '.join(consequences)})")
+    return lines
+
+
+def _assign_causes(config: Config, results: list[CheckResult]) -> None:
+    causes = gate_result.check_causes(config, results)
+    for result in results:
+        result.caused_by = causes[result.id]
 
 
 def _result_document(
@@ -928,7 +958,7 @@ def _result_document(
     selected: list[str] | None = None,
 ) -> dict[str, Any]:
     document = {
-        "schema": 2,
+        "schema": 3,
         "gate_version": gate_result.gate_version(),
         "revision": gate_result.consumer_revision(root),
         "dirty": gate_result.consumer_dirty(root),
@@ -1027,8 +1057,8 @@ def _print_decision(
         print(f"check: error: {configuration_error}", file=sys.stderr)
     elif decision == "rejected":
         print(
-            f"check: failed "
-            f"({', '.join(_failure_names(results, obligations))})",
+            *_rejection_lines(results, obligations),
+            sep="\n",
             file=sys.stderr,
         )
     elif decision == "accepted_with_exceptions":
@@ -1069,6 +1099,7 @@ def _finalize_check(
     prune_ids: list[str], trust: Any, selected: list[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     partial = selected is not None
+    _assign_causes(config, results)
     obligations = [] if partial else gate_result.obligations(config, results)
     prune_document = _perform_prune(config, prune_ids, results)
     decision, configuration_error = _check_decision(results, obligations, partial)

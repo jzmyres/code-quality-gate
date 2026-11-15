@@ -29,7 +29,7 @@ configuration, never repository coverage files or `COVERAGE_*` overrides; Python
 property accessors, overload declarations are skipped, and each file's outside-function code is a
 `PATH:<module>` subject. Clone evidence is complete only when jscpd's own source count covers every
 selected file and its SARIF has one jscpd run with results. `check --json` writes one machine-readable
-schema-2 result to stdout (schema 3 with a `trust` object under `--policy-from`), with execution, raw
+schema-3 result to stdout (schema 4 with a `trust` object under `--policy-from`), with execution, raw
 outcome, satisfaction, diagnostics, obligations, unmeasured baseline entries and prune reporting; human
 lines go to stderr. A baseline starts with `check` and
 `metric_version` matching the policy, and a requested prune that is refused still exits 1 while the
