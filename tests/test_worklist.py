@@ -561,6 +561,15 @@ class WorklistArgumentTests(FixtureCase):
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("unknown check 'nope'", result.stderr)
 
+    def test_a_baseline_key_naming_a_missing_file_exits_two(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.write_config(crap_config())
+        result = self.run_qg("worklist")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("checks.crap.baseline", result.stderr)
+        self.assertIn("quality-gate-crap.toml", result.stderr)
+        self.assertIn("does not exist", result.stderr)
+
     def test_check_without_baseline_exits_two(self) -> None:
         result = self.run_qg("worklist", "smoke")
         self.assertEqual(result.returncode, 2, output(result))

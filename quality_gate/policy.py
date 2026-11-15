@@ -543,11 +543,13 @@ def _header_string(
 
 def _baseline_header(path: Path) -> tuple[str, str] | None:
     """Read a baseline's identity header, deferring malformed TOML to the check."""
-    if not path.exists():
-        return None
     try:
         with path.open("rb") as stream:
             data = tomllib.load(stream)
+    except FileNotFoundError as error:
+        raise ConfigError(
+            f"{path}: expected an existing baseline file, got missing"
+        ) from error
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         return None
     return (
@@ -612,7 +614,7 @@ def _validate_baselines(
                 f"{check.baseline} is also used by checks.{owner}",
             )
         owners[key] = name
-        if not check.baseline.exists():
+        if not check.baseline.is_file():
             raise _config_error(
                 path,
                 f"checks.{name}.baseline",

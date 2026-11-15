@@ -819,7 +819,8 @@ class VerificationTrustTests(FindingMixin, TrustCase):
         )
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("new-verification.toml", result.stderr)
-        self.assertIn("FIFO", result.stderr)
+        self.assertIn("checks.verification.baseline", result.stderr)
+        self.assertIn("does not exist", result.stderr)
 
     def test_malformed_authorized_baseline_is_refused_before_checks(self) -> None:
         marker = self.base / "ran"

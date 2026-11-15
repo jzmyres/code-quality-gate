@@ -178,7 +178,11 @@ Rules:
   for a command it also identifies the missing `tests_pattern`.
 * A baseline path must name an existing file and must be used by exactly one
   check. A key naming a missing file, or two checks naming the same resolved
-  path, is a configuration error naming the check, the key and the path.
+  path, is a configuration error naming the check, the key and the path. A
+  check with no debt has no key, so a refusal means the path is wrong rather
+  than the debt gone. A consumer whose policy still names a missing file must
+  first update to a gate where the key is optional, then delete the key, and
+  only then take this version.
 * Every class named by a rule and every check named by a class must exist.
   Every code class must list at least one check.
 * `[[not_applicable]]` entries are the explicit, reasoned exemption for a
@@ -336,11 +340,6 @@ expires = 2026-12-31
 * Each extra metadata key declared by the adapter descriptor (for example clone
   `files`) is a list of strings and is preserved by `--prune`. Empty-reason
   diagnostics list present, nonempty extras in the descriptor's declared order.
-* A `baseline` key in the policy must name an existing file; one naming a
-  missing file is a configuration error when the policy loads, naming the
-  check, the key and the path. A check with no debt has no key. A consumer
-  whose policy still names a missing file must first update to a gate where
-  the key is optional, then delete the key, and only then take this version.
 * An absent baseline means no exception is accepted. An existing file with
   only the header is allowed. A `max` metric without an entry passes at or
   below its threshold. A `min` metric needs an entry: without one it is

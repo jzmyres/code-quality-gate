@@ -131,7 +131,7 @@ def _root_causes(
     config: Any, identifier: str, by_id: dict[str, Any]
 ) -> list[str]:
     """The root check ids an unsatisfied check's failure comes from."""
-    from .checks import _required
+    from .checks import _policy_order, _required
 
     roots: set[str] = set()
     for required in _required(config, config.checks[identifier]):
@@ -139,7 +139,7 @@ def _root_causes(
             roots.update(_root_causes(config, required, by_id))
     if not roots:
         return [identifier]
-    return [check_id for check_id in config.checks if check_id in roots]
+    return _policy_order(config, roots)
 
 
 def _check_causes(
@@ -172,12 +172,14 @@ def _obligation_causes(
     required: tuple[str, ...],
 ) -> list[str] | None:
     """An unsatisfied obligation's root causes, or null when it is a policy gap."""
+    from .checks import _policy_order
+
     roots: set[str] = set()
     for candidate in _candidate_checks(class_def, by_id, required):
         if by_id[candidate].is_satisfied():
             return None
         roots.update(_root_causes(config, candidate, by_id))
-    return [check_id for check_id in config.checks if check_id in roots] or None
+    return _policy_order(config, roots) or None
 
 
 def _obligation_entry(

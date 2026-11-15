@@ -408,6 +408,24 @@ class PolicyTests(FixtureCase):
         )
         self.assertIn("existing baseline file", message)
 
+    def test_baseline_key_naming_a_directory_is_a_configuration_error(
+        self,
+    ) -> None:
+        (self.repo / "quality-gate-clones.toml").mkdir()
+        message = self.config_error(
+            with_clones(),
+            "checks.clones.baseline",
+            "quality-gate-clones.toml",
+            "does not exist",
+        )
+        self.assertIn("existing baseline file", message)
+
+    def test_a_missing_baseline_header_file_raises_naming_its_path(self) -> None:
+        path = self.repo / "missing-header.toml"
+        with self.assertRaises(policy.ConfigError) as raised:
+            policy._baseline_header(path)
+        self.assertIn(str(path), str(raised.exception))
+
     def test_baseline_key_naming_an_existing_file_loads(self) -> None:
         self.add_file(
             "quality-gate-clones.toml",

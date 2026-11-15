@@ -922,6 +922,9 @@ comment, which has none. An unauthorized change to the policy, the tools lock or
 protected path makes the decision `blocked` (exit 1) too, naming the path, while `--allow-protected
 PATH` accepts a reviewed replacement and reports it as authorized. With an authorized policy, only that
 policy is checked against the candidate's files; the trusted policy then sets only the protected scope.
+A policy that names a baseline file the candidate lacks is refused (exit 2) naming the check, the key
+and the repository-relative path, with or without `--allow-protected` for that file, as it is without a
+trust root; an authorized candidate policy that removes the key may delete the file in the same change.
 Protected candidate files must be reached without following a symlink. The trusted directory compares
 files and globs only, so the caller checks a submodule pin. The gate records protected-input, tool-payload
 and gate-program identities before the checks and again after them, re-enumerating the protected scope

@@ -502,6 +502,10 @@ class ElispCrapTrustTests(TrustCase):
         (self.repo / "a.py").unlink()
         self.add_file("src/core.el", MODULE)
         suite = self.add_file("tests/suite.el", SUITE)
+        self.add_file(
+            "crap.toml",
+            baseline_text([], check="crap", metric_version="elisp-edebug/1"),
+        )
         self.write_config(crap_config())
         revision = self.directory_revision()
         outside = self.base / "outside.el"

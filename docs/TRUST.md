@@ -60,7 +60,12 @@ For every `--policy-from` run, the protected inputs are, in the trusted
 directory:
 
 * the policy file, `quality-gate.toml`;
-* every baseline file the policy names;
+* every baseline file the policy names, which must be a regular file in both
+  the trusted directory and the candidate: a `baseline` key naming a file
+  either side lacks is a usage error (exit 2) naming the check, the key and the
+  repository-relative path, whether or not `--allow-protected` names it. An
+  authorized candidate policy that removes the key may delete the file in the
+  same change;
 * the tools lock, `tools.lock.toml` at the candidate root; and
 * every path or glob listed in the trusted policy under `[protect] paths`, for
   example `ruff.toml`, `Makefile`, CI workflows, or a test runner such as

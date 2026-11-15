@@ -424,14 +424,14 @@ def _declared_status(item: _Input, allowed: set[str]) -> str:
     return "blocked"
 
 
-def _policy_baseline_names(data: dict[str, Any]) -> tuple[str, ...]:
+def _policy_baselines(data: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     checks = data.get("checks")
     if not isinstance(checks, dict):
         return ()
-    names: list[str] = []
-    for raw in checks.values():
+    names: list[tuple[str, str]] = []
+    for name, raw in checks.items():
         if isinstance(raw, dict) and isinstance(raw.get("baseline"), str):
-            names.append(raw["baseline"])
+            names.append((name, raw["baseline"]))
     return tuple(names)
 
 
@@ -456,11 +456,17 @@ def _materialize(
             f"{root / POLICY_NAME} at {source.location}: expected valid TOML, got "
             f"{error}"
         ) from error
-    for name in _policy_baseline_names(data):
-        raw = source.read(name)
-        target = _safe_join(policy_root, name)
-        if raw is None or target is None:
+    for name, baseline in _policy_baselines(data):
+        target = _safe_join(policy_root, baseline)
+        if target is None:
             continue
+        raw = source.read(baseline)
+        if raw is None:
+            raise UsageError(
+                f"{POLICY_NAME}: checks.{name}.baseline: expected an existing "
+                f"baseline file in the trusted source, got {baseline} does "
+                f"not exist"
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(raw)
 
@@ -509,7 +515,10 @@ def _rev_entries(
 ) -> list[BaselineEntry]:
     raw = source.read(relative)
     if raw is None:
-        return []
+        raise UsageError(
+            f"{relative}: expected the trusted source to name a regular "
+            f"baseline file, got missing"
+        )
     try:
         return _entries_from_bytes(temporary, "rev", raw, check)
     except GateError as error:
@@ -520,11 +529,8 @@ def _rev_entries(
 
 
 def _candidate_entries(
-    temporary: Path, root: Path, relative: str, check: Any
+    temporary: Path, raw: bytes, relative: str, check: Any
 ) -> tuple[list[BaselineEntry], bool]:
-    raw = _candidate_bytes(root, relative)
-    if raw is None:
-        return [], False
     try:
         return _entries_from_bytes(temporary, "candidate", raw, check), False
     except GateError as error:
@@ -614,15 +620,15 @@ def _baseline_status(
 
 def _merged_baseline(
     temporary: Path,
-    root: Path,
     source: _TrustedTree,
     relative: str,
     check: Any,
     item: _Input,
+    raw: bytes,
 ) -> tuple[list[BaselineEntry], str, tuple[str, ...]]:
     revision_entries = _rev_entries(temporary, source, relative, check)
     candidate_entries, invalid = _candidate_entries(
-        temporary, root, relative, check
+        temporary, raw, relative, check
     )
     if invalid:
         merged, ignored, tightened = revision_entries, (), False
@@ -638,17 +644,24 @@ def _merged_baseline(
 
 
 def _required_candidate_entries(
-    temporary: Path, root: Path, relative: str, check: Any
+    temporary: Path, raw: bytes, relative: str, check: Any
 ) -> list[BaselineEntry]:
-    raw = _candidate_bytes(root, relative)
-    if raw is None:
-        return []
     try:
         return _entries_from_bytes(temporary, "authorized", raw, check)
     except GateError as error:
         raise UsageError(
             f"{relative}: expected a valid effective baseline, got {error}"
         ) from error
+
+
+def _candidate_baseline(root: Path, name: str, relative: str) -> bytes:
+    raw = _candidate_bytes(root, relative)
+    if raw is None:
+        raise UsageError(
+            f"{POLICY_NAME}: checks.{name}.baseline: expected an existing "
+            f"baseline file in the candidate, got {relative} does not exist"
+        )
+    return raw
 
 
 def _apply_baselines(
@@ -670,15 +683,16 @@ def _apply_baselines(
         if relative is None:
             checks[name] = check
             continue
+        raw = _candidate_baseline(root, name, relative)
         if relative not in rev_names or relative in allowed:
             entries = _required_candidate_entries(
-                temporary, root, relative, check
+                temporary, raw, relative, check
             )
             if relative in rev_names:
                 statuses[relative] = _declared_status(inputs[relative], allowed)
         else:
             entries, status, ignored = _merged_baseline(
-                temporary, root, source, relative, check, inputs[relative]
+                temporary, source, relative, check, inputs[relative], raw
             )
             statuses[relative] = status
             ignored_entries[relative] = ignored

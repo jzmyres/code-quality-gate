@@ -12,6 +12,8 @@ import time
 import unittest
 import zlib
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from support import (
@@ -477,6 +479,163 @@ class BaselineTrustTests(TrustCase):
             self.baseline_bound(document, "clones", "fp1"), 5
         )
         self.assertTrue(self.check_by_id(document, "clones")["satisfied"])
+
+
+class MissingBaselineTrustTests(TrustCase):
+    """A trusted run refuses a policy that names a baseline the candidate lacks."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_config(with_clones())
+        self.add_file("b.py", "print('b')\n")
+        self.write_clones_baseline()
+        self.directory = self.directory_revision()
+        self.baseline = Path(self.directory) / "quality-gate-clones.toml"
+        (self.repo / "quality-gate-clones.toml").unlink()
+        self.clone_environment = self.clone_env()
+
+    def assert_refused(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> None:
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("checks.clones.baseline", result.stderr)
+        self.assertIn("does not exist", result.stderr)
+        self.assertIn(
+            "got quality-gate-clones.toml does not exist", result.stderr
+        )
+        self.assertNotIn(self.directory, result.stderr)
+        self.assertNotIn(str(self.repo), result.stderr)
+
+    def refuse_from_the_trusted_source(self) -> None:
+        self.write_clones_baseline()
+        self.baseline.unlink()
+
+    def test_candidate_deleting_a_named_baseline_is_refused(self) -> None:
+        result = self.run_qg(
+            "check", "--policy-from", self.directory,
+            env=self.clone_environment,
+        )
+        self.assert_refused(result)
+
+    def test_authorizing_the_baseline_file_does_not_allow_its_deletion(
+        self,
+    ) -> None:
+        result = self.run_qg(
+            "check", "--policy-from", self.directory,
+            "--allow-protected", "quality-gate-clones.toml",
+            env=self.clone_environment,
+        )
+        self.assert_refused(result)
+
+    def test_an_authorized_policy_removing_the_key_ends_the_refusal(
+        self,
+    ) -> None:
+        self.write_config(with_clones().replace(
+            'baseline = "quality-gate-clones.toml"\n', ""
+        ))
+        result = self.run_qg(
+            "check", "--policy-from", self.directory,
+            "--allow-protected", "quality-gate.toml",
+            env=self.install_fake_jscpd(sarif_report([])),
+        )
+        self.assertNotEqual(result.returncode, 2, output(result))
+        self.assertNotIn("expected an existing baseline file", result.stderr)
+
+    def test_an_authorized_policy_removing_the_key_allows_the_deletion(
+        self,
+    ) -> None:
+        self.write_config(with_clones().replace(
+            'baseline = "quality-gate-clones.toml"\n', ""
+        ))
+        result, document = self.trust_json(
+            self.directory,
+            "--allow-protected", "quality-gate.toml",
+            "--allow-protected", "quality-gate-clones.toml",
+            env=self.install_fake_jscpd(sarif_report([])),
+        )
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "accepted")
+        entry = self.protected(document, "quality-gate-clones.toml")
+        self.assertEqual(entry["status"], "authorized")
+
+    def test_a_trusted_policy_naming_a_missing_baseline_names_the_relative_path(
+        self,
+    ) -> None:
+        self.refuse_from_the_trusted_source()
+        result = self.run_qg(
+            "check", "--policy-from", self.directory,
+            env=self.clone_environment,
+        )
+        self.assert_refused(result)
+
+    def test_inventory_refuses_a_candidate_missing_a_named_baseline(
+        self,
+    ) -> None:
+        result = self.run_qg("inventory", "--policy-from", self.directory)
+        self.assert_refused(result)
+
+    def test_inventory_refuses_a_trusted_policy_naming_a_missing_baseline(
+        self,
+    ) -> None:
+        self.refuse_from_the_trusted_source()
+        result = self.run_qg("inventory", "--policy-from", self.directory)
+        self.assert_refused(result)
+
+    def test_a_revision_entry_without_its_trusted_file_raises_naming_it(
+        self,
+    ) -> None:
+        source = trust._TrustedTree(self.base / "empty-trusted")
+        (self.base / "empty-trusted").mkdir()
+        check = SimpleNamespace(
+            id="clones",
+            adapter="clones",
+            metric_version="jscpd-clone-occurrences/1",
+            direction="max",
+        )
+        with self.assertRaises(trust.UsageError) as raised:
+            trust._rev_entries(
+                self.base, source, "quality-gate-clones.toml", check
+            )
+        self.assertIn("quality-gate-clones.toml", str(raised.exception))
+
+    def test_a_candidate_directory_named_as_the_baseline_is_refused(self) -> None:
+        (self.repo / "quality-gate-clones.toml").mkdir()
+        result = self.run_qg(
+            "check", "--policy-from", self.directory,
+            env=self.clone_environment,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("quality-gate-clones.toml", result.stderr)
+        self.assertIn("expected a regular file", result.stderr)
+
+
+class MissingCrapBaselineTrustTests(TrustCase):
+    """A CRAP check's baseline is refused the same way when the candidate loses it."""
+
+    def test_missing_crap_baseline_is_refused_under_a_trusted_run(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.add_file("pkg/__init__.py", "")
+        self.add_file("pkg/new.py", "def one():\n    return 1\n")
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_ok(self):\n        self.assertTrue(True)\n",
+        )
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
+        )
+        self.write_config(crap_config())
+        directory = self.directory_revision()
+        (self.repo / "quality-gate-crap.toml").unlink()
+        result = self.run_qg(
+            "check", "--policy-from", directory,
+            env=self.default_tool_env(),
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("checks.crap.baseline", result.stderr)
+        self.assertIn("quality-gate-crap.toml", result.stderr)
+        self.assertNotIn("qg-tree-", result.stderr)
 
 
 class PruneTrustRefusalTests(TrustCase):
