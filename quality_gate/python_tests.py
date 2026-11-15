@@ -140,11 +140,10 @@ def _tests_summary(
     combined: str,
     diagnostics: Diagnostics,
     deadline: float,
-    temporary_reason: str | None = None,
 ) -> tuple[
     int | None, int | None, str | None, Any | None
 ]:
-    from .checks import _combined_reason, _tests_result
+    from .checks import _tests_result
 
     matches, evaluation = output_patterns._pattern_matches(
         output_patterns._command_patterns(spec),
@@ -163,9 +162,10 @@ def _tests_summary(
                     spec,
                     start,
                     prefix,
-                    _combined_reason(reason, temporary_reason),
+                    reason,
                     execution="budget",
                     diagnostics=diagnostics,
+                    report=False,
                 ),
             )
         reason = "test summary matching failed"
@@ -178,10 +178,11 @@ def _tests_summary(
                 spec,
                 start,
                 prefix,
-                _combined_reason(reason, temporary_reason),
+                reason,
                 outcome="error",
                 execution="error",
                 diagnostics=diagnostics,
+                report=False,
             ),
         )
     mark_step("test count analysis")
@@ -196,18 +197,13 @@ def _tests_failure_reason(
     ran: int | None,
     skipped: int | None,
     executed: int | None,
-    temporary_reason: str | None = None,
 ) -> str:
-    from .checks import _combined_reason
-
     if executed == 0:
-        reason = (
+        return (
             f"command exited {run_result.returncode} and no test executed: "
             f"{ran} ran, {skipped} skipped; zero tests is not a pass"
         )
-    else:
-        reason = f"command exited {run_result.returncode}"
-    return _combined_reason(reason, temporary_reason) or reason
+    return f"command exited {run_result.returncode}"
 
 
 def _tests_failed(
@@ -219,13 +215,11 @@ def _tests_failed(
     prefix: str,
     start: float,
     deadline: float,
-    temporary_reason: str | None = None,
 ) -> Any:
     from .checks import _tests_result
 
     ran, skipped, count_error, failure = _tests_summary(
         check, spec, start, prefix, combined, diagnostics, deadline,
-        temporary_reason,
     )
     if failure is not None:
         return failure
@@ -238,7 +232,7 @@ def _tests_failed(
             count_error,
             outcome="unsupported",
             diagnostics=diagnostics,
-            combined=combined,
+            report=False,
         )
     executed = _executed_tests(ran, skipped)
     return _tests_result(
@@ -246,14 +240,12 @@ def _tests_failed(
         spec,
         start,
         prefix,
-        _tests_failure_reason(
-            run_result, ran, skipped, executed, temporary_reason
-        ),
+        _tests_failure_reason(run_result, ran, skipped, executed),
         diagnostics=diagnostics,
         measurement={"tests": executed} if executed is not None else None,
         tests_ran=ran,
         tests_skipped=skipped,
-        combined=combined,
+        report=False,
     )
 
 
@@ -351,9 +343,8 @@ def _tests_execution_failure(
     combined: str,
     prefix: str,
     start: float,
-    temporary_reason: str | None = None,
 ) -> Any | None:
-    from .checks import _combined_reason, _tests_result
+    from .checks import _tests_result
 
     if run_result.execution == "error":
         reason = run_result.error or "cannot run command"
@@ -362,10 +353,11 @@ def _tests_execution_failure(
             spec,
             start,
             prefix,
-            _combined_reason(reason, temporary_reason),
+            reason,
             outcome="error",
             execution="error",
             diagnostics=diagnostics,
+            report=False,
         )
     if run_result.execution == "budget":
         return _tests_result(
@@ -373,13 +365,10 @@ def _tests_execution_failure(
             spec,
             start,
             prefix,
-            _combined_reason(
-                f"command exceeded its {spec.budget_seconds} second budget",
-                temporary_reason,
-            ),
+            f"command exceeded its {spec.budget_seconds} second budget",
             execution="budget",
             diagnostics=diagnostics,
-            combined=combined,
+            report=False,
         )
     if run_result.execution == "signal":
         return _tests_result(
@@ -387,13 +376,10 @@ def _tests_execution_failure(
             spec,
             start,
             prefix,
-            _combined_reason(
-                f"command terminated by signal {-run_result.returncode}",
-                temporary_reason,
-            ),
+            f"command terminated by signal {-run_result.returncode}",
             execution="signal",
             diagnostics=diagnostics,
-            combined=combined,
+            report=False,
         )
     return None
 
@@ -406,13 +392,11 @@ def _tests_counts(
     combined: str,
     diagnostics: Diagnostics,
     deadline: float,
-    temporary_reason: str | None = None,
 ) -> tuple[tuple[int, int, int] | None, Any | None]:
-    from .checks import _combined_reason, _tests_result
+    from .checks import _tests_result
 
     ran, skipped, count_error, failure = _tests_summary(
         check, spec, start, prefix, combined, diagnostics, deadline,
-        temporary_reason,
     )
     if failure is not None:
         return None, failure
@@ -422,10 +406,10 @@ def _tests_counts(
             spec,
             start,
             prefix,
-            _combined_reason(count_error, temporary_reason),
+            count_error,
             outcome="unsupported",
             diagnostics=diagnostics,
-            combined=combined,
+            report=False,
         )
     assert ran is not None and skipped is not None
     executed = ran - skipped
@@ -435,16 +419,13 @@ def _tests_counts(
             spec,
             start,
             prefix,
-            _combined_reason(
-                f"no test executed: {ran} ran, {skipped} skipped; "
-                "zero tests is not a pass",
-                temporary_reason,
-            ),
+            f"no test executed: {ran} ran, {skipped} skipped; "
+            "zero tests is not a pass",
             diagnostics=diagnostics,
             measurement={"tests": 0},
             tests_ran=ran,
             tests_skipped=skipped,
-            combined=combined,
+            report=False,
         )
     return (ran, skipped, executed), None
 
@@ -519,7 +500,8 @@ def _run_python_tests(context: Any) -> Any:
     from .checks import (
         CheckResult,
         _finish_temporary,
-        _temporary_failure,
+        _finish_test_result,
+        _temporary_reason,
         _temporary_test_directory,
         _tests_result,
     )
@@ -536,7 +518,7 @@ def _run_python_tests(context: Any) -> Any:
 
     command = expand_run(spec.run, python_prefix)
     environment = _test_environment(python_prefix)
-    temporary = _temporary_test_directory(evidence_dir)
+    temporary = _temporary_test_directory()
     environment["TMPDIR"] = str(temporary)
     mark_step("test command")
     try:
@@ -548,18 +530,17 @@ def _run_python_tests(context: Any) -> Any:
         )
     finally:
         temporary_paths = _finish_temporary(temporary)
-    temporary_reason = _temporary_failure(temporary_paths)
+    temporary_reason = _temporary_reason(temporary_paths)
 
     diagnostics = run_result.diagnostics()
     combined = run_result.combined_text
     failure = _tests_execution_failure(
         check, spec, run_result, diagnostics, combined, prefix, start,
-        temporary_reason,
     )
     if failure is not None:
-        return failure
+        return _finish_test_result(failure, temporary_reason, prefix, combined)
     if run_result.returncode != 0:
-        return _tests_failed(
+        result = _tests_failed(
             check,
             spec,
             run_result,
@@ -568,29 +549,32 @@ def _run_python_tests(context: Any) -> Any:
             prefix,
             start,
             deadline,
-            temporary_reason,
         )
+        return _finish_test_result(result, temporary_reason, prefix, combined)
 
     counts, failure = _tests_counts(
         check, spec, start, prefix, combined, diagnostics, deadline,
-        temporary_reason,
     )
     if failure is not None:
-        return failure
+        return _finish_test_result(failure, temporary_reason, prefix, combined)
     assert counts is not None
     ran, skipped, executed = counts
     if temporary_reason is not None:
-        return _tests_result(
+        result = _tests_result(
             check,
             spec,
             start,
             prefix,
-            temporary_reason,
+            "",
+            outcome="pass",
             diagnostics=diagnostics,
             measurement={"tests": executed},
             tests_ran=ran,
             tests_skipped=skipped,
-            combined=combined,
+            report=False,
+        )
+        return _finish_test_result(
+            result, temporary_reason, prefix, combined
         )
     return _tests_evidence(
         check,

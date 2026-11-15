@@ -530,11 +530,17 @@ def _make_read_only(tool: Tool, directory: Path) -> None:
 
 
 def _make_directories_writable(directory: Path) -> None:
-    """Restore the owner's write bit on a tree's directories before removal."""
-    for path in [directory, *directory.rglob("*")]:
+    """Restore the owner's read, write and search bits on a tree's directories."""
+    def unlock(path: Path) -> None:
         mode = path.lstat().st_mode
         if stat.S_ISDIR(mode):
-            os.chmod(path, stat.S_IMODE(mode) | stat.S_IWUSR)
+            os.chmod(path, stat.S_IMODE(mode) | 0o700)
+
+    unlock(directory)
+    for current, directories, _files in os.walk(directory):
+        base = Path(current)
+        for name in directories:
+            unlock(base / name)
 
 
 def _remove_install(destination: Path) -> None:

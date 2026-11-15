@@ -75,9 +75,9 @@ DECISIONS = (
     Decision(
         "tests_temporary_paths",
         "quality_gate/checks.py",
-        "_temporary_failure",
+        "_temporary_reason",
         "negate",
-        "len(paths) == 0",
+        "len(paths) > 0",
         "A test suite that leaves files in its temporary directory fails.",
     ),
     Decision(

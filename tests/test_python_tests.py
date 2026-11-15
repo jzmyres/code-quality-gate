@@ -24,8 +24,11 @@ from support import (
     PYTHON_COMMON_RULE_LINES,
     PYTHON_TEST_HEADER,
     FixtureCase,
+    assert_gate_temporary_directory,
     assert_temporary_failure,
+    assert_temporary_listing_error,
     copy_tree_writable,
+    long_temporary_directory,
     output,
 )
 
@@ -271,9 +274,23 @@ class PythonTestsTests(FixtureCase):
         )
         assert_temporary_failure(self, check, marker, "evidence")
 
+    def test_an_unreadable_temporary_subtree_fails_closed_and_names_its_path(self) -> None:
+        marker = self.base / "unreadable-tmpdir"
+        self.add_test(
+            "test_unreadable",
+            "    def test_unreadable(self):\n"
+            "        import os\n"
+            "        import pathlib\n"
+            f"        pathlib.Path({str(marker)!r}).write_text(os.environ['TMPDIR'])\n"
+            "        directory = pathlib.Path(os.environ['TMPDIR']) / 'unreadable'\n"
+            "        directory.mkdir()\n"
+            "        directory.chmod(0)\n",
+        )
+        result, document = self.run_tests()
+        assert_temporary_listing_error(self, result, document, marker)
+
     def test_the_suite_receives_the_gate_temporary_directory(self) -> None:
-        caller = self.base / "caller-tmp"
-        caller.mkdir()
+        caller = long_temporary_directory(self)
         marker = self.base / "suite-tmpdir"
         self.add_test(
             "test_tmpdir",
@@ -286,7 +303,30 @@ class PythonTestsTests(FixtureCase):
         caller_env["TMPDIR"] = str(caller)
         result, document = self.run_tests(env=caller_env)
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertNotEqual(marker.read_text(encoding="utf-8"), str(caller))
+        assert_gate_temporary_directory(self, marker, caller)
+
+    def test_a_long_caller_tmpdir_leaves_room_for_a_unix_socket(self) -> None:
+        caller = long_temporary_directory(self)
+        socket_name = "s" * 40
+        self.add_test(
+            "test_socket",
+            "    def test_socket(self):\n"
+            "        import os\n"
+            "        import pathlib\n"
+            "        import socket\n"
+            "        path = pathlib.Path(os.environ['TMPDIR']) / "
+            f"{socket_name!r}\n"
+            "        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "        try:\n"
+            "            listener.bind(str(path))\n"
+            "        finally:\n"
+            "            listener.close()\n"
+            "        path.unlink()\n",
+        )
+        caller_env = self.default_tool_env()
+        caller_env["TMPDIR"] = str(caller)
+        result, document = self.run_tests(env=caller_env)
+        assert_tests_pass(self, result, document, 1)
 
     def test_zero_tests_fails(self) -> None:
         self.add_file("tests/helper.py", "VALUE = 1\n")
@@ -1026,6 +1066,31 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 unreadable = coverage_tool._coverage_config_problem(data_dir, settings)
             self.assertIn("coverage.ini", unreadable)
             self.assertIn("denied", unreadable)
+
+    def test_eleven_temporary_paths_report_the_sorted_first_ten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            names = [f"left-{index:02d}" for index in range(11)]
+            for name in names:
+                (directory / name).write_text("", encoding="utf-8")
+            walk = os.walk
+
+            def reversed_walk(*args: object, **options: object):
+                for current, directories, files in walk(*args, **options):
+                    yield (
+                        current,
+                        sorted(directories, reverse=True),
+                        sorted(files, reverse=True),
+                    )
+
+            with mock.patch.object(checks.os, "walk", side_effect=reversed_walk):
+                paths = checks._temporary_paths(directory)
+        self.assertEqual(paths, sorted(names))
+        self.assertEqual(
+            checks._temporary_reason(paths),
+            "11 temporary paths left after the suite: "
+            + ", ".join(sorted(names)[:10]),
+        )
 
     def test_temporary_cleanup_failure_is_reported_with_its_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

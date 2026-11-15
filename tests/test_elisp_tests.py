@@ -11,8 +11,11 @@ from unittest import mock
 from support import (
     GATE,
     FixtureCase,
+    assert_gate_temporary_directory,
     assert_temporary_failure,
+    assert_temporary_listing_error,
     baseline_text,
+    long_temporary_directory,
     output,
 )
 
@@ -240,9 +243,22 @@ requires = "legacy-tests"
         )
         assert_temporary_failure(self, check, marker, "evidence")
 
+    def test_an_unreadable_temporary_subtree_fails_closed_and_names_its_path(self) -> None:
+        marker = self.base / "unreadable-tmpdir"
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest unreadable ()\n"
+                      f"  (with-temp-file {json.dumps(str(marker))} "
+                      "(insert (getenv \"TMPDIR\")))\n"
+                      "  (let ((directory (expand-file-name \"unreadable\" "
+                      "(getenv \"TMPDIR\"))))\n"
+                      "    (make-directory directory)\n"
+                      "    (set-file-modes directory #o000)))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        result, document = self.run_json()
+        assert_temporary_listing_error(self, result, document, marker)
+
     def test_the_suite_receives_the_gate_temporary_directory(self) -> None:
-        caller = self.base / "caller-tmp"
-        caller.mkdir()
+        caller = long_temporary_directory(self)
         marker = self.base / "suite-tmpdir"
         self.add_file("tests/suite.el", "(require 'ert)\n"
                       "(ert-deftest temporary ()\n"
@@ -253,9 +269,7 @@ requires = "legacy-tests"
         caller_env["TMPDIR"] = str(caller)
         result, document = self.run_json(env=caller_env)
         self.assertEqual(result.returncode, 0, output(result))
-        check = self.check_by_id(document, "legacy-tests")
-        self.assertEqual(check["outcome"], "pass")
-        self.assertNotEqual(marker.read_text(encoding="utf-8"), str(caller))
+        assert_gate_temporary_directory(self, marker, caller)
 
     def test_redefined_symbols_keep_each_definition_and_position(self) -> None:
         self.add_file("src/core.el", "(defun redefined () (+ 0 1))\n(defun redefined () (+ 1 1))\n")

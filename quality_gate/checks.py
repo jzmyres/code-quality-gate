@@ -360,13 +360,15 @@ def _tests_result(
     diagnostics: Diagnostics | None = None,
     measurement: dict[str, Any] | None = None,
     combined: str | None = None,
+    report: bool = True,
     **fields: Any,
 ) -> CheckResult:
     if execution == "budget":
         reason = _budget_detail(reason, start, spec.budget_seconds)
-    print(f"{prefix}: {reason}", file=sys.stderr)
-    if combined is not None:
-        _print_output(prefix, combined)
+    if report:
+        print(f"{prefix}: {reason}", file=sys.stderr)
+        if combined is not None:
+            _print_output(prefix, combined)
     return _check_result(
         check,
         start,
@@ -622,22 +624,24 @@ def _remove_run_directory(directory: Any, *, report: bool = False) -> None:
 TEMPORARY_PATH_LIMIT = 10
 
 
-def _temporary_test_directory(parent: Path) -> Path:
+def _temporary_test_directory() -> Path:
     """Create the fresh directory a test suite receives as TMPDIR."""
-    directory = parent / "tmp"
     try:
-        directory.mkdir()
+        return Path(tempfile.mkdtemp(prefix="qg-t-"))
     except OSError as error:
         raise UsageError(
-            f"cannot create the temporary directory {directory}: {error}"
+            f"cannot create the temporary directory: {error}"
         ) from error
-    return directory
 
 
 def _temporary_paths(directory: Path) -> list[str]:
     """Every path left under DIRECTORY, relative to it and sorted."""
     paths: list[str] = []
-    for current, directories, files in os.walk(directory):
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for current, directories, files in os.walk(directory, onerror=fail):
         base = Path(current)
         paths.extend(
             str((base / name).relative_to(directory))
@@ -655,12 +659,6 @@ def _temporary_reason(paths: list[str]) -> str | None:
             f"left after the suite: {shown}"
         )
     return None
-
-
-def _temporary_failure(paths: list[str]) -> str | None:
-    if len(paths) == 0:
-        return None
-    return _temporary_reason(paths)
 
 
 def _remove_temporary_directory(directory: Path) -> str | None:
@@ -698,6 +696,33 @@ def _combined_reason(first: str | None, second: str | None) -> str | None:
     if first is None:
         return second
     return f"{first}; {second}"
+
+
+def _merge_temporary_reason(
+    result: CheckResult, temporary_reason: str | None
+) -> CheckResult:
+    """Fold a leftover-path reason into a finished check result."""
+    if temporary_reason is None:
+        return result
+    result.reason = _combined_reason(result.reason or None, temporary_reason)
+    if result.outcome == "pass":
+        result.outcome = "fail"
+    return result
+
+
+def _finish_test_result(
+    result: CheckResult,
+    temporary_reason: str | None,
+    prefix: str,
+    combined: str | None = None,
+) -> CheckResult:
+    """Report a finished test result, including any temporary-path reason."""
+    result = _merge_temporary_reason(result, temporary_reason)
+    if result.reason is not None:
+        print(f"{prefix}: {result.reason}", file=sys.stderr)
+    if combined is not None:
+        _print_output(prefix, combined)
+    return result
 
 
 def _run_policy_checks(

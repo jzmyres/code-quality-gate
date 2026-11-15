@@ -391,14 +391,15 @@ digest are the authorized effective lock's, so the parent and the coverage runne
 authorized coverage upgrade.
 
 Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
-for that run, so the caller's `TMPDIR` never reaches the suite. After the command exits, the gate
-lists every path left under that directory, relative to it and sorted. Any path left fails the check
-with `N temporary paths left after the suite: PATH, ...`, naming the count and the first ten paths
+directly in the caller's temporary directory with a short `qg-t-` prefix, so the caller's `TMPDIR`
+never reaches the suite and the added path stays short. After the command exits, the gate lists every
+path left under that directory, relative to it and sorted. Any path left fails the check with
+`N temporary paths left after the suite: PATH, ...`, naming the count and the first ten paths
 (`path` is singular when N is 1); a command that failed for another reason reports both reasons.
-The gate removes the directory whether the suite passed or failed, adding the owner's write bit to
-every directory before removing its contents. A removal that still fails is a decision error naming
-the directory and the operating-system error; it is never ignored. No policy key enables or disables
-this rule.
+The gate removes the directory whether the suite passed or failed, restoring the owner's read, write
+and search bits on every directory before removing its contents. A listing or removal that still
+fails is a decision error naming the directory and the operating-system error; it is never ignored.
+No policy key enables or disables this rule.
 
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:
@@ -478,11 +479,13 @@ as failed, and skipped tests are counted separately. A passing check requires an
 a valid result, at least one executed test (`selected - skipped`), and no unexpected results.
 
 `elisp_tests` gives its suite the same temporary-directory rule as `python_tests`: `TMPDIR` is a
-fresh gate-owned directory, and every path left under it after the child exits fails the check with
+fresh gate-owned directory created in the caller's temporary directory with the same short prefix,
+and every path left under it after the child exits fails the check with
 `N temporary paths left after the suite: PATH, ...`, naming the count and the first ten sorted
 relative paths (`path` is singular when N is 1). A child that failed for another reason reports both
-reasons. The directory is removed afterwards, with every directory made writable first; a removal
-that still fails is a decision error naming the directory and the operating-system error.
+reasons. The directory is removed afterwards, with every directory given the owner's read, write and
+search bits first; a listing or removal that still fails is a decision error naming the directory
+and the operating-system error.
 
 A failed test names the test and its printed ERT condition. Zero executed tests, a missing or repeated
 batch call, errors instrumenting a file or loading the suite, and an expired budget fail the check;

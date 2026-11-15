@@ -722,6 +722,48 @@ def assert_temporary_failure(
     case.assertFalse(Path(marker.read_text(encoding="utf-8")).exists())
 
 
+def long_temporary_directory(case: unittest.TestCase) -> Path:
+    """A caller TMPDIR whose absolute path is exactly 48 characters.
+
+    It starts under /tmp so the test keeps the intended length even when the
+    gate itself runs with a longer TMPDIR.
+    """
+    root = Path(tempfile.mkdtemp(prefix="qg-caller-", dir="/tmp"))
+    case.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    caller = root / ("c" * (48 - len(str(root)) - 1))
+    caller.mkdir()
+    if len(str(caller)) != 48:
+        raise AssertionError(f"caller TMPDIR is {len(str(caller))} characters: {caller}")
+    return caller
+
+
+def assert_gate_temporary_directory(
+    case: unittest.TestCase, marker: Path, caller: Path
+) -> None:
+    """The suite saw a short gate-owned child of CALLER, removed afterwards."""
+    suite_tmpdir = Path(marker.read_text(encoding="utf-8"))
+    case.assertEqual(suite_tmpdir.parent, caller)
+    case.assertTrue(suite_tmpdir.name.startswith("qg-t-"))
+    case.assertFalse(suite_tmpdir.exists())
+
+
+def assert_temporary_listing_error(
+    case: unittest.TestCase,
+    result: subprocess.CompletedProcess[str],
+    document: dict[str, Any],
+    marker: Path,
+) -> None:
+    """An unreadable subtree made the gate fail closed, naming its path."""
+    case.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+    case.assertEqual(document["decision"], "error")
+    suite_tmpdir = Path(marker.read_text(encoding="utf-8"))
+    unreadable = suite_tmpdir / "unreadable"
+    case.assertIn("cannot list the temporary directory", document["error"])
+    case.assertIn(str(suite_tmpdir), document["error"])
+    case.assertIn(str(unreadable), document["error"])
+    case.assertFalse(suite_tmpdir.exists())
+
+
 def stub_check_result(check: Any, budget_seconds: int, **fields: Any) -> Any:
     """The passing CheckResult a stub adapter returns for CHECK."""
     from quality_gate import checks
