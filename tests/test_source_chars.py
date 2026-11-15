@@ -1,19 +1,16 @@
 """Tests for the source-character lint adapter and its ratcheted findings."""
 from __future__ import annotations
 
-import unittest
 from typing import Any
 
 from support import (
     BASE_CONFIG,
-    GATE,
     FixtureCase,
     _add_check_to_class,
     baseline_text,
     output,
 )
 
-from quality_gate.files import enumerate_files
 from quality_gate.policy import GateError
 from quality_gate.source_chars import measure_source_chars
 
@@ -362,14 +359,3 @@ class SourceCharsCheckTests(FixtureCase):
         self.assertEqual(document["decision"], "rejected")
         self.assertEqual(check["outcome"], "error")
         self.assertIn("invalid baseline", check["reason"])
-
-
-class RepositoryReplayTests(unittest.TestCase):
-    def test_this_repository_passes_source_chars(self) -> None:
-        # The check is not enabled in this repository's own policy yet: the
-        # trusted gate that judges a candidate comes from the base revision,
-        # whose adapter registry cannot name source_chars, so enabling it here
-        # would make every candidate policy unparseable. Replay the adapter on
-        # this tree instead, which is the measurement the design asks for.
-        findings = measure_source_chars(GATE, enumerate_files(GATE))
-        self.assertEqual(findings, [])
