@@ -24,6 +24,7 @@ from support import (
     PYTHON_COMMON_RULE_LINES,
     PYTHON_TEST_HEADER,
     FixtureCase,
+    assert_temporary_failure,
     copy_tree_writable,
     output,
 )
@@ -38,6 +39,19 @@ python_tests = importlib.import_module("quality_gate.python_tests")
 output_patterns = importlib.import_module("quality_gate.output_patterns")
 regexrun = importlib.import_module("quality_gate.regexrun")
 runner = importlib.import_module("quality_gate.runner")
+
+
+def assert_tests_pass(
+    case: unittest.TestCase,
+    result: subprocess.CompletedProcess[str],
+    document: dict[str, object],
+    expected: int,
+) -> dict[str, object]:
+    case.assertEqual(result.returncode, 0, output(result))
+    check = case.check_by_id(document, "tests")
+    case.assertEqual(check["outcome"], "pass")
+    case.assertEqual(check["measurement"], {"tests": expected})
+    return check
 
 
 def tests_config(
@@ -181,11 +195,8 @@ class PythonTestsTests(FixtureCase):
             "    def test_two(self):\n        self.assertTrue(True)\n",
         )
         result, document = self.run_tests()
-        self.assertEqual(result.returncode, 0, output(result))
-        check = self.check_by_id(document, "tests")
-        self.assertEqual(check["outcome"], "pass")
+        check = assert_tests_pass(self, result, document, 2)
         self.assertEqual(check["execution"], "completed")
-        self.assertEqual(check["measurement"], {"tests": 2})
         self.assertEqual(check["metric_version"], "test-count/1")
         self.assertIn("passed (2 tests", result.stderr)
 
@@ -196,6 +207,86 @@ class PythonTestsTests(FixtureCase):
         )
         _result, check = self.failed_tests("command exited 3")
         self.assertEqual(check["reason"], "command exited 3")
+
+    def test_a_temporary_file_left_by_the_suite_fails(self) -> None:
+        self.add_test(
+            "test_temporary",
+            "    def test_left(self):\n"
+            "        import os\n"
+            "        import tempfile\n"
+            "        descriptor, _path = tempfile.mkstemp(prefix='qg-left-')\n"
+            "        os.close(descriptor)\n",
+        )
+        _result, check = self.failed_tests(
+            "1 temporary path left after the suite:", "qg-left-"
+        )
+        self.assertIn("qg-left-", check["reason"])
+
+    def test_a_temporary_file_removed_by_the_suite_passes(self) -> None:
+        self.add_test(
+            "test_temporary",
+            "    def test_removed(self):\n"
+            "        import os\n"
+            "        import tempfile\n"
+            "        descriptor, path = tempfile.mkstemp(prefix='qg-left-')\n"
+            "        os.close(descriptor)\n"
+            "        os.unlink(path)\n",
+        )
+        result, document = self.run_tests()
+        assert_tests_pass(self, result, document, 1)
+
+    def test_a_failing_suite_reports_its_exit_and_the_leftover(self) -> None:
+        self.add_test(
+            "test_temporary",
+            "    def test_left(self):\n"
+            "        import tempfile\n"
+            "        tempfile.mkdtemp(prefix='qg-left-')\n"
+            "        self.fail('deliberate')\n",
+        )
+        _result, check = self.failed_tests(
+            "command exited 1",
+            "1 temporary path left after the suite:",
+            "qg-left-",
+        )
+        self.assertIn("command exited 1", check["reason"])
+        self.assertIn("qg-left-", check["reason"])
+
+    def test_a_read_only_temporary_tree_fails_and_is_removed(self) -> None:
+        marker = self.base / "read-only-tmpdir"
+        self.add_test(
+            "test_temporary",
+            "    def test_left(self):\n"
+            "        import os\n"
+            "        import pathlib\n"
+            "        import tempfile\n"
+            "        directory = pathlib.Path(tempfile.mkdtemp(prefix='qg-read-only-'))\n"
+            f"        pathlib.Path({str(marker)!r}).write_text(os.environ['TMPDIR'])\n"
+            "        evidence = directory / 'evidence'\n"
+            "        evidence.write_text('left')\n"
+            "        evidence.chmod(0o444)\n"
+            "        directory.chmod(0o555)\n",
+        )
+        _result, check = self.failed_tests(
+            "2 temporary paths left after the suite:", "qg-read-only-", "evidence"
+        )
+        assert_temporary_failure(self, check, marker, "evidence")
+
+    def test_the_suite_receives_the_gate_temporary_directory(self) -> None:
+        caller = self.base / "caller-tmp"
+        caller.mkdir()
+        marker = self.base / "suite-tmpdir"
+        self.add_test(
+            "test_tmpdir",
+            "    def test_tmpdir(self):\n"
+            "        import os\n"
+            "        import pathlib\n"
+            f"        pathlib.Path({str(marker)!r}).write_text(os.environ['TMPDIR'])\n",
+        )
+        caller_env = self.default_tool_env()
+        caller_env["TMPDIR"] = str(caller)
+        result, document = self.run_tests(env=caller_env)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertNotEqual(marker.read_text(encoding="utf-8"), str(caller))
 
     def test_zero_tests_fails(self) -> None:
         self.add_file("tests/helper.py", "VALUE = 1\n")
@@ -449,10 +540,7 @@ class AuthorizedCoverageTests(FixtureCase):
             "tools.lock.toml",
             env={"QG_TOOLS_DIR": str(tools)},
         )
-        self.assertEqual(result.returncode, 0, output(result))
-        check = self.check_by_id(document, "tests")
-        self.assertEqual(check["outcome"], "pass")
-        self.assertEqual(check["measurement"], {"tests": 1})
+        assert_tests_pass(self, result, document, 1)
 
 
 class CovrunTests(unittest.TestCase):
@@ -938,6 +1026,20 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 unreadable = coverage_tool._coverage_config_problem(data_dir, settings)
             self.assertIn("coverage.ini", unreadable)
             self.assertIn("denied", unreadable)
+
+    def test_temporary_cleanup_failure_is_reported_with_its_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "tmp"
+            directory.mkdir()
+            message = (
+                f"cannot remove the temporary directory {directory}: denied"
+            )
+            with mock.patch.object(
+                checks, "_remove_temporary_directory", return_value=message
+            ):
+                with self.assertRaises(policy.UsageError) as raised:
+                    checks._finish_temporary(directory)
+        self.assertIn(str(directory), str(raised.exception))
 
     def test_setup_returns_the_data_directory_and_prefix(self) -> None:
         temporary = tempfile.TemporaryDirectory()

@@ -8,7 +8,13 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
-from support import GATE, FixtureCase, baseline_text, output
+from support import (
+    GATE,
+    FixtureCase,
+    assert_temporary_failure,
+    baseline_text,
+    output,
+)
 
 from quality_gate import adapters
 from quality_gate import runner as gate_runner
@@ -185,6 +191,71 @@ requires = "legacy-tests"
         self.assertTrue(evidence["definitions"])
         self.assertEqual(evidence["definitions"], measured["definitions"])
         self.assertEqual(evidence["emacs_version"], measured["tool"]["version"])
+
+    def test_a_temporary_file_left_by_the_suite_fails(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest temporary () (make-temp-file \"qg-left-\"))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome(
+            "fail", "1 temporary path left after the suite:", "qg-left-"
+        )
+        self.assertIn("qg-left-", check["reason"])
+
+    def test_a_temporary_file_removed_by_the_suite_passes(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest temporary ()\n"
+                      "  (delete-file (make-temp-file \"qg-left-\")))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("pass")
+        self.assertEqual(check["measurement"], {"tests": 1})
+
+    def test_a_failing_suite_reports_its_condition_and_the_leftover(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest temporary ()\n"
+                      "  (make-temp-file \"qg-left-\")\n"
+                      "  (ert-fail \"deliberate\"))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome(
+            "fail", "deliberate",
+            "1 temporary path left after the suite:", "qg-left-",
+        )
+        self.assertIn("deliberate", check["reason"])
+        self.assertIn("qg-left-", check["reason"])
+
+    def test_a_read_only_temporary_tree_fails_and_is_removed(self) -> None:
+        marker = self.base / "read-only-tmpdir"
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest temporary ()\n"
+                      "  (let* ((directory (make-temp-file \"qg-read-only-\" t))\n"
+                      "         (evidence (expand-file-name \"evidence\" directory)))\n"
+                      "    (with-temp-file evidence (insert \"left\"))\n"
+                      "    (set-file-modes evidence #o444)\n"
+                      "    (set-file-modes directory #o555)\n"
+                      f"    (with-temp-file {json.dumps(str(marker))} "
+                      "(insert (getenv \"TMPDIR\")))))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome(
+            "fail", "2 temporary paths left after the suite:",
+            "qg-read-only-", "evidence",
+        )
+        assert_temporary_failure(self, check, marker, "evidence")
+
+    def test_the_suite_receives_the_gate_temporary_directory(self) -> None:
+        caller = self.base / "caller-tmp"
+        caller.mkdir()
+        marker = self.base / "suite-tmpdir"
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest temporary ()\n"
+                      f"  (with-temp-file {json.dumps(str(marker))} "
+                      "(insert (getenv \"TMPDIR\"))))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        caller_env = self.default_tool_env()
+        caller_env["TMPDIR"] = str(caller)
+        result, document = self.run_json(env=caller_env)
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(document, "legacy-tests")
+        self.assertEqual(check["outcome"], "pass")
+        self.assertNotEqual(marker.read_text(encoding="utf-8"), str(caller))
 
     def test_redefined_symbols_keep_each_definition_and_position(self) -> None:
         self.add_file("src/core.el", "(defun redefined () (+ 0 1))\n(defun redefined () (+ 1 1))\n")

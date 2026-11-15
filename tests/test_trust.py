@@ -87,8 +87,8 @@ class TrustCase(FixtureCase):
         """Candidate code overwrites the historical merged-baseline path."""
         name = hashlib.sha256(f"merged\0{check}".encode()).hexdigest()[:16]
         return (
-            "        import os, pathlib, tempfile\n"
-            "        for directory in pathlib.Path(tempfile.gettempdir()).glob('qg-merge-*'):\n"
+            "        import os, pathlib\n"
+            "        for directory in pathlib.Path(os.environ['QG_ATTACK_TMPDIR']).glob('qg-merge-*'):\n"
             f"            (directory / {name + '.toml'!r}).write_text({forged!r})\n"
             "            pathlib.Path(os.environ['QG_ATTACK_MARKER']).write_text('written')\n"
             "        self.assertTrue(True)\n"
@@ -100,6 +100,7 @@ class TrustCase(FixtureCase):
         env = self.default_tool_env()
         env.update({
             "TMPDIR": str(temporary),
+            "QG_ATTACK_TMPDIR": str(temporary),
             "QG_ATTACK_MARKER": str(self.base / "attack-marker"),
         })
         return env

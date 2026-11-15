@@ -714,6 +714,14 @@ def output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
 
 
+def assert_temporary_failure(
+    case: unittest.TestCase, check: dict[str, Any], marker: Path, needle: str
+) -> None:
+    """The leftover failed the check and the gate removed its directory."""
+    case.assertIn(needle, check["reason"])
+    case.assertFalse(Path(marker.read_text(encoding="utf-8")).exists())
+
+
 def stub_check_result(check: Any, budget_seconds: int, **fields: Any) -> Any:
     """The passing CheckResult a stub adapter returns for CHECK."""
     from quality_gate import checks

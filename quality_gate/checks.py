@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -615,6 +617,87 @@ def _remove_run_directory(directory: Any, *, report: bool = False) -> None:
             print(message, file=sys.stderr)
         else:
             raise RunCleanupError(message) from error
+
+
+TEMPORARY_PATH_LIMIT = 10
+
+
+def _temporary_test_directory(parent: Path) -> Path:
+    """Create the fresh directory a test suite receives as TMPDIR."""
+    directory = parent / "tmp"
+    try:
+        directory.mkdir()
+    except OSError as error:
+        raise UsageError(
+            f"cannot create the temporary directory {directory}: {error}"
+        ) from error
+    return directory
+
+
+def _temporary_paths(directory: Path) -> list[str]:
+    """Every path left under DIRECTORY, relative to it and sorted."""
+    paths: list[str] = []
+    for current, directories, files in os.walk(directory):
+        base = Path(current)
+        paths.extend(
+            str((base / name).relative_to(directory))
+            for name in (*directories, *files)
+        )
+    return sorted(paths)
+
+
+def _temporary_reason(paths: list[str]) -> str | None:
+    if len(paths) > 0:
+        count = len(paths)
+        shown = ", ".join(paths[:TEMPORARY_PATH_LIMIT])
+        return (
+            f"{count} temporary path{'s' if count != 1 else ''} "
+            f"left after the suite: {shown}"
+        )
+    return None
+
+
+def _temporary_failure(paths: list[str]) -> str | None:
+    if len(paths) == 0:
+        return None
+    return _temporary_reason(paths)
+
+
+def _remove_temporary_directory(directory: Path) -> str | None:
+    from .tools import _make_directories_writable
+
+    if not os.path.lexists(directory):
+        return None
+    try:
+        _make_directories_writable(directory)
+        shutil.rmtree(directory)
+    except OSError as error:
+        return f"cannot remove the temporary directory {directory}: {error}"
+    return None
+
+
+def _finish_temporary(directory: Path) -> list[str]:
+    """List the paths left in DIRECTORY, then remove it."""
+    paths: list[str] = []
+    listing_error: str | None = None
+    try:
+        paths = _temporary_paths(directory)
+    except OSError as error:
+        listing_error = f"cannot list the temporary directory {directory}: {error}"
+    removal_error = _remove_temporary_directory(directory)
+    if removal_error is not None:
+        raise UsageError(removal_error)
+    if listing_error is not None:
+        raise UsageError(listing_error)
+    return paths
+
+
+def _combined_reason(first: str | None, second: str | None) -> str | None:
+    if second is None:
+        return first
+    if first is None:
+        return second
+    return f"{first}; {second}"
 
 
 def _run_policy_checks(

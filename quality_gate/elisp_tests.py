@@ -299,18 +299,25 @@ def _temporary() -> tempfile.TemporaryDirectory[str]:
 
 
 def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any],
-            evidence: Path) -> Any:
-    from .checks import _check_result, _tests_result
+            evidence: Path, temporary_reason: str | None = None) -> Any:
+    from .checks import _check_result, _combined_reason, _tests_result
 
     check, prefix, spec = context.check, context.prefix, context.check.spec
     diagnostics = run_result.diagnostics()
     if "error" in document:
-        return _tests_result(check, spec, start, prefix, document["error"], diagnostics=diagnostics)
+        return _tests_result(
+            check, spec, start, prefix,
+            _combined_reason(document["error"], temporary_reason),
+            diagnostics=diagnostics,
+        )
     if run_result.returncode != 0:
-        reason = f"expected child exit 0 with a result, got exit {run_result.returncode}"
+        reason = _combined_reason(
+            f"expected child exit 0 with a result, got exit {run_result.returncode}",
+            temporary_reason,
+        )
         return _tests_result(check, spec, start, prefix, reason, outcome="unsupported",
                              diagnostics=diagnostics)
-    reason = _verdict(document)
+    reason = _combined_reason(_verdict(document), temporary_reason)
     result = _check_result(check, start, "fail" if reason else "pass", budget_seconds=spec.budget_seconds,
                            diagnostics=diagnostics, reason=reason, evidence_path=evidence)
     apply_document(result, document)
@@ -322,15 +329,22 @@ def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any
     return result
 
 
-def _execution_failure(context: Any, start: float, run_result: Any) -> Any:
-    from .checks import _tests_result
+def _execution_failure(context: Any, start: float, run_result: Any,
+                       temporary_reason: str | None = None) -> Any:
+    from .checks import _combined_reason, _tests_result
 
     check, prefix, spec = context.check, context.prefix, context.check.spec
     if run_result.execution == "budget":
-        return _tests_result(check, spec, start, prefix, "Emacs exceeded its budget", execution="budget",
-                             diagnostics=run_result.diagnostics())
+        return _tests_result(
+            check, spec, start, prefix,
+            _combined_reason("Emacs exceeded its budget", temporary_reason),
+            execution="budget", diagnostics=run_result.diagnostics(),
+        )
     if run_result.execution == "error":
-        reason = f"expected Emacs command {spec.emacs!r}, got {run_result.error}"
+        reason = _combined_reason(
+            f"expected Emacs command {spec.emacs!r}, got {run_result.error}",
+            temporary_reason,
+        )
         return _tests_result(check, spec, start, prefix, reason, outcome="unsupported", execution="error",
                              diagnostics=run_result.diagnostics())
     return None
@@ -358,7 +372,14 @@ def _suite_collision(context: Any, selected: list[str], start: float) -> Any:
 
 def run_tests(context: Any) -> Any:
     """Run the configured suite and return its check result and evidence."""
-    from .checks import _select_files, _tests_result
+    from .checks import (
+        _combined_reason,
+        _finish_temporary,
+        _select_files,
+        _temporary_failure,
+        _temporary_test_directory,
+        _tests_result,
+    )
 
     version, failure = probe_version(context)
     if failure is not None:
@@ -372,17 +393,27 @@ def run_tests(context: Any) -> Any:
     directory = context.evidence_dir
     stage = _stage(directory)
     evidence = directory / "result.json"
+    temporary = _temporary_test_directory(directory)
+    environment = os.environ.copy()
+    environment["TMPDIR"] = str(temporary)
     mark_step("Emacs test command")
-    child = run(_command(spec, context.root, selected, stage, evidence), cwd=context.root,
-                budget_seconds=spec.budget_seconds)
-    failure = _execution_failure(context, start, child)
+    try:
+        child = run(_command(spec, context.root, selected, stage, evidence), cwd=context.root,
+                    env=environment, budget_seconds=spec.budget_seconds)
+    finally:
+        temporary_paths = _finish_temporary(temporary)
+    temporary_reason = _temporary_failure(temporary_paths)
+    failure = _execution_failure(context, start, child, temporary_reason)
     if failure is not None:
         return failure
     try:
         mark_step("Emacs result validation")
         document = _read_document(evidence, selected, version)
     except ValueError as error:
-        reason = f"expected {error}; child exit {child.returncode}, execution {child.execution}"
+        reason = _combined_reason(
+            f"expected {error}; child exit {child.returncode}, execution {child.execution}",
+            temporary_reason,
+        )
         return _tests_result(context.check, spec, start, context.prefix, reason, outcome="unsupported",
                              execution=child.execution, diagnostics=child.diagnostics())
-    return _finish(context, start, child, document, evidence)
+    return _finish(context, start, child, document, evidence, temporary_reason)

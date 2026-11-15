@@ -390,6 +390,16 @@ one parses `covrun.py` for a `quality_gate` import. With `--policy-from`, the ve
 digest are the authorized effective lock's, so the parent and the coverage runner agree on an
 authorized coverage upgrade.
 
+Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
+for that run, so the caller's `TMPDIR` never reaches the suite. After the command exits, the gate
+lists every path left under that directory, relative to it and sorted. Any path left fails the check
+with `N temporary paths left after the suite: PATH, ...`, naming the count and the first ten paths
+(`path` is singular when N is 1); a command that failed for another reason reports both reasons.
+The gate removes the directory whether the suite passed or failed, adding the owner's write bit to
+every directory before removing its contents. A removal that still fails is a decision error naming
+the directory and the operating-system error; it is never ignored. No policy key enables or disables
+this rule.
+
 A test launcher that starts the consumer's Python programs as subprocesses must use the same prefix.
 The gate exports it as `QG_PYTHON`, a JSON array of strings, in the test command's environment:
 
@@ -466,6 +476,13 @@ in `suite-guard-run` does. The helper intercepts that call and records ERT's sta
 the suite runs once, in that same child Emacs. Expected ERT results count as passed, unexpected results
 as failed, and skipped tests are counted separately. A passing check requires an exit status of zero,
 a valid result, at least one executed test (`selected - skipped`), and no unexpected results.
+
+`elisp_tests` gives its suite the same temporary-directory rule as `python_tests`: `TMPDIR` is a
+fresh gate-owned directory, and every path left under it after the child exits fails the check with
+`N temporary paths left after the suite: PATH, ...`, naming the count and the first ten sorted
+relative paths (`path` is singular when N is 1). A child that failed for another reason reports both
+reasons. The directory is removed afterwards, with every directory made writable first; a removal
+that still fails is a decision error naming the directory and the operating-system error.
 
 A failed test names the test and its printed ERT condition. Zero executed tests, a missing or repeated
 batch call, errors instrumenting a file or loading the suite, and an expired budget fail the check;
@@ -838,7 +855,8 @@ same request may already have completed. `--prune` with `--policy-from` is a usa
 naming both options, before any check runs; `--prune` without `--policy-from` is unchanged.
 
 The decision is `error` (exit 2) for invalid policy, usage or configuration, when the run exceeds
-its limit, or when the run directory cannot be removed, `rejected` (exit 1) when
+its limit, when the run directory cannot be removed, or when a test check cannot remove its temporary
+suite directory, `rejected` (exit 1) when
 inventory, hygiene, any enforced check or any obligation is not satisfied, `partial` (exit 0) when a
 `--only` run's inventory, hygiene and every enforced check that ran are satisfied, and
 `accepted_with_exceptions` (exit 0) when every obligation and enforced check is satisfied but at least
@@ -894,7 +912,8 @@ commit is a candidate input until its submodule path is handled by the caller. S
   two checks sharing a baseline path), invalid command line, a repository that is not the top level of a
   git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
   `--policy-from` trusted directory, a trusted directory inside the candidate, a gate program inside
-  the candidate, or a protected input, tool payload or gate file that changed during the run.
+  the candidate, a protected input, tool payload or gate file that changed during the run, or a run or
+  test temporary directory that cannot be removed.
 
 ## Configuration
 
@@ -1229,8 +1248,9 @@ reaching tests. The runner exposes the current test ID through the environment, 
 processes are attributed to the test that started them; a hit that cannot be attributed is recorded
 as unattributed. The declared decisions in `tests/mutate_gate.py` cover baseline bounds, threshold
 and expiry comparisons, verification floors, prune refusal and exit status, gate decisions, trust-root
-identity and protection, and the rule that an ERT run must execute a test. They use comparison flips,
-boolean negation, an opposite boolean return, and removal of a raise. This is a selected set of faults,
+identity and protection, the rule that an ERT run must execute a test, and the rule that a test suite
+may not leave temporary paths. They use comparison flips, boolean negation, an opposite boolean return,
+and removal of a raise. This is a selected set of faults,
 not an exhaustive measurement of every possible change.
 
 Each mutant's copy is first imported with `python3 -I`, with the copy's root first on `sys.path`; a

@@ -73,6 +73,14 @@ DECISIONS = (
         "An ERT run with no executed test fails.",
     ),
     Decision(
+        "tests_temporary_paths",
+        "quality_gate/checks.py",
+        "_temporary_failure",
+        "negate",
+        "len(paths) == 0",
+        "A test suite that leaves files in its temporary directory fails.",
+    ),
+    Decision(
         "baseline_max_bound",
         "quality_gate/ratchet.py",
         "_within",
