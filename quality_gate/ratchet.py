@@ -8,11 +8,12 @@ import os
 import sys
 import tempfile
 import tomllib
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .policy import GateError, UnsupportedError, _describe
+from .policy import GateError, UnsupportedError, _describe, _unique
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,9 @@ class _Evaluation:
     exceptions: bool
 
 
+_BASELINE_KEYS = ("check", "metric_version", "entry")
+
+
 def _baseline_error(path: Path, key: str, expected: str, actual: str) -> GateError:
     return GateError(f"{path}: {key}: expected {expected}, got {actual}")
 
@@ -288,6 +292,17 @@ def _entry_expires(
     )
 
 
+_BASELINE_ENTRY_FIELDS: tuple[
+    tuple[str, Callable[[Path, str, dict[str, Any]], Any]], ...
+] = (
+    ("subject", _entry_subject),
+    ("bound", _entry_bound),
+    ("reason", _entry_reason),
+    ("expires", _entry_expires),
+)
+_BASELINE_ENTRY_KEYS = tuple(key for key, _reader in _BASELINE_ENTRY_FIELDS)
+
+
 def _parse_baseline_entry(
     path: Path,
     where: str,
@@ -296,7 +311,7 @@ def _parse_baseline_entry(
 ) -> BaselineEntry:
     if not isinstance(raw, dict):
         raise _baseline_error(path, where, "a table", _describe(raw))
-    allowed = ("subject", "bound", "reason", "expires", *allowed_extras)
+    allowed = (*_BASELINE_ENTRY_KEYS, *allowed_extras)
     for key in raw:
         if key not in allowed:
             raise _baseline_error(
@@ -305,11 +320,14 @@ def _parse_baseline_entry(
                 f"a known key ({', '.join(allowed)})",
                 "unknown key",
             )
+    values: dict[str, Any] = {}
+    for key, reader in _BASELINE_ENTRY_FIELDS:
+        values[key] = reader(path, where, raw)
     return BaselineEntry(
-        _entry_subject(path, where, raw),
-        _entry_bound(path, where, raw),
-        _entry_reason(path, where, raw),
-        _entry_expires(path, where, raw),
+        values["subject"],
+        values["bound"],
+        values["reason"],
+        values["expires"],
         _extras(path, where, raw, allowed_extras),
     )
 
@@ -325,10 +343,10 @@ def load_baseline(
 ) -> list[BaselineEntry]:
     data = _read_baseline(path)
     for key in data:
-        if key not in ("check", "metric_version", "entry"):
+        if key not in _BASELINE_KEYS:
+            allowed = ", ".join(_BASELINE_KEYS)
             raise GateError(
-                f"{path}: {key}: unknown key; allowed keys: check, "
-                "metric_version, entry"
+                f"{path}: {key}: unknown key; allowed keys: {allowed}"
             )
     _check_header(path, data, check_id, metric_version)
     raw_entries = data.get("entry", [])
@@ -346,14 +364,15 @@ def load_baseline(
             entry,
             direction=subject_direction(adapter, direction, entry.subject),
         )
-        if entry.subject in seen:
-            raise _baseline_error(
-                path,
-                f"entry[{index}].subject",
-                "a unique subject",
-                f"duplicate {entry.subject!r}",
-            )
-        seen.add(entry.subject)
+        _unique(
+            seen,
+            entry.subject,
+            path,
+            f"entry[{index}].subject",
+            "a unique subject",
+            f"duplicate {entry.subject!r}",
+            _baseline_error,
+        )
         entries.append(entry)
     return entries
 
@@ -366,22 +385,69 @@ def _number(value: float | int) -> str:
     return repr(value)
 
 
+def _toml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _toml_number(value: float | int) -> str:
+    if not math.isfinite(value):
+        raise GateError("cannot write a non-finite baseline value")
+    return _number(value)
+
+
+def _toml_datetime(value: datetime.date) -> str:
+    return value.isoformat()
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_string_list(value: list[object]) -> str:
+    if not all(isinstance(item, str) for item in value):
+        raise GateError(
+            f"cannot write baseline value of type {type(value).__name__}"
+        )
+    return "[" + ", ".join(
+        json.dumps(item, ensure_ascii=False) for item in value
+    ) + "]"
+
+
+_TOML_SERIALIZERS: tuple[
+    tuple[type | tuple[type, ...], Callable[[Any], str]], ...
+] = (
+    (bool, _toml_bool),
+    ((int, float), _toml_number),
+    (datetime.datetime, _toml_datetime),
+    (datetime.date, _toml_datetime),
+    (str, _toml_string),
+    (list, _toml_string_list),
+)
+
+
 def _toml_value(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        if not math.isfinite(value):
-            raise GateError("cannot write a non-finite baseline value")
-        return _number(value)
-    if isinstance(value, datetime.datetime):
-        return value.isoformat()
-    if isinstance(value, datetime.date):
-        return value.isoformat()
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, list) and all(isinstance(item, str) for item in value):
-        return "[" + ", ".join(json.dumps(item, ensure_ascii=False) for item in value) + "]"
+    for types, serializer in _TOML_SERIALIZERS:
+        if isinstance(value, types):
+            return serializer(value)
     raise GateError(f"cannot write baseline value of type {type(value).__name__}")
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=str(path.parent)
+        )
+    except OSError as error:
+        raise GateError(f"cannot write baseline {path}: {error}") from error
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(temporary, path)
+    except OSError as error:
+        with suppress(OSError):
+            os.unlink(temporary)
+        raise GateError(f"cannot write baseline {path}: {error}") from error
 
 
 def write_baseline(
@@ -412,23 +478,7 @@ def write_baseline(
             lines.append(f"{key} = {_toml_value(entry.extras[key])}")
         lines.append("")
     text = "\n".join(lines)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.", dir=str(path.parent)
-        )
-    except OSError as error:
-        raise GateError(f"cannot write baseline {path}: {error}") from error
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(text)
-        os.replace(temporary, path)
-    except OSError as error:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise GateError(f"cannot write baseline {path}: {error}") from error
+    _write_atomic(path, text)
     return text.encode("utf-8")
 
 

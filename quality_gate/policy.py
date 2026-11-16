@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import math
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .ratchet import BaselineEntry
@@ -114,6 +114,20 @@ def _describe(value: object) -> str:
     return type(value).__name__
 
 
+def _unique(
+    seen: set[Any],
+    key: Any,
+    path: Path,
+    where: str,
+    expected: str,
+    actual: str,
+    error: Callable[[Path, str, str, str], Exception],
+) -> None:
+    if key in seen:
+        raise error(path, where, expected, actual)
+    seen.add(key)
+
+
 def _check_keys(
     table: dict[str, Any], allowed: tuple[str, ...], path: Path, full_key: str
 ) -> None:
@@ -127,15 +141,162 @@ def _check_keys(
         )
 
 
+@dataclass(frozen=True)
+class _ValueRule:
+    expected: str
+    types: tuple[type, ...]
+    type_expected: str | None = None
+    non_empty: bool = False
+    finite: bool = False
+    minimum: int | float | None = None
+    maximum: int | float | None = None
+    minimum_expected: str = ""
+    maximum_expected: str = ""
+    item: "_ValueRule | None" = None
+    convert: Any = None
+
+
+_STRING_ITEM = _ValueRule("a string", (str,))
+_STRING = _ValueRule("a non-empty string", (str,), "a string", non_empty=True)
+_STRING_LIST = _ValueRule(
+    "a list of strings", (list,), item=_STRING_ITEM, convert=tuple
+)
+_BOOLEAN = _ValueRule("a boolean", (bool,))
+_TABLE = _ValueRule("a table", (dict,))
+_INTEGER = _ValueRule(
+    "an integer",
+    (int,),
+    minimum_expected="an integer >= {bound}",
+    maximum_expected="an integer <= {bound}",
+)
+_TIER = _ValueRule(
+    "an integer",
+    (int,),
+    minimum=1,
+    maximum=4,
+    minimum_expected="an integer >= 1",
+    maximum_expected="an integer <= 4",
+)
+_NUMBER = _ValueRule(
+    "a finite number",
+    (int, float),
+    finite=True,
+    minimum_expected="a finite number >= {bound}",
+    convert=float,
+)
+_INTEGER_LIST = _ValueRule(
+    "a list of integers",
+    (list,),
+    item=_ValueRule(
+        "an integer",
+        (int,),
+        minimum=1,
+        maximum=4,
+        minimum_expected="an integer from 1 to 4",
+        maximum_expected="an integer from 1 to 4",
+    ),
+    convert=tuple,
+)
+
+
+def _require_type(
+    path: Path, full_key: str, value: Any, rule: _ValueRule
+) -> None:
+    valid = isinstance(value, rule.types) and not (
+        isinstance(value, bool) and bool not in rule.types
+    )
+    if valid:
+        return
+    raise _config_error(
+        path, full_key, rule.type_expected or rule.expected, _describe(value)
+    )
+
+
+def _require_finite(
+    path: Path, full_key: str, value: Any, rule: _ValueRule
+) -> None:
+    if rule.finite and not math.isfinite(value):
+        raise _config_error(
+            path, full_key, rule.type_expected or rule.expected, _describe(value)
+        )
+
+
+def _require_non_empty(
+    path: Path, full_key: str, value: Any, rule: _ValueRule, allow_empty: bool
+) -> None:
+    if rule.non_empty and not allow_empty and not value.strip():
+        raise _config_error(path, full_key, rule.expected, _describe(value))
+
+
+def _require_bounds(
+    path: Path, full_key: str, value: Any, rule: _ValueRule
+) -> None:
+    if rule.minimum is not None and value < rule.minimum:
+        raise _config_error(
+            path,
+            full_key,
+            rule.minimum_expected.format(bound=rule.minimum),
+            str(value),
+        )
+    if rule.maximum is not None and value > rule.maximum:
+        raise _config_error(
+            path,
+            full_key,
+            rule.maximum_expected.format(bound=rule.maximum),
+            str(value),
+        )
+
+
+def _read_scalar(
+    path: Path,
+    full_key: str,
+    value: Any,
+    rule: _ValueRule,
+    allow_empty: bool = False,
+) -> Any:
+    _require_type(path, full_key, value, rule)
+    _require_finite(path, full_key, value, rule)
+    _require_non_empty(path, full_key, value, rule, allow_empty)
+    _require_bounds(path, full_key, value, rule)
+    return rule.convert(value) if rule.convert is not None else value
+
+
+def _read_list(
+    path: Path, full_key: str, value: Any, rule: _ValueRule
+) -> Any:
+    if not isinstance(value, list):
+        raise _config_error(path, full_key, rule.expected, _describe(value))
+    values = [
+        _read_scalar(path, f"{full_key}[{index}]", item, rule.item)
+        for index, item in enumerate(value)
+    ]
+    return rule.convert(values) if rule.convert is not None else tuple(values)
+
+
+def _read_value(
+    parent: dict[str, Any],
+    key: str,
+    path: Path,
+    full_key: str,
+    rule: _ValueRule,
+    *,
+    default: Any = None,
+    allow_empty: bool = False,
+) -> Any:
+    if key not in parent:
+        if default is not None:
+            return default
+        raise _config_error(path, full_key, rule.expected, "missing")
+    value = parent[key]
+    if rule.item is not None:
+        return _read_list(path, full_key, value, rule)
+    return _read_scalar(path, full_key, value, rule, allow_empty)
+
+
 def _required_table(
     parent: dict[str, Any], key: str, path: Path, full_key: str
 ) -> dict[str, Any]:
-    if key not in parent:
-        raise _config_error(path, full_key, "a table", "missing")
-    value = parent[key]
-    if not isinstance(value, dict):
-        raise _config_error(path, full_key, "a table", _describe(value))
-    return value
+    return _read_value(parent, key, path, full_key, _TABLE)
 
 
 def _optional_table(
@@ -157,30 +318,15 @@ def _string(
     *,
     allow_empty: bool = False,
 ) -> str:
-    if key not in parent:
-        raise _config_error(path, full_key, "a non-empty string", "missing")
-    value = parent[key]
-    if not isinstance(value, str):
-        raise _config_error(path, full_key, "a string", _describe(value))
-    if not allow_empty and not value.strip():
-        raise _config_error(path, full_key, "a non-empty string", _describe(value))
-    return value
+    return _read_value(
+        parent, key, path, full_key, _STRING, allow_empty=allow_empty
+    )
 
 
 def _string_list(
     parent: dict[str, Any], key: str, path: Path, full_key: str
 ) -> tuple[str, ...]:
-    if key not in parent:
-        raise _config_error(path, full_key, "a list of strings", "missing")
-    value = parent[key]
-    if not isinstance(value, list):
-        raise _config_error(path, full_key, "a list of strings", _describe(value))
-    for index, item in enumerate(value):
-        if not isinstance(item, str):
-            raise _config_error(
-                path, f"{full_key}[{index}]", "a string", _describe(item)
-            )
-    return tuple(value)
+    return _read_value(parent, key, path, full_key, _STRING_LIST)
 
 
 def _optional_string_list(
@@ -223,12 +369,7 @@ def _names(
 
 
 def _boolean(parent: dict[str, Any], key: str, path: Path, full_key: str) -> bool:
-    if key not in parent:
-        raise _config_error(path, full_key, "a boolean", "missing")
-    value = parent[key]
-    if not isinstance(value, bool):
-        raise _config_error(path, full_key, "a boolean", _describe(value))
-    return value
+    return _read_value(parent, key, path, full_key, _BOOLEAN)
 
 
 def _optional_string(
@@ -257,18 +398,8 @@ def _integer(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    if key not in parent:
-        if default is None:
-            raise _config_error(path, full_key, "an integer", "missing")
-        return default
-    value = parent[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise _config_error(path, full_key, "an integer", _describe(value))
-    if minimum is not None and value < minimum:
-        raise _config_error(path, full_key, f"an integer >= {minimum}", str(value))
-    if maximum is not None and value > maximum:
-        raise _config_error(path, full_key, f"an integer <= {maximum}", str(value))
-    return value
+    rule = replace(_INTEGER, minimum=minimum, maximum=maximum)
+    return _read_value(parent, key, path, full_key, rule, default=default)
 
 
 def _number(
@@ -280,44 +411,14 @@ def _number(
     default: float | None = None,
     minimum: float | None = None,
 ) -> float:
-    if key not in parent:
-        if default is None:
-            raise _config_error(path, full_key, "a number", "missing")
-        return default
-    value = parent[key]
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-    ):
-        raise _config_error(path, full_key, "a finite number", _describe(value))
-    if minimum is not None and value < minimum:
-        raise _config_error(
-            path, full_key, f"a finite number >= {minimum}", str(value)
-        )
-    return float(value)
+    rule = replace(_NUMBER, minimum=minimum)
+    return _read_value(parent, key, path, full_key, rule, default=default)
 
 
 def _integer_list(
     parent: dict[str, Any], key: str, path: Path, full_key: str
 ) -> tuple[int, ...]:
-    if key not in parent:
-        raise _config_error(path, full_key, "a list of integers", "missing")
-    value = parent[key]
-    if not isinstance(value, list):
-        raise _config_error(path, full_key, "a list of integers", _describe(value))
-    result: list[int] = []
-    for index, item in enumerate(value):
-        if isinstance(item, bool) or not isinstance(item, int):
-            raise _config_error(
-                path, f"{full_key}[{index}]", "an integer", _describe(item)
-            )
-        if item < 1 or item > 4:
-            raise _config_error(
-                path, f"{full_key}[{index}]", "an integer from 1 to 4", str(item)
-            )
-        result.append(item)
-    return tuple(result)
+    return _read_value(parent, key, path, full_key, _INTEGER_LIST)
 
 
 def _parse_classes(
@@ -665,6 +766,38 @@ def _parse_levels(
     return required
 
 
+@dataclass(frozen=True)
+class _FieldRule:
+    key: str
+    rule: _ValueRule
+    validator: Callable[[Any, dict[str, ClassDef], Path, str], None]
+
+
+def _valid_field(
+    value: Any, classes: dict[str, ClassDef], path: Path, key: str
+) -> None:
+    return None
+
+
+def _known_class(
+    value: Any, classes: dict[str, ClassDef], path: Path, key: str
+) -> None:
+    if value in classes:
+        return
+    known = ", ".join(sorted(classes)) or "none"
+    raise _config_error(
+        path, key, f"a configured class ({known})", f"unknown class {value!r}"
+    )
+
+
+_NOT_APPLICABLE_FIELDS = (
+    _FieldRule("class", _STRING, _known_class),
+    _FieldRule("tier", _TIER, _valid_field),
+    _FieldRule("reason", _STRING, _valid_field),
+)
+_NOT_APPLICABLE_KEYS = tuple(field.key for field in _NOT_APPLICABLE_FIELDS)
+
+
 def _parse_not_applicable(
     data: dict[str, Any], classes: dict[str, ClassDef], path: Path
 ) -> tuple[NotApplicable, ...]:
@@ -679,30 +812,28 @@ def _parse_not_applicable(
         full_key = f"not_applicable[{index}]"
         if not isinstance(raw, dict):
             raise _config_error(path, full_key, "a table", _describe(raw))
-        _check_keys(raw, ("class", "tier", "reason"), path, full_key)
-        class_name = _string(raw, "class", path, f"{full_key}.class")
-        if class_name not in classes:
-            known = ", ".join(sorted(classes)) or "none"
-            raise _config_error(
-                path,
-                f"{full_key}.class",
-                f"a configured class ({known})",
-                f"unknown class {class_name!r}",
+        _check_keys(raw, _NOT_APPLICABLE_KEYS, path, full_key)
+        values: dict[str, Any] = {}
+        for field in _NOT_APPLICABLE_FIELDS:
+            value = _read_value(
+                raw, field.key, path, f"{full_key}.{field.key}", field.rule
             )
-        tier = _integer(
-            raw, "tier", path, f"{full_key}.tier", minimum=1, maximum=4
+            field.validator(
+                value, classes, path, f"{full_key}.{field.key}"
+            )
+            values[field.key] = value
+        class_name = values["class"]
+        tier = values["tier"]
+        _unique(
+            seen,
+            (class_name, tier),
+            path,
+            full_key,
+            "one entry per class and tier",
+            f"duplicate {class_name!r} tier {tier}",
+            _config_error,
         )
-        reason = _string(raw, "reason", path, f"{full_key}.reason")
-        key = (class_name, tier)
-        if key in seen:
-            raise _config_error(
-                path,
-                full_key,
-                "one entry per class and tier",
-                f"duplicate {class_name!r} tier {tier}",
-            )
-        seen.add(key)
-        entries.append(NotApplicable(class_name, tier, reason))
+        entries.append(NotApplicable(class_name, tier, values["reason"]))
     return tuple(entries)
 
 

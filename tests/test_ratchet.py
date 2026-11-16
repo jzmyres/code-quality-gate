@@ -434,6 +434,13 @@ class BaselineFileTests(unittest.TestCase):
             )
         self.assertEqual(entries, [])
 
+    def test_atomic_write_replaces_the_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            path.write_text("old\n", encoding="utf-8")
+            ratchet._write_atomic(path, "new\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+
     def test_header_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "baseline.toml"
