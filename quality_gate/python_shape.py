@@ -155,7 +155,6 @@ class FileIndex:
     functions: tuple[ShapeFunction, ...]
     calls: tuple[CallSite, ...]
     tests: frozenset[str]
-    names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -175,7 +174,6 @@ class ShapeInput:
     tests: frozenset[str]
     spec: ShapeSpec
     limit: float
-    mentions: frozenset[str] = frozenset()
 
 
 def _is_test_path(relative: str) -> bool:
@@ -297,10 +295,7 @@ def _file_index(relative: str, source: str) -> FileIndex:
     tests: set[str] = set()
     if _is_test_path(relative):
         _test_functions(tree.body, False, tests)
-    return FileIndex(
-        tuple(functions), tuple(calls), frozenset(tests),
-        frozenset(_references(tree)),
-    )
+    return FileIndex(tuple(functions), tuple(calls), frozenset(tests))
 
 
 def _read_source(root: Path, relative: str) -> str:
@@ -508,10 +503,8 @@ def _shape_input(
         [path for path in scoped if path in diff.paths],
     )
     calls, tests = _uses(parsed, names)
-    mentions = frozenset().union(*map(attrgetter("names"), parsed))
     return ShapeInput(
-        functions, before, added, candidates, calls, tests, spec, limit,
-        mentions,
+        functions, before, added, candidates, calls, tests, spec, limit
     )
 
 
@@ -653,11 +646,9 @@ def _cpf_targets(
 
 
 def _uncalled_findings(data: ShapeInput) -> list[Finding]:
-    """Each added function something names but no call and no test names."""
+    """Each added function no call and no test names."""
     findings = []
     for function in data.candidates:
-        if function.final_name not in data.mentions:
-            continue
         if function.final_name in data.tests:
             continue
         if _called_outside(data, function):

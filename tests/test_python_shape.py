@@ -193,6 +193,9 @@ def main():
 
 def render_json():
     return json.dumps("value", indent=2, sort_keys=True)
+
+
+main()
 """
 
 PTW_TEST = """\
@@ -231,6 +234,9 @@ def main(render):
 
 def render(render):
     return render(render)
+
+
+main(render)
 """
 
 # PTW-SU: two own parameters, and only one of them is forwarded.
@@ -258,6 +264,10 @@ def lane_class(lane: dict) -> str:
     window = "lane--peak" if lane.get("window") == "peak" else "lane--off"
     fill = " lane--working" if lane.get("working") else " lane--idle"
     return f"lane {window}{fill}"
+
+
+chip_class({})
+lane_class({})
 """
 
 # LTC: the source order is the reverse of the identities' alphabetical order.
@@ -272,6 +282,10 @@ def chip_class(lane: dict) -> str:
     window = "chip--peak" if lane.get("window") == "peak" else "chip--off"
     fill = "chip--working" if lane.get("working") else "chip--idle"
     return f"chip {window} {fill}"
+
+
+lane_class({})
+chip_class({})
 """
 
 # The report's judged false positive: 30 shared tokens at similarity 0.938.
@@ -295,6 +309,10 @@ def _top_usage(record):
         if key.startswith("usage"):
             return record[key]
     return None
+
+
+_codex_payload({})
+_top_usage({})
 """
 
 # LTC: 18 shared tokens at full similarity, below the token minimum.
@@ -309,6 +327,10 @@ def second_label(lane):
     window = "peak" if lane else "off"
     fill = "working" if lane else "idle"
     return window + fill
+
+
+first_label({})
+second_label({})
 """
 
 # LTC: 62 shared tokens, above the cap the 50-token clone check already covers.
@@ -347,6 +369,10 @@ def _second_class(record):
     else:
         fill = "lane--off"
     return window + fill
+
+
+_first_class({})
+_second_class({})
 """
 
 # LTC: the nested function duplicates its enclosing function.
@@ -357,6 +383,9 @@ def outer(lane):
         fill = "chip--working" if lane.get("working") else "chip--idle"
         return f"chip {window} {fill}"
     return inner(lane)
+
+
+outer({})
 """
 
 # A table-driven refactor: the decisions leave the function for one data table.
@@ -514,6 +543,86 @@ def _files(kind):
 TABLE = {"files": _files}
 """
 
+# UNCALLED: a dead function that nothing names at all.
+DEAD_FUNCTION = """\
+def lonely(value):
+    return 1 if value else 0
+"""
+
+DEAD_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import lonely
+
+
+class DeadTests(unittest.TestCase):
+    def test_the_dead_function_exists(self):
+        self.assertIs(lonely, lonely)
+"""
+
+# UNCALLED: a singledispatch handler registered by a decorator, not called.
+SINGLEDISPATCH_BASE = """\
+def entry(value):
+    return render(value)
+"""
+
+SINGLEDISPATCH = """\
+from functools import singledispatch
+
+
+@singledispatch
+def render(value):
+    return [value]
+
+
+@render.register
+def _render_int(value):
+    return "int"
+"""
+
+SINGLEDISPATCH_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import _render_int
+
+
+class HandlerTests(unittest.TestCase):
+    def test_the_handler_exists(self):
+        self.assertIs(_render_int, _render_int)
+"""
+
+# UNCALLED: a method reached only through getattr, whose name is a string.
+GETATTR_BASE = """\
+def dispatch(handler):
+    return getattr(handler, "handle")
+"""
+
+GETATTR_ONLY = """\
+class Handler:
+    def handle(self):
+        return 1
+"""
+
+GETATTR_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import Handler
+
+
+class HandlerTests(unittest.TestCase):
+    def test_the_handler_exists(self):
+        self.assertIs(Handler.handle, Handler.handle)
+"""
+
 # UNCALLED: a function called once by name is called, and an edited existing
 # function is not added.
 CALLED_BASE = """\
@@ -556,6 +665,7 @@ def chain_module(links: int) -> str:
                 if index < links else "    return total"
             ),
         ])
+    lines.extend(["", "run(1)"])
     return "\n".join(lines) + "\n"
 
 
@@ -575,6 +685,19 @@ class ShapeCase(FixtureCase):
         for relative, content in files.items():
             self.add_file(relative, content)
         self.commit_all("change")
+
+    def names_test(self, *names: str) -> str:
+        """A test module that directly names each given function."""
+        checks = "\n".join(
+            f"        self.assertIs({name}, {name})" for name in names
+        )
+        return (
+            "import sys\nimport unittest\n\nsys.path.insert(0, \".\")\n\n"
+            f"from pkg.app import {', '.join(names)}\n\n\n"
+            "class NamingTests(unittest.TestCase):\n"
+            "    def test_each_name(self):\n"
+            f"{checks}\n"
+        )
 
     def run_shape(
         self, env: dict[str, str] | None = None
@@ -636,7 +759,10 @@ class RuleTests(ShapeCase):
 
     def test_a_pass_through_wrapper_with_one_untested_call_site_fails(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
-        self.commit({"pkg/app.py": PTW_WRAPPED})
+        self.commit({
+            "pkg/app.py": PTW_WRAPPED,
+            "tests/test_app.py": self.names_test("main"),
+        })
         finding = self.rejected()
         subject = finding["subject"]
         self.assertTrue(
@@ -661,7 +787,10 @@ class RuleTests(ShapeCase):
 
     def test_a_wrapper_that_does_not_forward_every_parameter_passes(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
-        self.commit({"pkg/app.py": PTW_UNFORWARDED})
+        self.commit({
+            "pkg/app.py": PTW_UNFORWARDED,
+            "tests/test_app.py": self.names_test("main"),
+        })
         self.accepted()
 
     def test_a_zero_parameter_function_is_not_a_pass_through_wrapper(self) -> None:
@@ -680,6 +809,7 @@ class RuleTests(ShapeCase):
             "pkg/app.py": PTW_WRAPPED + (
                 "\n\ndef other(data):\n    return render_json(data)\n"
             ),
+            "tests/test_app.py": self.names_test("other"),
         })
         self.accepted()
 
@@ -770,6 +900,7 @@ class RuleTests(ShapeCase):
             "pkg/app.py": CPF_FRAGMENT + (
                 "\n\ndef summary(items, flag):\n    return _step(items, flag)\n"
             ),
+            "tests/test_app.py": self.names_test("summary"),
         })
         self.accepted()
 
@@ -845,6 +976,43 @@ class UncalledTests(ShapeCase):
         self.base_commit({"pkg/app.py": "TABLE = {}\n"})
         self.commit({"pkg/app.py": TABLE_REGISTERED})
         self.assert_uncalled("_files")
+
+    def test_a_dead_function_is_uncalled(self) -> None:
+        self.base_commit()
+        self.commit({"pkg/app.py": DEAD_FUNCTION})
+        self.assert_uncalled("lonely")
+
+    def test_a_direct_test_naming_a_dead_function_passes(self) -> None:
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": DEAD_FUNCTION, "tests/test_app.py": DEAD_TEST,
+        })
+        self.accepted()
+
+    def test_a_singledispatch_handler_is_uncalled(self) -> None:
+        self.base_commit({"pkg/driver.py": SINGLEDISPATCH_BASE})
+        self.commit({"pkg/app.py": SINGLEDISPATCH})
+        self.assert_uncalled("_render_int")
+
+    def test_a_direct_test_naming_a_singledispatch_handler_passes(self) -> None:
+        self.base_commit({"pkg/driver.py": SINGLEDISPATCH_BASE})
+        self.commit({
+            "pkg/app.py": SINGLEDISPATCH,
+            "tests/test_app.py": SINGLEDISPATCH_TEST,
+        })
+        self.accepted()
+
+    def test_a_getattr_only_method_is_uncalled(self) -> None:
+        self.base_commit({"pkg/driver.py": GETATTR_BASE})
+        self.commit({"pkg/app.py": GETATTR_ONLY})
+        self.assert_uncalled("Handler.handle")
+
+    def test_a_direct_test_naming_a_getattr_only_method_passes(self) -> None:
+        self.base_commit({"pkg/driver.py": GETATTR_BASE})
+        self.commit({
+            "pkg/app.py": GETATTR_ONLY, "tests/test_app.py": GETATTR_TEST,
+        })
+        self.accepted()
 
     def test_a_direct_test_naming_the_passed_function_passes(self) -> None:
         self.base_commit({"pkg/app.py": KEY_BASE})
@@ -944,7 +1112,10 @@ class ScopeTests(ShapeCase):
 
     def test_changed_scope_measures_the_functions_the_diff_touches(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
-        self.commit({"pkg/app.py": PTW_BASE + "\n\ndef extra():\n    return 2\n"})
+        self.commit({
+            "pkg/app.py": PTW_BASE + "\n\ndef extra():\n    return 2\n",
+            "tests/test_app.py": self.names_test("extra"),
+        })
         check = self.accepted()
         self.assertEqual(
             check["measurement"],
@@ -1392,15 +1563,16 @@ class HelperTests(unittest.TestCase):
         tokens = {first.identity: ("ID",), second.identity: ()}
         self.assertIsNone(_clone_finding(data, first, second, tokens))
 
-    def test_uncalled_findings_need_a_mention_but_no_call_or_test(self) -> None:
+    def test_uncalled_findings_need_no_call_or_test(self) -> None:
         recursive = shape_function(
             "def recursive():\n    return recursive()\n"
         )
         named = shape_function("def named():\n    return 1\n")
         tested = shape_function("def tested():\n    return 2\n")
+        lonely = shape_function("def lonely():\n    return 3\n")
         data = ShapeInput(
-            (recursive, named, tested), {}, (),
-            (recursive, named, tested),
+            (recursive, named, tested, lonely), {}, (),
+            (recursive, named, tested, lonely),
             {
                 "recursive": (
                     CallSite(
@@ -1413,11 +1585,11 @@ class HelperTests(unittest.TestCase):
                 ),
             },
             frozenset({"tested"}), SHAPE_SPEC, 6,
-            frozenset({"recursive", "named", "tested"}),
         )
         findings = _uncalled_findings(data)
         self.assertEqual(
-            [item.measurement["name"] for item in findings], ["recursive"]
+            [item.measurement["name"] for item in findings],
+            ["recursive", "lonely"],
         )
         self.assertEqual(findings[0].value, 1)
 
@@ -1676,7 +1848,10 @@ class MutationTests(ShapeCase):
 
     def test_ptw_su_needs_its_rule(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
-        self.commit({"pkg/app.py": PTW_WRAPPED})
+        self.commit({
+            "pkg/app.py": PTW_WRAPPED,
+            "tests/test_app.py": self.names_test("main"),
+        })
         self.assert_rule_dies_without_its_condition("PTW-SU rule")
 
     def test_scc_needs_its_depth_limit(self) -> None:
@@ -1691,7 +1866,10 @@ class MutationTests(ShapeCase):
 
     def test_ptw_su_needs_every_parameter_forwarded(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
-        self.commit({"pkg/app.py": PTW_UNFORWARDED})
+        self.commit({
+            "pkg/app.py": PTW_UNFORWARDED,
+            "tests/test_app.py": self.names_test("main"),
+        })
         self.assert_guard_keeps_its_fixture_passing(
             "PTW-SU every parameter forwarded"
         )
@@ -1710,7 +1888,10 @@ class MutationTests(ShapeCase):
 
     def test_ptw_su_needs_a_one_statement_body(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
-        self.commit({"pkg/app.py": PTW_MORE_THAN_ONE_STATEMENT})
+        self.commit({
+            "pkg/app.py": PTW_MORE_THAN_ONE_STATEMENT,
+            "tests/test_app.py": self.names_test("main"),
+        })
         self.assert_guard_keeps_its_fixture_passing("PTW-SU one statement")
 
     def test_ltc_needs_its_similarity_bound(self) -> None:

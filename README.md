@@ -647,13 +647,13 @@ finding has value `1`, so any finding fails the check. The five rules are:
   excludes the docstring and the signature, normalises identifiers to `ID`, numbers to `N` and
   strings to `S`, and keeps keywords and operators; an f-string's data is not structure. The upper
   bound keeps the rule in the gap the 50-token clone check does not cover.
-* **UNCALLED**, named but never called. An added function that a name or attribute in the selected
-  files mentions but that no call names outside its own body, and that no test names directly.
-  A descriptor-table entry, a keyword argument such as `sorted(key=f)` and a dispatch table called
-  as `TABLE[kind](x)` all mention the function without calling it. The remedy is a direct test, a
-  call by name, or the decision kept as data in its one owner. Its known limit is the one the other
-  rules share: a call by an unrelated name that happens to be spelled the same counts as a call,
-  as it does for the other rules.
+* **UNCALLED**, never called. An added function that no call names outside its own body and that no
+  test names directly. Dead code, a handler registered by a decorator such as `singledispatch`, a
+  method reached only through `getattr(obj, "handle")`, a descriptor-table entry, a keyword argument
+  such as `sorted(key=f)` and a dispatch table called as `TABLE[kind](x)` are all refused unless a
+  test names them directly. The remedy is a direct test, a call by name, or the decision kept as data
+  in its one owner. Its known limit is the one the other rules share: a call by an unrelated name that
+  happens to be spelled the same counts as a call, as it does for the other rules.
 
 A test file is a path with a `tests/` component, a `test_*.py` name or a `*_test.py` name. Test
 files are excluded from every rule's scope, and a function is a "direct test" of a name only when a
@@ -674,10 +674,10 @@ error naming it.
 
 The shapes the rules accept are deliberate. A single-use helper with a direct test passes CPF and
 PTW-SU; a helper with two call sites passes them too. A refactor that moves decisions into a data
-table adds no single-use helper and no mentioned-but-uncalled function, so CPF and UNCALLED do not
-fire. A tested decision function plus a thin effect adapter is accepted when the adapter has a
-direct test or a second caller. That is the QF12 shape: its helpers are directly tested, so CPF
-reports nothing.
+table adds no single-use helper, so CPF does not fire, but each table entry still needs a direct test
+or UNCALLED refuses it. A tested decision function plus a thin effect adapter is accepted when the
+adapter has a direct test or a second caller. That is the QF12 shape: its helpers are directly
+tested, so CPF reports nothing.
 
 Each finding's `subject` names the rule, the functions and the measured values, and the expected
 limit. The human report adds the check id and the location:
