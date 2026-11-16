@@ -21,7 +21,7 @@ from test_verification import (
     executed_entry, exclusion_entry, verification_baseline, verification_config,
 )
 
-from quality_gate import adapters, checks, files, policy, worklist
+from quality_gate import adapters, checks, policy, worklist
 from test_check import SLEEP_STUB
 
 
@@ -178,6 +178,30 @@ reason = "Emacs Lisp suite"
     return text + "\n" + extra
 
 
+def write_mixed_language_fixture(
+    case: FixtureCase, *, reason: str, message: str = "fixture"
+) -> None:
+    (case.repo / "a.py").unlink()
+    case.write_config(combined_config())
+    case.add_file("pkg/alpha.py", SIMPLE)
+    case.add_file("tests/test_sample.py", PASSING_TEST)
+    case.add_file("quality-gate-crap.toml", python_baseline([]))
+    case.add_file("src/core.el", ELISP_MODULE)
+    case.add_file("tests/suite.el", ELISP_SUITE)
+    case.add_file(
+        "quality-gate-elisp-crap.toml",
+        elisp_baseline([
+            {"subject": "src/core.el:alpha-elisp", "bound": 15, "reason": reason},
+        ]),
+    )
+    case.commit_all(message)
+
+
+def commit_revision(case: FixtureCase, message: str) -> str:
+    case.commit_all(message)
+    return case.git("rev-parse", "HEAD").stdout.strip()
+
+
 def _bridge_parse(raw, root, path, full_key):
     from types import SimpleNamespace
     return adapters.ParsedSpec(SimpleNamespace(requires=raw["requires"]), "bridge/1",
@@ -190,6 +214,25 @@ def _bridge_run(context):
     required = prior[check.spec.requires]
     return _check_result(check, time.monotonic(), required.outcome,
                          tests_ran=required.tests_ran, tests_skipped=required.tests_skipped)
+
+
+def _no_threshold_parse(raw, root, path, full_key):
+    from types import SimpleNamespace
+    baseline = Path(raw["baseline"])
+    if not baseline.is_absolute():
+        baseline = root / baseline
+    return adapters.ParsedSpec(
+        SimpleNamespace(), "python-lines/1", ("crap",), baseline=baseline
+    )
+
+
+def _no_threshold_run(_context):
+    raise AssertionError("debt started a check")
+
+
+NO_THRESHOLD = adapters.AdapterDescriptor(
+    "no-threshold", ("baseline",), _no_threshold_parse, _no_threshold_run
+)
 
 
 def run_worklist(
@@ -328,26 +371,7 @@ class WorklistOrderTests(FixtureCase):
 class WorklistElispTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
-        (self.repo / "a.py").unlink()
-        self.write_config(combined_config())
-        self.add_file("pkg/alpha.py", SIMPLE)
-        self.add_file("tests/test_sample.py", PASSING_TEST)
-        self.add_file("quality-gate-crap.toml", python_baseline([]))
-        self.add_file("src/core.el", ELISP_MODULE)
-        self.add_file("tests/suite.el", ELISP_SUITE)
-        self.add_file(
-            "quality-gate-elisp-crap.toml",
-            elisp_baseline(
-                [
-                    {
-                        "subject": "src/core.el:alpha-elisp",
-                        "bound": 15,
-                        "reason": "elisp debt",
-                    }
-                ]
-            ),
-        )
-        self.commit_all()
+        write_mixed_language_fixture(self, reason="elisp debt")
 
     def test_elisp_debt_appears_in_the_same_report(self) -> None:
         result = run_worklist(self, "--json")
@@ -904,6 +928,42 @@ class DebtSelectionTests(FixtureCase):
         self.assertIn("debt: 1 entries\n", result.stdout)
 
 
+class DebtMultipleBaselineTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        config = crap_config(threshold=6) + (
+            '\n[checks.clones]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nmin_tokens = 50\n'
+            'baseline = "quality-gate-clones.toml"\n'
+        )
+        self.write_config(config)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/alpha.py:above", "bound": 7, "reason": "above"},
+            {"subject": "pkg/alpha.py:at", "bound": 6, "reason": "at"},
+        ]))
+        self.add_file("quality-gate-clones.toml", baseline_text([
+            {"subject": "first", "bound": 1, "reason": "first"},
+            {"subject": "second", "bound": 3, "reason": "second"},
+        ]))
+        self.commit_all()
+
+    def test_checks_follow_policy_order_and_the_total_sums_every_check(self) -> None:
+        result = run_debt(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        document = self.parse_json(result)
+        self.assertEqual([check["id"] for check in document["checks"]],
+                         ["crap", "clones"])
+        crap, clones = document["checks"]
+        self.assertEqual((crap["entries"], crap["debt"]), (2, 1))
+        self.assertEqual([row["subject"] for row in crap["rows"]],
+                         ["pkg/alpha.py:above"])
+        self.assertEqual((clones["entries"], clones["debt"]), (2, 2))
+        self.assertEqual([row["subject"] for row in clones["rows"]],
+                         ["first", "second"])
+        self.assertEqual(document["debt"], 3)
+
+
 class DebtCloneTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
@@ -947,6 +1007,34 @@ class DebtFloorTests(FixtureCase):
                          (1, 0, []))
 
 
+class DebtNoThresholdTests(FixtureCase):
+    def test_a_check_without_a_threshold_counts_every_max_entry(self) -> None:
+        (self.repo / "a.py").unlink()
+        config = crap_config().replace(
+            '[checks.crap]\nadapter = "python_crap"',
+            '[checks.crap]\nadapter = "no-threshold"',
+        ).replace(
+            'requires = "tests"\nbaseline = "quality-gate-crap.toml"',
+            'baseline = "quality-gate-crap.toml"',
+        )
+        self.write_config(config)
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/low.py:low", "bound": 1, "reason": "low"},
+            {"subject": "pkg/high.py:high", "bound": 4, "reason": "high"},
+        ]))
+        self.commit_all("no threshold")
+        with mock.patch.dict(adapters.ADAPTERS, {NO_THRESHOLD.name: NO_THRESHOLD}):
+            result = run_debt(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.parse_json(result)["checks"][0]
+        self.assertEqual((check["entries"], check["debt"]), (2, 2))
+        self.assertEqual([row["threshold"] for row in check["rows"]], [None, None])
+        self.assertEqual(
+            [row["subject"] for row in check["rows"]],
+            ["pkg/low.py:low", "pkg/high.py:high"],
+        )
+
+
 class DebtRevisionTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
@@ -980,15 +1068,83 @@ class DebtRevisionTests(FixtureCase):
             ["pkg/alpha.py:new"],
         )
 
+    def _started(self, *args: str):
+        with mock.patch.object(
+            subprocess, "Popen", wraps=subprocess.Popen
+        ) as started:
+            result = run_debt(self, "--json", *args)
+        return result, [call.args[0] for call in started.call_args_list]
+
+    def _git_commands(self, commands: list[list[str]]) -> set[str]:
+        for command in commands:
+            self.assertEqual(command[0], "git", command)
+        return {command[command.index("-C") + 2] for command in commands}
+
     def test_the_run_starts_no_subprocess_other_than_git(self) -> None:
-        with mock.patch.object(worklist, "run", wraps=worklist.run) as debt_run, \
-                mock.patch.object(files, "run", wraps=files.run) as files_run:
-            result = run_debt(self, "--json", "--revision", self.old)
+        result, commands = self._started("--revision", self.old)
         self.assertEqual(result.returncode, 0, output(result))
-        calls = debt_run.call_args_list + files_run.call_args_list
-        self.assertTrue(calls)
-        for call in calls:
-            self.assertEqual(call.args[0][0], "git")
+        self.assertTrue(commands)
+        self.assertEqual(self._git_commands(commands), {"rev-parse", "show"})
+
+    def test_working_tree_mode_starts_only_git(self) -> None:
+        result, commands = self._started()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue(commands)
+        self.assertEqual(self._git_commands(commands), {"rev-parse"})
+
+
+class DebtCommittedInputTests(FixtureCase):
+    def test_a_revision_reads_suites_the_working_tree_lost(self) -> None:
+        write_mixed_language_fixture(self, reason="old", message="mixed language")
+        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "tests/suite.el").unlink()
+        shutil.rmtree(self.repo / "src")
+        result = run_debt(self, "--json", "--revision", revision)
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(self.parse_json(result), "elisp-crap")
+        self.assertEqual((check["entries"], check["debt"]), (1, 1))
+        self.assertEqual(
+            [row["subject"] for row in check["rows"]],
+            ["src/core.el:alpha-elisp"],
+        )
+
+
+class DebtBaselinePathTests(FixtureCase):
+    def test_a_nul_baseline_path_exits_two_in_both_modes(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.write_config(crap_config(baseline="bad\\u0000baseline.toml"))
+        revision = commit_revision(self, "nul baseline path")
+        for args in ((), ("--revision", revision)):
+            with self.subTest(mode=args):
+                result = run_debt(self, "--json", *args)
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(result.stdout, "")
+                self.assertIn("bad", result.stderr)
+                self.assertIn("baseline.toml", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                if args:
+                    self.assertIn(revision, result.stderr)
+
+
+class DebtBaselineSpellingTests(FixtureCase):
+    def test_the_policy_spelling_survives_in_both_modes(self) -> None:
+        (self.repo / "a.py").unlink()
+        self.add_file("pkg/alpha.py", SIMPLE)
+        self.add_file("quality-gate-crap.toml", python_baseline([]))
+        spellings = (
+            str(self.repo / "quality-gate-crap.toml"),
+            "./quality-gate-crap.toml",
+        )
+        for baseline in spellings:
+            with self.subTest(baseline=baseline):
+                self.write_config(crap_config(baseline=baseline))
+                revision = commit_revision(self, f"baseline {baseline}")
+                for args in ((), ("--revision", revision)):
+                    with self.subTest(mode=args):
+                        result = run_debt(self, "--json", *args)
+                        self.assertEqual(result.returncode, 0, output(result))
+                        check = self.parse_json(result)["checks"][0]
+                        self.assertEqual(check["baseline"], baseline)
 
 
 class DebtFailureTests(FixtureCase):

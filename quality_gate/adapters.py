@@ -18,6 +18,7 @@ from . import (
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
+    _config_error,
     _number,
     _string,
 )
@@ -91,6 +92,10 @@ def _baseline(
     if "baseline" not in raw:
         return None
     name = _string(raw, "baseline", path, f"{full_key}.baseline")
+    if "\x00" in name:
+        raise _config_error(
+            path, f"{full_key}.baseline", "a path without NUL", repr(name)
+        )
     baseline = Path(name)
     if not baseline.is_absolute():
         baseline = root / baseline

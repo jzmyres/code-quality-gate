@@ -513,6 +513,8 @@ def _content(root: Path, revision: str, name: str, label: str) -> bytes:
 
 
 def _relative_name(root: Path, name: str, label: str) -> str:
+    if "\x00" in name:
+        raise UsageError(f"{label}: expected a path without NUL, got {name!r}")
     path = Path(name)
     try:
         relative = path.relative_to(root) if path.is_absolute() else path
@@ -562,7 +564,6 @@ def _revision_config(
     raw = _content(root, sha, POLICY_NAME, f"{label}:{POLICY_NAME}")
     data = _policy_data(raw, f"{label}:{POLICY_NAME}")
     names = _named_baselines(data)
-    _stage(temporary, POLICY_NAME, raw)
     checks = cast(dict[str, Any], data.get("checks", {}))
     for name, baseline in names.items():
         relative = _relative_name(root, baseline, f"{label}:{baseline}")
@@ -574,49 +575,35 @@ def _revision_config(
         checks[name]["baseline"] = relative
     try:
         config = _config_from_data(
-            temporary, root / POLICY_NAME, data, candidate_root=root
+            temporary,
+            root / POLICY_NAME,
+            data,
+            candidate_root=root,
+            parse_candidate_inputs=False,
         )
     except UsageError as error:
         raise UsageError(f"{label}: {error}") from error
     return sha, config, names
 
 
-def _baseline_label(
-    check: CheckDef, config: Config, names: dict[str, str] | None
-) -> str:
-    if names is not None and check.id in names:
-        return names[check.id]
-    assert check.baseline is not None
-    try:
-        return check.baseline.relative_to(config.root).as_posix()
-    except ValueError:
-        return str(check.baseline)
-
-
-def _debt_check(
-    check: CheckDef, entries: list[BaselineEntry], baseline: str
-) -> CheckDebt:
-    rows = tuple(
-        DebtRow(entry.subject, entry.bound, check.threshold, entry.reason)
-        for entry in _debt_entries(entries, check.threshold)
-    )
-    return CheckDebt(check.id, baseline, len(entries), rows)
-
-
 def _check_debts(
-    config: Config, names: dict[str, str] | None, revision: str | None
+    config: Config, names: dict[str, str], revision: str | None
 ) -> list[CheckDebt]:
     reports: list[CheckDebt] = []
     for check in config.checks.values():
         if check.baseline is None:
             continue
-        baseline = _baseline_label(check, config, names)
+        baseline = names[check.id]
         try:
             entries = _baseline_entries(check)
         except GateError as error:
             location = f"{revision}:{baseline}" if revision else baseline
             raise UsageError(f"{location}: {error}") from error
-        reports.append(_debt_check(check, entries, baseline))
+        rows = tuple(
+            DebtRow(entry.subject, entry.bound, check.threshold, entry.reason)
+            for entry in _debt_entries(entries, check.threshold)
+        )
+        reports.append(CheckDebt(check.id, baseline, len(entries), rows))
     return reports
 
 
@@ -648,7 +635,9 @@ def command_debt(
 ) -> int:
     try:
         if revision is None:
-            reports = _check_debts(load_config(root), None, None)
+            config = load_config(root)
+            data = _policy_data(config.path.read_bytes(), str(config.path))
+            reports = _check_debts(config, _named_baselines(data), None)
             sha = None
         else:
             with tempfile.TemporaryDirectory(prefix="qg-debt-") as temporary:

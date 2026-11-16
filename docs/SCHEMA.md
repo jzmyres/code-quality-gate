@@ -736,9 +736,10 @@ one JSON document to stdout. Its schema is 1:
 ```
 
 `revision` is the resolved commit SHA read by `--revision`, or null when the policy and baselines come
-from the working tree. `checks` follows policy order and holds one object per check with a baseline,
-including a check with no debt. A policy with no baseline has an empty `checks` array and `debt` 0.
-`debt` is the sum of every check's `debt`.
+from the working tree. With `--revision`, the report depends only on files committed at that revision:
+no adapter reads a candidate input from the working tree. `checks` follows policy order and holds one
+object per check with a baseline, including a check with no debt. A policy with no baseline has an empty
+`checks` array and `debt` 0. `debt` is the sum of every check's `debt`.
 
 | Check field | JSON type | Meaning |
 | --- | --- | --- |
@@ -754,8 +755,8 @@ strictly above the threshold. A `min` entry is a floor and never appears. Every 
 (string).
 
 An unreadable revision, a policy or baseline that cannot be read or parsed, or a baseline the policy
-names that is missing at that revision exits 2 with a message naming the revision and path. It never
-reports zero for an error.
+names that is missing at that revision exits 2 with a message naming the revision and path. A baseline
+path with an embedded NUL is rejected the same way in either mode. It never reports zero for an error.
 
 ## Versions and superseded proposals
 

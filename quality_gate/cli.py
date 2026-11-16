@@ -171,8 +171,6 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         return command_hygiene(root, config)
     if args.command == "worklist":
         return command_worklist(root, config, args.check_ids, args.json)
-    if args.command == "debt":
-        return command_debt(root, args.revision, args.json)
     return command_check(
         root,
         config,
