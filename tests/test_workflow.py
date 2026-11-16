@@ -22,7 +22,8 @@ def workflow_script() -> str:
         if not line.startswith("          "):
             break
         body.append(line[10:])
-    return "\n".join(body) + "\n"
+    # The test runs as its own user, so it drops the wrapper that runs git as gate.
+    return "\n".join(body).replace("runuser -u gate -- ", "") + "\n"
 
 
 class ResolveChangeStepTests(FixtureCase):

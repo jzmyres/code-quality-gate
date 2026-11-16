@@ -1511,8 +1511,9 @@ The workflow itself is proven only by the CI run after landing, which the design
 
 The job setup (packages, pinned runtimes and cache restores) runs as the container's root. Each job
 then creates an unprivileged `gate` user and gives it ownership of the checkout and `QG_TOOLS_DIR`;
-fetching pinned tools, the gate and the mutation run as that user through `runuser`. A restored
-tools cache keeps its modes and changes only ownership, so read-only payloads stay read-only.
+after that handover, resolving the judged change, fetching pinned tools, the gate and the mutation
+run as that user through `runuser`. A restored tools cache keeps its modes and changes only ownership,
+so read-only payloads stay read-only.
 
 The check matrix checks out the full history, restores the pinned tools cache keyed on the environment
 name, architecture and `tools.lock.toml`, fetches any missing tools (including the coverage wheel),
