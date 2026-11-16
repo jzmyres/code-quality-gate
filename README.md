@@ -652,13 +652,13 @@ test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` 
 judge only the functions the diff adds, not every function it changes. `scope = "tree"` evaluates
 every function of the selected production files, so a function the commit does not touch can fail
 SCC or LTC there. CPF is not a tree property, so it compares against `base` in both scopes (a clean
-tree with `base = "HEAD"` has no CPF finding). A helper's call sites are counted in every Python
-file the check selects, with or without a `.py` suffix (a selected program's shebang decides); Python
-embedded in a file neither named `.py` nor starting with a Python shebang — a shell script, for
-example — is not read. A missing or invalid input is a configuration error, never a skipped rule:
-unknown keys, a `scope` other than `changed` or `tree`, a missing or non-existent `base`,
-`max_chain` below 1, `clone_min_tokens` outside 20-49, `clone_similarity` outside 0.5-1.0, and a
-`crap_check` naming no check or a check that is not a `python_crap` check are all rejected. An
+tree with `base = "HEAD"` has no CPF finding). A helper's call sites are counted in every
+enumerated Python file, with or without a `.py` suffix, so a caller outside the check's own scope
+still counts. Python embedded in a shell script is not read. A missing or invalid input is a
+configuration error, never a skipped rule: unknown keys, a `scope` other than `changed` or
+`tree`, a missing or non-existent `base`, `max_chain` below 1, `clone_min_tokens` outside 20-49,
+`clone_similarity` outside 0.5-1.0, and a `crap_check` naming no check or a check that is not a
+`python_crap` check are all rejected. An
 unparsable changed file or a path Git still quotes is an error naming it.
 
 The shapes the rules accept are deliberate. A single-use helper with a direct test passes CPF and
@@ -679,7 +679,7 @@ The `measurement` carries the measured values per rule: `rule`, `file`, `name`, 
 `call_sites`, `direct_test`, `callee`, `forwarded`, `constants`, `cc_before`, `cc_after`, `limit`,
 `chain_depth`, `chain`, `longest`, `ratio` and `tokens`. The check reports
 `{"functions": N, "added": M}` in its measurement, so a run shows how much it measured. The metric
-version is `python-shape/1`. The adapter itself is 59 functions, scores at most CC 6, and passes
+version is `python-shape/1`. The adapter itself is 47 functions, scores at most CC 6, and passes
 all four rules over its own source; no function of it scores above CRAP 6 measured over its test
 module.
 

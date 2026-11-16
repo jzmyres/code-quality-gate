@@ -17,6 +17,7 @@ import time
 import tokenize
 from collections.abc import Callable
 from dataclasses import dataclass
+from operator import attrgetter
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -183,31 +184,25 @@ def _is_test_path(relative: str) -> bool:
     return name.startswith("test_") or name.endswith("_test.py")
 
 
-def _definition(
-    node: ast.FunctionDef | ast.AsyncFunctionDef, prefix: str, path: str
-) -> ShapeFunction:
-    name = _function_identity(node, prefix)
-    return ShapeFunction(
-        identity=f"{path}:{name}",
-        path=path,
-        name=name,
-        node=node,
-        start_line=_start_line(node),
-        end_line=node.end_lineno or node.lineno,
-        cc=cyclomatic_complexity(
-            ast.Module(body=node.body, type_ignores=[])
-        ),
-        final_name=node.name,
-    )
-
-
 def _collect_definitions(
     nodes: list[ast.AST], prefix: str, path: str,
     found: list[ShapeFunction],
 ) -> None:
     for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            function = _definition(node, prefix, path)
+            name = _function_identity(node, prefix)
+            function = ShapeFunction(
+                identity=f"{path}:{name}",
+                path=path,
+                name=name,
+                node=node,
+                start_line=_start_line(node),
+                end_line=node.end_lineno or node.lineno,
+                cc=cyclomatic_complexity(
+                    ast.Module(body=node.body, type_ignores=[])
+                ),
+                final_name=node.name,
+            )
             found.append(function)
             _collect_definitions(node.body, f"{function.name}.", path, found)
             continue
@@ -261,20 +256,17 @@ def _test_functions(
 ) -> None:
     """Collect the names the test functions mention into found."""
     for node in nodes:
-        _test_function(node, in_test, found)
-
-
-def _test_function(node: ast.AST, in_test: bool, found: set[str]) -> None:
-    """Collect the names one node contributes, and walk to the next ones."""
-    if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-        _test_functions(list(ast.iter_child_nodes(node)), in_test, found)
-        return
-    if not isinstance(node, ast.ClassDef) and (
-        in_test or node.name.startswith("test")
-    ):
-        found.update(_references(node))
-        return
-    _test_functions(list(node.body), _inside_test(node, in_test), found)
+        if not isinstance(
+            node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            _test_functions(list(ast.iter_child_nodes(node)), in_test, found)
+            continue
+        if not isinstance(node, ast.ClassDef) and (
+            in_test or node.name.startswith("test")
+        ):
+            found.update(_references(node))
+            continue
+        _test_functions(list(node.body), _inside_test(node, in_test), found)
 
 
 def _inside_test(node: ast.AST, in_test: bool) -> bool:
@@ -333,24 +325,6 @@ def _added_lines(header: str) -> range:
     return range(start, start + count)
 
 
-def _verify_base(root: Path, base: str) -> None:
-    """A base that is not one existing revision is an error, not a skip."""
-    checked = run(
-        git_argv(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"),
-        budget_seconds=600,
-        capture_limit=None,
-    )
-    problem = (
-        f"got git {checked.execution}"
-        if checked.execution != "completed"
-        else "got no such revision"
-    )
-    if checked.execution != "completed" or checked.returncode != 0:
-        raise GateError(
-            f"base {base!r}: expected an existing revision, {problem}"
-        )
-
-
 def _hunks(raw: bytes) -> tuple[set[str], dict[str, set[int]]]:
     """The after paths of a zero-context diff and each one's added lines."""
     paths: set[str] = set()
@@ -367,8 +341,23 @@ def _hunks(raw: bytes) -> tuple[set[str], dict[str, set[int]]]:
     return paths, added
 
 
-def _diff(root: Path, base: str) -> bytes:
-    return _git(
+def _diff_lines(root: Path, base: str) -> Diff:
+    """The added line numbers of every changed path, and new whole files."""
+    checked = run(
+        git_argv(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"),
+        budget_seconds=600,
+        capture_limit=None,
+    )
+    problem = (
+        f"got git {checked.execution}"
+        if checked.execution != "completed"
+        else "got no such revision"
+    )
+    if checked.execution != "completed" or checked.returncode != 0:
+        raise GateError(
+            f"base {base!r}: expected an existing revision, {problem}"
+        )
+    raw = _git(
         root,
         [
             "-c", "core.quotePath=false",
@@ -378,12 +367,7 @@ def _diff(root: Path, base: str) -> bytes:
         ],
         "python-shape diff",
     )
-
-
-def _diff_lines(root: Path, base: str) -> Diff:
-    """The added line numbers of every changed path, and new whole files."""
-    _verify_base(root, base)
-    paths, added = _hunks(_diff(root, base))
+    paths, added = _hunks(raw)
     untracked = frozenset(
         _untracked_files(root, "python-shape untracked-file selection")
     )
@@ -453,14 +437,9 @@ def _scan_files(
         ):
             continue
         source = _read_source(context.root, relative)
-        if _mentions(source, names):
+        if any(name in source for name in names):
             indexes[relative] = _file_index(relative, source)
     return indexes
-
-
-def _mentions(source: str, names: set[str]) -> bool:
-    """Whether any of the names appears in the source at all."""
-    return any(name in source for name in names)
 
 
 def _uses(
@@ -478,14 +457,6 @@ def _uses(
         {name: tuple(sites) for name, sites in calls.items()},
         frozenset(tests),
     )
-
-
-def _candidates(
-    spec: ShapeSpec, functions: tuple[ShapeFunction, ...],
-    added: tuple[ShapeFunction, ...],
-) -> tuple[ShapeFunction, ...]:
-    """The functions PTW-SU, SCC and LTC judge: a tree's, or the added ones."""
-    return functions if spec.scope == "tree" else added
 
 
 def _selected_functions(
@@ -535,7 +506,7 @@ def _shape_input(
             & diff.added.get(function.path, frozenset())
         ),
     )
-    candidates = _candidates(spec, functions, added)
+    candidates = {"tree": functions, "changed": added}[spec.scope]
     names = {function.final_name for function in candidates}
     scanned = _scan_files(context, scoped, names)
     parsed = [*indexes.values(), *scanned.values()]
@@ -610,7 +581,9 @@ def _forwarded(values: list[ast.AST], own: list[str]) -> list[str] | None:
     constants = sum(isinstance(value, ast.Constant) for value in values)
     forwarding = sorted(named) != sorted(own)
     plain = len(named) + constants != len(values)
-    return None if forwarding or plain else named
+    if not all((named, not forwarding, not plain)):
+        return None
+    return named
 
 
 def _wrapper_call(call: ast.Call, own: list[str]) -> Wrapper | None:
@@ -686,38 +659,32 @@ def _cpf_findings(data: ShapeInput) -> list[Finding]:
         target = targets.get(site.caller) if site is not None else None
         if target is None or helper.final_name in data.tests:
             continue
-        findings.append(_cpf_finding(data, target[0], target[1], helper))
+        before, function = target
+        subject = (
+            f"CPF {function.identity} CC {before} -> {function.cc}, helper "
+            f"{helper.identity} (1 call site, no direct test; limit "
+            f"{_number_text(data.limit)} CC; expected the helper to have a direct "
+            "test or a second caller, or the function to stay unsplit)"
+        )
+        measurement = {
+            "rule": "CPF",
+            "call_sites": 1,
+            "direct_test": False,
+            "file": function.path,
+            "name": function.name,
+            "caller": function.identity,
+            "helper": helper.identity,
+            "helper_file": helper.path,
+            "helper_name": helper.name,
+            "cc_before": before,
+            "cc_after": function.cc,
+            "limit": data.limit,
+        }
+        findings.append(Finding(
+            subject, 1, _span(function), measurement,
+            (_location(function), _location(helper)),
+        ))
     return findings
-
-
-def _cpf_finding(
-    data: ShapeInput, before: int, target: ShapeFunction,
-    helper: ShapeFunction,
-) -> Finding:
-    subject = (
-        f"CPF {target.identity} CC {before} -> {target.cc}, helper "
-        f"{helper.identity} (1 call site, no direct test; limit "
-        f"{_number_text(data.limit)} CC; expected the helper to have a direct "
-        "test or a second caller, or the function to stay unsplit)"
-    )
-    measurement = {
-        "rule": "CPF",
-        "call_sites": 1,
-        "direct_test": False,
-        "file": target.path,
-        "name": target.name,
-        "caller": target.identity,
-        "helper": helper.identity,
-        "helper_file": helper.path,
-        "helper_name": helper.name,
-        "cc_before": before,
-        "cc_after": target.cc,
-        "limit": data.limit,
-    }
-    return Finding(
-        subject, 1, _span(target), measurement,
-        (_location(target), _location(helper)),
-    )
 
 
 def _ptw_findings(data: ShapeInput) -> list[Finding]:
@@ -730,30 +697,27 @@ def _ptw_findings(data: ShapeInput) -> list[Finding]:
             and function.final_name not in data.tests
             and wrapper is not None
         ):
-            findings.append(_ptw_finding(function, wrapper))
+            subject = (
+                f"PTW-SU {function.identity} -> {wrapper.callee} (forwards "
+                f"{', '.join(wrapper.forwarded)}, {wrapper.constants} constants, "
+                "1 call site, no direct test; limit 1 call site with no direct "
+                "test; expected a direct test, a second caller, or no wrapper)"
+            )
+            measurement = {
+                "rule": "PTW-SU",
+                "file": function.path,
+                "name": function.name,
+                "callee": wrapper.callee,
+                "forwarded": list(wrapper.forwarded),
+                "constants": wrapper.constants,
+                "call_sites": 1,
+                "direct_test": False,
+            }
+            findings.append(Finding(
+                subject, 1, _span(function), measurement,
+                (_location(function),),
+            ))
     return findings
-
-
-def _ptw_finding(function: ShapeFunction, wrapper: Wrapper) -> Finding:
-    subject = (
-        f"PTW-SU {function.identity} -> {wrapper.callee} (forwards "
-        f"{', '.join(wrapper.forwarded)}, {wrapper.constants} constants, "
-        "1 call site, no direct test; limit 1 call site with no direct test; "
-        "expected a direct test, a second caller, or no wrapper)"
-    )
-    measurement = {
-        "rule": "PTW-SU",
-        "file": function.path,
-        "name": function.name,
-        "callee": wrapper.callee,
-        "forwarded": list(wrapper.forwarded),
-        "constants": wrapper.constants,
-        "call_sites": 1,
-        "direct_test": False,
-    }
-    return Finding(
-        subject, 1, _span(function), measurement, (_location(function),)
-    )
 
 
 def _chain_edges(
@@ -792,29 +756,24 @@ def _scc_findings(data: ShapeInput) -> list[Finding]:
     for head in heads:
         depth, chain = _chain_path(head, successors, frozenset())
         if depth > data.spec.max_chain:
-            findings.append(_scc_finding(data, candidates, chain))
+            limit = data.spec.max_chain
+            subject = (
+                f"SCC chain depth {len(chain)}: {' -> '.join(chain)} "
+                f"(limit {limit}; expected at most {limit} consecutive "
+                "single-caller functions)"
+            )
+            measurement = {
+                "rule": "SCC",
+                "chain_depth": len(chain),
+                "chain": list(chain),
+                "limit": limit,
+            }
+            members = [candidates[identity] for identity in chain]
+            findings.append(Finding(
+                subject, 1, _span(members[0]), measurement,
+                tuple(_location(member) for member in members),
+            ))
     return findings
-
-
-def _scc_finding(
-    data: ShapeInput, added: dict[str, ShapeFunction], chain: list[str]
-) -> Finding:
-    limit = data.spec.max_chain
-    subject = (
-        f"SCC chain depth {len(chain)}: {' -> '.join(chain)} (limit {limit}; "
-        f"expected at most {limit} consecutive single-caller functions)"
-    )
-    measurement = {
-        "rule": "SCC",
-        "chain_depth": len(chain),
-        "chain": list(chain),
-        "limit": limit,
-    }
-    members = [added[identity] for identity in chain]
-    return Finding(
-        subject, 1, _span(members[0]), measurement,
-        tuple(_location(member) for member in members),
-    )
 
 
 def _normalised_tokens(
@@ -846,6 +805,14 @@ def _clone_pairs(
     tokens: dict[str, tuple[str, ...]], minimum: int,
 ) -> list[tuple[str, str]]:
     """Each pair of functions that shares one window of minimum tokens."""
+    ordered = sorted(
+        functions,
+        key=lambda function: (
+            function.path, function.start_line, function.end_line,
+            function.identity,
+        ),
+    )
+    order = {function.identity: index for index, function in enumerate(ordered)}
     buckets: dict[tuple[str, ...], set[str]] = {}
     for function in functions:
         sequence = tokens[function.identity]
@@ -855,9 +822,11 @@ def _clone_pairs(
             ).add(function.identity)
     pairs: set[tuple[str, str]] = set()
     for identities in buckets.values():
-        for pair in itertools.combinations(sorted(identities), 2):
+        for pair in itertools.combinations(
+            sorted(identities, key=order.__getitem__), 2
+        ):
             pairs.add(pair)
-    return sorted(pairs)
+    return sorted(pairs, key=lambda pair: (order[pair[0]], order[pair[1]]))
 
 
 def _longest_common_run(
@@ -962,27 +931,6 @@ def _findings(data: ShapeInput) -> list[Finding]:
     return findings
 
 
-def _configuration_error(
-    check: Any, start: float, prefix: str, error: Exception
-) -> Any:
-    from .checks import _ratchet_error
-
-    result = _ratchet_error(check, start, prefix, error)
-    result.configuration_error = True
-    return result
-
-
-def _report_pass(prefix: str, satisfied: bool, functions: int) -> None:
-    """A satisfied run says how many functions it measured."""
-    if satisfied:
-        print(f"{prefix}: {functions} functions measured", flush=True)
-
-
-def _counts(data: ShapeInput) -> dict[str, int]:
-    """What a run measured, reported in its measurement object."""
-    return {"functions": len(data.functions), "added": len(data.added)}
-
-
 def _run_python_shape(context: Any) -> Any:
     from .checks import _evaluate_ratchet, _ratchet_result
 
@@ -993,10 +941,14 @@ def _run_python_shape(context: Any) -> Any:
         mark_step("python-shape analysis")
         data = _shape_input(context, check.spec, limit)
     except GateError as error:
-        return _configuration_error(check, start, context.prefix, error)
+        from .checks import _ratchet_error
+
+        result = _ratchet_error(check, start, context.prefix, error)
+        result.configuration_error = True
+        return result
     mark_step("python-shape rules")
     measured = Domain.of_files(
-        sorted({function.path for function in data.functions}),
+        sorted(set(map(attrgetter("path"), data.functions))),
         "the measured production files",
     )
     ratchet, failure = _evaluate_ratchet(
@@ -1004,7 +956,14 @@ def _run_python_shape(context: Any) -> Any:
     )
     if ratchet is None:
         return _ratchet_result(check, start, failure or "error", reason=failure)
-    _report_pass(context.prefix, ratchet.satisfied, len(data.functions))
+    if ratchet.satisfied:
+        print(
+            f"{context.prefix}: {len(data.functions)} functions measured",
+            flush=True,
+        )
     return _ratchet_result(
-        check, start, ratchet.outcome, ratchet=ratchet, measurement=_counts(data),
+        check, start, ratchet.outcome, ratchet=ratchet,
+        measurement={
+            "functions": len(data.functions), "added": len(data.added),
+        },
     )

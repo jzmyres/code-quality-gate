@@ -2,22 +2,54 @@
 from __future__ import annotations
 
 import ast
+import io
 import subprocess
+import tokenize
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from support import BASE_CONFIG, FixtureCase, _add_check_to_class, output
 
 from quality_gate import policy
 from quality_gate.python_shape import (
+    CallSite,
+    Diff,
+    FileIndex,
+    ShapeFunction,
+    ShapeInput,
+    ShapeSpec,
+    _added_lines,
+    _after_path,
+    _arguments,
+    _before_complexities,
     _body_value,
+    _chain_edges,
+    _clone_finding,
+    _clone_pairs,
+    _collect_definitions,
+    _cpf_targets,
+    _crap_limit,
+    _diff_lines,
+    _findings,
     _forwarded,
+    _hunks,
     _inside_test,
-    _mentions,
+    _longest_common_run,
+    _measured_paths,
+    _normalised_tokens,
     _own_names,
+    _references,
+    _scan_files,
+    _shape_input,
     _test_functions,
+    _token_text,
+    _touched,
+    _uses,
     _wrapper,
+    _wrapper_call,
 )
 
 
@@ -138,6 +170,19 @@ def render_json(data):
     return json.dumps(data, indent=2, sort_keys=True)
 """
 
+# PTW-SU: a zero-parameter function forwards no parameter, so it is not a wrapper.
+PTW_ZERO_PARAMETER = """\
+import json
+
+
+def main():
+    return render_json()
+
+
+def render_json():
+    return json.dumps("value", indent=2, sort_keys=True)
+"""
+
 PTW_TEST = """\
 import sys
 import unittest
@@ -201,6 +246,20 @@ def lane_class(lane: dict) -> str:
     window = "lane--peak" if lane.get("window") == "peak" else "lane--off"
     fill = " lane--working" if lane.get("working") else " lane--idle"
     return f"lane {window}{fill}"
+"""
+
+# LTC: the source order is the reverse of the identities' alphabetical order.
+LTC_REVERSED = """\
+def lane_class(lane: dict) -> str:
+    window = "lane--peak" if lane.get("window") == "peak" else "lane--off"
+    fill = "lane--working" if lane.get("working") else "lane--idle"
+    return f"lane {window}{fill}"
+
+
+def chip_class(lane: dict) -> str:
+    window = "chip--peak" if lane.get("window") == "peak" else "chip--off"
+    fill = "chip--working" if lane.get("working") else "chip--idle"
+    return f"chip {window} {fill}"
 """
 
 # The report's judged false positive: 30 shared tokens at similarity 0.938.
@@ -471,6 +530,11 @@ class RuleTests(ShapeCase):
         self.commit({"pkg/app.py": PTW_UNFORWARDED})
         self.accepted()
 
+    def test_a_zero_parameter_function_is_not_a_pass_through_wrapper(self) -> None:
+        self.base_commit({"pkg/app.py": PTW_BASE})
+        self.commit({"pkg/app.py": PTW_ZERO_PARAMETER})
+        self.accepted()
+
     def test_a_wrapper_with_a_direct_test_passes(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
         self.commit({"pkg/app.py": PTW_WRAPPED, "tests/test_app.py": PTW_TEST})
@@ -516,6 +580,17 @@ class RuleTests(ShapeCase):
         self.assertEqual(finding["measurement"]["longest"], 34)
         self.assertEqual(finding["measurement"]["ratio"], 1.0)
         self.assertEqual(len(finding["locations"]), 2)
+
+    def test_a_clone_pair_is_reported_in_source_order(self) -> None:
+        self.base_commit({"pkg/app.py": "VALUE = 0\n"})
+        self.commit({"pkg/app.py": LTC_REVERSED})
+        finding = self.rejected()
+        self.assertIn(
+            "LTC pkg/app.py:lane_class <-> pkg/app.py:chip_class",
+            finding["subject"],
+        )
+        self.assertEqual(finding["measurement"]["first"], "pkg/app.py:lane_class")
+        self.assertEqual(finding["measurement"]["second"], "pkg/app.py:chip_class")
 
     def test_a_near_duplicate_at_lower_similarity_passes(self) -> None:
         self.base_commit({"pkg/app.py": "VALUE = 0\n"})
@@ -746,6 +821,26 @@ def function_node(source: str) -> Any:
     return ast.parse(source).body[0]
 
 
+SHAPE_SPEC = ShapeSpec("changed", "HEAD", 6, 30, 0.95, "crap")
+
+
+def shape_function(
+    source: str, *, cc: int = 1, path: str = "pkg/app.py"
+) -> ShapeFunction:
+    """One shape function built from a source snippet."""
+    node = function_node(source)
+    return ShapeFunction(
+        identity=f"{path}:{node.name}",
+        path=path,
+        name=node.name,
+        node=node,
+        start_line=node.lineno,
+        end_line=node.end_lineno or node.lineno,
+        cc=cc,
+        final_name=node.name,
+    )
+
+
 class HelperTests(unittest.TestCase):
     """Direct tests of the adapter's small parsing steps."""
 
@@ -787,10 +882,6 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(_forwarded(values("f(data, data)"), ["data"]))
         self.assertIsNone(_forwarded(values("f(data, flag)"), ["data"]))
 
-    def test_a_mention_is_any_name_in_the_source(self) -> None:
-        self.assertTrue(_mentions("render_json(x)\n", {"render_json"}))
-        self.assertFalse(_mentions("render_json(x)\n", {"other"}))
-
     def test_a_test_class_keeps_a_walk_inside_a_test(self) -> None:
         suite = ast.parse("class SpecialTests:\n    pass\n").body[0]
         other = ast.parse("class Helper:\n    pass\n").body[0]
@@ -808,6 +899,281 @@ class HelperTests(unittest.TestCase):
         found: set[str] = set()
         _test_functions(tree.body, False, found)
         self.assertEqual(found, {"helper"})
+
+    def test_referenced_names_include_attributes(self) -> None:
+        tree = ast.parse("value = holder.method\nother\n")
+        self.assertEqual(
+            _references(tree), {"value", "holder", "method", "other"}
+        )
+
+    def test_diff_headers_name_their_paths(self) -> None:
+        self.assertEqual(_after_path("b/pkg/app.py"), "pkg/app.py")
+        self.assertIsNone(_after_path("/dev/null"))
+        with self.assertRaises(policy.GateError):
+            _after_path('"pkg/odd name.py"')
+
+    def test_hunk_headers_give_added_lines(self) -> None:
+        self.assertEqual(list(_added_lines("@@ -1 +2,3 @@")), [2, 3, 4])
+        self.assertEqual(list(_added_lines("@@ -0,0 +1 @@")), [1])
+
+    def test_hunks_read_added_lines_and_skip_deleted_paths(self) -> None:
+        raw = (
+            b"+++ b/pkg/app.py\n@@ -1 +2,2 @@\n+x\n+y\n"
+            b"+++ /dev/null\n@@ -4 +0,0 @@\n-x\n"
+        )
+        self.assertEqual(
+            _hunks(raw),
+            ({"pkg/app.py"}, {"pkg/app.py": {2, 3}}),
+        )
+
+    def test_arguments_include_keyword_values_and_reject_unpacking(self) -> None:
+        call = ast.parse("f(data, flag=2)").body[0].value
+        values = _arguments(call)
+        self.assertEqual([ast.unparse(value) for value in values], ["data", "2"])
+        self.assertIsNone(
+            _arguments(ast.parse("f(data, **options)").body[0].value)
+        )
+
+    def test_wrapper_call_needs_a_named_callee_and_no_unpacking(self) -> None:
+        wrapper = _wrapper_call(
+            ast.parse("f(data, 2)").body[0].value, ["data"]
+        )
+        self.assertEqual(
+            (wrapper.callee, wrapper.forwarded, wrapper.constants),
+            ("f", ("data",), 1),
+        )
+        self.assertIsNone(_wrapper_call(
+            ast.parse("f(data, **options)").body[0].value, ["data"]
+        ))
+        self.assertIsNone(_wrapper_call(
+            ast.parse("f(data)").body[0].value, ["f"]
+        ))
+
+    def test_crap_limit_returns_the_named_threshold(self) -> None:
+        config = SimpleNamespace(checks={
+            "crap": SimpleNamespace(adapter="python_crap", threshold=4.5),
+        })
+        self.assertEqual(_crap_limit(config, SHAPE_SPEC), 4.5)
+        with self.assertRaises(policy.GateError):
+            _crap_limit(SimpleNamespace(checks={}), SHAPE_SPEC)
+
+    def test_uses_filters_call_sites_and_collects_test_names(self) -> None:
+        site = CallSite(
+            "render_json", "pkg.helper.render_json", "pkg/helper.py", 3, "main"
+        )
+        other = CallSite(
+            "other", "other", "pkg/helper.py", 4, "main"
+        )
+        indexes = [
+            FileIndex((), (site, other), frozenset({"render_json"})),
+            FileIndex((), (), frozenset({"helper"})),
+        ]
+        calls, tests = _uses(indexes, {"render_json"})
+        self.assertEqual(calls, {"render_json": (site,)})
+        self.assertEqual(tests, frozenset({"render_json", "helper"}))
+
+    def test_measured_paths_keep_production_files_in_scope(self) -> None:
+        diff = Diff(frozenset({"pkg/app.py"}), {}, frozenset())
+        context = SimpleNamespace(config=None, check=None, files=[], classes={})
+        selected = (["pkg/app.py", "tests/test_app.py", "pkg/other.py"], {})
+        with mock.patch("quality_gate.checks._select_files", return_value=selected):
+            self.assertEqual(
+                _measured_paths(context, SHAPE_SPEC, diff),
+                ["pkg/app.py"],
+            )
+            tree_spec = ShapeSpec("tree", "HEAD", 6, 30, 0.95, "crap")
+            self.assertEqual(
+                _measured_paths(context, tree_spec, diff),
+                ["pkg/app.py", "pkg/other.py"],
+            )
+
+    def test_touched_compares_tree_whole_files_and_added_lines(self) -> None:
+        function = shape_function("def f():\n    return 1\n")
+        changed = Diff(
+            frozenset({"pkg/app.py"}),
+            {"pkg/app.py": frozenset({1})},
+            frozenset(),
+        )
+        self.assertTrue(_touched(SHAPE_SPEC, changed, function))
+        outside = Diff(
+            frozenset({"pkg/app.py"}),
+            {"pkg/app.py": frozenset({3})},
+            frozenset(),
+        )
+        self.assertFalse(_touched(SHAPE_SPEC, outside, function))
+        whole = Diff(frozenset({"pkg/app.py"}), {}, frozenset({"pkg/app.py"}))
+        self.assertTrue(_touched(SHAPE_SPEC, whole, function))
+        tree_spec = ShapeSpec("tree", "HEAD", 6, 30, 0.95, "crap")
+        self.assertTrue(
+            _touched(tree_spec, Diff(frozenset(), {}, frozenset()), function)
+        )
+
+    def test_cpf_targets_need_a_payoff_within_the_limit(self) -> None:
+        paid = shape_function("def paid():\n    return 1\n", cc=2)
+        still_complex = shape_function(
+            "def still_complex():\n    return 2\n", cc=7
+        )
+        data = ShapeInput(
+            (paid, still_complex),
+            {"pkg/app.py": {paid.identity: 7, still_complex.identity: 7}},
+            (), (), {}, frozenset(), SHAPE_SPEC, 6,
+        )
+        self.assertEqual(_cpf_targets(data), {paid.identity: (7, paid)})
+
+    def test_chain_edges_ignore_callers_outside_the_candidates(self) -> None:
+        head = shape_function("def head():\n    return 1\n")
+        tail = shape_function("def tail():\n    return 2\n")
+        outside = shape_function("def outside():\n    return 3\n")
+        candidates = (head, tail, outside)
+        data = ShapeInput(
+            candidates, {}, (), candidates,
+            {
+                "tail": (
+                    CallSite(
+                        "tail", "head.tail", "pkg/other.py", 1, head.identity
+                    ),
+                ),
+                "outside": (
+                    CallSite(
+                        "outside", "x.outside", "pkg/other.py", 2, "elsewhere"
+                    ),
+                ),
+            },
+            frozenset(), SHAPE_SPEC, 6,
+        )
+        successors, heads = _chain_edges(
+            data, {item.identity: item for item in candidates}
+        )
+        self.assertEqual(successors, {head.identity: [tail.identity]})
+        self.assertEqual(heads, [head.identity, outside.identity])
+
+    def test_normalised_tokens_drop_the_docstring_and_normalise_values(
+        self,
+    ) -> None:
+        node = function_node(
+            'def f(value):\n    """Doc."""\n    return value + 1\n'
+        )
+        self.assertEqual(
+            _normalised_tokens(node), ("return", "ID", "+", "N")
+        )
+
+    def test_token_text_keeps_keywords_and_normalises_values(self) -> None:
+        tokens = tokenize.generate_tokens(
+            io.StringIO('if value: 1\n"text"\n').readline
+        )
+        rendered = [
+            _token_text(token) for token in tokens
+            if token.type in (
+                tokenize.NAME, tokenize.NUMBER, tokenize.STRING
+            )
+        ]
+        self.assertEqual(rendered, ["if", "ID", "N", "S"])
+
+    def test_longest_common_run_finds_a_discontiguous_run(self) -> None:
+        self.assertEqual(
+            _longest_common_run(("a", "b", "c", "d"), ("x", "b", "c", "y")),
+            2,
+        )
+        self.assertEqual(_longest_common_run(("a", "b"), ("c", "d")), 0)
+
+    def test_clone_pairs_follow_source_order(self) -> None:
+        functions: list[ShapeFunction] = []
+        _collect_definitions(
+            ast.parse(
+                "def zebra():\n    return 1\n\n\n"
+                "def alpha():\n    return 2\n"
+            ).body,
+            "", "pkg/app.py", functions,
+        )
+        tokens = {function.identity: ("ID", "ID") for function in functions}
+        self.assertEqual(
+            _clone_pairs(tuple(functions), tokens, 2),
+            [(functions[0].identity, functions[1].identity)],
+        )
+
+    def test_clone_finding_skips_an_empty_shorter_body(self) -> None:
+        first = shape_function("def first():\n    return 1\n")
+        second = shape_function("def second():\n    return 2\n")
+        data = ShapeInput(
+            (first, second), {}, (), (first, second), {},
+            frozenset(), SHAPE_SPEC, 6,
+        )
+        tokens = {first.identity: ("ID",), second.identity: ()}
+        self.assertIsNone(_clone_finding(data, first, second, tokens))
+
+    def test_findings_are_in_subject_order(self) -> None:
+        before = SimpleNamespace(subject="b")
+        after = SimpleNamespace(subject="a")
+        rules = (lambda data: [before], lambda data: [after])
+        with mock.patch("quality_gate.python_shape.RULES", rules):
+            self.assertEqual(_findings(None), [after, before])
+
+
+class HelperInputTests(ShapeCase):
+    """Direct tests of the adapter's git-backed steps."""
+
+    def test_diff_lines_reports_untracked_files_whole(self) -> None:
+        self.base_commit({"pkg/app.py": "VALUE = 0\n"})
+        self.add_file("pkg/app.py", "VALUE = 2\n")
+        self.add_file("pkg/new.py", "VALUE = 1\n")
+        diff = _diff_lines(self.repo, "HEAD")
+        self.assertEqual(
+            diff.paths, frozenset({"pkg/app.py", "pkg/new.py"})
+        )
+        self.assertEqual(diff.added, {"pkg/app.py": frozenset({1})})
+        self.assertEqual(diff.whole, frozenset({"pkg/new.py"}))
+
+    def test_before_complexities_reads_the_base_tree(self) -> None:
+        self.base_commit({"pkg/app.py": COMPLEX_BASE})
+        before = _before_complexities(
+            self.repo, "HEAD", ["pkg/app.py", "pkg/new.py"]
+        )
+        self.assertEqual(before["pkg/app.py"], {"pkg/app.py:process": 7})
+        self.assertEqual(before["pkg/new.py"], {})
+
+    def test_scan_files_reads_python_programs_only(self) -> None:
+        self.add_file("pkg/app.py", "VALUE = 0\n")
+        self.add_file(
+            "pkg/helper", "#!/usr/bin/env python3\nprint(render_json())\n"
+        )
+        self.add_file("pkg/shell", "#!/bin/sh\nrender_json()\n")
+        context = SimpleNamespace(
+            root=self.repo,
+            files=["pkg/app.py", "pkg/helper", "pkg/shell"],
+        )
+        indexes = _scan_files(context, [], {"render_json"})
+        self.assertEqual(set(indexes), {"pkg/helper"})
+
+    def test_shape_input_assembles_the_selected_scope(self) -> None:
+        self.add_file(
+            "pkg/app.py",
+            "def first():\n    return 1\n\n\ndef second():\n    return 2\n",
+        )
+        diff = Diff(
+            frozenset({"pkg/app.py"}),
+            {"pkg/app.py": frozenset({1})},
+            frozenset(),
+        )
+        context = SimpleNamespace(root=self.repo, files=["pkg/app.py"])
+        with mock.patch.multiple(
+            "quality_gate.python_shape",
+            _diff_lines=mock.Mock(return_value=diff),
+            _measured_paths=mock.Mock(return_value=["pkg/app.py"]),
+            _scan_files=mock.Mock(return_value={}),
+            _before_complexities=mock.Mock(return_value={}),
+        ):
+            data = _shape_input(context, SHAPE_SPEC, 6)
+        self.assertEqual(
+            [function.name for function in data.functions], ["first"]
+        )
+        self.assertEqual(
+            [function.name for function in data.added], ["first"]
+        )
+        self.assertEqual(
+            [function.name for function in data.candidates], ["first"]
+        )
+        self.assertEqual(data.calls, {})
+        self.assertEqual(data.tests, frozenset())
 
 
 MUTATIONS = {
@@ -827,6 +1193,10 @@ MUTATIONS = {
     "PTW-SU every parameter forwarded": (
         "forwarding = sorted(named) != sorted(own)",
         "forwarding = False",
+    ),
+    "PTW-SU zero parameters": (
+        "if not all((named, not forwarding, not plain)):",
+        "if not all((True, not forwarding, not plain)):",
     ),
     "PTW-SU callee is a parameter": (
         "if values is None or callee is None or callee in own:",
@@ -850,8 +1220,8 @@ MUTATIONS = {
         "        False",
     ),
     "changed scope judges the added": (
-        "return functions if spec.scope == \"tree\" else added",
-        "return functions",
+        "candidates = {\"tree\": functions, \"changed\": added}[spec.scope]",
+        "candidates = functions",
     ),
 }
 
@@ -918,6 +1288,11 @@ class MutationTests(ShapeCase):
         self.assert_guard_keeps_its_fixture_passing(
             "PTW-SU every parameter forwarded"
         )
+
+    def test_ptw_su_needs_a_forwarded_parameter(self) -> None:
+        self.base_commit({"pkg/app.py": PTW_BASE})
+        self.commit({"pkg/app.py": PTW_ZERO_PARAMETER})
+        self.assert_guard_keeps_its_fixture_passing("PTW-SU zero parameters")
 
     def test_ptw_su_needs_the_callee_not_to_be_a_parameter(self) -> None:
         self.base_commit({"pkg/app.py": PTW_BASE})
