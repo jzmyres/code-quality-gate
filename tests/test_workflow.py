@@ -151,6 +151,21 @@ class ResolveChangeStepTests(FixtureCase):
         self.assertIsNone(written)
         self.assertIn("no base commit for pull_request", result.stderr)
 
+    def test_a_pull_request_without_a_base_on_a_branch_named_none_fails(self) -> None:
+        self.git("checkout", "-q", "-b", "none")
+        self.commit({"pkg/none.py": "VALUE = 5\n"}, "none branch")
+        for name, pr_base in (
+            ("unset", None),
+            ("empty", ""),
+        ):
+            with self.subTest(case=name):
+                result, written = self.run_step(
+                    event="pull_request", pr_base=pr_base
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIsNone(written)
+                self.assertIn("no base commit for pull_request", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
