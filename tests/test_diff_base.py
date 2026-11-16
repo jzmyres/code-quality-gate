@@ -126,6 +126,26 @@ class OneResolutionTests(FixtureCase):
             {self.base_commit},
         )
 
+    def test_an_existing_tree_is_not_a_base_commit(self) -> None:
+        tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        result, document = self.run_all(env={"QG_DIFF_BASE": tree})
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn(
+            f"{files.DIFF_BASE_ENV} {tree!r}: expected an existing commit",
+            document["error"],
+        )
+
+    def test_an_existing_blob_is_not_a_base_commit(self) -> None:
+        blob = self.git("rev-parse", "HEAD:pkg/mod.py").stdout.strip()
+        result, document = self.run_all(env={"QG_DIFF_BASE": blob})
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn(
+            f"{files.DIFF_BASE_ENV} {blob!r}: expected an existing commit",
+            document["error"],
+        )
+
     def test_a_branch_that_moves_after_resolution_keeps_one_commit(self) -> None:
         self.git("branch", "moving", self.base_commit)
         original = files._verified_commit

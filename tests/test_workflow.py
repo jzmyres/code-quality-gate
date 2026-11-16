@@ -32,6 +32,7 @@ class ResolveChangeStepTests(FixtureCase):
         self.script = workflow_script()
         self.base_commit = self.commit({}, "base")
         self.publish_main()
+        self.invocations = 0
 
     def commit(self, files: dict[str, str], message: str) -> str:
         for relative, content in files.items():
@@ -53,7 +54,9 @@ class ResolveChangeStepTests(FixtureCase):
         before: str | None = None,
         pr_base: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str | None]:
-        env_file = self.base / "github-env"
+        self.invocations += 1
+        env_file = self.base / f"github-env-{self.invocations}"
+        env_file.touch()
         env = self.env({
             "GITHUB_EVENT_NAME": event,
             "GITHUB_ENV": str(env_file),
@@ -101,11 +104,28 @@ class ResolveChangeStepTests(FixtureCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(written, expected)
 
+    def test_a_push_with_neither_lookup_succeeds_fails(self) -> None:
+        self.git("checkout", "-q", "--orphan", "unrelated")
+        self.commit({"pkg/other.py": "VALUE = 4\n"}, "unrelated")
+        result, written = self.run_step(event="push", before="a" * 40)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIsNone(written)
+        self.assertIn("no base commit for push", result.stderr)
+
     def test_a_manual_run_without_a_before_uses_the_merge_base(self) -> None:
         self.commit({"pkg/change.py": "VALUE = 1\n"}, "change")
         result, written = self.run_step(event="workflow_dispatch")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(written, self.base_commit)
+
+    def test_a_manual_run_on_a_branch_named_none_uses_the_merge_base(self) -> None:
+        self.commit({"pkg/change.py": "VALUE = 1\n"}, "change")
+        self.git("checkout", "-q", "-b", "none")
+        expected = self.git("merge-base", "HEAD", "origin/main").stdout.strip()
+        result, written = self.run_step(event="workflow_dispatch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(written, expected)
+        self.assertNotEqual(written, self.git("rev-parse", "HEAD").stdout.strip())
 
     def test_a_pull_request_keeps_its_event_base_when_the_branch_moved(self) -> None:
         self.git("checkout", "-q", "-b", "feature")

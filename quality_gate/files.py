@@ -152,29 +152,12 @@ class DiffBaseOverride:
                 raise self.error
             if self.base is not None:
                 return self.base
-        return _policy_base(root, policy_base)
-
-
-def _policy_base(root: Path, policy_base: str) -> DiffBase:
-    commit, problem = _verified_commit(root, policy_base)
-    if commit is None:
-        raise GateError(
-            f"base {policy_base!r}: expected an existing revision, {problem}"
-        )
-    return DiffBase(commit, "base")
-
-
-def _override_base(root: Path, value: str) -> DiffBase:
-    if not value.strip():
-        raise ConfigError(
-            f"{DIFF_BASE_ENV} {value!r}: expected a commit id, got an empty value"
-        )
-    commit, problem = _verified_commit(root, value)
-    if commit is None:
-        raise ConfigError(
-            f"{DIFF_BASE_ENV} {value!r}: expected an existing commit, {problem}"
-        )
-    return DiffBase(commit, DIFF_BASE_ENV)
+        commit, problem = _verified_commit(root, policy_base)
+        if commit is None:
+            raise GateError(
+                f"base {policy_base!r}: expected an existing revision, {problem}"
+            )
+        return DiffBase(commit, "base")
 
 
 def resolve_diff_base(root: Path) -> DiffBaseOverride:
@@ -182,10 +165,22 @@ def resolve_diff_base(root: Path) -> DiffBaseOverride:
     value = os.environ.get(DIFF_BASE_ENV)
     if value is None:
         return DiffBaseOverride()
-    try:
-        return DiffBaseOverride(base=_override_base(root, value))
-    except ConfigError as error:
-        return DiffBaseOverride(error=error)
+    if not value.strip():
+        return DiffBaseOverride(
+            error=ConfigError(
+                f"{DIFF_BASE_ENV} {value!r}: expected a commit id, "
+                "got an empty value"
+            )
+        )
+    commit, problem = _verified_commit(root, value)
+    if commit is None:
+        return DiffBaseOverride(
+            error=ConfigError(
+                f"{DIFF_BASE_ENV} {value!r}: expected an existing commit, "
+                f"{problem}"
+            )
+        )
+    return DiffBaseOverride(base=DiffBase(commit, DIFF_BASE_ENV))
 
 
 def diff_base(

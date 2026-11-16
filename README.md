@@ -688,7 +688,9 @@ This repository's own `quality-gate.toml` enables `python_shape` in the `python`
 sets `QG_DIFF_BASE` instead: a runner gates one item from the item's base commit, a landing check
 gives the main commit it lands on, and CI gives the pushed commits. A gate run resolves
 `QG_DIFF_BASE` once before any adapter runs, and every check that diffs uses that commit, so a branch
-that moves during the run cannot make checks judge different changes.
+that moves during the run cannot make checks judge different changes. The variable must name a
+commit: an existing tree or blob is a configuration error that names the variable and its value,
+never a fallback to the policy `base`.
 
 ### Emacs Lisp CRAP
 
@@ -1519,11 +1521,13 @@ The check matrix checks out the full history, restores the pinned tools cache ke
 name, architecture and `tools.lock.toml`, fetches any missing tools (including the coverage wheel),
 and runs `make -k check`: Ruff, clones, the test suite under coverage, Python CRAP, Python function
 shape and the Emacs Lisp checks. A checkout of one commit has no base to diff against, so a step
-resolves `QG_DIFF_BASE` and prints it: on a push the event's `before` commit when the history holds
-it, otherwise (a new branch or a force push whose old commit is not fetched) the merge base with the
-default branch, and on a pull request the event's own base commit, which must be in the fetched
-history. A failed lookup stays inside a shell condition so the fallback is still reached, and only
-when every lookup fails does the step report that it has no base commit. The gate step passes the
+resolves `QG_DIFF_BASE` and prints it: on a push the event's `before` commit when it is present,
+non-empty and in the history, otherwise (a new branch or a force push whose old commit is not
+fetched) the merge base with the default branch, and on a pull request the event's own base commit,
+which must be present, non-empty and in the fetched history. A value is looked up only when it is set
+and not empty, so even a branch named `none` cannot stand in for a missing base. A failed push
+lookup stays inside a shell condition so the fallback is still reached; a pull request without a
+usable base fails, and a push fails only when the fallback also fails. The gate step passes the
 variable through `runuser`, so every check that diffs judges that one change. The separate Debian 13
 job restores the same Debian tools cache and runs `make mutation`.
 
