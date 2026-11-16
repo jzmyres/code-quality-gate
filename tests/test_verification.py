@@ -17,6 +17,7 @@ from support import (
 )
 from test_trust import TrustCase
 
+from quality_gate.policy import load_config
 from quality_gate.verification import measure_exclusions
 
 BASELINE = "quality-gate-verification.toml"
@@ -151,6 +152,28 @@ def verification_with_crap_after_config() -> str:
         crap_check_block("crap", "quality-gate-crap.toml") + "[[rule]]",
         1,
     )
+
+
+def verification_with_later_tests_and_crap_config() -> str:
+    """A policy whose verification is followed by a test and a CRAP check."""
+    text = verification_config(requires=None).replace(
+        'checks = ["tests", "verification"]',
+        'checks = ["tests", "tests2", "crap", "verification"]',
+        1,
+    )
+    tests2 = (
+        "[checks.tests2]\n"
+        'adapter = "python_tests"\n'
+        "tier = 1\n"
+        'enforcement = "enforced"\n'
+        'run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]\n'
+        f"tests_pattern = {json.dumps(r'^Ran (\d+) tests? in')}\n"
+        f"skipped_pattern = {json.dumps(r'skipped=(\d+)')}\n\n"
+    )
+    crap = crap_check_block("crap", "quality-gate-crap.toml").replace(
+        'requires = "tests"', 'requires = "tests2"'
+    )
+    return text.replace("[[rule]]", tests2 + crap + "[[rule]]", 1)
 
 
 def verification_with_two_crap_config() -> str:
@@ -604,37 +627,36 @@ class VerificationTests(FindingMixin, FixtureCase):
             ]
         )
 
-    def test_a_crap_check_declared_after_verification_runs_before_it(self) -> None:
-        self.write_config(verification_with_crap_after_config())
+    def test_a_crap_check_declared_after_verification_is_refused(self) -> None:
         self.add_file(
             "quality-gate-crap.toml",
             baseline_text([], check="crap", metric_version="python-lines/1"),
         )
-        self.add_tests(1)
-        self.write_verification_baseline([
-            executed_entry(1),
-            exclusion_entry("pkg/mod.py", "no-cover", 1),
-        ])
-        self.add_file(
-            "pkg/mod.py",
-            "def measured():\n"
-            "    value = 1\n"
-            "    return value  # pragma: no cover\n",
+        self.write_verification_baseline([])
+        for config in (
+            verification_with_crap_after_config(),
+            verification_with_later_tests_and_crap_config(),
+        ):
+            with self.subTest(config=config):
+                self.write_config(config)
+                result = self.run_qg("check")
+                text = output(result)
+                self.assertEqual(result.returncode, 2, text)
+                self.assertIn("crap", text)
+                self.assertIn("verification", text)
+                self.assertIn(
+                    "verification counts the exclusions of every CRAP check, "
+                    "so it must come after them",
+                    text,
+                )
+
+    def test_a_crap_check_declared_before_verification_loads(self) -> None:
+        self.enable_crap()
+        self.write_verification_baseline([])
+        config = load_config(self.repo)
+        self.assertEqual(
+            list(config.checks), ["tests", "crap", "verification"]
         )
-        for args in ((), ("--only", "verification")):
-            with self.subTest(args=args):
-                result, document, check = self.run_verification(*args)
-                self.assertEqual(result.returncode, 0, output(result))
-                self.assertTrue(check["satisfied"], output(result))
-                self.assertEqual(
-                    self.finding(check, "exclusions:pkg/mod.py:no-cover")["value"],
-                    1,
-                )
-                identifiers = [item["id"] for item in document["checks"]]
-                self.assertLess(
-                    identifiers.index("crap"),
-                    identifiers.index("verification"),
-                )
 
     def test_a_crap_check_without_a_measurement_leaves_no_cover_unmeasured(
         self,
@@ -690,6 +712,15 @@ class VerificationTests(FindingMixin, FixtureCase):
         )
         self.assertEqual(result.returncode, 1, output(result))
         self.assertEqual(self.check_by_id(document, "crap")["outcome"], "pass")
+        identifiers = [item["id"] for item in document["checks"]]
+        self.assertEqual(
+            [
+                identifier
+                for identifier in identifiers
+                if identifier in ("tests", "crap", "verification")
+            ],
+            ["tests", "crap", "verification"],
+        )
         finding = self.finding(check, "exclusions:pkg/mod.py:no-cover")
         self.assertEqual(finding["value"], 1)
         self.assertIn("exclusions:pkg/mod.py:no-cover", result.stderr)

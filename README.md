@@ -109,8 +109,8 @@ configured check's evidence; a check produces tests exactly when that evidence i
 The registry is the only list of supported adapters. A test adapter reports how many tests ran and
 were skipped, and its outcome. A metric adapter returns findings. Verification's
 test prerequisite is every earlier check with `tests` evidence: `python_tests`, `elisp_tests`,
-and `command` checks with `tests_pattern`; every `python_crap` check is also its prerequisite and
-runs before it.
+and `command` checks with `tests_pattern`; a policy lists every `python_crap` check before its
+`verification` check, and checks run in policy order.
 
 The parent process decodes JSON evidence documents and tool results through one strict loader before
 validating their adapter-specific shape. Duplicate object names at any depth are invalid, even when
@@ -926,9 +926,9 @@ bound fails.
 `worklist` ranks the debt a reasoned baseline still carries. With no `CHECK` it covers every
 configured check that has a baseline and a threshold; with ids it covers exactly those checks. For
 each selected check it runs the check and every check it requires, with each prerequisite before
-the check that needs it, using the same producer selection as `check`: every earlier test
-producer verification needs (all of them when `requires` is omitted) and every `python_crap`
-check, whatever its place in the policy. The checks run in the repository itself, as with `check`,
+the check that needs it, using the same policy order and producer selection as `check`: every
+earlier test producer verification needs (all of them when `requires` is omitted), with every
+`python_crap` check listed before verification. The checks run in the repository itself, as with `check`,
 and may write what `check` writes.
 The worklist no longer runs its checks in a temporary copy.
 
@@ -1284,8 +1284,10 @@ Notes:
   excluded line counted once even when several CRAP checks measure the file. It comes from the
   `excluded_lines` those checks reported, not from matching text and not from verification's file
   selection, so a file a CRAP check measures but verification's classes do not select is counted too.
-  Every `python_crap` check is a prerequisite of verification: a run and `--only verification` run
-  every one of them before verification, whatever their order in the policy. A `python_crap` check
+  A policy must list every `python_crap` check before every `verification` check: loading one
+  that does not is a configuration error naming both checks, because verification counts the
+  exclusions of every CRAP check. Checks run in policy order, so a run and `--only verification`
+  run every `python_crap` check before verification. A `python_crap` check
   that ran without a measurement leaves the exclusion count unmeasured: the check is an error
   naming that check, never 0. With no `python_crap` check there are no `no-cover` subjects. The
   noqa and file-wide counts still scan the selected files. A selected file is Python when its name

@@ -407,6 +407,32 @@ class PartialRunTests(FixtureCase):
         self.assertEqual(document["obligations"], [])
         self.assertIn("check: partial run passed (3 checks)", text)
 
+    def test_only_runs_selected_checks_in_policy_order(self) -> None:
+        marker = self.repo / "smoke-ran"
+        smoke = json.dumps([
+            sys.executable, "-I", "-c",
+            f"open({str(marker)!r}, 'w').write('x'); print(1)",
+        ])
+        lint = json.dumps([
+            sys.executable, "-I", "-c",
+            f"assert open({str(marker)!r}).read() == 'x'; print(1)",
+        ])
+        self.write_config(
+            _two_check_config(lint).replace(
+                'run = ["python3", "-c", "print(1)"]', f"run = {smoke}", 1
+            )
+        )
+        result, document = self.run_json("--only", "lint", "smoke")
+        text = output(result)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("check: smoke (command)", text)
+        self.assertIn("check: lint (command)", text)
+        self.assertLess(
+            text.index("check: smoke (command)"),
+            text.index("check: lint (command)"),
+        )
+        self.assertEqual(document["selected"], ["smoke", "lint"])
+
     def test_a_selected_failing_check_is_rejected(self) -> None:
         self.write_config(
             _two_check_config('["python3", "-c", "raise SystemExit(1)"]')

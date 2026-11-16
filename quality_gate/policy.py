@@ -512,6 +512,25 @@ def _parse_check(
     return check
 
 
+def _validate_crap_before_verification(
+    checks: dict[str, CheckDef], path: Path
+) -> None:
+    verifications: list[str] = []
+    for check in checks.values():
+        if check.adapter == "verification":
+            verifications.append(check.id)
+        elif check.adapter == "python_crap" and verifications:
+            raise _config_error(
+                path,
+                f"checks.{check.id}",
+                "every python_crap check before every verification check, "
+                "because verification counts the exclusions of every CRAP "
+                "check, so it must come after them",
+                f"python_crap check {check.id!r} declared after verification "
+                f"check {verifications[-1]!r}",
+            )
+
+
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path, *, validate_headers: bool = True,
     candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
@@ -523,6 +542,7 @@ def _parse_checks(
     for name, raw in raw_checks.items():
         checks[name] = _parse_check(name, raw, root, path, checks,
                                     candidate_root or root, parse_candidate_inputs)
+    _validate_crap_before_verification(checks, path)
     _validate_baselines(checks, path, validate_headers=validate_headers)
     return checks
 

@@ -181,10 +181,11 @@ Rules:
   uses every earlier check with that evidence. A reference to a check that
   produces no tests is a configuration error naming its id and adapter;
   for a command it also identifies the missing `tests_pattern`.
-* A `verification` check also has every `python_crap` check as a
-  prerequisite: a full run and a `--only` selection run every
-  `python_crap` check before verification, whatever their order in the
-  policy.
+* A policy must list every `python_crap` check before every `verification`
+  check: loading one that does not is a configuration error naming both
+  checks, because verification counts the exclusions of every CRAP check.
+  Checks run in policy order, so a full run and an `--only` selection run
+  every prerequisite before the check that needs it.
 * A baseline path must name an existing file and must be used by exactly one
   check. A key naming a missing file, or two checks naming the same resolved
   path, is a configuration error naming the check, the key and the path. A
@@ -245,10 +246,12 @@ the number of distinct lines CRAP's coverage excluded in that check's measured
 functions, one subject per file even when several CRAP checks measure it. The
 count is read from the `excluded_lines` the checks reported, not from matching
 text and not from verification's file selection, so a file CRAP measures but
-verification's classes do not select is counted. Every `python_crap` check
-is a prerequisite of verification: a full run and `--only verification` run
-every one of them before verification, whatever their order in the policy. A
-`python_crap` check that ran without a measurement leaves the exclusion count
+verification's classes do not select is counted. The policy lists every
+`python_crap` check before every `verification` check; loading a policy that
+does not is a configuration error naming both checks, because verification
+counts the exclusions of every CRAP check. Checks run in policy order, so a
+full run and `--only verification` run every `python_crap` check before
+verification. A `python_crap` check that ran without a measurement leaves the exclusion count
 unmeasured: the check is an error naming that check, never 0. With no
 `python_crap` check there are no `no-cover` subjects. It also records
 `exclusions:FILE:noqa` (inline `# noqa` comments) and

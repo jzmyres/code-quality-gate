@@ -190,13 +190,17 @@ class _CrapExclusions:
     ) -> "_CrapExclusions":
         exclusions = cls()
         for check in config.checks.values():
-            if check.adapter == "python_crap":
-                exclusions._add(check.id, prior.get(check.id))
+            if check.adapter != "python_crap":
+                continue
+            result = prior.get(check.id)
+            if result is None:
+                raise GateError(
+                    f"no-cover exclusions unreliable: {check.id} did not run"
+                )
+            exclusions._add(check.id, result)
         return exclusions
 
     def _add(self, identifier: str, result: Any) -> None:
-        # Every python_crap check is a prerequisite, so its result is present.
-        assert result is not None
         if result.measurement is None:
             raise GateError(
                 f"no-cover exclusions unreliable: {identifier} reported no "
