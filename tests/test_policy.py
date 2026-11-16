@@ -176,6 +176,24 @@ class PolicyTests(FixtureCase):
             "non-empty",
         )
 
+    def test_not_applicable_entries_are_validated_in_order(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace(
+                "[code]",
+                'not_applicable = [{ class = "missing", tier = 2, '
+                'reason = "r" }, 0]\n\n[code]',
+                1,
+            )
+        )
+        with self.assertRaises(policy.ConfigError) as raised:
+            policy.load_config(self.repo)
+        self.assertEqual(
+            str(raised.exception),
+            f"{self.config_path}: not_applicable[0].class: expected a "
+            "configured class (config, doc, python), got unknown class "
+            "'missing'",
+        )
+
     def test_not_applicable_class_must_exist(self) -> None:
         self.config_error(
             BASE_CONFIG
@@ -386,6 +404,10 @@ class PolicyTests(FixtureCase):
              "/policy.toml: value[0]: expected a string, got int 1"),
             (policy._string_list, {"value": [float("inf")]}, {},
              "/policy.toml: value[0]: expected a string, got float inf"),
+            (policy._read_value, {}, {"rule": policy._TABLE},
+             "/policy.toml: value: expected a table, got missing"),
+            (policy._read_value, {"value": 1}, {"rule": policy._TABLE},
+             "/policy.toml: value: expected a table, got int 1"),
             (policy._read_value, {}, {"rule": policy._BOOLEAN},
              "/policy.toml: value: expected a boolean, got missing"),
             (policy._read_value, {"value": 1}, {"rule": policy._BOOLEAN},
@@ -399,6 +421,65 @@ class PolicyTests(FixtureCase):
                 with self.assertRaises(policy.ConfigError) as raised:
                     reader(parent, "value", path, "value", **options)
                 self.assertEqual(str(raised.exception), expected)
+        self.assertEqual(
+            policy._string_list({"value": []}, "value", path, "value"), ()
+        )
+        self.assertEqual(
+            policy._integer_list({"value": []}, "value", path, "value"), ()
+        )
+
+    def test_readers_accept_subclasses_as_before(self) -> None:
+        class IntSubclass(int):
+            pass
+
+        class FloatSubclass(float):
+            pass
+
+        class StringSubclass(str):
+            pass
+
+        class ListSubclass(list):
+            pass
+
+        class DictSubclass(dict):
+            pass
+
+        path = Path("/policy.toml")
+        integer = IntSubclass(2)
+        self.assertIs(
+            policy._integer({"value": integer}, "value", path, "value"),
+            integer,
+        )
+        number = FloatSubclass(2.5)
+        converted = policy._number({"value": number}, "value", path, "value")
+        self.assertEqual(converted, 2.5)
+        self.assertIs(type(converted), float)
+        string = StringSubclass("text")
+        self.assertIs(
+            policy._string({"value": string}, "value", path, "value"),
+            string,
+        )
+        members = [StringSubclass("a"), StringSubclass("b")]
+        strings = policy._string_list(
+            {"value": ListSubclass(members)}, "value", path, "value"
+        )
+        self.assertEqual(strings, ("a", "b"))
+        self.assertIs(strings[0], members[0])
+        self.assertIs(strings[1], members[1])
+        integers = [IntSubclass(1), IntSubclass(4)]
+        integer_list = policy._integer_list(
+            {"value": ListSubclass(integers)}, "value", path, "value"
+        )
+        self.assertEqual(integer_list, (1, 4))
+        self.assertIs(integer_list[0], integers[0])
+        self.assertIs(integer_list[1], integers[1])
+        table = DictSubclass({"key": "value"})
+        self.assertIs(
+            policy._read_value(
+                {"value": table}, "value", path, "value", policy._TABLE
+            ),
+            table,
+        )
 
     def test_elisp_decision_rules_refuse_invalid_entries(self) -> None:
         prefix = (BASE_CONFIG + '\n[checks.crap]\nadapter = "elisp_crap"\n'
@@ -541,6 +622,36 @@ class PolicyTests(FixtureCase):
             "one of max, min",
             "sideways",
         )
+
+    def test_verification_requires_messages_match_72eb80c(self) -> None:
+        cases = (
+            (
+                BASE_CONFIG
+                + '\n[checks.verification]\nadapter = "verification"\n'
+                'tier = 1\nenforcement = "enforced"\nrequires = "missing"\n'
+                'baseline = "verification.toml"\n',
+                "unknown check 'missing'",
+            ),
+            (
+                BASE_CONFIG.replace("tests_pattern = '(\\d+)'\n", "")
+                + '\n[checks.verification]\nadapter = "verification"\n'
+                'tier = 1\nenforcement = "enforced"\nrequires = "smoke"\n'
+                'baseline = "verification.toml"\n',
+                "'smoke' is a command check that produces no tests "
+                "(no tests_pattern)",
+            ),
+        )
+        for config, actual in cases:
+            with self.subTest(actual=actual):
+                self.write_config(config)
+                with self.assertRaises(policy.ConfigError) as raised:
+                    policy.load_config(self.repo)
+                self.assertEqual(
+                    str(raised.exception),
+                    f"{self.config_path}: checks.verification.requires: "
+                    "expected the id of an earlier check that produces tests, "
+                    f"got {actual}",
+                )
 
     def test_verification_requires_refuses_command_without_tests_pattern(self) -> None:
         self.config_error(

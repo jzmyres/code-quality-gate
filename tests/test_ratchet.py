@@ -383,6 +383,37 @@ class BaselineFileTests(unittest.TestCase):
         with self.assertRaises(policy.GateError):
             ratchet._toml_value(object())
 
+    def test_number_formats_what_it_formatted_before(self) -> None:
+        cases = (
+            (float("inf"), "inf"),
+            (float("-inf"), "-inf"),
+            (float("nan"), "nan"),
+            (10**400, str(10**400)),
+        )
+        display = adapters.adapter_for("command").display
+        for value, expected in cases:
+            with self.subTest(value=repr(value)[:20]):
+                self.assertEqual(ratchet._number(value), expected)
+                self.assertEqual(display(value), expected)
+
+    def test_write_baseline_refuses_a_non_finite_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.toml"
+            with self.assertRaises(policy.GateError) as raised:
+                ratchet.write_baseline(
+                    path,
+                    [
+                        ratchet.BaselineEntry(
+                            "subject", float("inf"), "reason"
+                        )
+                    ],
+                    check_id="metric",
+                    metric_version="metric/1",
+                )
+        self.assertEqual(
+            str(raised.exception), "cannot write a non-finite baseline value"
+        )
+
     def test_write_and_load_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "baseline.toml"

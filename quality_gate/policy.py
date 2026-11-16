@@ -149,19 +149,22 @@ class _ValueRule:
     minimum: int | float | None = None
     maximum: int | float | None = None
     item: "_ValueRule | None" = None
+    exclude: tuple[type, ...] = ()
     convert: Any = None
 
 
 _STRING_ITEM = _ValueRule(
-    "a string", (("type", (str,), "a string"),), convert=str
+    "a string", (("type", (str,), "a string"),)
 )
 _STRING = _ValueRule(
     "a non-empty string",
-    (("type", (str,), "a string"), ("nonempty", None, "a non-empty string")),
-    convert=str,
+    (
+        ("type", (str,), "a string"),
+        ("reject", operator.methodcaller("strip"), "a non-empty string"),
+    ),
 )
 _STRING_ALLOW_EMPTY = _ValueRule(
-    "a non-empty string", (("type", (str,), "a string"),), convert=str
+    "a non-empty string", (("type", (str,), "a string"),)
 )
 _STRING_LIST = _ValueRule(
     "a list of strings",
@@ -169,8 +172,8 @@ _STRING_LIST = _ValueRule(
     item=_STRING_ITEM,
     convert=tuple,
 )
-_BOOLEAN = _ValueRule("a boolean", (("type", (bool,), "a boolean"),), convert=bool)
-_TABLE = _ValueRule("a table", (("type", (dict,), "a table"),), convert=dict)
+_BOOLEAN = _ValueRule("a boolean", (("type", (bool,), "a boolean"),))
+_TABLE = _ValueRule("a table", (("type", (dict,), "a table"),))
 _INTEGER = _ValueRule(
     "an integer",
     (
@@ -180,7 +183,7 @@ _INTEGER = _ValueRule(
     ),
     minimum=-math.inf,
     maximum=math.inf,
-    convert=int,
+    exclude=(bool,),
 )
 _TIER = _ValueRule(
     "an integer",
@@ -191,17 +194,18 @@ _TIER = _ValueRule(
     ),
     minimum=1,
     maximum=4,
-    convert=int,
+    exclude=(bool,),
 )
 _NUMBER = _ValueRule(
     "a number",
     (
         ("type", (int, float), "a finite number"),
-        ("finite", None, "a finite number"),
+        ("reject", math.isfinite, "a finite number"),
         ("bound", ("minimum", operator.lt), "a finite number >= {bound}"),
     ),
     minimum=-math.inf,
     maximum=math.inf,
+    exclude=(bool,),
     convert=float,
 )
 _INTEGER_LIST = _ValueRule(
@@ -216,7 +220,7 @@ _INTEGER_LIST = _ValueRule(
         ),
         minimum=1,
         maximum=4,
-        convert=int,
+        exclude=(bool,),
     ),
     convert=tuple,
 )
@@ -230,18 +234,18 @@ def _read_scalar(
 ) -> Any:
     for kind, parameter, expected in rule.checks:
         match kind:
-            case "type" if type(value) not in parameter:
+            case "type" if not all(
+                (isinstance(value, parameter), not isinstance(value, rule.exclude))
+            ):
                 raise _config_error(path, full_key, expected, _describe(value))
-            case "finite" if not math.isfinite(value):
-                raise _config_error(path, full_key, expected, _describe(value))
-            case "nonempty" if not value.strip():
+            case "reject" if not parameter(value):
                 raise _config_error(path, full_key, expected, _describe(value))
             case "bound" if parameter[1](value, getattr(rule, parameter[0])):
                 bound = getattr(rule, parameter[0])
                 raise _config_error(
                     path, full_key, expected.format(bound=bound), str(value)
                 )
-    return rule.convert(value)
+    return rule.convert(value) if rule.convert is not None else value
 
 
 def _read_value(
@@ -503,11 +507,10 @@ def _validate_requires(
     expected = f"the id of a {descriptor.requires_adapter} check declared earlier"
     if descriptor.requires_tests:
         expected = "the id of an earlier check that produces tests"
-        required_descriptor = (
-            adapter_for(required.adapter) if required is not None else None
-        )
-        detail = getattr(required_descriptor, "no_tests_hint", "")
-        actual += f" that produces no tests{detail}"
+        if required is not None:
+            required_descriptor = adapter_for(required.adapter)
+            detail = getattr(required_descriptor, "no_tests_hint", "")
+            actual += f" that produces no tests{detail}"
     raise _config_error(
         path,
         f"checks.{name}.requires",
@@ -750,7 +753,6 @@ _NOT_APPLICABLE_KEYS = tuple(field.key for field in _NOT_APPLICABLE_FIELDS)
 _NOT_APPLICABLE_LIST = _ValueRule(
     "an array of tables",
     (("type", (list,), "an array of tables"),),
-    item=_TABLE,
     convert=tuple,
 )
 
@@ -770,6 +772,7 @@ def _parse_not_applicable(
     seen: set[tuple[str, int]] = set()
     for index, raw in enumerate(raw_entries):
         full_key = f"not_applicable[{index}]"
+        _read_scalar(path, full_key, raw, _TABLE)
         _check_keys(raw, _NOT_APPLICABLE_KEYS, path, full_key)
         values: dict[str, Any] = {}
         for field in _NOT_APPLICABLE_FIELDS:

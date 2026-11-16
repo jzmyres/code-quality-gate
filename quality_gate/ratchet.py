@@ -380,8 +380,6 @@ def load_baseline(
 
 
 def _number(value: float | int) -> str:
-    if not math.isfinite(value):
-        raise GateError("cannot write a non-finite baseline value")
     if isinstance(value, int):
         return str(value)
     if value.is_integer():
@@ -393,7 +391,15 @@ _TOML_FORMATS: tuple[
     tuple[type | tuple[type, ...], Callable[[Any], str]], ...
 ] = (
     (bool, json.dumps),
-    ((int, float), _number),
+    (
+        (int, float),
+        lambda value: (
+            _require_finite(
+                value, "cannot write a non-finite baseline value", GateError
+            ),
+            _number(value),
+        )[1],
+    ),
     (datetime.datetime, datetime.datetime.isoformat),
     (datetime.date, datetime.date.isoformat),
     (str, functools.partial(json.dumps, ensure_ascii=False)),
@@ -590,9 +596,11 @@ def _format_failure(
     return f"{prefix}: {label}: {detail} at {finding.location}"
 
 
-def _require_finite(value: float, message: str) -> None:
+def _require_finite(
+    value: float, message: str, error: type[GateError] = UnsupportedError
+) -> None:
     if not math.isfinite(value):
-        raise UnsupportedError(message)
+        raise error(message)
 
 
 def _finite_inputs(
