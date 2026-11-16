@@ -425,12 +425,18 @@ def _required(config: Config, check: CheckDef) -> list[str]:
     descriptor = adapter_for(check.adapter)
     assert descriptor is not None
     if descriptor.requires_tests:
-        prior: dict[str, CheckDef] = {}
-        for candidate in config.checks.values():
-            if candidate.id == check.id:
-                break
-            prior[candidate.id] = candidate
-        return _test_check_dependencies(check, prior)
+        ordered = list(config.checks.values())
+        earlier = ordered[: list(config.checks).index(check.id)]
+        return [
+            *_test_check_dependencies(
+                check, {candidate.id: candidate for candidate in earlier}
+            ),
+            *(
+                candidate.id
+                for candidate in earlier
+                if candidate.adapter == "python_crap"
+            ),
+        ]
     required = getattr(check.spec, "requires", None)
     return [required] if required is not None else []
 

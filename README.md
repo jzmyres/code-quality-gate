@@ -381,9 +381,11 @@ expands in place to a prefix that starts the current interpreter under coverage:
 version and payload digest from the effective tool lock, the gate-owned coverage configuration path,
 and the registry directory. The adapter writes and every child uses one
 gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`, `source` the
-repository root, `exclude_lines` exactly the comment-anchored `#\s*pragma:\s*no cover`
-expression, so a line is excluded only when it carries the pragma as a comment) for collection,
-combination and analysis. Repository roots containing spaces or non-ASCII letters are supported.
+repository root, `exclude_lines` exactly `#[ \t]*pragma:[ \t]*no cover`) for collection,
+combination and analysis. Coverage matches that expression against the whole source text, so the
+pattern's whitespace never crosses a line break; because the match is not limited to Python
+comment tokens, a string containing the comment form is excluded too. Repository roots containing
+spaces or non-ASCII letters are supported.
 Before coverage runs, a pure rule refuses roots containing a comma, `$`, any `str.splitlines()`
 separator (including LF, CR, vertical tab, U+0085, U+2028 and U+2029), or leading or trailing
 whitespace, naming the root and offending character. These characters let coverage's list parser
@@ -923,8 +925,9 @@ bound fails.
 `worklist` ranks the debt a reasoned baseline still carries. With no `CHECK` it covers every
 configured check that has a baseline and a threshold; with ids it covers exactly those checks. For
 each selected check it runs the check and every check it requires, in policy order, using the same
-producer selection as `check`, including every earlier test producer needed by verification when
-`requires` is omitted. The checks run in the repository itself, as with `check`, and may write what `check` writes.
+producer selection as `check`, including every earlier test producer verification needs (all of
+them when `requires` is omitted) and every earlier `python_crap` check. The checks run in the
+repository itself, as with `check`, and may write what `check` writes.
 The worklist no longer runs its checks in a temporary copy.
 
 The report lists every `max` baseline entry whose
@@ -1274,10 +1277,16 @@ Notes:
   identifies its missing `tests_pattern`. Without `requires` every earlier test-producing check is used. It
   measures executed tests (a `min` floor) and skipped tests from those results, and inline `# noqa`
   comments and file-wide lint suppressions for the selected Python files, without running the tests
-  again. It counts `#\s*pragma:\s*no cover` lines only in files whose coverage a `python_crap` check
-  measures, using coverage's comment-anchored pattern, so an exclusion counts only where it removes
-  lines from a measured value; exclusions in other files, such as tests, are not counted. A selected
-  file is Python when its name ends in `.py`, or when it is a
+  again. The `no-cover` count is the lines CRAP's coverage excluded in the measured functions of the
+  policy's `python_crap` checks: one `exclusions:FILE:no-cover` subject per file, with each distinct
+  excluded line counted once even when several CRAP checks measure the file. It comes from the
+  `excluded_lines` those checks reported, not from matching text and not from verification's file
+  selection, so a file a CRAP check measures but verification's classes do not select is counted too.
+  Under `--only verification`, every earlier `python_crap` check runs first as a prerequisite. A
+  `python_crap` check that did not run in this gate run, or ran without a measurement, leaves the
+  exclusion count unmeasured: the check is an error naming that check, never 0. With no `python_crap`
+  check there are no `no-cover` subjects. The noqa and file-wide counts still scan the selected
+  files. A selected file is Python when its name ends in `.py`, or when it is a
   regular file whose shebang interpreter is `python`, `python3` or `python3.N` for one or more
   digits N (as `env` and its options resolve), so an executable Python program without the suffix
   is measured too; `python3-config` and `pythonw` are not Python interpreters here. Any other
@@ -1394,10 +1403,10 @@ This repository gates itself with `quality-gate.toml`:
 * `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
   requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
   and a worklist reason;
-* `verification` uses the `tests` counts and measures inline `# noqa`, file-wide lint suppressions and
-  `#\s*pragma:\s*no cover` lines only in the files the `crap` check measures;
-  `quality-gate-verification.toml` floors the executed tests and ceilings the skips and exclusions
-  measured at adoption;
+* `verification` uses the `tests` counts and measures inline `# noqa` and file-wide lint suppressions
+  in its selected Python files; its `no-cover` subjects are the lines the `crap` check's coverage
+  excluded in measured functions, one subject per file; `quality-gate-verification.toml` floors the
+  executed tests and ceilings the skips and exclusions measured at adoption;
 * the `elisp` class lists `elisp-tests`, `elisp-crap`, `elisp-compile` and `elisp-checkdoc`, so this
   repository gates its Emacs Lisp helpers with the gate's own Elisp checks; the ERT suite
   `tests/elisp/qg-elisp-tests.el` exercises the complexity, child and lint helpers, `elisp-crap` scores

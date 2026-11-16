@@ -236,10 +236,20 @@ exists. An unsatisfied obligation rejects the gate.
 The `verification` adapter measures verification loss. For each earlier
 test-producing check it records `tests:CHECK:executed` (direction `min`,
 value `ran - skipped`) and `tests:CHECK:skipped` (direction `max`). For each
-selected Python file it records `exclusions:FILE:no-cover` (lines matching the
-`pragma: no cover` coverage exclusion), `exclusions:FILE:noqa` (inline `# noqa`
-comments), and `exclusions:FILE:file-suppression` (file-wide lint suppression
-directives), all `max`. File-wide directives include Ruff's `# ruff: noqa`,
+file a `python_crap` check measured it records `exclusions:FILE:no-cover`:
+the number of distinct lines CRAP's coverage excluded in that check's measured
+functions, one subject per file even when several CRAP checks measure it. The
+count is read from the `excluded_lines` the checks reported, not from matching
+text and not from verification's file selection, so a file CRAP measures but
+verification's classes do not select is counted. Under `--only verification`,
+every earlier `python_crap` check runs first as a prerequisite. A
+`python_crap` check that did not run in this gate run, or ran without a
+measurement, leaves the exclusion count unmeasured: the check is an error
+naming that check, never 0. With no `python_crap` check there are no
+`no-cover` subjects. It also records `exclusions:FILE:noqa` (inline `# noqa`
+comments) and `exclusions:FILE:file-suppression` (file-wide lint suppression
+directives) for each selected Python file; all three exclusion subjects are
+`max`. File-wide directives include Ruff's `# ruff: noqa`,
 with or without codes, `# ruff: file-ignore[...]`, Flake8's `# flake8: noqa`
 forms, and isort's `# isort: skip_file` (also recognized by Ruff). Each directive
 contributes one to the file-wide count, separate from the inline count. The lint

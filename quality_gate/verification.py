@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .coverage_tool import PRAGMA_NO_COVER
 from .files import _regular_interpreter
 from .policy import CheckDef, Config, GateError, _string
 from .ratchet import Domain, Finding, Location
@@ -51,7 +50,6 @@ def _verification_entry_direction(subject: str, configured: str) -> str:
     return "max"
 
 
-NO_COVER = re.compile(PRAGMA_NO_COVER)
 NOQA = re.compile(r"#\s*noqa\b", re.IGNORECASE)
 FILE_NOQA = re.compile(
     r"#\s*(?:ruff|flake8)\s*:\s*(?i:noqa)"
@@ -124,19 +122,6 @@ def _noqa_lines(
     return lines, file_suppressions
 
 
-def _source_lines(source: str) -> list[str]:
-    """Number lines at '\n', as Git and the tokenizer do."""
-    return source.split("\n")
-
-
-def _no_cover_lines(source: str) -> list[int]:
-    return [
-        number
-        for number, line in enumerate(_source_lines(source), 1)
-        if NO_COVER.search(line)
-    ]
-
-
 def _file_suppression_location(relative: str, directives: list[tuple[int, str]]) -> str:
     if not directives:
         return relative
@@ -145,18 +130,10 @@ def _file_suppression_location(relative: str, directives: list[tuple[int, str]])
 
 
 def measure_exclusions(
-    relative: str, source: str, count_no_cover: bool = True
+    relative: str, source: str
 ) -> list[Finding]:
-    no_cover = _no_cover_lines(source) if count_no_cover else []
     noqa, file_suppressions = _noqa_lines(relative, source)
     return [
-        Finding(
-            f"exclusions:{relative}:no-cover",
-            len(no_cover),
-            _location(relative, no_cover),
-            locations=tuple(Location(relative, line, line) for line in no_cover),
-            kind="exclusion",
-        ),
         Finding(
             f"exclusions:{relative}:noqa",
             len(noqa),
@@ -196,13 +173,68 @@ def test_findings(
     ]
 
 
+class _CrapExclusions:
+    """The lines each python_crap check's coverage excluded in measured functions.
+
+    CRAP is the one source of truth for no-cover: verification reads the
+    excluded lines the checks reported, never the source text and never a file
+    selection of its own.
+    """
+
+    def __init__(self) -> None:
+        self.files: dict[str, set[int]] = {}
+
+    @classmethod
+    def measure(
+        cls, config: Config, prior: dict[str, Any]
+    ) -> "_CrapExclusions":
+        exclusions = cls()
+        for check in config.checks.values():
+            if check.adapter == "python_crap":
+                exclusions._add(check.id, prior.get(check.id))
+        return exclusions
+
+    def _add(self, identifier: str, result: Any) -> None:
+        if result is None:
+            raise GateError(
+                f"no-cover exclusions unreliable: {identifier} did not run"
+            )
+        if result.measurement is None:
+            raise GateError(
+                f"no-cover exclusions unreliable: {identifier} reported no "
+                "measurement"
+            )
+        for finding in result.findings:
+            if finding.measurement is not None and finding.locations:
+                self.files.setdefault(
+                    finding.locations[0].path, set()
+                ).update(finding.measurement["excluded_lines"])
+
+    def findings(self) -> list[Finding]:
+        findings: list[Finding] = []
+        for relative, excluded in self.files.items():
+            lines = sorted(excluded)
+            findings.append(
+                Finding(
+                    f"exclusions:{relative}:no-cover",
+                    len(lines),
+                    _location(relative, lines),
+                    locations=tuple(
+                        Location(relative, line, line) for line in lines
+                    ),
+                    kind="exclusion",
+                )
+            )
+        return findings
+
+
 def measure_verification(
     root: Path,
     files: list[str],
     test_counts: list[tuple[str, int, int]],
-    no_cover_files: set[str],
+    no_cover: _CrapExclusions,
 ) -> list[Finding]:
-    findings: list[Finding] = []
+    findings: list[Finding] = no_cover.findings()
     for check_id, ran, skipped in test_counts:
         findings.extend(test_findings(check_id, ran, skipped))
     for relative in files:
@@ -210,9 +242,7 @@ def measure_verification(
             source = (root / relative).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise GateError(f"cannot read {relative}: {error}") from error
-        findings.extend(
-            measure_exclusions(relative, source, relative in no_cover_files)
-        )
+        findings.extend(measure_exclusions(relative, source))
     findings.sort(key=lambda item: item.subject)
     return findings
 
@@ -290,20 +320,6 @@ def _verification_files(root: Path, selected: list[str]) -> list[str]:
     ]
 
 
-def _crap_selected_files(
-    config: Config,
-    files: list[str],
-    classes: dict[str, str],
-) -> set[str]:
-    from .checks import _select_files
-
-    measured: set[str] = set()
-    for check in config.checks.values():
-        if check.adapter == "python_crap":
-            measured.update(_select_files(config, check, files, classes)[0])
-    return measured
-
-
 def _verification_domain(findings: list[Any]) -> Domain:
     return Domain.of_subjects(
         [finding.subject for finding in findings],
@@ -315,7 +331,7 @@ def _verification_findings(
     root: Path,
     check: CheckDef,
     files: list[str],
-    no_cover_files: set[str],
+    no_cover: _CrapExclusions,
     prior: dict[str, Any],
     start: float,
     prefix: str,
@@ -336,7 +352,7 @@ def _verification_findings(
     assert counts is not None
     mark_step("verification analysis")
     try:
-        return measure_verification(root, files, counts, no_cover_files)
+        return measure_verification(root, files, counts, no_cover)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
 
@@ -355,14 +371,14 @@ def _verification_measurement(
 
     mark_step("file selection")
     selected, _names = _select_files(config, check, files, classes)
-    no_cover_files = _crap_selected_files(config, files, classes)
     mark_step("Python file selection")
     try:
         python_files = _verification_files(root, selected)
+        no_cover = _CrapExclusions.measure(config, prior)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
     return _verification_findings(
-        root, check, python_files, no_cover_files, prior, start, prefix
+        root, check, python_files, no_cover, prior, start, prefix
     )
 
 

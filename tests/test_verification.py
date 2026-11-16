@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -128,6 +129,79 @@ def verification_with_crap_config() -> str:
     return text.replace("[checks.verification]", block + "[checks.verification]", 1)
 
 
+def crap_check_block(identifier: str, baseline: str) -> str:
+    return (
+        f"[checks.{identifier}]\n"
+        'adapter = "python_crap"\n'
+        "tier = 1\n"
+        'enforcement = "enforced"\n'
+        'requires = "tests"\n'
+        f'baseline = "{baseline}"\n'
+        "\n"
+    )
+
+
+def verification_with_crap_after_config() -> str:
+    """A verification policy whose python_crap check is declared after it."""
+    text = verification_config().replace(
+        'checks = ["tests", "verification"]',
+        'checks = ["tests", "crap", "verification"]',
+        1,
+    )
+    return text.replace(
+        "[[rule]]",
+        crap_check_block("crap", "quality-gate-crap.toml") + "[[rule]]",
+        1,
+    )
+
+
+def verification_with_two_crap_config() -> str:
+    text = verification_with_crap_config().replace(
+        'checks = ["tests", "crap", "verification"]',
+        'checks = ["tests", "crap", "crap2", "verification"]',
+        1,
+    )
+    return text.replace(
+        "[checks.verification]",
+        crap_check_block("crap2", "quality-gate-crap2.toml")
+        + "[checks.verification]",
+        1,
+    )
+
+
+def with_crap_only_class(text: str) -> str:
+    classes = (
+        "[classes.crap-only]\n"
+        "code = true\n"
+        'description = "Measured only by CRAP"\n'
+        'checks = ["tests", "crap"]\n'
+        "\n"
+    )
+    rule = (
+        "[[rule]]\n"
+        'pattern = "lib/*.py"\n'
+        'class = "crap-only"\n'
+        'reason = "only CRAP measures it"\n'
+        "\n"
+    )
+    text = text.replace("[classes.config]", classes + "[classes.config]", 1)
+    return text.replace("[[rule]]", rule + "[[rule]]", 1)
+
+
+def with_pyw_pattern(text: str) -> str:
+    text = text.replace(
+        'patterns = ["*.py"]', 'patterns = ["*.py", "*.pyw"]', 1
+    )
+    rule = (
+        "[[rule]]\n"
+        'pattern = "*.pyw"\n'
+        'class = "python"\n'
+        'reason = "windowed Python program"\n'
+        "\n"
+    )
+    return text.replace("[[rule]]", rule + "[[rule]]", 1)
+
+
 def rewriting_config(rewrite: str) -> str:
     """A verification policy with a command check that runs before the tests."""
     text = verification_config()
@@ -237,8 +311,10 @@ class VerificationTests(FindingMixin, FixtureCase):
     ) -> None:
         self.add_file(BASELINE, verification_baseline(entries))
 
-    def enable_crap(self) -> None:
-        self.write_config(verification_with_crap_config())
+    def enable_crap(self, config: str | None = None) -> None:
+        self.write_config(
+            verification_with_crap_config() if config is None else config
+        )
         self.add_file(
             "quality-gate-crap.toml",
             baseline_text([], check="crap", metric_version="python-lines/1"),
@@ -410,11 +486,12 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(
             self.finding(check, "exclusions:pkg/mod.py:no-cover")["value"], 1
         )
-        self.assertEqual(
-            self.finding(
-                check, "exclusions:tests/test_sample.py:no-cover"
-            )["value"],
-            0,
+        self.assertFalse(
+            [
+                item
+                for item in check["findings"]
+                if item["subject"] == "exclusions:tests/test_sample.py:no-cover"
+            ]
         )
 
     def test_a_production_string_with_the_pragma_is_counted(self) -> None:
@@ -432,7 +509,7 @@ class VerificationTests(FindingMixin, FixtureCase):
             self.finding(check, "exclusions:pkg/mod.py:no-cover")["value"], 1
         )
 
-    def test_the_pragma_definition_line_is_not_an_exclusion(self) -> None:
+    def test_the_exclusion_pattern_does_not_match_its_own_definition(self) -> None:
         from quality_gate import coverage_tool
 
         definition = next(
@@ -442,31 +519,204 @@ class VerificationTests(FindingMixin, FixtureCase):
             ).splitlines()
             if line.startswith("PRAGMA_NO_COVER =")
         )
-        findings = {
-            finding.subject.rsplit(":", 1)[-1]: finding
-            for finding in measure_exclusions(
-                "quality_gate/coverage_tool.py", definition
-            )
-        }
-        self.assertEqual(findings["no-cover"].value, 0)
+        self.assertIsNone(re.search(coverage_tool.PRAGMA_NO_COVER, definition))
+
+    def test_the_exclusion_pattern_stays_on_one_line(self) -> None:
+        from quality_gate.coverage_tool import PRAGMA_NO_COVER
+
+        source = f'VALUE = """#\n{NO_COVER_TEXT}"""\n'
+        self.assertIsNone(re.search(PRAGMA_NO_COVER, source))
+        self.assertIsNotNone(re.search(PRAGMA_NO_COVER, f"VALUE = 1  {NO_COVER}\n"))
+
+    def test_a_multiline_string_does_not_cross_the_exclusion_pattern(self) -> None:
+        self.enable_crap()
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/blocks.py",
+            "def with_block():\n"
+            "    value = 1\n"
+            f'    text = """#\n{NO_COVER_TEXT}"""\n'
+            "    return value + len(text)\n",
+        )
+        self.add_file(
+            "tests/test_sample.py",
+            PYTHON_TEST_HEADER + "\nclass Sample(unittest.TestCase):\n"
+            "    def test_block(self):\n"
+            "        import pkg.blocks\n"
+            "        self.assertTrue(pkg.blocks.with_block())\n",
+        )
+        result, document, check = self.run_verification()
+        excluded = sorted({
+            line
+            for finding in self.check_by_id(document, "crap")["findings"]
+            for line in finding.get("measurement", {}).get("excluded_lines", [])
+        })
+        finding = self.finding(check, "exclusions:pkg/blocks.py:no-cover")
+        self.assertEqual(finding["value"], len(excluded))
+        if excluded:
+            self.assertEqual(result.returncode, 1, output(result))
+            self.assertIn("exclusions:pkg/blocks.py:no-cover", result.stderr)
+        else:
+            self.assertEqual(result.returncode, 0, output(result))
+
+    def test_a_crap_only_file_counts_its_no_cover_lines(self) -> None:
+        self.enable_crap(with_crap_only_class(verification_with_crap_config()))
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "lib/hidden.py",
+            "def hidden():\n"
+            "    value = 1  # noqa: E501\n"
+            f"    return value  {NO_COVER}\n",
+        )
+        result, _document, check = self.failed_verification()
+        finding = self.finding(check, "exclusions:lib/hidden.py:no-cover")
+        self.assertEqual(finding["value"], 1)
+        self.assertEqual(finding["bound"], None)
+        self.assertIn("exclusions:lib/hidden.py:no-cover", result.stderr)
+        self.assertFalse(
+            [
+                item
+                for item in check["findings"]
+                if item["subject"] == "exclusions:lib/hidden.py:noqa"
+            ]
+        )
+
+    def test_a_pyw_file_counts_its_no_cover_lines(self) -> None:
+        self.enable_crap(with_pyw_pattern(verification_with_crap_config()))
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/windowed.pyw",
+            "def windowed():\n"
+            "    value = 1  # noqa: E501\n"
+            f"    return value  {NO_COVER}\n",
+        )
+        result, _document, check = self.failed_verification()
+        finding = self.finding(check, "exclusions:pkg/windowed.pyw:no-cover")
+        self.assertEqual(finding["value"], 1)
+        self.assertIn("exclusions:pkg/windowed.pyw:no-cover", result.stderr)
+        self.assertFalse(
+            [
+                item
+                for item in check["findings"]
+                if item["subject"] == "exclusions:pkg/windowed.pyw:noqa"
+            ]
+        )
+
+    def test_a_crap_check_that_did_not_run_leaves_no_cover_unmeasured(self) -> None:
+        self.write_config(verification_with_crap_after_config())
+        self.add_file(
+            "quality-gate-crap.toml",
+            baseline_text([], check="crap", metric_version="python-lines/1"),
+        )
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn(
+            "no-cover exclusions unreliable: crap did not run", check["reason"]
+        )
+        self.assertIn(
+            "no-cover exclusions unreliable: crap did not run", result.stderr
+        )
+        self.assertFalse(
+            [
+                item
+                for item in check["findings"]
+                if item["subject"].endswith(":no-cover")
+            ]
+        )
+
+    def test_a_crap_check_without_a_measurement_leaves_no_cover_unmeasured(
+        self,
+    ) -> None:
+        self.enable_crap()
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/broken.py",
+            "def same():\n    return 1\n\n\ndef same():\n    return 2\n",
+        )
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("crap reported no measurement", check["reason"])
+
+    def test_two_crap_checks_count_an_excluded_line_once(self) -> None:
+        self.enable_crap(verification_with_two_crap_config())
+        self.add_file(
+            "quality-gate-crap2.toml",
+            baseline_text([], check="crap2", metric_version="python-lines/1"),
+        )
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file(
+            "pkg/mod.py",
+            "def covered():\n"
+            "    value = 1\n"
+            f"    return value  {NO_COVER}\n",
+        )
+        result, document, check = self.failed_verification()
+        for identifier in ("crap", "crap2"):
+            with self.subTest(identifier=identifier):
+                crap = self.check_by_id(document, identifier)
+                self.assertEqual(crap["outcome"], "pass")
+                self.assertEqual(
+                    self.finding(crap, "pkg/mod.py:covered")["measurement"][
+                        "excluded_lines"
+                    ],
+                    [3],
+                )
+        finding = self.finding(check, "exclusions:pkg/mod.py:no-cover")
+        self.assertEqual(finding["value"], 1)
+        self.assertIn("exclusions:pkg/mod.py:no-cover", result.stderr)
+
+    def test_only_verification_runs_the_crap_prerequisite(self) -> None:
+        self.enable_crap()
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file("pkg/mod.py", f"VALUE = 1\nMARKER = '{NO_COVER}'\n")
+        result, document, check = self.run_verification(
+            "--only", "verification"
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(self.check_by_id(document, "crap")["outcome"], "pass")
+        finding = self.finding(check, "exclusions:pkg/mod.py:no-cover")
+        self.assertEqual(finding["value"], 1)
+        self.assertIn("exclusions:pkg/mod.py:no-cover", result.stderr)
+
+    def test_without_a_crap_check_nothing_is_coverage_measured(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_file("pkg/mod.py", f"VALUE = 1\nMARKER = '{NO_COVER}'\n")
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertFalse(
+            [
+                item
+                for item in check["findings"]
+                if item["subject"].endswith(":no-cover")
+            ]
+        )
 
     def test_measure_exclusions_numbers_lines_at_newline_only(self) -> None:
-        source = f'"""doc\u2028more"""\nVALUE = 1  {NO_COVER}  # noqa: E501\n'
+        source = '"""doc\u2028more"""\nVALUE = 1  # noqa: E501\n'
         findings = {
             finding.subject.rsplit(":", 1)[-1]: finding
             for finding in measure_exclusions("pkg/mod.py", source)
         }
-        for metric in ("no-cover", "noqa"):
-            with self.subTest(metric=metric):
-                finding = findings[metric]
-                self.assertEqual(finding.value, 1)
-                self.assertEqual(
-                    [
-                        (location.start_line, location.end_line)
-                        for location in finding.locations
-                    ],
-                    [(2, 2)],
-                )
+        finding = findings["noqa"]
+        self.assertEqual(finding.value, 1)
+        self.assertEqual(
+            [
+                (location.start_line, location.end_line)
+                for location in finding.locations
+            ],
+            [(2, 2)],
+        )
 
     def add_rule(
         self,

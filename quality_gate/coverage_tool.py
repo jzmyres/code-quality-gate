@@ -21,7 +21,7 @@ from .tools import installed_tool_dir
 
 COVERAGE_CONFIG_NAME = "coverage.ini"
 REGISTRY_NAME = "registry"
-PRAGMA_NO_COVER = r"#\s*pragma:\s*no cover"
+PRAGMA_NO_COVER = r"#[ \t]*pragma:[ \t]*no cover"
 
 
 def coverage_config_text(root: Path) -> str:
