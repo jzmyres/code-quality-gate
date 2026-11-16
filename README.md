@@ -635,7 +635,8 @@ finding has value `1`, so any finding fails the check. The four rules are:
   its own parameter, and the function has exactly one call site and no direct test. A method's
   leading `self` or `cls` is not a parameter.
 * **SCC**, single-caller chain. Among the added functions, an edge `f -> g` exists when `g`'s only
-  call site is inside `f`; a chain deeper than `max_chain` fails, naming every function in it.
+  call site is inside `f`; a chain deeper than `max_chain` fails, naming every function in it. A
+  chain head that branches reports only its deepest path, so each function appears in one finding.
 * **LTC**, lower-threshold token clone. Two functions added by the same commit, both production and
   neither an ancestor of the other, whose bodies share a normalised token run of
   `clone_min_tokens` to 49 tokens at similarity at least `clone_similarity`. Tokenising the body
@@ -647,15 +648,18 @@ A test file is a path with a `tests/` component, a `test_*.py` name or a `*_test
 files are excluded from every rule's scope, and a function is a "direct test" of a name only when a
 test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` class) names it.
 
-`scope = "changed"` evaluates only the functions the diff adds or changes, and reads the before tree
-only for CPF. `scope = "tree"` evaluates every function of the selected production files; CPF is not
-a tree property, so it still compares against `base` (a clean tree with `base = "HEAD"` has no CPF
-finding). A change the commit does not touch is never failed. A missing or invalid input is a
-configuration error, never a skipped rule: unknown keys, a `scope` other than `changed` or `tree`, a
-missing or non-existent `base`, `max_chain` below 1, `clone_min_tokens` outside 20-49,
-`clone_similarity` outside 0.5-1.0, and a `crap_check` naming no check or a check that is not a
-`python_crap` check are all rejected. An unparsable changed file or a path Git still quotes is an
-error naming it.
+`scope = "changed"` evaluates only the functions the diff adds or changes, and PTW-SU, SCC and LTC
+judge only the functions the diff adds, not every function it changes. `scope = "tree"` evaluates
+every function of the selected production files, so a function the commit does not touch can fail
+SCC or LTC there. CPF is not a tree property, so it compares against `base` in both scopes (a clean
+tree with `base = "HEAD"` has no CPF finding). A helper's call sites are counted in every Python
+file the check selects, with or without a `.py` suffix (a selected program's shebang decides); Python
+embedded in a file neither named `.py` nor starting with a Python shebang — a shell script, for
+example — is not read. A missing or invalid input is a configuration error, never a skipped rule:
+unknown keys, a `scope` other than `changed` or `tree`, a missing or non-existent `base`,
+`max_chain` below 1, `clone_min_tokens` outside 20-49, `clone_similarity` outside 0.5-1.0, and a
+`crap_check` naming no check or a check that is not a `python_crap` check are all rejected. An
+unparsable changed file or a path Git still quotes is an error naming it.
 
 The shapes the rules accept are deliberate. A single-use helper with a direct test passes CPF and
 PTW-SU; a helper with two call sites passes them too. A refactor that moves decisions into a data
@@ -675,8 +679,9 @@ The `measurement` carries the measured values per rule: `rule`, `file`, `name`, 
 `call_sites`, `direct_test`, `callee`, `forwarded`, `constants`, `cc_before`, `cc_after`, `limit`,
 `chain_depth`, `chain`, `longest`, `ratio` and `tokens`. The check reports
 `{"functions": N, "added": M}` in its measurement, so a run shows how much it measured. The metric
-version is `python-shape/1`. The adapter itself is 92 functions, scores at most CC 5, and passes all
-four rules over its own source; its highest CRAP measured over its test module is 5.4.
+version is `python-shape/1`. The adapter itself is 59 functions, scores at most CC 6, and passes
+all four rules over its own source; no function of it scores above CRAP 6 measured over its test
+module.
 
 This repository's own `quality-gate.toml` does not enable `python_shape`: the landing check runs the
 gate program at the base revision, which rejects an adapter it does not know. A later item enables
