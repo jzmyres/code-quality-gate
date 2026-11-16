@@ -1080,10 +1080,15 @@ class HelperTests(unittest.TestCase):
         functions: list[ShapeFunction] = []
         _collect_definitions(
             ast.parse(
-                "def zebra():\n    return 1\n\n\n"
-                "def alpha():\n    return 2\n"
+                "\n" * 99 + "def late():\n    return 1\n"
             ).body,
-            "", "pkg/app.py", functions,
+            "", "pkg/a.py", functions,
+        )
+        _collect_definitions(
+            ast.parse(
+                "def early():\n    return 2\n"
+            ).body,
+            "", "pkg/z.py", functions,
         )
         tokens = {function.identity: ("ID", "ID") for function in functions}
         self.assertEqual(
