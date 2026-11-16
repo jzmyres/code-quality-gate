@@ -198,15 +198,21 @@ class ProcGroupMemberTests(unittest.TestCase):
 
 
 class RunInterruptTests(unittest.TestCase):
-    @staticmethod
-    def _raise_timeout(_signum: int, _frame: object) -> None:
-        raise TimeoutError("test timer")
-
     def test_an_interrupt_kills_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             pid_file = Path(directory) / "pid"
-            program = f"echo $$ > {pid_file}; sleep 30 & wait"
-            previous = signal.signal(signal.SIGALRM, self._raise_timeout)
+            program = (
+                f"sleep 30 & echo $$ > {pid_file}.tmp; "
+                f"mv {pid_file}.tmp {pid_file}; wait"
+            )
+
+            def interrupt_after_pid(_signum: int, _frame: object) -> None:
+                if not pid_file.exists():
+                    signal.setitimer(signal.ITIMER_REAL, 0.01)
+                    return
+                raise TimeoutError("test timer")
+
+            previous = signal.signal(signal.SIGALRM, interrupt_after_pid)
             self.addCleanup(signal.signal, signal.SIGALRM, previous)
             self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0.0)
             signal.setitimer(signal.ITIMER_REAL, 1.0)

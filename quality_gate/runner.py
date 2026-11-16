@@ -356,6 +356,9 @@ def _close(selector: selectors.BaseSelector, streams: dict[str, Any]) -> None:
 
 def _kill_and_wait(process: subprocess.Popen[bytes]) -> None:
     _signal_group(process.pid, signal.SIGKILL)
+    while _group_alive(process.pid):
+        _signal_group(process.pid, signal.SIGKILL)
+        time.sleep(0.01)
     try:
         process.wait(timeout=5.0)
     except subprocess.TimeoutExpired:

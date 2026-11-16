@@ -544,6 +544,28 @@ def _named_baselines(data: dict[str, Any]) -> dict[str, str]:
     }
 
 
+@dataclass(frozen=True)
+class _BaselineStager:
+    root: Path
+    sha: str
+    label: str
+    temporary: Path
+
+    def stage(self, baseline: str) -> str:
+        label = f"{self.label}:{baseline}"
+        relative = _relative_name(self.root, baseline, label)
+        content = _content(self.root, self.sha, relative, label)
+        target = self.temporary.joinpath(*PurePosixPath(relative).parts)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        except OSError as error:
+            raise UsageError(
+                f"{label}: expected a stageable baseline, got {error}"
+            ) from error
+        return relative
+
+
 def _revision_config(
     root: Path, revision: str, temporary: Path
 ) -> tuple[str, Config, dict[str, str]]:
@@ -558,14 +580,9 @@ def _revision_config(
     data = _policy_data(raw, f"{label}:{POLICY_NAME}")
     names = _named_baselines(data)
     checks = cast(dict[str, Any], data.get("checks", {}))
+    stager = _BaselineStager(root, sha, label, temporary)
     for name, baseline in names.items():
-        relative = _relative_name(root, baseline, f"{label}:{baseline}")
-        target = temporary.joinpath(*PurePosixPath(relative).parts)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(
-            _content(root, sha, relative, f"{label}:{baseline}")
-        )
-        checks[name]["baseline"] = relative
+        checks[name]["baseline"] = stager.stage(baseline)
     try:
         config = _config_from_data(
             temporary,
@@ -636,7 +653,9 @@ def command_debt(
                     f"{path}: expected a readable configuration file, got {error}"
                 ) from error
             data = _policy_data(raw, str(path))
-            config = _config_from_data(root, path, data)
+            config = _config_from_data(
+                root, path, data, parse_candidate_inputs=False
+            )
             reports = _check_debts(config, _named_baselines(data), None)
             sha = None
         else:

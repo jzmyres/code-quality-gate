@@ -943,19 +943,21 @@ or threshold.
     python3 -I qg.py --repo /path/to/repo debt --revision HEAD~5
 
 `debt` lists every baseline entry that still excuses a finding, without running a check, tool or test.
-Without `--revision` it reads `quality-gate.toml` and each baseline from the working tree; with
-`--revision REV` it reads them from that commit through `git show REV:PATH` and never checks anything
-out. A revision's result depends only on that commit's files: missing or changed working-tree suites and
-load paths do not affect it. An entry is debt when its direction is `max` and either its check has no
-threshold or its bound is above the threshold; a `min` floor is not debt. Clones use a threshold of 0,
-so every clone entry with a positive bound counts.
+Without `--revision` it reads `quality-gate.toml` once and takes both the configuration and the baseline
+names from those bytes, then reads each baseline from the working tree; with `--revision REV` it reads
+the policy and baselines from that commit through `git show REV:PATH` and stages the baselines in a
+temporary directory, never checking anything out. Neither mode reads source files, suites or load paths,
+so a result depends only on the policy and the baselines it reads. An entry is debt when its direction is
+`max` and either its check has no threshold or its bound is above the threshold; a `min` floor is not
+debt. Clones use a threshold of 0, so every clone entry with a positive bound counts.
 
 The human report prints `CHECK: N debt entries of M` for every check with a baseline, in policy order,
 then `debt: N entries`. `--json` writes one document whose schema is in `docs/SCHEMA.md`; `revision` is
 the commit's SHA, or null for the working tree. A policy with no baseline reports `debt: 0` and no
-checks. An unreadable revision, a policy or baseline that cannot be read or parsed, or a baseline named
-by the policy that is missing at that revision exits 2 with a message naming the revision and path. A
-baseline path with an embedded NUL is rejected the same way in either mode.
+checks. An input that cannot be read or staged exits 2 with nothing on stdout: an unreadable revision, a
+policy or baseline that cannot be read or parsed, a baseline that cannot be staged, or a baseline named
+by the policy that is missing at that revision, and the message names the revision and path. A baseline
+path with an embedded NUL is rejected the same way in either mode.
 
 ### Locations
 

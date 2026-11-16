@@ -1108,6 +1108,17 @@ class DebtCommittedInputTests(FixtureCase):
             ["src/core.el:alpha-elisp"],
         )
 
+    def test_the_working_tree_reads_only_its_policy_and_baselines(self) -> None:
+        write_mixed_language_fixture(self, reason="current", message="mixed language")
+        before = run_debt(self, "--json")
+        self.assertEqual(before.returncode, 0, output(before))
+        expected = self.parse_json(before)
+        (self.repo / "tests/suite.el").unlink()
+        shutil.rmtree(self.repo / "src")
+        after = run_debt(self, "--json")
+        self.assertEqual(after.returncode, 0, output(after))
+        self.assertEqual(self.parse_json(after), expected)
+
 
 class DebtBaselinePathTests(FixtureCase):
     def test_a_nul_baseline_path_exits_two_in_both_modes(self) -> None:
@@ -1124,6 +1135,23 @@ class DebtBaselinePathTests(FixtureCase):
                 self.assertNotIn("Traceback", result.stderr)
                 if args:
                     self.assertIn(revision, result.stderr)
+
+
+class DebtStagedBaselineTests(FixtureCase):
+    def test_a_baseline_that_cannot_be_staged_exits_two_and_names_it(self) -> None:
+        write_crap_fixture(self, [], message="with baseline")
+        self.write_config(crap_config() + (
+            '\n[checks.clones]\nadapter = "clones"\ntier = 1\n'
+            'enforcement = "enforced"\nmin_tokens = 50\n'
+            'baseline = "quality-gate-crap.toml/missing.toml"\n'
+        ))
+        revision = commit_revision(self, "nested baseline")
+        result = run_debt(self, "--revision", revision)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn(revision, result.stderr)
+        self.assertIn("quality-gate-crap.toml/missing.toml", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 class DebtBaselineSpellingTests(FixtureCase):
