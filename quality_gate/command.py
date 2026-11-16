@@ -1,11 +1,12 @@
 """Configure and run command checks, including tool and file expansion."""
 from __future__ import annotations
 
+import functools
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from . import output_patterns, policy
 from .policy import (
@@ -93,45 +94,11 @@ class _RunExpansion:
     tools: Any = None
 
 
-def _run_literal(
-    argument: str, match: re.Match[str] | None, state: _RunExpansion
-) -> tuple[list[str], str | None]:
-    return [argument], None
-
-
-def _run_files(
-    argument: str, match: re.Match[str] | None, state: _RunExpansion
-) -> tuple[list[str], str | None]:
-    return list(map(_file_argument, state.files)), None
-
-
-def _run_tool(
-    argument: str, match: re.Match[str] | None, state: _RunExpansion
-) -> tuple[list[str], str | None]:
-    name = match.group(1)
-    if state.tools is None:
-        _lock, state.tools = current_tools()
-    if name not in state.tools:
-        known = ", ".join(sorted(state.tools)) or "none"
-        return (
-            [],
-            f"unknown tool {name!r} (pinned tools: {known}); "
-            "run 'python3 -I qg.py tools fetch'",
-        )
-    try:
-        return [str(tool_binary(name))], None
-    except UnsupportedError as error:
-        return [], str(error)
-
-
-_RunExpansionFn = Callable[
-    [str, re.Match[str] | None, _RunExpansion],
-    tuple[list[str], str | None],
-]
-_RUN_EXPANSIONS: tuple[tuple[re.Pattern[str], _RunExpansionFn], ...] = (
-    (re.compile(r"\{files\}"), _run_files),
-    (re.compile(r"\{tool:([^{}]+)\}"), _run_tool),
-    (re.compile(r".*", re.DOTALL), _run_literal),
+_EXPANSION = re.compile(
+    r"(?P<files>\{files\})"
+    r"|(?P<tool>\{tool:(?P<name>[^{}]+)\})"
+    r"|(?P<literal>.*)",
+    re.DOTALL,
 )
 
 
@@ -139,17 +106,34 @@ def _expand_run(
     check: CheckDef, files: list[str]
 ) -> tuple[list[str], str | None]:
     spec = check.spec
-    state = _RunExpansion(files)
+    state = _RunExpansion(
+        list(map(_file_argument, files)), functools.cache(current_tools)
+    )
     expanded: list[str] = []
     for argument in spec.run:
-        for pattern, expand in _RUN_EXPANSIONS:
-            match = pattern.fullmatch(argument)
-            if match is not None:
-                values, error = expand(argument, match, state)
-                if error is not None:
-                    return [], error
-                expanded.extend(values)
-                break
+        match = _EXPANSION.fullmatch(argument)
+        assert match is not None
+        if match.lastgroup == "tool":
+            name = match.group("name")
+            tools = state.tools()[1]
+            if name not in tools:
+                known = ", ".join(sorted(tools)) or "none"
+                return (
+                    [],
+                    f"unknown tool {name!r} (pinned tools: {known}); "
+                    "run 'python3 -I qg.py tools fetch'",
+                )
+            try:
+                expanded.append(str(tool_binary(name)))
+            except UnsupportedError as error:
+                return [], str(error)
+            continue
+        expanded.extend(
+            {
+                "files": state.files,
+                "literal": [argument],
+            }.get(match.lastgroup, [])
+        )
     return expanded, None
 
 

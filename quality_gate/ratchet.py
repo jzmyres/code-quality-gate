@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import datetime
+import functools
+import itertools
 import json
 import math
 import os
@@ -175,10 +177,6 @@ def _baseline_error(path: Path, key: str, expected: str, actual: str) -> GateErr
     return GateError(f"{path}: {key}: expected {expected}, got {actual}")
 
 
-def _is_number(value: object) -> bool:
-    return not isinstance(value, bool) and isinstance(value, (int, float))
-
-
 def _date_value(value: object) -> datetime.date | None:
     if isinstance(value, datetime.datetime):
         return value.date()
@@ -257,7 +255,11 @@ def _entry_subject(path: Path, where: str, raw: dict[str, Any]) -> str:
 
 def _entry_bound(path: Path, where: str, raw: dict[str, Any]) -> float:
     bound = raw.get("bound")
-    if _is_number(bound) and math.isfinite(bound):
+    if (
+        not isinstance(bound, bool)
+        and isinstance(bound, (int, float))
+        and math.isfinite(bound)
+    ):
         return bound
     raise _baseline_error(
         path,
@@ -378,6 +380,8 @@ def load_baseline(
 
 
 def _number(value: float | int) -> str:
+    if not math.isfinite(value):
+        raise GateError("cannot write a non-finite baseline value")
     if isinstance(value, int):
         return str(value)
     if value.is_integer():
@@ -385,50 +389,27 @@ def _number(value: float | int) -> str:
     return repr(value)
 
 
-def _toml_bool(value: bool) -> str:
-    return "true" if value else "false"
-
-
-def _toml_number(value: float | int) -> str:
-    if not math.isfinite(value):
-        raise GateError("cannot write a non-finite baseline value")
-    return _number(value)
-
-
-def _toml_datetime(value: datetime.date) -> str:
-    return value.isoformat()
-
-
-def _toml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _toml_string_list(value: list[object]) -> str:
-    if not all(isinstance(item, str) for item in value):
-        raise GateError(
-            f"cannot write baseline value of type {type(value).__name__}"
-        )
-    return "[" + ", ".join(
-        json.dumps(item, ensure_ascii=False) for item in value
-    ) + "]"
-
-
-_TOML_SERIALIZERS: tuple[
+_TOML_FORMATS: tuple[
     tuple[type | tuple[type, ...], Callable[[Any], str]], ...
 ] = (
-    (bool, _toml_bool),
-    ((int, float), _toml_number),
-    (datetime.datetime, _toml_datetime),
-    (datetime.date, _toml_datetime),
-    (str, _toml_string),
-    (list, _toml_string_list),
+    (bool, json.dumps),
+    ((int, float), _number),
+    (datetime.datetime, datetime.datetime.isoformat),
+    (datetime.date, datetime.date.isoformat),
+    (str, functools.partial(json.dumps, ensure_ascii=False)),
 )
 
 
 def _toml_value(value: object) -> str:
-    for types, serializer in _TOML_SERIALIZERS:
+    if isinstance(value, list):
+        if not all(map(isinstance, value, itertools.repeat(str))):
+            raise GateError(
+                f"cannot write baseline value of type {type(value).__name__}"
+            )
+        return json.dumps(value, ensure_ascii=False)
+    for types, formatter in _TOML_FORMATS:
         if isinstance(value, types):
-            return serializer(value)
+            return formatter(value)
     raise GateError(f"cannot write baseline value of type {type(value).__name__}")
 
 

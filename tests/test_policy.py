@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import sys
 import unittest
+from pathlib import Path
 
 from support import BASE_CONFIG, GATE, FixtureCase, output, with_clones
 
@@ -325,6 +326,79 @@ class PolicyTests(FixtureCase):
                     "finite",
                 )
 
+
+    def test_scalar_reader_messages_match_the_pre_table_readers(self) -> None:
+        path = Path("/policy.toml")
+        cases = (
+            (policy._integer, {}, {},
+             "/policy.toml: value: expected an integer, got missing"),
+            (policy._integer, {"value": "x"}, {},
+             "/policy.toml: value: expected an integer, got str 'x'"),
+            (policy._integer, {"value": True}, {},
+             "/policy.toml: value: expected an integer, got bool True"),
+            (policy._integer, {"value": 1.5}, {},
+             "/policy.toml: value: expected an integer, got float 1.5"),
+            (policy._integer, {"value": float("inf")}, {},
+             "/policy.toml: value: expected an integer, got float inf"),
+            (policy._integer, {"value": 0}, {"minimum": 1},
+             "/policy.toml: value: expected an integer >= 1, got 0"),
+            (policy._integer, {"value": 5}, {"maximum": 4},
+             "/policy.toml: value: expected an integer <= 4, got 5"),
+            (policy._number, {}, {},
+             "/policy.toml: value: expected a number, got missing"),
+            (policy._number, {"value": "x"}, {},
+             "/policy.toml: value: expected a finite number, got str 'x'"),
+            (policy._number, {"value": True}, {},
+             "/policy.toml: value: expected a finite number, got bool True"),
+            (policy._number, {"value": float("inf")}, {},
+             "/policy.toml: value: expected a finite number, got float inf"),
+            (policy._number, {"value": float("nan")}, {},
+             "/policy.toml: value: expected a finite number, got float nan"),
+            (policy._number, {"value": 0.5}, {"minimum": 1},
+             "/policy.toml: value: expected a finite number >= 1, got 0.5"),
+            (policy._integer_list, {}, {},
+             "/policy.toml: value: expected a list of integers, got missing"),
+            (policy._integer_list, {"value": "x"}, {},
+             "/policy.toml: value: expected a list of integers, got str 'x'"),
+            (policy._integer_list, {"value": [1.5]}, {},
+             "/policy.toml: value[0]: expected an integer, got float 1.5"),
+            (policy._integer_list, {"value": [float("inf")]}, {},
+             "/policy.toml: value[0]: expected an integer, got float inf"),
+            (policy._integer_list, {"value": [0]}, {},
+             "/policy.toml: value[0]: expected an integer from 1 to 4, got 0"),
+            (policy._integer_list, {"value": [5]}, {},
+             "/policy.toml: value[0]: expected an integer from 1 to 4, got 5"),
+            (policy._string, {}, {},
+             "/policy.toml: value: expected a non-empty string, got missing"),
+            (policy._string, {"value": 1}, {},
+             "/policy.toml: value: expected a string, got int 1"),
+            (policy._string, {"value": ""}, {},
+             "/policy.toml: value: expected a non-empty string, got str ''"),
+            (policy._string, {"value": "   "}, {},
+             "/policy.toml: value: expected a non-empty string, got str '   '"),
+            (policy._string, {"value": float("inf")}, {},
+             "/policy.toml: value: expected a string, got float inf"),
+            (policy._string_list, {}, {},
+             "/policy.toml: value: expected a list of strings, got missing"),
+            (policy._string_list, {"value": "x"}, {},
+             "/policy.toml: value: expected a list of strings, got str 'x'"),
+            (policy._string_list, {"value": [1]}, {},
+             "/policy.toml: value[0]: expected a string, got int 1"),
+            (policy._string_list, {"value": [float("inf")]}, {},
+             "/policy.toml: value[0]: expected a string, got float inf"),
+            (policy._read_value, {}, {"rule": policy._BOOLEAN},
+             "/policy.toml: value: expected a boolean, got missing"),
+            (policy._read_value, {"value": 1}, {"rule": policy._BOOLEAN},
+             "/policy.toml: value: expected a boolean, got int 1"),
+            (policy._read_value, {"value": float("inf")},
+             {"rule": policy._BOOLEAN},
+             "/policy.toml: value: expected a boolean, got float inf"),
+        )
+        for reader, parent, options, expected in cases:
+            with self.subTest(reader=reader.__name__, parent=parent):
+                with self.assertRaises(policy.ConfigError) as raised:
+                    reader(parent, "value", path, "value", **options)
+                self.assertEqual(str(raised.exception), expected)
 
     def test_elisp_decision_rules_refuse_invalid_entries(self) -> None:
         prefix = (BASE_CONFIG + '\n[checks.crap]\nadapter = "elisp_crap"\n'

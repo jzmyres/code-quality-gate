@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import operator
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -144,107 +145,81 @@ def _check_keys(
 @dataclass(frozen=True)
 class _ValueRule:
     expected: str
-    types: tuple[type, ...]
-    type_expected: str | None = None
-    non_empty: bool = False
-    finite: bool = False
+    checks: tuple[tuple[str, Any, str], ...]
     minimum: int | float | None = None
     maximum: int | float | None = None
-    minimum_expected: str = ""
-    maximum_expected: str = ""
     item: "_ValueRule | None" = None
     convert: Any = None
 
 
-_STRING_ITEM = _ValueRule("a string", (str,))
-_STRING = _ValueRule("a non-empty string", (str,), "a string", non_empty=True)
-_STRING_LIST = _ValueRule(
-    "a list of strings", (list,), item=_STRING_ITEM, convert=tuple
+_STRING_ITEM = _ValueRule(
+    "a string", (("type", (str,), "a string"),), convert=str
 )
-_BOOLEAN = _ValueRule("a boolean", (bool,))
-_TABLE = _ValueRule("a table", (dict,))
+_STRING = _ValueRule(
+    "a non-empty string",
+    (("type", (str,), "a string"), ("nonempty", None, "a non-empty string")),
+    convert=str,
+)
+_STRING_ALLOW_EMPTY = _ValueRule(
+    "a non-empty string", (("type", (str,), "a string"),), convert=str
+)
+_STRING_LIST = _ValueRule(
+    "a list of strings",
+    (("type", (list,), "a list of strings"),),
+    item=_STRING_ITEM,
+    convert=tuple,
+)
+_BOOLEAN = _ValueRule("a boolean", (("type", (bool,), "a boolean"),), convert=bool)
+_TABLE = _ValueRule("a table", (("type", (dict,), "a table"),), convert=dict)
 _INTEGER = _ValueRule(
     "an integer",
-    (int,),
-    minimum_expected="an integer >= {bound}",
-    maximum_expected="an integer <= {bound}",
+    (
+        ("type", (int,), "an integer"),
+        ("bound", ("minimum", operator.lt), "an integer >= {bound}"),
+        ("bound", ("maximum", operator.gt), "an integer <= {bound}"),
+    ),
+    minimum=-math.inf,
+    maximum=math.inf,
+    convert=int,
 )
 _TIER = _ValueRule(
     "an integer",
-    (int,),
+    (
+        ("type", (int,), "an integer"),
+        ("bound", ("minimum", operator.lt), "an integer >= 1"),
+        ("bound", ("maximum", operator.gt), "an integer <= 4"),
+    ),
     minimum=1,
     maximum=4,
-    minimum_expected="an integer >= 1",
-    maximum_expected="an integer <= 4",
+    convert=int,
 )
 _NUMBER = _ValueRule(
-    "a finite number",
-    (int, float),
-    finite=True,
-    minimum_expected="a finite number >= {bound}",
+    "a number",
+    (
+        ("type", (int, float), "a finite number"),
+        ("finite", None, "a finite number"),
+        ("bound", ("minimum", operator.lt), "a finite number >= {bound}"),
+    ),
+    minimum=-math.inf,
+    maximum=math.inf,
     convert=float,
 )
 _INTEGER_LIST = _ValueRule(
     "a list of integers",
-    (list,),
+    (("type", (list,), "a list of integers"),),
     item=_ValueRule(
         "an integer",
-        (int,),
+        (
+            ("type", (int,), "an integer"),
+            ("bound", ("minimum", operator.lt), "an integer from 1 to 4"),
+            ("bound", ("maximum", operator.gt), "an integer from 1 to 4"),
+        ),
         minimum=1,
         maximum=4,
-        minimum_expected="an integer from 1 to 4",
-        maximum_expected="an integer from 1 to 4",
+        convert=int,
     ),
     convert=tuple,
 )
-
-
-def _require_type(
-    path: Path, full_key: str, value: Any, rule: _ValueRule
-) -> None:
-    valid = isinstance(value, rule.types) and not (
-        isinstance(value, bool) and bool not in rule.types
-    )
-    if valid:
-        return
-    raise _config_error(
-        path, full_key, rule.type_expected or rule.expected, _describe(value)
-    )
-
-
-def _require_finite(
-    path: Path, full_key: str, value: Any, rule: _ValueRule
-) -> None:
-    if rule.finite and not math.isfinite(value):
-        raise _config_error(
-            path, full_key, rule.type_expected or rule.expected, _describe(value)
-        )
-
-
-def _require_non_empty(
-    path: Path, full_key: str, value: Any, rule: _ValueRule, allow_empty: bool
-) -> None:
-    if rule.non_empty and not allow_empty and not value.strip():
-        raise _config_error(path, full_key, rule.expected, _describe(value))
-
-
-def _require_bounds(
-    path: Path, full_key: str, value: Any, rule: _ValueRule
-) -> None:
-    if rule.minimum is not None and value < rule.minimum:
-        raise _config_error(
-            path,
-            full_key,
-            rule.minimum_expected.format(bound=rule.minimum),
-            str(value),
-        )
-    if rule.maximum is not None and value > rule.maximum:
-        raise _config_error(
-            path,
-            full_key,
-            rule.maximum_expected.format(bound=rule.maximum),
-            str(value),
-        )
 
 
 def _read_scalar(
@@ -252,25 +227,21 @@ def _read_scalar(
     full_key: str,
     value: Any,
     rule: _ValueRule,
-    allow_empty: bool = False,
 ) -> Any:
-    _require_type(path, full_key, value, rule)
-    _require_finite(path, full_key, value, rule)
-    _require_non_empty(path, full_key, value, rule, allow_empty)
-    _require_bounds(path, full_key, value, rule)
-    return rule.convert(value) if rule.convert is not None else value
-
-
-def _read_list(
-    path: Path, full_key: str, value: Any, rule: _ValueRule
-) -> Any:
-    if not isinstance(value, list):
-        raise _config_error(path, full_key, rule.expected, _describe(value))
-    values = [
-        _read_scalar(path, f"{full_key}[{index}]", item, rule.item)
-        for index, item in enumerate(value)
-    ]
-    return rule.convert(values) if rule.convert is not None else tuple(values)
+    for kind, parameter, expected in rule.checks:
+        match kind:
+            case "type" if type(value) not in parameter:
+                raise _config_error(path, full_key, expected, _describe(value))
+            case "finite" if not math.isfinite(value):
+                raise _config_error(path, full_key, expected, _describe(value))
+            case "nonempty" if not value.strip():
+                raise _config_error(path, full_key, expected, _describe(value))
+            case "bound" if parameter[1](value, getattr(rule, parameter[0])):
+                bound = getattr(rule, parameter[0])
+                raise _config_error(
+                    path, full_key, expected.format(bound=bound), str(value)
+                )
+    return rule.convert(value)
 
 
 def _read_value(
@@ -281,7 +252,6 @@ def _read_value(
     rule: _ValueRule,
     *,
     default: Any = None,
-    allow_empty: bool = False,
 ) -> Any:
     if key not in parent:
         if default is not None:
@@ -289,14 +259,15 @@ def _read_value(
         raise _config_error(path, full_key, rule.expected, "missing")
     value = parent[key]
     if rule.item is not None:
-        return _read_list(path, full_key, value, rule)
-    return _read_scalar(path, full_key, value, rule, allow_empty)
-
-
-def _required_table(
-    parent: dict[str, Any], key: str, path: Path, full_key: str
-) -> dict[str, Any]:
-    return _read_value(parent, key, path, full_key, _TABLE)
+        if not isinstance(value, list):
+            raise _config_error(path, full_key, rule.expected, _describe(value))
+        return rule.convert(
+            [
+                _read_scalar(path, f"{full_key}[{index}]", item, rule.item)
+                for index, item in enumerate(value)
+            ]
+        )
+    return _read_scalar(path, full_key, value, rule)
 
 
 def _optional_table(
@@ -318,9 +289,8 @@ def _string(
     *,
     allow_empty: bool = False,
 ) -> str:
-    return _read_value(
-        parent, key, path, full_key, _STRING, allow_empty=allow_empty
-    )
+    rule = _STRING_ALLOW_EMPTY if allow_empty else _STRING
+    return _read_value(parent, key, path, full_key, rule)
 
 
 def _string_list(
@@ -368,10 +338,6 @@ def _names(
         )
 
 
-def _boolean(parent: dict[str, Any], key: str, path: Path, full_key: str) -> bool:
-    return _read_value(parent, key, path, full_key, _BOOLEAN)
-
-
 def _optional_string(
     parent: dict[str, Any], key: str, default: str, path: Path, full_key: str
 ) -> str:
@@ -385,7 +351,7 @@ def _optional_boolean(
 ) -> bool:
     if key not in parent:
         return default
-    return _boolean(parent, key, path, f"{full_key}.{key}")
+    return _read_value(parent, key, path, f"{full_key}.{key}", _BOOLEAN)
 
 
 def _integer(
@@ -398,7 +364,11 @@ def _integer(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    rule = replace(_INTEGER, minimum=minimum, maximum=maximum)
+    rule = replace(
+        _INTEGER,
+        minimum=minimum if minimum is not None else _INTEGER.minimum,
+        maximum=maximum if maximum is not None else _INTEGER.maximum,
+    )
     return _read_value(parent, key, path, full_key, rule, default=default)
 
 
@@ -411,7 +381,9 @@ def _number(
     default: float | None = None,
     minimum: float | None = None,
 ) -> float:
-    rule = replace(_NUMBER, minimum=minimum)
+    rule = replace(
+        _NUMBER, minimum=minimum if minimum is not None else _NUMBER.minimum
+    )
     return _read_value(parent, key, path, full_key, rule, default=default)
 
 
@@ -424,7 +396,7 @@ def _integer_list(
 def _parse_classes(
     data: dict[str, Any], path: Path
 ) -> dict[str, ClassDef]:
-    classes_raw = _required_table(data, "classes", path, "classes")
+    classes_raw = _read_value(data, "classes", path, "classes", _TABLE)
     classes: dict[str, ClassDef] = {}
     for name, raw in classes_raw.items():
         full_key = f"classes.{name}"
@@ -434,7 +406,7 @@ def _parse_classes(
         checks = _optional_string_list(raw, "checks", path, f"{full_key}.checks")
         classes[name] = ClassDef(
             name=name,
-            code=_boolean(raw, "code", path, f"{full_key}.code"),
+            code=_read_value(raw, "code", path, f"{full_key}.code", _BOOLEAN),
             description=_string(raw, "description", path, f"{full_key}.description"),
             checks=checks,
         )
@@ -509,16 +481,6 @@ def _requires_match(
     return True
 
 
-def _test_producer_refusal(required: CheckDef | None) -> str:
-    from .adapters import adapter_for
-
-    if required is None:
-        return ""
-    descriptor = adapter_for(required.adapter)
-    detail = descriptor.no_tests_hint if descriptor is not None else ""
-    return f" that produces no tests{detail}"
-
-
 def _validate_requires(
     checks: dict[str, CheckDef],
     name: str,
@@ -526,6 +488,8 @@ def _validate_requires(
     path: Path,
     descriptor: Any,
 ) -> None:
+    from .adapters import adapter_for
+
     if requires is None:
         return
     required = checks.get(requires)
@@ -539,7 +503,11 @@ def _validate_requires(
     expected = f"the id of a {descriptor.requires_adapter} check declared earlier"
     if descriptor.requires_tests:
         expected = "the id of an earlier check that produces tests"
-        actual += _test_producer_refusal(required)
+        required_descriptor = (
+            adapter_for(required.adapter) if required is not None else None
+        )
+        detail = getattr(required_descriptor, "no_tests_hint", "")
+        actual += f" that produces no tests{detail}"
     raise _config_error(
         path,
         f"checks.{name}.requires",
@@ -770,57 +738,52 @@ def _parse_levels(
 class _FieldRule:
     key: str
     rule: _ValueRule
-    validator: Callable[[Any, dict[str, ClassDef], Path, str], None]
-
-
-def _valid_field(
-    value: Any, classes: dict[str, ClassDef], path: Path, key: str
-) -> None:
-    return None
-
-
-def _known_class(
-    value: Any, classes: dict[str, ClassDef], path: Path, key: str
-) -> None:
-    if value in classes:
-        return
-    known = ", ".join(sorted(classes)) or "none"
-    raise _config_error(
-        path, key, f"a configured class ({known})", f"unknown class {value!r}"
-    )
+    known_class: bool = False
 
 
 _NOT_APPLICABLE_FIELDS = (
-    _FieldRule("class", _STRING, _known_class),
-    _FieldRule("tier", _TIER, _valid_field),
-    _FieldRule("reason", _STRING, _valid_field),
+    _FieldRule("class", _STRING, True),
+    _FieldRule("tier", _TIER),
+    _FieldRule("reason", _STRING),
 )
 _NOT_APPLICABLE_KEYS = tuple(field.key for field in _NOT_APPLICABLE_FIELDS)
+_NOT_APPLICABLE_LIST = _ValueRule(
+    "an array of tables",
+    (("type", (list,), "an array of tables"),),
+    item=_TABLE,
+    convert=tuple,
+)
 
 
 def _parse_not_applicable(
     data: dict[str, Any], classes: dict[str, ClassDef], path: Path
 ) -> tuple[NotApplicable, ...]:
-    raw_entries = data.get("not_applicable", [])
-    if not isinstance(raw_entries, list):
-        raise _config_error(
-            path, "not_applicable", "an array of tables", _describe(raw_entries)
-        )
+    raw_entries = _read_value(
+        data,
+        "not_applicable",
+        path,
+        "not_applicable",
+        _NOT_APPLICABLE_LIST,
+        default=[],
+    )
     entries: list[NotApplicable] = []
     seen: set[tuple[str, int]] = set()
     for index, raw in enumerate(raw_entries):
         full_key = f"not_applicable[{index}]"
-        if not isinstance(raw, dict):
-            raise _config_error(path, full_key, "a table", _describe(raw))
         _check_keys(raw, _NOT_APPLICABLE_KEYS, path, full_key)
         values: dict[str, Any] = {}
         for field in _NOT_APPLICABLE_FIELDS:
             value = _read_value(
                 raw, field.key, path, f"{full_key}.{field.key}", field.rule
             )
-            field.validator(
-                value, classes, path, f"{full_key}.{field.key}"
-            )
+            if field.known_class and value not in classes:
+                known = ", ".join(sorted(classes)) or "none"
+                raise _config_error(
+                    path,
+                    f"{full_key}.{field.key}",
+                    f"a configured class ({known})",
+                    f"unknown class {value!r}",
+                )
             values[field.key] = value
         class_name = values["class"]
         tier = values["tier"]
@@ -882,7 +845,7 @@ def _config_from_data(
     _check_keys(data, TOP_LEVEL_KEYS, path, "")
     schema = _declared_schema(data, path)
 
-    code = _required_table(data, "code", path, "code")
+    code = _read_value(data, "code", path, "code", _TABLE)
     _check_keys(code, ("patterns", "shebangs"), path, "code")
     patterns = _string_list(code, "patterns", path, "code.patterns")
     shebangs = _string_list(code, "shebangs", path, "code.shebangs")
