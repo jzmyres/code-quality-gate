@@ -21,7 +21,7 @@ from operator import attrgetter
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from .files import _git, _split_nul, _untracked_files, git_argv
+from .files import DiffBase, _git, _split_nul, _untracked_files, diff_base
 from .policy import (
     ConfigError,
     GateError,
@@ -37,7 +37,7 @@ from .python_crap import (
     cyclomatic_complexity,
 )
 from .ratchet import Domain, Finding, Location
-from .runner import mark_step, run
+from .runner import mark_step
 from .verification import _is_python_program
 
 
@@ -343,20 +343,6 @@ def _hunks(raw: bytes) -> tuple[set[str], dict[str, set[int]]]:
 
 def _diff_lines(root: Path, base: str) -> Diff:
     """The added line numbers of every changed path, and new whole files."""
-    checked = run(
-        git_argv(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"),
-        budget_seconds=600,
-        capture_limit=None,
-    )
-    problem = (
-        f"got git {checked.execution}"
-        if checked.execution != "completed"
-        else "got no such revision"
-    )
-    if checked.execution != "completed" or checked.returncode != 0:
-        raise GateError(
-            f"base {base!r}: expected an existing revision, {problem}"
-        )
     raw = _git(
         root,
         [
@@ -487,10 +473,10 @@ def _measured_paths(
 
 
 def _shape_input(
-    context: Any, spec: ShapeSpec, limit: float
+    context: Any, spec: ShapeSpec, limit: float, base: DiffBase
 ) -> ShapeInput:
     """One parse of the measured files, and the indexes every rule reads."""
-    diff = _diff_lines(context.root, spec.base)
+    diff = _diff_lines(context.root, base.commit)
     scoped = _measured_paths(context, spec, diff)
     indexes = {
         path: _file_index(path, _read_source(context.root, path))
@@ -513,7 +499,7 @@ def _shape_input(
     # CPF is the one rule that compares against the before tree, and only for
     # the files the diff touches; every other rule reads the after tree alone.
     before = _before_complexities(
-        context.root, spec.base,
+        context.root, base.commit,
         [path for path in scoped if path in diff.paths],
     )
     calls, tests = _uses(parsed, names)
@@ -938,8 +924,9 @@ def _run_python_shape(context: Any) -> Any:
     start = time.monotonic()
     try:
         limit = _crap_limit(context.config, check.spec)
+        base = diff_base(context.root, check.spec.base)
         mark_step("python-shape analysis")
-        data = _shape_input(context, check.spec, limit)
+        data = _shape_input(context, check.spec, limit, base)
     except GateError as error:
         from .checks import _ratchet_error
 
@@ -964,6 +951,8 @@ def _run_python_shape(context: Any) -> Any:
     return _ratchet_result(
         check, start, ratchet.outcome, ratchet=ratchet,
         measurement={
-            "functions": len(data.functions), "added": len(data.added),
+            "functions": len(data.functions),
+            "added": len(data.added),
+            "base": base.measurement(),
         },
     )

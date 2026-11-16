@@ -16,7 +16,7 @@ paths = ["ruff.toml"]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "tests", "crap", "verification", "source-chars"]
+checks = ["ruff", "clones", "tests", "crap", "shape", "verification", "source-chars"]
 
 [classes.test]
 code = true
@@ -135,6 +135,14 @@ enforcement = "enforced"
 requires = "tests"
 threshold = 6
 baseline = "quality-gate-crap.toml"
+
+[checks.shape]
+adapter = "python_shape"
+tier = 1
+enforcement = "enforced"
+scope = "changed"
+base = "HEAD"
+crap_check = "crap"
 
 [checks.verification]
 adapter = "verification"

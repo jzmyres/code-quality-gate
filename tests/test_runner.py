@@ -11,6 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 from support import GATE
@@ -24,6 +25,9 @@ class _FakeProcess:
 
     def __init__(self, waits: list[object]) -> None:
         self.waits = iter(waits)
+
+    def poll(self) -> None:
+        return None
 
     def wait(self, timeout: float) -> int:
         outcome = next(self.waits)
@@ -197,6 +201,36 @@ class ProcGroupMemberTests(unittest.TestCase):
                 self.assertTrue(runner._proc_group_member(str(entry), self.group))
 
 
+def _zombie(pid: int) -> bool:
+    """Whether PID is an unreaped zombie this process still owns."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return state.rpartition(")")[2].split()[0] == "Z"
+
+
+def _interrupt(pid_file: Path, program: str) -> TimeoutError:
+    """Run PROGRAM until PID_FILE exists, then interrupt it and disarm again."""
+
+    def interrupt_after_pid(_signum: int, _frame: object) -> None:
+        if not pid_file.exists():
+            signal.setitimer(signal.ITIMER_REAL, 0.01)
+            return
+        raise TimeoutError("test timer")
+
+    previous = signal.signal(signal.SIGALRM, interrupt_after_pid)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 1.0)
+        runner.run(["sh", "-c", program], budget_seconds=60)
+    except TimeoutError as error:
+        return error
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+    raise AssertionError("the interrupt did not end the run")
+
+
 class RunInterruptTests(unittest.TestCase):
     def test_an_interrupt_kills_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -205,22 +239,62 @@ class RunInterruptTests(unittest.TestCase):
                 f"sleep 30 & echo $$ > {pid_file}.tmp; "
                 f"mv {pid_file}.tmp {pid_file}; wait"
             )
-
-            def interrupt_after_pid(_signum: int, _frame: object) -> None:
-                if not pid_file.exists():
-                    signal.setitimer(signal.ITIMER_REAL, 0.01)
-                    return
-                raise TimeoutError("test timer")
-
-            previous = signal.signal(signal.SIGALRM, interrupt_after_pid)
-            self.addCleanup(signal.signal, signal.SIGALRM, previous)
-            self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0.0)
-            signal.setitimer(signal.ITIMER_REAL, 1.0)
-            with self.assertRaises(TimeoutError):
-                runner.run(["sh", "-c", program], budget_seconds=60)
+            _interrupt(pid_file, program)
             self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
             pid = int(pid_file.read_text(encoding="utf-8"))
             self.assertFalse(runner._group_alive(pid))
+
+
+class InterruptCleanupTests(unittest.TestCase):
+    """An interrupt returns within the cleanup deadline, whatever liveness says."""
+
+    def _interrupted(self, patch: Any) -> tuple[float, int]:
+        """Interrupt one real child under PATCH, and return its time and pid."""
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "pid"
+            program = (
+                f"echo $$ > {pid_file}.tmp; mv {pid_file}.tmp {pid_file}; "
+                "sleep 30"
+            )
+            with patch:
+                start = time.monotonic()
+                _interrupt(pid_file, program)
+                elapsed = time.monotonic() - start
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 5.0
+            while _zombie(pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+        return elapsed, pid
+
+    def _assert_bounded_and_reaped(self, patch: Any) -> None:
+        elapsed, pid = self._interrupted(patch)
+        self.assertLess(elapsed, runner.CLEANUP_SECONDS + 3.0)
+        self.assertFalse(_zombie(pid))
+        self.assertFalse(runner._group_alive(pid))
+
+    def test_an_unreadable_process_table_still_returns(self) -> None:
+        self._assert_bounded_and_reaped(mock.patch.object(
+            runner, "_proc_group_running",
+            side_effect=OSError("denied"),
+        ))
+
+    def test_the_non_linux_branch_still_returns(self) -> None:
+        self._assert_bounded_and_reaped(
+            mock.patch.object(runner.sys, "platform", "darwin")
+        )
+
+
+class UnconfirmedCleanupTests(unittest.TestCase):
+    def test_a_group_that_survives_sigkill_reports_unconfirmed_cleanup(self) -> None:
+        program = "import time; time.sleep(30)"
+        with mock.patch.object(runner, "_group_alive", return_value=True):
+            start = time.monotonic()
+            result = runner.run([sys.executable, "-c", program], budget_seconds=0.2)
+            elapsed = time.monotonic() - start
+        self.assertLess(elapsed, runner.CLEANUP_SECONDS + 8.0)
+        self.assertEqual(result.execution, "error")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.error, runner.CLEANUP_ERROR)
 
 
 if __name__ == "__main__":

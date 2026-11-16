@@ -544,26 +544,22 @@ def _named_baselines(data: dict[str, Any]) -> dict[str, str]:
     }
 
 
-@dataclass(frozen=True)
-class _BaselineStager:
-    root: Path
-    sha: str
-    label: str
-    temporary: Path
-
-    def stage(self, baseline: str) -> str:
-        label = f"{self.label}:{baseline}"
-        relative = _relative_name(self.root, baseline, label)
-        content = _content(self.root, self.sha, relative, label)
-        target = self.temporary.joinpath(*PurePosixPath(relative).parts)
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-        except OSError as error:
-            raise UsageError(
-                f"{label}: expected a stageable baseline, got {error}"
-            ) from error
-        return relative
+def _stage_baseline(
+    root: Path, sha: str, label: str, temporary: Path, baseline: str
+) -> str:
+    """Write BASELINE from SHA into TEMPORARY and return its relative path."""
+    label = f"{label}:{baseline}"
+    relative = _relative_name(root, baseline, label)
+    content = _content(root, sha, relative, label)
+    target = temporary.joinpath(*PurePosixPath(relative).parts)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    except OSError as error:
+        raise UsageError(
+            f"{label}: expected a stageable baseline, got {error}"
+        ) from error
+    return relative
 
 
 def _revision_config(
@@ -580,9 +576,10 @@ def _revision_config(
     data = _policy_data(raw, f"{label}:{POLICY_NAME}")
     names = _named_baselines(data)
     checks = cast(dict[str, Any], data.get("checks", {}))
-    stager = _BaselineStager(root, sha, label, temporary)
     for name, baseline in names.items():
-        checks[name]["baseline"] = stager.stage(baseline)
+        checks[name]["baseline"] = _stage_baseline(
+            root, sha, label, temporary, baseline
+        )
     try:
         config = _config_from_data(
             temporary,
@@ -640,6 +637,27 @@ def _debt_document(
     }
 
 
+@contextlib.contextmanager
+def _staging_area():
+    """A temporary staging area whose creation and removal are usage errors."""
+    try:
+        directory = tempfile.TemporaryDirectory(prefix="qg-debt-")
+    except OSError as error:
+        raise UsageError(
+            f"staging area: expected a creatable temporary directory, got {error}"
+        ) from error
+    try:
+        yield Path(directory.name)
+    finally:
+        try:
+            directory.cleanup()
+        except OSError as error:
+            raise UsageError(
+                f"staging area {directory.name}: expected a removable directory, "
+                f"got {error}"
+            ) from error
+
+
 def command_debt(
     root: Path, revision: str | None, json_output: bool
 ) -> int:
@@ -659,10 +677,8 @@ def command_debt(
             reports = _check_debts(config, _named_baselines(data), None)
             sha = None
         else:
-            with tempfile.TemporaryDirectory(prefix="qg-debt-") as temporary:
-                sha, config, names = _revision_config(
-                    root, revision, Path(temporary)
-                )
+            with _staging_area() as temporary:
+                sha, config, names = _revision_config(root, revision, temporary)
                 reports = _check_debts(config, names, f"{revision} ({sha})")
     except UsageError as error:
         print(f"debt: {error}", file=sys.stderr)

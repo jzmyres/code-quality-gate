@@ -11,9 +11,18 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from support import BASE_CONFIG, FixtureCase, _add_check_to_class, output
+from support import (
+    BASE_CONFIG,
+    GATE,
+    FixtureCase,
+    _add_check_to_class,
+    assert_base_measurement,
+    baseline_text,
+    output,
+)
 
 from quality_gate import policy
+from quality_gate.files import DiffBase
 from quality_gate.python_shape import (
     CallSite,
     Diff,
@@ -107,10 +116,12 @@ def process(items, flag):
     return total
 """
 
-# CPF: the CRAP-impossible function pays off with an untested single-use helper.
+# CPF: the complexity-7 function splits into a complexity-3 one and a helper.
 CPF_FRAGMENT = """\
 def process(items, flag):
     total = 0
+    if not items:
+        return total
     for item in items:
         total += _step(item, flag)
     return total
@@ -453,9 +464,18 @@ class ShapeCase(FixtureCase):
             self.add_file(relative, content)
         self.commit_all("change")
 
-    def run_shape(self) -> tuple[Any, dict[str, Any], dict[str, Any]]:
-        result, document = self.run_json("--only", "shape")
+    def run_shape(
+        self, env: dict[str, str] | None = None
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        result, document = self.run_json("--only", "shape", env=env)
         return result, document, self.check_by_id(document, "shape")
+
+    def policy_base(self, revision: str = "HEAD^") -> dict[str, str]:
+        """The measurement of the base the policy's revision resolves to."""
+        return {
+            "commit": self.git("rev-parse", revision).stdout.strip(),
+            "source": "base",
+        }
 
     def rejected(self) -> dict[str, Any]:
         """Run the check and return the single finding it must report."""
@@ -472,8 +492,10 @@ class ShapeCase(FixtureCase):
         self.assertEqual(check["findings"], [])
         return check
 
-    def errored(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        result, document, check = self.run_shape()
+    def errored(
+        self, env: dict[str, str] | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        result, document, check = self.run_shape(env)
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(document["decision"], "error")
         self.assertEqual(check["outcome"], "error")
@@ -485,14 +507,14 @@ class RuleTests(ShapeCase):
         self.base_commit({"pkg/app.py": COMPLEX_BASE})
         self.commit({"pkg/app.py": CPF_FRAGMENT})
         finding = self.rejected()
-        self.assertIn("CPF pkg/app.py:process CC 7 -> 2", finding["subject"])
+        self.assertIn("CPF pkg/app.py:process CC 7 -> 3", finding["subject"])
         self.assertIn("helper pkg/app.py:_step (1 call site, no direct test", finding["subject"])
         self.assertIn("limit 6 CC", finding["subject"])
         self.assertEqual(finding["measurement"]["rule"], "CPF")
         self.assertEqual(finding["measurement"]["cc_before"], 7)
-        self.assertEqual(finding["measurement"]["cc_after"], 2)
+        self.assertEqual(finding["measurement"]["cc_after"], 3)
         self.assertEqual(finding["measurement"]["limit"], 6)
-        self.assertEqual(finding["location"], "pkg/app.py:1-5")
+        self.assertEqual(finding["location"], "pkg/app.py:1-7")
 
     def test_the_qf12_split_with_tested_helpers_passes(self) -> None:
         self.base_commit({"pkg/app.py": COMPLEX_BASE})
@@ -640,12 +662,68 @@ class RuleTests(ShapeCase):
         self.accepted()
 
 
+class DiffBaseTests(ShapeCase):
+    """QG_DIFF_BASE names the change, and the measurement says which one."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_config(shape_config(table=SHAPE_TABLE.replace(
+            'base = "HEAD^"', 'base = "HEAD"'
+        )))
+
+    def override_base(self) -> str:
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def test_the_override_base_judges_a_split_the_policy_base_would_hide(self) -> None:
+        self.base_commit({"pkg/app.py": COMPLEX_BASE})
+        base = self.override_base()
+        self.commit({"pkg/app.py": CPF_FRAGMENT})
+        result, _document, check = self.run_shape(env={"QG_DIFF_BASE": base})
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(len(check["findings"]), 1, check["findings"])
+        subject = check["findings"][0]["subject"]
+        self.assertIn("CPF pkg/app.py:process CC 7 -> 3", subject)
+        self.assertIn("helper pkg/app.py:_step", subject)
+        assert_base_measurement(self, check, base, "QG_DIFF_BASE")
+
+    def test_the_clean_tree_passes_without_the_variable(self) -> None:
+        self.base_commit({"pkg/app.py": COMPLEX_BASE})
+        self.commit({"pkg/app.py": CPF_FRAGMENT})
+        check = self.accepted()
+        assert_base_measurement(self, check, self.override_base(), "base")
+
+    def test_the_same_split_with_a_test_naming_the_helper_passes(self) -> None:
+        self.base_commit({"pkg/app.py": COMPLEX_BASE})
+        base = self.override_base()
+        self.commit({"pkg/app.py": CPF_FRAGMENT, "tests/test_app.py": QF12_TEST})
+        result, _document, check = self.run_shape(env={"QG_DIFF_BASE": base})
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass")
+        assert_base_measurement(self, check, base, "QG_DIFF_BASE")
+
+    def test_an_empty_value_is_a_configuration_error_naming_it(self) -> None:
+        self.base_commit({"pkg/app.py": COMPLEX_BASE})
+        self.commit({"pkg/app.py": CPF_FRAGMENT})
+        document, _check = self.errored(env={"QG_DIFF_BASE": ""})
+        self.assertIn("QG_DIFF_BASE", document["error"])
+
+    def test_an_unresolvable_value_is_a_configuration_error_naming_it(self) -> None:
+        self.base_commit({"pkg/app.py": COMPLEX_BASE})
+        self.commit({"pkg/app.py": CPF_FRAGMENT})
+        document, _check = self.errored(env={"QG_DIFF_BASE": "no-such-revision"})
+        self.assertIn("QG_DIFF_BASE", document["error"])
+        self.assertIn("no-such-revision", document["error"])
+
+
 class ScopeTests(ShapeCase):
     def test_changed_scope_ignores_an_untouched_long_chain(self) -> None:
         self.base_commit({"pkg/chain.py": chain_module(6)})
         self.commit({"notes.md": "# the chain is untouched\n"})
         check = self.accepted()
-        self.assertEqual(check["measurement"], {"functions": 0, "added": 0})
+        self.assertEqual(
+            check["measurement"],
+            {"functions": 0, "added": 0, "base": self.policy_base()},
+        )
 
     def test_tree_scope_reports_the_untouched_long_chain(self) -> None:
         self.write_config(shape_config(table=SHAPE_TABLE.replace(
@@ -669,7 +747,10 @@ class ScopeTests(ShapeCase):
         self.base_commit({"pkg/app.py": PTW_BASE})
         self.commit({"pkg/app.py": PTW_BASE + "\n\ndef extra():\n    return 2\n"})
         check = self.accepted()
-        self.assertEqual(check["measurement"], {"functions": 1, "added": 1})
+        self.assertEqual(
+            check["measurement"],
+            {"functions": 1, "added": 1, "base": self.policy_base()},
+        )
 
     def test_changed_scope_judges_only_the_added_functions(self) -> None:
         base = chain_module(6)
@@ -680,7 +761,10 @@ class ScopeTests(ShapeCase):
         )
         self.commit({"pkg/chain.py": edited})
         check = self.accepted()
-        self.assertEqual(check["measurement"], {"functions": 7, "added": 0})
+        self.assertEqual(
+            check["measurement"],
+            {"functions": 7, "added": 0, "base": self.policy_base()},
+        )
 
 
 class CallSiteTests(ShapeCase):
@@ -711,7 +795,10 @@ class CallSiteTests(ShapeCase):
         self.base_commit({"pkg/app.py": PTW_BASE, "pkg/helper": self.caller()})
         self.commit({"pkg/app.py": PTW_WRAPPED})
         check = self.accepted()
-        self.assertEqual(check["measurement"], {"functions": 2, "added": 1})
+        self.assertEqual(
+            check["measurement"],
+            {"functions": 2, "added": 1, "base": self.policy_base()},
+        )
 
     def test_the_helper_without_the_caller_is_single_use(self) -> None:
         self.suffixless_config()
@@ -1167,7 +1254,7 @@ class HelperInputTests(ShapeCase):
             _scan_files=mock.Mock(return_value={}),
             _before_complexities=mock.Mock(return_value={}),
         ):
-            data = _shape_input(context, SHAPE_SPEC, 6)
+            data = _shape_input(context, SHAPE_SPEC, 6, DiffBase("HEAD", "base"))
         self.assertEqual(
             [function.name for function in data.functions], ["first"]
         )
@@ -1179,6 +1266,93 @@ class HelperInputTests(ShapeCase):
         )
         self.assertEqual(data.calls, {})
         self.assertEqual(data.tests, frozenset())
+
+
+SHIPPED_POLICY = (GATE / "quality-gate.toml").read_text(encoding="utf-8")
+
+# One file for every rule of the shipped policy, so its inventory is complete.
+SHIPPED_FILES = {
+    "qg.py": "VALUE = 1\n",
+    "quality_gate/mod.py": "def build(value):\n    return value\n",
+    "quality_gate/elisp/helper.el": "(defun helper ()\n  nil)\n",
+    "tests/test_mod.py": (
+        "import unittest\n"
+        "\n"
+        "\n"
+        "class ModTests(unittest.TestCase):\n"
+        "    def test_nothing(self):\n"
+        "        self.assertTrue(True)\n"
+    ),
+    "tests/elisp/qg-elisp-tests.el": "(require 'ert)\n",
+    "quality-gate-crap.toml": baseline_text(
+        [], check="crap", metric_version="python-lines/1"
+    ),
+    "quality-gate-verification.toml": baseline_text(
+        [], check="verification", metric_version="verification/1"
+    ),
+    "Makefile": "check:\n\tpython3 -I qg.py check\n",
+    ".github/workflows/check.yml": "name: check\n\non: push\n",
+    "README.md": "# fixture\n",
+    "LICENSE": "AGPL-3.0\n",
+    ".gitignore": "__pycache__/\n",
+}
+# A single-use, untested pass-through wrapper added to a gate module.
+SHIPPED_WRAPPER = """\
+def build(value):
+    return render(value)
+
+
+def render(value):
+    return _format(value, 2)
+
+
+def _format(value, indented):
+    return value
+"""
+
+
+class ShippedPolicyTests(FixtureCase):
+    """The gate's own policy judges one change, named by its caller."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_config(SHIPPED_POLICY)
+        (self.repo / "a.py").unlink()
+        for relative, content in SHIPPED_FILES.items():
+            self.add_file(relative, content)
+        self.commit_all("base")
+
+    def run_shipped_shape(
+        self, env: dict[str, str] | None = None
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        result = self.run_qg_process(
+            "check", "--json", "--only", "shape", env=env
+        )
+        document = self.parse_json(result)
+        return result, document, self.check_by_id(document, "shape")
+
+    def add_wrapper(self) -> str:
+        self.add_file("quality_gate/mod.py", SHIPPED_WRAPPER)
+        self.commit_all("add the wrapper")
+        return self.git("rev-parse", "HEAD^").stdout.strip()
+
+    def test_the_shipped_policy_fails_an_untested_wrapper_from_its_base(self) -> None:
+        base = self.add_wrapper()
+        result, _document, check = self.run_shipped_shape(
+            env={"QG_DIFF_BASE": base}
+        )
+        self.assertEqual(result.returncode, 1, output(result))
+        subjects = [item["subject"] for item in check["findings"]]
+        self.assertEqual(len(subjects), 1, subjects)
+        self.assertTrue(subjects[0].startswith("PTW-SU quality_gate/mod.py:render "), subjects)
+        self.assertEqual(check["measurement"]["base"], {"commit": base, "source": "QG_DIFF_BASE"})
+
+    def test_a_clean_tree_passes_without_the_variable(self) -> None:
+        self.add_wrapper()
+        result, _document, check = self.run_shipped_shape()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass")
+        self.assertEqual(check["findings"], [])
 
 
 MUTATIONS = {

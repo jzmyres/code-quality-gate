@@ -30,6 +30,10 @@ from .policy import UsageError
 CAPTURE_LIMIT = 1024 * 1024
 TAIL_LIMIT = 4096
 GRACE_SECONDS = 5.0
+CLEANUP_SECONDS = 1.0
+CLEANUP_ERROR = (
+    f"cleanup did not confirm the process group gone within {CLEANUP_SECONDS:g} s"
+)
 _PIPE_READ = 65536
 
 
@@ -213,13 +217,19 @@ def _proc_group_running(pid: int) -> bool:
 
 
 def _group_alive(pid: int) -> bool:
+    """Whether the group may still hold a live member; cannot tell means yes."""
     try:
         os.killpg(pid, 0)
     except ProcessLookupError:
         return False
     except OSError:
         return True
-    return _proc_group_running(pid) if sys.platform.startswith("linux") else True
+    if not sys.platform.startswith("linux"):
+        return True
+    try:
+        return _proc_group_running(pid)
+    except OSError:
+        return True
 
 
 @dataclass
@@ -354,22 +364,38 @@ def _close(selector: selectors.BaseSelector, streams: dict[str, Any]) -> None:
             stream.close()
 
 
-def _kill_and_wait(process: subprocess.Popen[bytes]) -> None:
-    _signal_group(process.pid, signal.SIGKILL)
-    while _group_alive(process.pid):
+def _kill_and_wait(process: subprocess.Popen[bytes]) -> bool:
+    """Kill the group, and tell whether its absence was confirmed by the deadline.
+
+    The leader is polled every turn: an unreaped zombie of the leader is what
+    keeps the group looking alive where 'killpg' cannot tell, so reaping it is
+    part of showing the group gone.
+    """
+    deadline = time.monotonic() + CLEANUP_SECONDS
+    gone = False
+    while not gone:
         _signal_group(process.pid, signal.SIGKILL)
+        process.poll()
+        gone = not _group_alive(process.pid)
+        if gone or time.monotonic() >= deadline:
+            break
         time.sleep(0.01)
     try:
-        process.wait(timeout=5.0)
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         pass
+    return gone
 
 
-def _reap(process: subprocess.Popen[bytes]) -> None:
+def _reap(process: subprocess.Popen[bytes]) -> bool:
+    """Wait for the leader, and tell whether the group was confirmed gone."""
     try:
-        process.wait(timeout=1.0)
+        process.wait(timeout=CLEANUP_SECONDS)
     except subprocess.TimeoutExpired:
-        _kill_and_wait(process)
+        return _kill_and_wait(process)
+    if not _group_alive(process.pid):
+        return True
+    return _kill_and_wait(process)
 
 
 def _was_signalled(execution: str, returncode: int | None) -> bool:
@@ -378,6 +404,21 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
         and returncode is not None
         and returncode < 0
     )
+
+
+def _execution_terms(
+    execution: str, returncode: int | None, cleaned: bool
+) -> tuple[str, str | None, bool]:
+    """The result's execution, error and timeout, from what the run observed.
+
+    Cleanup that could not show the group gone wins over the drained execution:
+    the run must never report a silent success in that case.
+    """
+    if not cleaned:
+        return "error", CLEANUP_ERROR, True
+    if _was_signalled(execution, returncode):
+        execution = "signal"
+    return execution, None, execution == "budget"
 
 
 def _run_budget(
@@ -462,10 +503,11 @@ def run(
         execution, capture = _capture_process(
             process, deadline, grace_seconds, capture_limit
         )
-        _reap(process)
+        cleaned = _reap(process)
         returncode = process.poll()
-        if _was_signalled(execution, returncode):
-            execution = "signal"
+        execution, error, timed_out = _execution_terms(
+            execution, returncode, cleaned
+        )
         return RunResult(
             argv=argv_tuple,
             execution=execution,
@@ -476,7 +518,8 @@ def run(
             output_tail=bytes(capture.tail),
             output_truncated=capture.truncated,
             duration_seconds=time.monotonic() - started,
-            timed_out=execution == "budget",
+            error=error,
+            timed_out=timed_out,
         )
     except BaseException:
         _kill_and_wait(process)

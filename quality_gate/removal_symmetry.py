@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .files import _git, _untracked_files
+from .files import DiffBase, _git, _untracked_files, diff_base
 from .policy import (
     GateError,
     Rule,
@@ -222,6 +222,7 @@ def _collect_tokens(
 def _diff_token_maps(
     root: Path,
     spec: RemovalSymmetrySpec,
+    base: DiffBase,
     class_names: set[str] | None,
     rules: tuple[Rule, ...],
 ) -> tuple[
@@ -233,7 +234,7 @@ def _diff_token_maps(
             "-c", "core.quotePath=false",
             "diff", "--unified=0", "--no-color", "--no-ext-diff",
             "--src-prefix=a/", "--dst-prefix=b/",
-            spec.base, "--",
+            base.commit, "--",
         ],
         "removal-symmetry diff",
     )
@@ -252,10 +253,11 @@ def _diff_token_maps(
 def _removed_tokens(
     root: Path,
     spec: RemovalSymmetrySpec,
+    base: DiffBase,
     class_names: set[str] | None,
     rules: tuple[Rule, ...],
 ) -> list[tuple[str, str, tuple[str, ...]]]:
-    removed, added = _diff_token_maps(root, spec, class_names, rules)
+    removed, added = _diff_token_maps(root, spec, base, class_names, rules)
     return [
         (kind, token, tuple(sorted(paths)))
         for (kind, token), paths in sorted(removed.items())
@@ -421,11 +423,12 @@ def _not_measured_finding(relative: str) -> Finding:
 def measure_removal_symmetry(
     root: Path,
     spec: RemovalSymmetrySpec,
+    base: DiffBase,
     class_names: set[str] | None,
     rules: tuple[Rule, ...],
     contents: list[tuple[str, str]],
 ) -> tuple[list[tuple[str, str, tuple[str, ...]]], list[Finding]]:
-    tokens = _removed_tokens(root, spec, class_names, rules)
+    tokens = _removed_tokens(root, spec, base, class_names, rules)
     findings = [
         finding
         for kind, token, removed_from in tokens
@@ -442,6 +445,7 @@ def _measurement(
     list[str],
     list[str],
     list[Finding],
+    DiffBase,
 ]:
     from .checks import _select_files
 
@@ -450,16 +454,17 @@ def _measurement(
         context.config, context.check, context.files, context.classes
     )
     spec = context.check.spec
+    base = diff_base(context.root, spec.base, override=spec.scope == "changed")
     scan_files = _scan_files(context, spec)
     contents, unmeasured = _read_files(context.root, scan_files)
     class_names = None if spec.scope == "all" else set(check_classes)
     mark_step("removed-token scan")
     tokens, findings = measure_removal_symmetry(
-        context.root, spec, class_names, context.config.rules, contents
+        context.root, spec, base, class_names, context.config.rules, contents
     )
     findings.extend(map(_not_measured_finding, unmeasured))
     findings.sort(key=lambda item: item.subject)
-    return tokens, scan_files, unmeasured, findings
+    return tokens, scan_files, unmeasured, findings, base
 
 
 def _domain_subjects(
@@ -479,23 +484,18 @@ def _domain_subjects(
     return subjects
 
 
-def _configuration_error(
-    check: Any, start: float, prefix: str, error: Exception
-) -> Any:
-    from .checks import _ratchet_error
-
-    result = _ratchet_error(check, start, prefix, error)
-    result.configuration_error = True
-    return result
-
-
 def _run_removal_symmetry(context: Any) -> Any:
-    from .checks import _baseline_entries, _finish_ratchet, _ratchet_error
+    from .checks import (
+        _baseline_entries,
+        _configuration_error,
+        _finish_ratchet,
+        _ratchet_error,
+    )
 
     check = context.check
     start = time.monotonic()
     try:
-        tokens, scan_files, unmeasured, findings = _measurement(context)
+        tokens, scan_files, unmeasured, findings, base = _measurement(context)
     except GateError as error:
         return _configuration_error(check, start, context.prefix, error)
     mark_step("baseline loading")
@@ -508,6 +508,8 @@ def _run_removal_symmetry(context: Any) -> Any:
         _domain_subjects(tokens, scan_files, unmeasured),
         "the removed tokens and selected scan files",
     )
-    return _finish_ratchet(
+    result = _finish_ratchet(
         check, findings, entries, context.prefix, start, domain, "removed-token"
     )
+    result.measurement = {"base": base.measurement()}
+    return result

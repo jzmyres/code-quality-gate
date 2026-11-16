@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .clones import _read_regular
-from .files import _git, _split_nul, _untracked_files
+from .files import DiffBase, _git, _split_nul, _untracked_files, diff_base
 from .policy import (
+    ConfigError,
     GateError,
     _names,
     _optional_boolean,
@@ -215,11 +216,11 @@ def _domain_subjects(files: list[str], unscanned: set[str]) -> list[str]:
     return subjects
 
 
-def _changed_files(root: Path, spec: SourceCharsSpec) -> list[str]:
+def _changed_files(root: Path, spec: SourceCharsSpec, base: DiffBase) -> list[str]:
     raw = _git(
         root,
         ["diff", "--name-only", "-z", "--diff-filter=ACMRTUXB",
-         spec.base, "--"],
+         base.commit, "--"],
         "source-character change selection",
     )
     names = _split_nul(raw)
@@ -228,28 +229,48 @@ def _changed_files(root: Path, spec: SourceCharsSpec) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _source_chars_measurement(context: Any) -> tuple[list[str], list[Finding]]:
+def _selected_files(context: Any) -> list[str]:
     from .checks import _select_files
 
     mark_step("file selection")
-    selected, _class_names = _select_files(
+    return _select_files(
         context.config, context.check, context.files, context.classes
-    )
+    )[0]
+
+
+def _source_chars_measurement(
+    context: Any,
+) -> tuple[list[str], list[Finding], DiffBase | None]:
     spec = context.check.spec
+    selected = _selected_files(context)
+    base = None
     if spec.scope == "changed":
-        changed = set(_changed_files(context.root, spec))
+        base = diff_base(context.root, spec.base)
+        changed = set(_changed_files(context.root, spec, base))
         selected = [relative for relative in selected if relative in changed]
     mark_step("source character scan")
-    return selected, measure_source_chars(context.root, selected)
+    return selected, measure_source_chars(context.root, selected), base
+
+
+def _measurement(base: DiffBase | None) -> dict[str, Any] | None:
+    """The judged change, when this scope judged one."""
+    return None if base is None else {"base": base.measurement()}
 
 
 def _run_source_chars(context: Any) -> Any:
-    from .checks import _baseline_entries, _finish_ratchet, _ratchet_error
+    from .checks import (
+        _baseline_entries,
+        _configuration_error,
+        _finish_ratchet,
+        _ratchet_error,
+    )
 
     check = context.check
     start = time.monotonic()
     try:
-        selected, findings = _source_chars_measurement(context)
+        selected, findings, base = _source_chars_measurement(context)
+    except ConfigError as error:
+        return _configuration_error(check, start, context.prefix, error)
     except GateError as error:
         return _ratchet_error(check, start, context.prefix, error)
     mark_step("baseline loading")
@@ -262,6 +283,8 @@ def _run_source_chars(context: Any) -> Any:
         _domain_subjects(selected, _unscanned(findings)),
         "the selected source files and code points",
     )
-    return _finish_ratchet(
+    result = _finish_ratchet(
         check, findings, entries, context.prefix, start, domain, "character"
     )
+    result.measurement = _measurement(base)
+    return result

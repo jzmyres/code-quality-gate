@@ -67,7 +67,7 @@ in how each one invokes the gate.
 
 | Consumer | Language | `[code]` | Classes, then checks | How it runs the gate |
 | --- | --- | --- | --- | --- |
-| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` |
+| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
 | A shell and Python agent harness | Shell and Python | `*.py`, `*.sh`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `shell-tested`, `shell-sourced`, `shell-probe`, `config`, `build`, `doc`, `gate`; `ruff`, `shellcheck`, `json` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification` | A runner gates each candidate with `--policy-from` the last landed commit |
 | An Emacs Lisp editor configuration | Emacs Lisp, with shell helpers | Emacs Lisp sources and their shell helpers | `modules`, `tools`, `suites`, `startup`, `shell`, `config`, `data`, `docs`, `fixture`, `gate`; `emacs-tests`, `tooling-tests` (`elisp_tests`), `emacs-crap`, `tooling-crap` (`elisp_crap`), `elisp-compile`, `elisp-checkdoc`, `shellcheck` (`command`) | Ran beside its own older gate, recording parity first |
 
@@ -683,9 +683,10 @@ version is `python-shape/1`. The adapter itself is 47 functions, scores at most 
 all four rules over its own source; no function of it scores above CRAP 6 measured over its test
 module.
 
-This repository's own `quality-gate.toml` does not enable `python_shape`: the landing check runs the
-gate program at the base revision, which rejects an adapter it does not know. A later item enables
-it.
+This repository's own `quality-gate.toml` enables `python_shape` in the `python` class. Its
+`base = "HEAD"` judges a local check's uncommitted change; a caller that knows the change's base
+sets `QG_DIFF_BASE` instead: a runner gates one item from the item's base commit, a landing check
+gives the main commit it lands on, and CI gives the pushed commits.
 
 ### Emacs Lisp CRAP
 
@@ -885,9 +886,13 @@ enumeration and identity, command checks, jscpd and test runs) uses one bounded 
 own process group, is terminated at its own budget and is reaped. The budget is the smaller of the
 requested seconds and the current check's remaining time. At a check's budget it sends SIGTERM to the
 group followed immediately by SIGKILL; a subprocess outside a check has a five-second grace before
-SIGKILL. An interrupt that ends the run kills the group immediately. A group whose remaining members
-are all zombies counts as stopped, because a zombie cannot run and a container's PID 1 may never reap
-it. Termination and reaping can add a small amount of time after the budget. Check output is captured
+SIGKILL. An interrupt that ends the run kills the group immediately and reaps the leader while it
+waits, so the leader's unreaped zombie never keeps the group looking alive. That wait is bounded: when
+the group cannot be shown gone within one second, the run still returns, with
+`execution = "error"`, `timed_out = true` and an `error` that says cleanup did not confirm the group
+gone. Cleanup therefore never succeeds silently. A group whose remaining members are all zombies
+counts as stopped, because a zombie cannot run and a container's PID 1 may never reap it.
+Termination and reaping can add a small amount of time after the budget. Check output is captured
 up to 1 MiB; later bytes are counted and discarded. A consumer therefore never has to parse stderr to
 learn why a check failed.
 
@@ -957,7 +962,10 @@ the commit's SHA, or null for the working tree. A policy with no baseline report
 checks. An input that cannot be read or staged exits 2 with nothing on stdout: an unreadable revision, a
 policy or baseline that cannot be read or parsed, a baseline that cannot be staged, or a baseline named
 by the policy that is missing at that revision, and the message names the revision and path. A baseline
-path with an embedded NUL is rejected the same way in either mode.
+path with an embedded NUL is rejected the same way in either mode. The staging area itself is covered
+too: a temporary directory that cannot be created or removed is the same usage error, naming the staging
+area and the error, so a full temporary filesystem exits 2 with nothing on stdout instead of exiting 1
+with a traceback.
 
 ### Locations
 
@@ -1217,7 +1225,9 @@ Notes:
   baseline entries. Its files come from the classes that list it. The character table is fixed;
   `allow` and `deny` may restate it but cannot change it. `scope` defaults
   to `all`; `changed` uses `base` (default `HEAD^`) and includes untracked files unless
-  `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`.
+  `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`. For a
+  `changed` scope, `QG_DIFF_BASE` replaces `base`, and the check's measurement names the commit
+  it judged and whether `QG_DIFF_BASE` or the policy key named it.
 * A `removal_symmetry` check may name a `baseline` path, which must exist; without one it accepts
   no baseline entries. Its files come from the classes that list it and supply the diff scope; a
   removing path is classified by rule from the diff's old path, so a
@@ -1225,7 +1235,9 @@ Notes:
   when omitted), and `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults
   to `HEAD^`; `min_token_chars` defaults to 16; `search_untracked = false` removes untracked
   files from the search domain. `token_kinds` is the fixed pair `definition` and `string`. Tokens
-  the same diff adds anywhere are not reported. The check ships advisory: with
+  the same diff adds anywhere are not reported. `QG_DIFF_BASE` replaces `base`, and the check's
+  measurement names the commit it judged and whether `QG_DIFF_BASE` or the policy key named it.
+  The check ships advisory: with
   `enforcement = "advisory"` its findings are reported but never fail the gate; with `enforced`
   an uncovered finding rejects the gate.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
@@ -1245,7 +1257,9 @@ Notes:
   and `crap_check`, and accepts `scope` (`changed` or `tree`, default `changed`), `max_chain`
   (default 6), `clone_min_tokens` (20-49, default 30) and `clone_similarity` (0.5-1.0, default
   0.95). Its files come from the classes that list it, minus test files, and CPF's limit is the
-  `threshold` of the `python_crap` check `crap_check` names.
+  `threshold` of the `python_crap` check `crap_check` names. `QG_DIFF_BASE` replaces `base` in
+  both scopes, and the check's measurement names the commit it judged and whether `QG_DIFF_BASE`
+  or the policy key named it.
 * A `verification` check may name a `baseline` path, which must exist; without one it accepts no
   baseline entries. Its optional `requires` names an earlier check with `tests` evidence:
   `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.
@@ -1496,10 +1510,15 @@ then creates an unprivileged `gate` user and gives it ownership of the checkout 
 fetching pinned tools, the gate and the mutation run as that user through `runuser`. A restored
 tools cache keeps its modes and changes only ownership, so read-only payloads stay read-only.
 
-The check matrix restores the pinned tools cache keyed on the environment name, architecture and
-`tools.lock.toml`, fetches any missing tools (including the coverage wheel), and runs `make -k check`:
-Ruff, clones, the test suite under coverage, Python CRAP and the Emacs Lisp checks. The separate
-Debian 13 job restores the same Debian tools cache and runs `make mutation`.
+The check matrix checks out the full history, restores the pinned tools cache keyed on the environment
+name, architecture and `tools.lock.toml`, fetches any missing tools (including the coverage wheel),
+and runs `make -k check`: Ruff, clones, the test suite under coverage, Python CRAP, Python function
+shape and the Emacs Lisp checks. A checkout of one commit has no base to diff against, so a step
+resolves `QG_DIFF_BASE` and prints it: on a push the event's `before` commit when the history holds
+it, otherwise (a new branch) the merge base with the default branch, and on a pull request the base
+branch's commit the pull request is compared with. The gate step passes the variable through
+`runuser`, so every check that diffs judges that one change. The separate Debian 13 job restores the
+same Debian tools cache and runs `make mutation`.
 
 Step timeouts are fixed at about five times the longest run observed as of 2026-10-31: 60 minutes
 for the gate, 15 for the cold Emacs build and 120 for the mutation step, and each job adds 10 minutes

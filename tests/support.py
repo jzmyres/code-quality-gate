@@ -422,6 +422,7 @@ class FixtureCase(unittest.TestCase):
         env = os.environ.copy()
         for key in (
             "QG_TOOLS_DIR",
+            "QG_DIFF_BASE",
             "QG_FAKE_SARIF",
             "QG_FAKE_EXIT",
             "QG_FAKE_ERROR",
@@ -712,6 +713,18 @@ class FixtureCase(unittest.TestCase):
 
 def output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
+
+
+def assert_base_measurement(
+    case: unittest.TestCase,
+    check: dict[str, Any],
+    commit: str,
+    source: str,
+) -> None:
+    """The check's measurement names the commit it judged and what named it."""
+    case.assertEqual(
+        check["measurement"]["base"], {"commit": commit, "source": source}
+    )
 
 
 def assert_temporary_failure(

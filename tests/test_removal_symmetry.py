@@ -8,6 +8,7 @@ from support import (
     BASE_CONFIG,
     FixtureCase,
     _add_check_to_class,
+    assert_base_measurement,
     baseline_text,
     output,
 )
@@ -71,8 +72,10 @@ class RemovalSymmetryCheckTests(FixtureCase):
         self.add_file(BASELINE, removal_baseline([]))
         self.write_config(removal_config())
 
-    def run_removal_check(self) -> tuple[Any, dict[str, Any], dict[str, Any]]:
-        result, document = self.run_json()
+    def run_removal_check(
+        self, env: dict[str, str] | None = None
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        result, document = self.run_json(env=env)
         return result, document, self.check_by_id(document, "removal-symmetry")
 
     def finding(
@@ -335,6 +338,57 @@ class RemovalSymmetryCheckTests(FixtureCase):
             [item["subject"] for item in check["findings"]],
             [f"{token}@README.md"],
         )
+
+    def test_the_override_base_judges_a_change_the_policy_base_hides(self) -> None:
+        self.write_config(removal_config(base="HEAD"))
+        self.add_file("pkg/mod.py", "def gone_helper():\n    return 1\n")
+        self.add_file(
+            "tests/test_mod.py", "def test_it():\n    gone_helper()\n"
+        )
+        self.commit_all("base")
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.remove_product()
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        cases = (
+            (None, head, "base", []),
+            ({"QG_DIFF_BASE": base}, base, "QG_DIFF_BASE",
+             ["gone_helper@tests/test_mod.py"]),
+        )
+        for env, commit, source, subjects in cases:
+            with self.subTest(source=source):
+                _result, _document, check = self.run_removal_check(env=env)
+                self.assertEqual(
+                    [item["subject"] for item in check["findings"]], subjects
+                )
+                assert_base_measurement(self, check, commit, source)
+
+    def test_scope_all_keeps_the_policy_base(self) -> None:
+        self.write_config(removal_config(scope="all"))
+        self.install_removed_definition("all_helper", "all_helper()")
+        _result, _document, check = self.run_removal_check(
+            env={"QG_DIFF_BASE": "no-such-revision"}
+        )
+        self.assertEqual(
+            [item["subject"] for item in check["findings"]],
+            ["all_helper@tests/test_mod.py"],
+        )
+        assert_base_measurement(
+            self,
+            check,
+            self.git("rev-parse", "HEAD^").stdout.strip(),
+            "base",
+        )
+
+    def test_an_unresolvable_override_value_is_a_configuration_error(self) -> None:
+        self.install_removed_definition("gone_helper", "gone_helper()")
+        for value in ("", "no-such-revision"):
+            with self.subTest(value=value):
+                result, document, _check = self.run_removal_check(
+                    env={"QG_DIFF_BASE": value}
+                )
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn("QG_DIFF_BASE", document["error"])
 
     def test_an_invalid_base_is_a_configuration_error(self) -> None:
         self.write_config(removal_config(base="not-a-revision"))

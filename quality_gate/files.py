@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from .policy import Config, GateError, UsageError
+from .policy import Config, ConfigError, GateError, UsageError
 from .runner import run
 
 
 SHEBANG_LIMIT = 4096
+DIFF_BASE_ENV = "QG_DIFF_BASE"
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,64 @@ def _git(root: Path, args: list[str], what: str) -> bytes:
         detail = result.stderr_text.strip()
         raise GateError(f"{what} failed: {detail or f'git exited {result.returncode}'}")
     return result.stdout
+
+
+@dataclass(frozen=True)
+class DiffBase:
+    """The commit a diff check judged from, and the value that named it."""
+
+    commit: str
+    source: str
+
+    def measurement(self) -> dict[str, str]:
+        return {"commit": self.commit, "source": self.source}
+
+
+def _verified_commit(root: Path, value: str) -> tuple[str | None, str]:
+    """The commit VALUE names, and why it does not when it names none."""
+    checked = run(
+        git_argv(root, "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"),
+        budget_seconds=600,
+        capture_limit=None,
+    )
+    if checked.execution == "completed" and checked.returncode == 0:
+        return checked.stdout_text.strip(), ""
+    problem = (
+        f"got git {checked.execution}"
+        if checked.execution != "completed"
+        else "got no such revision"
+    )
+    return None, problem
+
+
+def diff_base(
+    root: Path, policy_base: str, *, override: bool = True
+) -> DiffBase:
+    """The commit a diff check judges from, once for every check that diffs.
+
+    QG_DIFF_BASE names the change the caller judges: a runner's item base, a
+    landing check's main commit, or CI's pushed base.  It replaces the policy
+    base and never falls back to it, so an unusable value is an error.  A check
+    whose scope judges the whole tree keeps its policy base.
+    """
+    value = os.environ.get(DIFF_BASE_ENV) if override else None
+    if value is None:
+        commit, problem = _verified_commit(root, policy_base)
+        if commit is None:
+            raise GateError(
+                f"base {policy_base!r}: expected an existing revision, {problem}"
+            )
+        return DiffBase(commit, "base")
+    if not value.strip():
+        raise ConfigError(
+            f"{DIFF_BASE_ENV} {value!r}: expected a commit id, got an empty value"
+        )
+    commit, problem = _verified_commit(root, value)
+    if commit is None:
+        raise ConfigError(
+            f"{DIFF_BASE_ENV} {value!r}: expected an existing commit, {problem}"
+        )
+    return DiffBase(commit, DIFF_BASE_ENV)
 
 
 def _staged_entries(root: Path) -> list[GitFile]:

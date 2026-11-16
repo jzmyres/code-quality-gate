@@ -346,6 +346,15 @@ def _ratchet_error(
     )
 
 
+def _configuration_error(
+    check: CheckDef, start: float, prefix: str, error: Exception
+) -> CheckResult:
+    """The check could not measure because its configuration or input is unusable."""
+    result = _ratchet_error(check, start, prefix, error)
+    result.configuration_error = True
+    return result
+
+
 def _print_output(prefix: str, combined: str) -> None:
     if combined.strip():
         print(combined.rstrip(), file=sys.stderr)

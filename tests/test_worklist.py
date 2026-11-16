@@ -1154,6 +1154,143 @@ class DebtStagedBaselineTests(FixtureCase):
         self.assertNotIn("Traceback", result.stderr)
 
 
+STAGING_FAILURES = {
+    "create": (
+        "def fail(*args, **options):\n"
+        "    raise OSError(errno.ENOSPC, 'No space left on device')\n"
+        "tempfile.mkdtemp = fail\n"
+    ),
+    "remove": (
+        "original = tempfile.TemporaryDirectory.cleanup\n"
+        "def cleanup(directory):\n"
+        "    if directory.name.rsplit(os.sep, 1)[-1].startswith('qg-debt-'):\n"
+        "        with open(LEFTOVERS, 'a', encoding='utf-8') as stream:\n"
+        "            stream.write(directory.name + '\\n')\n"
+        "        directory._finalizer.detach()\n"
+        "        raise OSError(errno.ENOSPC, 'No space left on device')\n"
+        "    return original(directory)\n"
+        "tempfile.TemporaryDirectory.cleanup = cleanup\n"
+    ),
+}
+
+
+def run_debt_process(
+    case: FixtureCase, injection: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the real CLI with one filesystem operation made to fail."""
+    runner = case.base / "injected-runner.py"
+    leftovers = case.base / "staging-leftovers.txt"
+    runner.write_text(
+        "import errno, os, runpy, sys, tempfile\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(GATE)!r})\n"
+        f"LEFTOVERS = {str(leftovers)!r}\n"
+        f"{injection}"
+        f"runpy.run_path({str(GATE / 'qg.py')!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    return subprocess.run(
+        [
+            *case.python_prefix(),
+            str(runner),
+            "--repo", str(case.repo),
+            "debt", *args,
+        ],
+        cwd=str(case.repo),
+        env=case.env(case.default_tool_env()),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+class DebtStagingFailureTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_crap_fixture(self, [], message="with baseline")
+        self.revision = self.git("rev-parse", "HEAD").stdout.strip()
+        self.addCleanup(self._remove_staging_areas)
+
+    def _remove_staging_areas(self) -> None:
+        """Remove what a failed removal left, so the suite's TMPDIR stays clean."""
+        recorded = self.base / "staging-leftovers.txt"
+        if not recorded.exists():
+            return
+        for leftover in recorded.read_text(encoding="utf-8").splitlines():
+            shutil.rmtree(leftover, ignore_errors=True)
+
+    def _assert_usage_error(self, result) -> None:
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn("staging area", result.stderr)
+        self.assertIn("No space left on device", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_staging_area_that_cannot_be_created_exits_two(self) -> None:
+        self._assert_usage_error(run_debt_process(
+            self, STAGING_FAILURES["create"], "--revision", self.revision
+        ))
+
+    def test_a_staging_area_that_cannot_be_removed_exits_two(self) -> None:
+        self._assert_usage_error(run_debt_process(
+            self, STAGING_FAILURES["remove"], "--revision", self.revision
+        ))
+
+
+BASELINE_STAGING_FAILURES = {
+    "directory": (
+        "original = Path.mkdir\n"
+        "def mkdir(path, *args, **options):\n"
+        "    if path.name == 'baselines':\n"
+        "        raise OSError(errno.ENOSPC, 'No space left on device')\n"
+        "    return original(path, *args, **options)\n"
+        "Path.mkdir = mkdir\n"
+    ),
+    "write": (
+        "original = Path.write_bytes\n"
+        "def write_bytes(path, data):\n"
+        "    if path.name == 'quality-gate-crap.toml':\n"
+        "        raise OSError(errno.ENOSPC, 'No space left on device')\n"
+        "    return original(path, data)\n"
+        "Path.write_bytes = write_bytes\n"
+    ),
+}
+
+
+class DebtBaselineStagingFailureTests(FixtureCase):
+    """Staging a baseline's own filesystem failures exit 2 and name both."""
+
+    baseline = "baselines/quality-gate-crap.toml"
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.write_config(crap_config(baseline=self.baseline))
+        self.add_file("pkg/alpha.py", SIMPLE)
+        self.add_file("tests/test_sample.py", PASSING_TEST)
+        self.add_file(self.baseline, python_baseline([]))
+        self.revision = commit_revision(self, "nested baseline")
+
+    def _assert_usage_error(self, operation: str) -> None:
+        result = run_debt_process(
+            self,
+            BASELINE_STAGING_FAILURES[operation],
+            "--revision",
+            self.revision,
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn(self.revision, result.stderr)
+        self.assertIn(self.baseline, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_baseline_directory_that_cannot_be_created_exits_two(self) -> None:
+        self._assert_usage_error("directory")
+
+    def test_a_baseline_that_cannot_be_written_exits_two(self) -> None:
+        self._assert_usage_error("write")
+
+
 class DebtBaselineSpellingTests(FixtureCase):
     def test_the_policy_spelling_survives_in_both_modes(self) -> None:
         (self.repo / "a.py").unlink()

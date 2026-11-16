@@ -7,6 +7,7 @@ from support import (
     BASE_CONFIG,
     FixtureCase,
     _add_check_to_class,
+    assert_base_measurement,
     baseline_text,
     output,
 )
@@ -181,8 +182,10 @@ class SourceCharsCheckTests(FixtureCase):
         self.add_file(BASELINE, source_chars_baseline([]))
         self.write_config(source_chars_config())
 
-    def run_source_check(self) -> tuple[Any, dict[str, Any], dict[str, Any]]:
-        result, document = self.run_json()
+    def run_source_check(
+        self, env: dict[str, str] | None = None
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        result, document = self.run_json(env=env)
         return result, document, self.check_by_id(document, "source-chars")
 
     def finding(
@@ -352,6 +355,46 @@ class SourceCharsCheckTests(FixtureCase):
             [item["subject"] for item in check["findings"]],
             ["pkg/tracked.py:U+0000", "pkg/untracked.py:U+001B"],
         )
+
+    def committed_change(self) -> str:
+        """A base commit without the change, then a commit that adds one NUL."""
+        self.write_config(
+            source_chars_config(extra='scope = "changed"\nbase = "HEAD"\n')
+        )
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        self.commit_all("base")
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.add_file("pkg/mod.py", b"VALUE = 1\x00\n")
+        self.commit_all("change")
+        return base
+
+    def test_the_override_base_judges_a_change_the_policy_base_hides(self) -> None:
+        base = self.committed_change()
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        cases = (
+            (None, head, "base", 0, []),
+            ({"QG_DIFF_BASE": base}, base, "QG_DIFF_BASE", 1, ["pkg/mod.py:U+0000"]),
+        )
+        for env, commit, source, code, subjects in cases:
+            with self.subTest(source=source):
+                result, _document, check = self.run_source_check(env=env)
+                self.assertEqual(result.returncode, code, output(result))
+                self.assertEqual(
+                    [item["subject"] for item in check["findings"]], subjects
+                )
+                assert_base_measurement(self, check, commit, source)
+
+    def test_an_unresolvable_value_is_a_configuration_error_naming_it(self) -> None:
+        self.committed_change()
+        for value in ("", "no-such-revision"):
+            with self.subTest(value=value):
+                result, document, check = self.run_source_check(
+                    env={"QG_DIFF_BASE": value}
+                )
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn("QG_DIFF_BASE", document["error"])
+                self.assertEqual(check["outcome"], "error")
 
     def test_malformed_baseline_is_an_error_not_a_pass(self) -> None:
         self.add_file(BASELINE, "not = a valid [ baseline\n")
