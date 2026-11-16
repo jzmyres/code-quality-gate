@@ -686,7 +686,9 @@ module.
 This repository's own `quality-gate.toml` enables `python_shape` in the `python` class. Its
 `base = "HEAD"` judges a local check's uncommitted change; a caller that knows the change's base
 sets `QG_DIFF_BASE` instead: a runner gates one item from the item's base commit, a landing check
-gives the main commit it lands on, and CI gives the pushed commits.
+gives the main commit it lands on, and CI gives the pushed commits. A gate run resolves
+`QG_DIFF_BASE` once before any adapter runs, and every check that diffs uses that commit, so a branch
+that moves during the run cannot make checks judge different changes.
 
 ### Emacs Lisp CRAP
 
@@ -888,10 +890,12 @@ requested seconds and the current check's remaining time. At a check's budget it
 group followed immediately by SIGKILL; a subprocess outside a check has a five-second grace before
 SIGKILL. An interrupt that ends the run kills the group immediately and reaps the leader while it
 waits, so the leader's unreaped zombie never keeps the group looking alive. That wait is bounded: when
-the group cannot be shown gone within one second, the run still returns, with
+a normal run's group cannot be shown gone within one second, the run still returns, with
 `execution = "error"`, `timed_out = true` and an `error` that says cleanup did not confirm the group
-gone. Cleanup therefore never succeeds silently. A group whose remaining members are all zombies
-counts as stopped, because a zombie cannot run and a container's PID 1 may never reap it.
+gone. An interrupt is always re-raised; if its cleanup cannot be shown gone, the interrupt carries a
+note naming the process group and saying the cleanup was not confirmed, and the runner prints that
+note on stderr. Cleanup therefore never succeeds silently. A group whose remaining members are all
+zombies counts as stopped, because a zombie cannot run and a container's PID 1 may never reap it.
 Termination and reaping can add a small amount of time after the budget. Check output is captured
 up to 1 MiB; later bytes are counted and discarded. A consumer therefore never has to parse stderr to
 learn why a check failed.
@@ -1515,10 +1519,12 @@ name, architecture and `tools.lock.toml`, fetches any missing tools (including t
 and runs `make -k check`: Ruff, clones, the test suite under coverage, Python CRAP, Python function
 shape and the Emacs Lisp checks. A checkout of one commit has no base to diff against, so a step
 resolves `QG_DIFF_BASE` and prints it: on a push the event's `before` commit when the history holds
-it, otherwise (a new branch) the merge base with the default branch, and on a pull request the base
-branch's commit the pull request is compared with. The gate step passes the variable through
-`runuser`, so every check that diffs judges that one change. The separate Debian 13 job restores the
-same Debian tools cache and runs `make mutation`.
+it, otherwise (a new branch or a force push whose old commit is not fetched) the merge base with the
+default branch, and on a pull request the event's own base commit, which must be in the fetched
+history. A failed lookup stays inside a shell condition so the fallback is still reached, and only
+when every lookup fails does the step report that it has no base commit. The gate step passes the
+variable through `runuser`, so every check that diffs judges that one change. The separate Debian 13
+job restores the same Debian tools cache and runs `make mutation`.
 
 Step timeouts are fixed at about five times the longest run observed as of 2026-10-31: 60 minutes
 for the gate, 15 for the cold Emacs build and 120 for the mutation step, and each job adds 10 minutes

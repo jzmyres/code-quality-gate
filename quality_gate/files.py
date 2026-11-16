@@ -136,24 +136,35 @@ def _verified_commit(root: Path, value: str) -> tuple[str | None, str]:
     return None, problem
 
 
-def diff_base(
-    root: Path, policy_base: str, *, override: bool = True
-) -> DiffBase:
-    """The commit a diff check judges from, once for every check that diffs.
+@dataclass(frozen=True)
+class DiffBaseOverride:
+    """A run's QG_DIFF_BASE, resolved once before its adapters run."""
 
-    QG_DIFF_BASE names the change the caller judges: a runner's item base, a
-    landing check's main commit, or CI's pushed base.  It replaces the policy
-    base and never falls back to it, so an unusable value is an error.  A check
-    whose scope judges the whole tree keeps its policy base.
-    """
-    value = os.environ.get(DIFF_BASE_ENV) if override else None
-    if value is None:
-        commit, problem = _verified_commit(root, policy_base)
-        if commit is None:
-            raise GateError(
-                f"base {policy_base!r}: expected an existing revision, {problem}"
-            )
-        return DiffBase(commit, "base")
+    base: DiffBase | None = None
+    error: ConfigError | None = None
+
+    def for_scope(
+        self, root: Path, policy_base: str, *, override: bool = True
+    ) -> DiffBase:
+        """The override for a scope that takes it, else the policy base."""
+        if override:
+            if self.error is not None:
+                raise self.error
+            if self.base is not None:
+                return self.base
+        return _policy_base(root, policy_base)
+
+
+def _policy_base(root: Path, policy_base: str) -> DiffBase:
+    commit, problem = _verified_commit(root, policy_base)
+    if commit is None:
+        raise GateError(
+            f"base {policy_base!r}: expected an existing revision, {problem}"
+        )
+    return DiffBase(commit, "base")
+
+
+def _override_base(root: Path, value: str) -> DiffBase:
     if not value.strip():
         raise ConfigError(
             f"{DIFF_BASE_ENV} {value!r}: expected a commit id, got an empty value"
@@ -164,6 +175,38 @@ def diff_base(
             f"{DIFF_BASE_ENV} {value!r}: expected an existing commit, {problem}"
         )
     return DiffBase(commit, DIFF_BASE_ENV)
+
+
+def resolve_diff_base(root: Path) -> DiffBaseOverride:
+    """Resolve QG_DIFF_BASE once, keeping a failure for each diff check."""
+    value = os.environ.get(DIFF_BASE_ENV)
+    if value is None:
+        return DiffBaseOverride()
+    try:
+        return DiffBaseOverride(base=_override_base(root, value))
+    except ConfigError as error:
+        return DiffBaseOverride(error=error)
+
+
+def diff_base(
+    root: Path,
+    policy_base: str,
+    *,
+    override: bool = True,
+    resolved: DiffBaseOverride | None = None,
+) -> DiffBase:
+    """The commit a diff check judges from, once for every check that diffs.
+
+    QG_DIFF_BASE names the change the caller judges: a runner's item base, a
+    landing check's main commit, or CI's pushed base.  It replaces the policy
+    base and never falls back to it, so an unusable value is an error.  A check
+    whose scope judges the whole tree keeps its policy base.  A run passes its
+    one RESOLVED value to every check, so a moving branch cannot change it.
+    """
+    choice = (
+        resolved if resolved is not None else resolve_diff_base(root)
+    )
+    return choice.for_scope(root, policy_base, override=override)
 
 
 def _staged_entries(root: Path) -> list[GitFile]:

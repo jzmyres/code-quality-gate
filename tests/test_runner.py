@@ -1,7 +1,9 @@
 """Unit tests for the bounded runner's pipe, reaping and group helpers."""
 from __future__ import annotations
 
+import contextlib
 import importlib
+import io
 import os
 import signal
 import subprocess
@@ -285,6 +287,31 @@ class InterruptCleanupTests(unittest.TestCase):
 
 
 class UnconfirmedCleanupTests(unittest.TestCase):
+    def test_an_interrupted_group_that_never_reads_as_gone_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "pid"
+            program = (
+                f"echo $$ > {pid_file}.tmp; mv {pid_file}.tmp {pid_file}; "
+                "sleep 30"
+            )
+            captured = io.StringIO()
+            with mock.patch.object(
+                runner, "_group_alive", return_value=True
+            ), contextlib.redirect_stderr(captured):
+                error = _interrupt(pid_file, program)
+            pid = int(pid_file.read_text(encoding="utf-8"))
+        self.assertIn(f"process group {pid}", captured.getvalue())
+        self.assertIn(runner.CLEANUP_ERROR, captured.getvalue())
+        notes = getattr(error, "__notes__", [])
+        self.assertTrue(
+            any(
+                f"process group {pid}" in note
+                and runner.CLEANUP_ERROR in note
+                for note in notes
+            ),
+            notes,
+        )
+
     def test_a_group_that_survives_sigkill_reports_unconfirmed_cleanup(self) -> None:
         program = "import time; time.sleep(30)"
         with mock.patch.object(runner, "_group_alive", return_value=True):

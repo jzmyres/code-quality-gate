@@ -924,7 +924,10 @@ def _run_python_shape(context: Any) -> Any:
     start = time.monotonic()
     try:
         limit = _crap_limit(context.config, check.spec)
-        base = diff_base(context.root, check.spec.base)
+        base = diff_base(
+            context.root, check.spec.base,
+            resolved=getattr(context, "base_override", None),
+        )
         mark_step("python-shape analysis")
         data = _shape_input(context, check.spec, limit, base)
     except GateError as error:

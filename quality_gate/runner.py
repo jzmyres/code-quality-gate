@@ -406,21 +406,6 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
     )
 
 
-def _execution_terms(
-    execution: str, returncode: int | None, cleaned: bool
-) -> tuple[str, str | None, bool]:
-    """The result's execution, error and timeout, from what the run observed.
-
-    Cleanup that could not show the group gone wins over the drained execution:
-    the run must never report a silent success in that case.
-    """
-    if not cleaned:
-        return "error", CLEANUP_ERROR, True
-    if _was_signalled(execution, returncode):
-        execution = "signal"
-    return execution, None, execution == "budget"
-
-
 def _run_budget(
     budget_seconds: float, grace_seconds: float
 ) -> tuple[float, float]:
@@ -505,9 +490,15 @@ def run(
         )
         cleaned = _reap(process)
         returncode = process.poll()
-        execution, error, timed_out = _execution_terms(
-            execution, returncode, cleaned
-        )
+        # Cleanup that could not show the group gone wins over the drained
+        # execution: the run must never report a silent success in that case.
+        if not cleaned:
+            execution = "error"
+            error, timed_out = CLEANUP_ERROR, True
+        elif _was_signalled(execution, returncode):
+            execution, error, timed_out = "signal", None, False
+        else:
+            error, timed_out = None, execution == "budget"
         return RunResult(
             argv=argv_tuple,
             execution=execution,
@@ -521,6 +512,9 @@ def run(
             error=error,
             timed_out=timed_out,
         )
-    except BaseException:
-        _kill_and_wait(process)
+    except BaseException as error:
+        if not _kill_and_wait(process):
+            note = f"process group {process.pid}: {CLEANUP_ERROR}"
+            error.add_note(note)
+            print(note, file=sys.stderr, flush=True)
         raise

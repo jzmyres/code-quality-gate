@@ -229,32 +229,26 @@ def _changed_files(root: Path, spec: SourceCharsSpec, base: DiffBase) -> list[st
     return list(dict.fromkeys(names))
 
 
-def _selected_files(context: Any) -> list[str]:
-    from .checks import _select_files
-
-    mark_step("file selection")
-    return _select_files(
-        context.config, context.check, context.files, context.classes
-    )[0]
-
-
 def _source_chars_measurement(
     context: Any,
 ) -> tuple[list[str], list[Finding], DiffBase | None]:
+    from .checks import _select_files
+
     spec = context.check.spec
-    selected = _selected_files(context)
+    mark_step("file selection")
+    selected = _select_files(
+        context.config, context.check, context.files, context.classes
+    )[0]
     base = None
     if spec.scope == "changed":
-        base = diff_base(context.root, spec.base)
+        base = diff_base(
+            context.root, spec.base,
+            resolved=getattr(context, "base_override", None),
+        )
         changed = set(_changed_files(context.root, spec, base))
         selected = [relative for relative in selected if relative in changed]
     mark_step("source character scan")
     return selected, measure_source_chars(context.root, selected), base
-
-
-def _measurement(base: DiffBase | None) -> dict[str, Any] | None:
-    """The judged change, when this scope judged one."""
-    return None if base is None else {"base": base.measurement()}
 
 
 def _run_source_chars(context: Any) -> Any:
@@ -286,5 +280,7 @@ def _run_source_chars(context: Any) -> Any:
     result = _finish_ratchet(
         check, findings, entries, context.prefix, start, domain, "character"
     )
-    result.measurement = _measurement(base)
+    result.measurement = (
+        None if base is None else {"base": base.measurement()}
+    )
     return result

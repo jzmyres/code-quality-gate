@@ -110,14 +110,21 @@ jobs:
       - name: Resolve the judged change
         env:
           BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            base=$(git rev-parse --verify --quiet "origin/$GITHUB_BASE_REF^{commit}")
+            if ! base=$(git rev-parse --verify --quiet "${PR_BASE_SHA:-none}^{commit}"); then
+              base=""
+            fi
           else
-            base=$(git rev-parse --verify --quiet "${BEFORE:-none}^{commit}")
+            if ! base=$(git rev-parse --verify --quiet "${BEFORE:-none}^{commit}"); then
+              base=""
+            fi
             if [ -z "$base" ]; then
-              base=$(git merge-base HEAD "origin/$DEFAULT_BRANCH")
+              if ! base=$(git merge-base HEAD "origin/$DEFAULT_BRANCH"); then
+                base=""
+              fi
             fi
           fi
           if [ -z "$base" ]; then

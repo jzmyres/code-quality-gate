@@ -454,7 +454,11 @@ def _measurement(
         context.config, context.check, context.files, context.classes
     )
     spec = context.check.spec
-    base = diff_base(context.root, spec.base, override=spec.scope == "changed")
+    base = diff_base(
+        context.root, spec.base,
+        override=spec.scope == "changed",
+        resolved=getattr(context, "base_override", None),
+    )
     scan_files = _scan_files(context, spec)
     contents, unmeasured = _read_files(context.root, scan_files)
     class_names = None if spec.scope == "all" else set(check_classes)

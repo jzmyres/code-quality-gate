@@ -16,7 +16,13 @@ from typing import Any
 
 from . import gate_result
 from .adapters import AdapterContext, adapter_for
-from .files import git_argv, hygiene_result, validate_inventory
+from .files import (
+    DiffBaseOverride,
+    git_argv,
+    hygiene_result,
+    resolve_diff_base,
+    validate_inventory,
+)
 from .policy import (
     CheckDef,
     Config,
@@ -457,9 +463,11 @@ def _adapter_runner(
     prefix: str,
     evidence_dir: Path,
     prior: dict[str, CheckResult],
+    base_override: DiffBaseOverride | None = None,
 ) -> CheckResult:
     context = AdapterContext(
         root, config, check, files, classes, prefix, prior, evidence_dir,
+        base_override,
     )
     return _check_descriptor(check).run(context)
 
@@ -474,12 +482,14 @@ def run_check(
     prefix: str,
     evidence_dir: Path,
     prior: dict[str, CheckResult] | None = None,
+    base_override: DiffBaseOverride | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
     start = time.monotonic()
     with check_deadline(check.id, start, _check_budget(check)):
         return _adapter_runner(
-            root, config, check, files, classes, prefix, evidence_dir, prior or {}
+            root, config, check, files, classes, prefix, evidence_dir,
+            prior or {}, base_override,
         )
 
 
@@ -778,6 +788,7 @@ def _run_policy_checks(
     run_directory = tempfile.TemporaryDirectory(prefix="qg-run-")
     previous = _arm_run_limit(_run_limit(selected_checks))
     try:
+        base_override = resolve_diff_base(root)
         try:
             for check in selected_checks:
                 if inventory_code != 0:
@@ -801,6 +812,7 @@ def _run_policy_checks(
                     prefix=f"check: {check.id}",
                     evidence_dir=evidence_dir,
                     prior=prior,
+                    base_override=base_override,
                 )
                 results.append(outcome)
                 prior[check.id] = outcome

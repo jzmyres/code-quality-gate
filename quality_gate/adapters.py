@@ -15,6 +15,7 @@ from . import (
     clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_shape,
     python_tests, ratchet, removal_symmetry, source_chars, verification,
 )
+from .files import DiffBaseOverride
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -42,6 +43,7 @@ class AdapterContext:
     prefix: str
     prior: dict[str, Any]
     evidence_dir: Path
+    base_override: DiffBaseOverride | None = None
 
 
 @dataclass(frozen=True)
