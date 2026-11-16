@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase, output
 
@@ -640,6 +641,38 @@ class InventoryTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
         self.assertIn("expected the top level of a git work tree", text)
+
+    def test_a_repo_path_that_cannot_be_resolved_exits_two_and_names_it(self) -> None:
+        missing = self.base / "missing"
+        result = self.run_qg("inventory", repo=missing)
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("expected the top level of a git work tree", text)
+        self.assertIn(str(missing), text)
+
+    def test_a_repo_path_that_is_not_a_directory_exits_two(self) -> None:
+        ordinary = self.add_file("ordinary.txt", "x\n")
+        result = self.run_qg("inventory", repo=ordinary)
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("got a non-directory", text)
+
+    def test_a_top_level_that_cannot_be_resolved_still_names_it(self) -> None:
+        subdirectory = self.repo / "sub"
+        subdirectory.mkdir()
+        unresolved = self.base / "gone"
+        with mock.patch.object(
+            files, "_git_toplevel", return_value=str(unresolved)
+        ):
+            with self.assertRaises(files.UsageError) as raised:
+                files.resolve_repo(str(subdirectory))
+        self.assertEqual(
+            str(raised.exception),
+            f"{subdirectory.resolve()}: expected the top level of a git work "
+            f"tree, got {unresolved}",
+        )
 
     def test_default_repo_is_the_current_directory(self) -> None:
         result = self.run_qg("inventory", include_repo=False, cwd=self.repo)

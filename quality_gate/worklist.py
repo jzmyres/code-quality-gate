@@ -25,7 +25,6 @@ from .policy import (
     GateError,
     UsageError,
     _config_from_data,
-    load_config,
 )
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
 from .runner import RunResult, run
@@ -545,12 +544,6 @@ def _named_baselines(data: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _stage(temporary: Path, name: str, raw: bytes) -> None:
-    target = temporary.joinpath(*PurePosixPath(name).parts)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(raw)
-
-
 def _revision_config(
     root: Path, revision: str, temporary: Path
 ) -> tuple[str, Config, dict[str, str]]:
@@ -567,10 +560,10 @@ def _revision_config(
     checks = cast(dict[str, Any], data.get("checks", {}))
     for name, baseline in names.items():
         relative = _relative_name(root, baseline, f"{label}:{baseline}")
-        _stage(
-            temporary,
-            relative,
-            _content(root, sha, relative, f"{label}:{baseline}"),
+        target = temporary.joinpath(*PurePosixPath(relative).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            _content(root, sha, relative, f"{label}:{baseline}")
         )
         checks[name]["baseline"] = relative
     try:
@@ -635,8 +628,15 @@ def command_debt(
 ) -> int:
     try:
         if revision is None:
-            config = load_config(root)
-            data = _policy_data(config.path.read_bytes(), str(config.path))
+            path = root / POLICY_NAME
+            try:
+                raw = path.read_bytes()
+            except OSError as error:
+                raise UsageError(
+                    f"{path}: expected a readable configuration file, got {error}"
+                ) from error
+            data = _policy_data(raw, str(path))
+            config = _config_from_data(root, path, data)
             reports = _check_debts(config, _named_baselines(data), None)
             sha = None
         else:

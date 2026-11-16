@@ -17,11 +17,6 @@ bound = 11.003367003367003
 reason = "above 6 after QF1 (2026-10-25); worklist; moved from checks.py in QF85"
 
 [[entry]]
-subject = "quality_gate/clones.py:_sarif_path"
-bound = 12.17283950617284
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
 subject = "quality_gate/files.py:_shebang_interpreter"
 bound = 8.087791495198903
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
@@ -29,11 +24,6 @@ reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 [[entry]]
 subject = "quality_gate/files.py:command_inventory"
 bound = 10
-reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
-subject = "quality_gate/files.py:resolve_repo"
-bound = 7.333333333333334
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 
 [[entry]]
@@ -95,8 +85,3 @@ reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
 subject = "quality_gate/tools.py:_wheel_member_path"
 bound = 8.296296296296296
 reason = "above 6 at adoption (M1c, 2026-10-24); worklist"
-
-[[entry]]
-subject = "quality_gate/tools.py:load_tools"
-bound = 6.010666666666666
-reason = "above 6 after QF1 (2026-10-25); worklist"

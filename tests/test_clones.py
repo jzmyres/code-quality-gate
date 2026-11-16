@@ -957,6 +957,20 @@ class SarifLocationTests(unittest.TestCase):
             "a.py:3-4",
         )
 
+    def test_file_uri_and_absolute_path_under_the_root_are_relative(self) -> None:
+        self.assertEqual(clones._sarif_path("file:///repo/a.py", self.root), "a.py")
+        self.assertEqual(clones._sarif_path("/repo/a.py", self.root), "a.py")
+
+    def test_file_uri_and_absolute_path_outside_the_root_stay_absolute(self) -> None:
+        self.assertEqual(
+            clones._sarif_path("file:///elsewhere/a.py", self.root),
+            "/elsewhere/a.py",
+        )
+        self.assertEqual(
+            clones._sarif_path("/elsewhere/a.py", self.root),
+            "/elsewhere/a.py",
+        )
+
     def test_malformed_location_is_unsupported(self) -> None:
         cases = [
             ({}, "missing location data"),

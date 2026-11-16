@@ -590,6 +590,16 @@ class ToolsTests(FixtureCase):
         self.assertIn("missing-lock.toml", text)
         self.assertIn("missing", text)
 
+    def test_fetch_unreadable_lock_exits_2(self) -> None:
+        lock = self.base / "lock.toml"
+        lock.mkdir()
+        result = self.fetch(lock, self.base / "tools")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("expected a readable tool lock file", text)
+        self.assertIn(str(lock), text)
+
     def test_fetch_invalid_lock_toml_exits_2(self) -> None:
         lock = self.base / "lock.toml"
         lock.write_text("[jscpd\n", encoding="utf-8")

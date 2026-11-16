@@ -1220,5 +1220,43 @@ class DebtEmptyTests(FixtureCase):
         self.assertEqual(human.stdout, "debt: 0 entries\n")
 
 
+class DebtPolicyReadTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_threshold_debt_fixture(self)
+
+    def test_the_policy_is_read_once_and_its_entries_survive_its_removal(self) -> None:
+        policy_path = self.repo / "quality-gate.toml"
+        original_open = Path.open
+        opened: list[Path] = []
+
+        def open_once(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if path == policy_path:
+                opened.append(path)
+                policy_path.unlink()
+            return stream
+
+        with mock.patch.object(Path, "open", open_once):
+            result = run_debt(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(len(opened), 1)
+        check = self.parse_json(result)["checks"][0]
+        self.assertEqual(
+            [row["subject"] for row in check["rows"]],
+            ["pkg/alpha.py:above"],
+        )
+
+    def test_a_policy_that_cannot_be_read_exits_two_and_names_it(self) -> None:
+        policy_path = self.repo / "quality-gate.toml"
+        policy_path.unlink()
+        policy_path.mkdir()
+        result = run_debt(self)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(policy_path), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
