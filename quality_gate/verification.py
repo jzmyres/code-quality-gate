@@ -195,10 +195,8 @@ class _CrapExclusions:
         return exclusions
 
     def _add(self, identifier: str, result: Any) -> None:
-        if result is None:
-            raise GateError(
-                f"no-cover exclusions unreliable: {identifier} did not run"
-            )
+        # Every python_crap check is a prerequisite, so its result is present.
+        assert result is not None
         if result.measurement is None:
             raise GateError(
                 f"no-cover exclusions unreliable: {identifier} reported no "

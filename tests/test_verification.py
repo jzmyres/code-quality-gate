@@ -22,8 +22,6 @@ from quality_gate.verification import measure_exclusions
 BASELINE = "quality-gate-verification.toml"
 METRIC_VERSION = "verification/1"
 ADOPTION_REASON = "measured at adoption (M2c, 2026-10-25)"
-NO_COVER_TEXT = "pragma: " "no cover"
-NO_COVER = "# " + NO_COVER_TEXT
 
 
 def noqa_source(count: int) -> str:
@@ -452,7 +450,7 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.write_verification_baseline([executed_entry(1)])
         self.add_file(
             "pkg/mod.py",
-            f"VALUE = 1\nOTHER = 2  {NO_COVER}\n",
+            "VALUE = 1\nOTHER = 2  # pragma: no cover\n",
         )
         result, _document, check = self.failed_verification()
         finding = self.finding(
@@ -469,15 +467,15 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.add_file(
             "pkg/mod.py",
             "VALUE = 1\n"
-            f"COMMENT = 2  {NO_COVER}\n"
-            f"TEXT = '{NO_COVER_TEXT}'\n",
+            "COMMENT = 2  # pragma: no cover\n"
+            "TEXT = 'pragma: no cover'\n",
         )
         self.add_file(
             "tests/test_sample.py",
             self.read_file("tests/test_sample.py").replace(
                 "class Sample",
-                f"MARKER = '{NO_COVER}'\n"
-                f"TEXT = '{NO_COVER_TEXT}'\n\n"
+                "MARKER = '# pragma: no cover'\n"
+                "TEXT = 'pragma: no cover'\n\n"
                 "class Sample",
             ),
         )
@@ -501,7 +499,7 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.add_file(
             "pkg/mod.py",
             "VALUE = 1\n"
-            f'MARKER = "{NO_COVER}"\n',
+            'MARKER = "# pragma: no cover"\n',
         )
         result, _document, check = self.failed_verification()
         self.assertIn("exclusions:pkg/mod.py:no-cover", result.stderr)
@@ -524,9 +522,11 @@ class VerificationTests(FindingMixin, FixtureCase):
     def test_the_exclusion_pattern_stays_on_one_line(self) -> None:
         from quality_gate.coverage_tool import PRAGMA_NO_COVER
 
-        source = f'VALUE = """#\n{NO_COVER_TEXT}"""\n'
+        source = 'VALUE = """#\npragma: no cover"""\n'
         self.assertIsNone(re.search(PRAGMA_NO_COVER, source))
-        self.assertIsNotNone(re.search(PRAGMA_NO_COVER, f"VALUE = 1  {NO_COVER}\n"))
+        self.assertIsNotNone(
+            re.search(PRAGMA_NO_COVER, "VALUE = 1  # pragma: no cover\n")
+        )
 
     def test_a_multiline_string_does_not_cross_the_exclusion_pattern(self) -> None:
         self.enable_crap()
@@ -535,7 +535,7 @@ class VerificationTests(FindingMixin, FixtureCase):
             "pkg/blocks.py",
             "def with_block():\n"
             "    value = 1\n"
-            f'    text = """#\n{NO_COVER_TEXT}"""\n'
+            '    text = """#\npragma: no cover"""\n'
             "    return value + len(text)\n",
         )
         self.add_file(
@@ -567,7 +567,7 @@ class VerificationTests(FindingMixin, FixtureCase):
             "lib/hidden.py",
             "def hidden():\n"
             "    value = 1  # noqa: E501\n"
-            f"    return value  {NO_COVER}\n",
+            "    return value  # pragma: no cover\n",
         )
         result, _document, check = self.failed_verification()
         finding = self.finding(check, "exclusions:lib/hidden.py:no-cover")
@@ -590,7 +590,7 @@ class VerificationTests(FindingMixin, FixtureCase):
             "pkg/windowed.pyw",
             "def windowed():\n"
             "    value = 1  # noqa: E501\n"
-            f"    return value  {NO_COVER}\n",
+            "    return value  # pragma: no cover\n",
         )
         result, _document, check = self.failed_verification()
         finding = self.finding(check, "exclusions:pkg/windowed.pyw:no-cover")
@@ -604,31 +604,37 @@ class VerificationTests(FindingMixin, FixtureCase):
             ]
         )
 
-    def test_a_crap_check_that_did_not_run_leaves_no_cover_unmeasured(self) -> None:
+    def test_a_crap_check_declared_after_verification_runs_before_it(self) -> None:
         self.write_config(verification_with_crap_after_config())
         self.add_file(
             "quality-gate-crap.toml",
             baseline_text([], check="crap", metric_version="python-lines/1"),
         )
         self.add_tests(1)
-        self.write_verification_baseline([executed_entry(1)])
-        self.add_file("pkg/mod.py", "VALUE = 1\n")
-        result, _document, check = self.run_verification()
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertEqual(check["outcome"], "error")
-        self.assertIn(
-            "no-cover exclusions unreliable: crap did not run", check["reason"]
+        self.write_verification_baseline([
+            executed_entry(1),
+            exclusion_entry("pkg/mod.py", "no-cover", 1),
+        ])
+        self.add_file(
+            "pkg/mod.py",
+            "def measured():\n"
+            "    value = 1\n"
+            "    return value  # pragma: no cover\n",
         )
-        self.assertIn(
-            "no-cover exclusions unreliable: crap did not run", result.stderr
-        )
-        self.assertFalse(
-            [
-                item
-                for item in check["findings"]
-                if item["subject"].endswith(":no-cover")
-            ]
-        )
+        for args in ((), ("--only", "verification")):
+            with self.subTest(args=args):
+                result, document, check = self.run_verification(*args)
+                self.assertEqual(result.returncode, 0, output(result))
+                self.assertTrue(check["satisfied"], output(result))
+                self.assertEqual(
+                    self.finding(check, "exclusions:pkg/mod.py:no-cover")["value"],
+                    1,
+                )
+                identifiers = [item["id"] for item in document["checks"]]
+                self.assertLess(
+                    identifiers.index("crap"),
+                    identifiers.index("verification"),
+                )
 
     def test_a_crap_check_without_a_measurement_leaves_no_cover_unmeasured(
         self,
@@ -657,7 +663,7 @@ class VerificationTests(FindingMixin, FixtureCase):
             "pkg/mod.py",
             "def covered():\n"
             "    value = 1\n"
-            f"    return value  {NO_COVER}\n",
+            "    return value  # pragma: no cover\n",
         )
         result, document, check = self.failed_verification()
         for identifier in ("crap", "crap2"):
@@ -678,7 +684,7 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.enable_crap()
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])
-        self.add_file("pkg/mod.py", f"VALUE = 1\nMARKER = '{NO_COVER}'\n")
+        self.add_file("pkg/mod.py", "VALUE = 1\nMARKER = '# pragma: no cover'\n")
         result, document, check = self.run_verification(
             "--only", "verification"
         )
@@ -691,7 +697,7 @@ class VerificationTests(FindingMixin, FixtureCase):
     def test_without_a_crap_check_nothing_is_coverage_measured(self) -> None:
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])
-        self.add_file("pkg/mod.py", f"VALUE = 1\nMARKER = '{NO_COVER}'\n")
+        self.add_file("pkg/mod.py", "VALUE = 1\nMARKER = '# pragma: no cover'\n")
         result, _document, check = self.run_verification()
         self.assertEqual(result.returncode, 0, output(result))
         self.assertFalse(

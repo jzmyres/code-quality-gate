@@ -21,8 +21,6 @@ from support import (
     output,
 )
 
-PRAGMA_TEXT = "pragma: " "no cover"
-
 
 def crap_config(
     *,
@@ -344,7 +342,7 @@ class PythonCrapTests(FixtureCase):
             "pkg/pragma.py",
             "def with_pragma():\n"
             "    value = 1\n"
-            f"    return value  # {PRAGMA_TEXT}\n",
+            "    return value  # pragma: no cover\n",
         )
         self.add_tests(
             "    def test_pragma(self):\n"
@@ -360,12 +358,12 @@ class PythonCrapTests(FixtureCase):
         self.add_file(
             "pkg/pragma_text.py",
             "def with_text():\n"
-            f"    return '{PRAGMA_TEXT}'\n",
+            "    return 'pragma: no cover'\n",
         )
         self.add_tests(
             "    def test_text(self):\n"
             "        import pkg.pragma_text\n"
-            f"        self.assertEqual(pkg.pragma_text.with_text(), '{PRAGMA_TEXT}')\n"
+            "        self.assertEqual(pkg.pragma_text.with_text(), 'pragma: no cover')\n"
         )
         result, _document, check = self.run_crap()
         self.assertEqual(result.returncode, 0, output(result))
@@ -489,8 +487,8 @@ class PythonCrapTests(FixtureCase):
         self.add_default_test()
         self.add_file(
             "pkg/excluded.py",
-            f"def empty():  # {PRAGMA_TEXT}\n"
-            f"    pass  # {PRAGMA_TEXT}\n",
+            "def empty():  # pragma: no cover\n"
+            "    pass  # pragma: no cover\n",
         )
         result, _document, check = self.run_crap()
         self.assertEqual(result.returncode, 1, output(result))

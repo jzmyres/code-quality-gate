@@ -433,7 +433,7 @@ def _required(config: Config, check: CheckDef) -> list[str]:
             ),
             *(
                 candidate.id
-                for candidate in earlier
+                for candidate in ordered
                 if candidate.adapter == "python_crap"
             ),
         ]
@@ -442,11 +442,18 @@ def _required(config: Config, check: CheckDef) -> list[str]:
 
 
 def _needed_order(config: Config, selected: list[CheckDef]) -> list[str]:
-    needed = {check.id for check in selected}
-    for check in reversed(list(config.checks.values())):
-        if check.id in needed:
-            needed.update(_required(config, check))
-    return _policy_order(config, needed)
+    order: list[str] = []
+
+    def add(check: CheckDef) -> None:
+        if check.id in order:
+            return
+        for identifier in _required(config, check):
+            add(config.checks[identifier])
+        order.append(check.id)
+
+    for check in selected:
+        add(check)
+    return order
 
 
 def _policy_order(config: Config, needed: set[str]) -> list[str]:
@@ -787,7 +794,11 @@ def _run_policy_checks(
     inventory_code: int,
     selected_ids: list[str] | None = None,
 ) -> list[CheckResult]:
-    selected = list(config.checks) if selected_ids is None else selected_ids
+    selected = (
+        _needed_order(config, list(config.checks.values()))
+        if selected_ids is None
+        else selected_ids
+    )
     selected_checks = [config.checks[identifier] for identifier in selected]
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
