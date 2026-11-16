@@ -1,7 +1,7 @@
-"""Function-shape checks: CRAP-payoff fragmentation, pass-through wrappers,
-single-caller chains and shattered duplicates.
+"""Function-shape checks: uncalled functions, CRAP-payoff fragmentation,
+pass-through wrappers, single-caller chains and shattered duplicates.
 
-One parse of the selected production files feeds four structural rules.  A
+One parse of the selected production files feeds five structural rules.  A
 finding is a violation of the rule's predicate, reported as value 1 against
 threshold 0, so any finding fails the check: there is no baseline key and no
 suppression.  A missing or invalid input is a configuration error, never a
@@ -155,6 +155,7 @@ class FileIndex:
     functions: tuple[ShapeFunction, ...]
     calls: tuple[CallSite, ...]
     tests: frozenset[str]
+    names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,7 @@ class ShapeInput:
     tests: frozenset[str]
     spec: ShapeSpec
     limit: float
+    mentions: frozenset[str] = frozenset()
 
 
 def _is_test_path(relative: str) -> bool:
@@ -295,7 +297,10 @@ def _file_index(relative: str, source: str) -> FileIndex:
     tests: set[str] = set()
     if _is_test_path(relative):
         _test_functions(tree.body, False, tests)
-    return FileIndex(tuple(functions), tuple(calls), frozenset(tests))
+    return FileIndex(
+        tuple(functions), tuple(calls), frozenset(tests),
+        frozenset(_references(tree)),
+    )
 
 
 def _read_source(root: Path, relative: str) -> str:
@@ -503,8 +508,10 @@ def _shape_input(
         [path for path in scoped if path in diff.paths],
     )
     calls, tests = _uses(parsed, names)
+    mentions = frozenset().union(*map(attrgetter("names"), parsed))
     return ShapeInput(
         functions, before, added, candidates, calls, tests, spec, limit,
+        mentions,
     )
 
 
@@ -536,6 +543,15 @@ def _single_call_site(
         )
     ]
     return sites[0] if len(sites) == 1 else None
+
+
+def _called_outside(data: ShapeInput, function: ShapeFunction) -> bool:
+    """Whether a call outside the function's own body names it."""
+    return any(
+        site.path != function.path
+        or not function.start_line <= site.line <= function.end_line
+        for site in data.calls.get(function.final_name, ())
+    )
 
 
 def _own_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
@@ -634,6 +650,35 @@ def _cpf_targets(
         if before is not None and before > data.limit >= function.cc:
             targets[function.identity] = (before, function)
     return targets
+
+
+def _uncalled_findings(data: ShapeInput) -> list[Finding]:
+    """Each added function something names but no call and no test names."""
+    findings = []
+    for function in data.candidates:
+        if function.final_name not in data.mentions:
+            continue
+        if function.final_name in data.tests:
+            continue
+        if _called_outside(data, function):
+            continue
+        subject = (
+            f"UNCALLED {function.identity} (0 call sites, no direct test; "
+            "limit 0 call sites with no direct test; expected a direct test, "
+            "a call by name, or the decision kept as data in its one owner)"
+        )
+        measurement = {
+            "rule": "UNCALLED",
+            "file": function.path,
+            "name": function.name,
+            "call_sites": 0,
+            "direct_test": False,
+        }
+        findings.append(Finding(
+            subject, 1, _span(function), measurement,
+            (_location(function),),
+        ))
+    return findings
 
 
 def _cpf_findings(data: ShapeInput) -> list[Finding]:
@@ -902,7 +947,8 @@ def _ltc_findings(data: ShapeInput) -> list[Finding]:
 
 
 RULES: tuple[Callable[[ShapeInput], list[Finding]], ...] = (
-    _cpf_findings, _ptw_findings, _scc_findings, _ltc_findings,
+    _uncalled_findings, _cpf_findings, _ptw_findings, _scc_findings,
+    _ltc_findings,
 )
 
 

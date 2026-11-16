@@ -625,9 +625,9 @@ excluded by `# pragma: no cover` inside the measured span). An added pragma is t
     clone_similarity = 0.95               # optional; 0.5-1.0; this is the default
 
 `python_shape` refuses a change that meets a CRAP threshold by fragmenting a function or shattering
-a duplicate. One parse of the selected production files feeds four structural rules, and every
+a duplicate. One parse of the selected production files feeds five structural rules, and every
 finding is enforced with no `baseline` key and no suppression: the check's threshold is `0` and each
-finding has value `1`, so any finding fails the check. The four rules are:
+finding has value `1`, so any finding fails the check. The five rules are:
 
 * **CPF**, CRAP-payoff fragmentation. A function present before and after in a changed file has
   complexity above the CRAP limit before and at most it after, and the commit adds a helper whose
@@ -647,29 +647,37 @@ finding has value `1`, so any finding fails the check. The four rules are:
   excludes the docstring and the signature, normalises identifiers to `ID`, numbers to `N` and
   strings to `S`, and keeps keywords and operators; an f-string's data is not structure. The upper
   bound keeps the rule in the gap the 50-token clone check does not cover.
+* **UNCALLED**, named but never called. An added function that a name or attribute in the selected
+  files mentions but that no call names outside its own body, and that no test names directly.
+  A descriptor-table entry, a keyword argument such as `sorted(key=f)` and a dispatch table called
+  as `TABLE[kind](x)` all mention the function without calling it. The remedy is a direct test, a
+  call by name, or the decision kept as data in its one owner. Its known limit is the one the other
+  rules share: a call by an unrelated name that happens to be spelled the same counts as a call,
+  as it does for the other rules.
 
 A test file is a path with a `tests/` component, a `test_*.py` name or a `*_test.py` name. Test
 files are excluded from every rule's scope, and a function is a "direct test" of a name only when a
 test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` class) names it.
 
-`scope = "changed"` evaluates only the functions the diff adds or changes, and PTW-SU, SCC and LTC
-judge only the functions the diff adds, not every function it changes. `scope = "tree"` evaluates
-every function of the selected production files, so a function the commit does not touch can fail
-SCC or LTC there. CPF is not a tree property, so it compares against `base` in both scopes (a clean
-tree with `base = "HEAD"` has no CPF finding). A helper's call sites are counted in every
-enumerated Python file, with or without a `.py` suffix, so a caller outside the check's own scope
-still counts. Python embedded in a shell script is not read. A missing or invalid input is a
-configuration error, never a skipped rule: unknown keys, a `scope` other than `changed` or
-`tree`, a missing or non-existent `base`, `max_chain` below 1, `clone_min_tokens` outside 20-49,
+`scope = "changed"` evaluates only the functions the diff adds or changes, and UNCALLED, PTW-SU,
+SCC and LTC judge only the functions the diff adds, not every function it changes. `scope = "tree"`
+evaluates every function of the selected production files, so a function the commit does not touch
+can fail SCC, LTC or UNCALLED there. CPF is not a tree property, so it compares against `base` in
+both scopes (a clean tree with `base = "HEAD"` has no CPF finding). A helper's call sites are
+counted in every enumerated Python file, with or without a `.py` suffix, so a caller outside the
+check's own scope still counts. Python embedded in a shell script is not read. A missing or invalid
+input is a configuration error, never a skipped rule: unknown keys, a `scope` other than `changed`
+or `tree`, a missing or non-existent `base`, `max_chain` below 1, `clone_min_tokens` outside 20-49,
 `clone_similarity` outside 0.5-1.0, and a `crap_check` naming no check or a check that is not a
-`python_crap` check are all rejected. An
-unparsable changed file or a path Git still quotes is an error naming it.
+`python_crap` check are all rejected. An unparsable changed file or a path Git still quotes is an
+error naming it.
 
 The shapes the rules accept are deliberate. A single-use helper with a direct test passes CPF and
 PTW-SU; a helper with two call sites passes them too. A refactor that moves decisions into a data
-table adds no single-use helper, so CPF does not fire. A tested decision function plus a thin effect
-adapter is accepted when the adapter has a direct test or a second caller. That is the QF12 shape:
-its helpers are directly tested, so CPF reports nothing.
+table adds no single-use helper and no mentioned-but-uncalled function, so CPF and UNCALLED do not
+fire. A tested decision function plus a thin effect adapter is accepted when the adapter has a
+direct test or a second caller. That is the QF12 shape: its helpers are directly tested, so CPF
+reports nothing.
 
 Each finding's `subject` names the rule, the functions and the measured values, and the expected
 limit. The human report adds the check id and the location:
@@ -678,14 +686,15 @@ limit. The human report adds the check id and the location:
     check: shape: PTW-SU pkg/app.py:render_json -> json.dumps (forwards data, 2 constants, 1 call site, no direct test; limit 1 call site with no direct test; expected a direct test, a second caller, or no wrapper): value 1 exceeds threshold 0 at pkg/app.py:8-9
     check: shape: SCC chain depth 7: pkg/chain.py:run -> pkg/chain.py:_chain_1 -> pkg/chain.py:_chain_2 -> pkg/chain.py:_chain_3 -> pkg/chain.py:_chain_4 -> pkg/chain.py:_chain_5 -> pkg/chain.py:_chain_6 (limit 6; expected at most 6 consecutive single-caller functions): value 1 exceeds threshold 0 at pkg/chain.py:1-3
     check: shape: LTC pkg/app.py:chip_class <-> pkg/app.py:lane_class (34 normalised tokens, similarity 1.00; limit 30-49 tokens at similarity 0.95; expected no duplicated run below the clone detector's 50-token minimum): value 1 exceeds threshold 0 at pkg/app.py:1-4
+    check: shape: UNCALLED pkg/app.py:_run_files (0 call sites, no direct test; limit 0 call sites with no direct test; expected a direct test, a call by name, or the decision kept as data in its one owner): value 1 exceeds threshold 0 at pkg/app.py:5-6
 
 The `measurement` carries the measured values per rule: `rule`, `file`, `name`, `caller`, `helper`,
 `call_sites`, `direct_test`, `callee`, `forwarded`, `constants`, `cc_before`, `cc_after`, `limit`,
 `chain_depth`, `chain`, `longest`, `ratio` and `tokens`. The check reports
 `{"functions": N, "added": M}` in its measurement, so a run shows how much it measured. The metric
-version is `python-shape/1`. The adapter itself is 47 functions, scores at most CC 6, and passes
-all four rules over its own source; no function of it scores above CRAP 6 measured over its test
-module.
+version is `python-shape/1`. The adapter itself is 49 functions and scores at most CC 6; no
+function of it scores above CRAP 6 measured over its test module, and its own change passes every
+rule at `scope = "changed"`.
 
 This repository's own `quality-gate.toml` enables `python_shape` in the `python` class. Its
 `base = "HEAD"` judges a local check's uncommitted change; a caller that knows the change's base

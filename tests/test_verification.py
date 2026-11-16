@@ -144,12 +144,15 @@ def verification_with_crap_after_config() -> str:
     """A verification policy whose python_crap check is declared after it."""
     text = verification_config().replace(
         'checks = ["tests", "verification"]',
-        'checks = ["tests", "crap", "verification"]',
-        1,
+        'checks = ["tests", "risk", "audit"]',
+    )
+    text = text.replace("[checks.verification]", "[checks.audit]").replace(
+        'baseline = "quality-gate-verification.toml"',
+        'baseline = "quality-gate-audit.toml"',
     )
     return text.replace(
         "[[rule]]",
-        crap_check_block("crap", "quality-gate-crap.toml") + "[[rule]]",
+        crap_check_block("risk", "quality-gate-risk.toml") + "[[rule]]",
         1,
     )
 
@@ -158,8 +161,11 @@ def verification_with_later_tests_and_crap_config() -> str:
     """A policy whose verification is followed by a test and a CRAP check."""
     text = verification_config(requires=None).replace(
         'checks = ["tests", "verification"]',
-        'checks = ["tests", "tests2", "crap", "verification"]',
-        1,
+        'checks = ["tests", "tests2", "risk", "audit"]',
+    )
+    text = text.replace("[checks.verification]", "[checks.audit]").replace(
+        'baseline = "quality-gate-verification.toml"',
+        'baseline = "quality-gate-audit.toml"',
     )
     tests2 = (
         "[checks.tests2]\n"
@@ -170,7 +176,7 @@ def verification_with_later_tests_and_crap_config() -> str:
         f"tests_pattern = {json.dumps(r'^Ran (\d+) tests? in')}\n"
         f"skipped_pattern = {json.dumps(r'skipped=(\d+)')}\n\n"
     )
-    crap = crap_check_block("crap", "quality-gate-crap.toml").replace(
+    crap = crap_check_block("risk", "quality-gate-risk.toml").replace(
         'requires = "tests"', 'requires = "tests2"'
     )
     return text.replace("[[rule]]", tests2 + crap + "[[rule]]", 1)
@@ -629,10 +635,13 @@ class VerificationTests(FindingMixin, FixtureCase):
 
     def test_a_crap_check_declared_after_verification_is_refused(self) -> None:
         self.add_file(
-            "quality-gate-crap.toml",
-            baseline_text([], check="crap", metric_version="python-lines/1"),
+            "quality-gate-risk.toml",
+            baseline_text([], check="risk", metric_version="python-lines/1"),
         )
-        self.write_verification_baseline([])
+        self.add_file(
+            "quality-gate-audit.toml",
+            baseline_text([], check="audit", metric_version=METRIC_VERSION),
+        )
         for config in (
             verification_with_crap_after_config(),
             verification_with_later_tests_and_crap_config(),
@@ -642,8 +651,8 @@ class VerificationTests(FindingMixin, FixtureCase):
                 result = self.run_qg("check")
                 text = output(result)
                 self.assertEqual(result.returncode, 2, text)
-                self.assertIn("crap", text)
-                self.assertIn("verification", text)
+                self.assertIn("risk", text)
+                self.assertIn("audit", text)
                 self.assertIn(
                     "verification counts the exclusions of every CRAP check, "
                     "so it must come after them",

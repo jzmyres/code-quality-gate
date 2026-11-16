@@ -1,4 +1,4 @@
-"""Tests for the python_shape adapter: its four rules, keys, scope and messages."""
+"""Tests for the python_shape adapter: its five rules, keys, scope and messages."""
 from __future__ import annotations
 
 import ast
@@ -56,6 +56,7 @@ from quality_gate.python_shape import (
     _test_functions,
     _token_text,
     _touched,
+    _uncalled_findings,
     _uses,
     _wrapper,
     _wrapper_call,
@@ -431,6 +432,117 @@ class DecisionTests(unittest.TestCase):
 """
 
 
+# UNCALLED: the ladder's three decisions live in a dispatch table, which calls
+# them through a subscript, so no call site names any of the three.
+DISPATCH_BASE = """\
+def run(kind):
+    return kind
+"""
+
+DISPATCH_TABLE = """\
+def run(kind):
+    return TABLE[kind](kind)
+
+
+def _run_files(kind):
+    return ["files", kind]
+
+
+def _run_tool(kind):
+    return ["tool", kind]
+
+
+def _run_check(kind):
+    return ["check", kind]
+
+
+TABLE = {"files": _run_files, "tool": _run_tool, "check": _run_check}
+"""
+
+DISPATCH_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import _run_check, _run_files, _run_tool
+
+
+class DispatchTests(unittest.TestCase):
+    def test_each_entry_is_a_callable(self):
+        self.assertEqual(
+            [_run_files, _run_tool, _run_check],
+            [_run_files, _run_tool, _run_check],
+        )
+"""
+
+# UNCALLED: a function passed as a keyword value is named, but no call names it.
+KEY_BASE = """\
+def ordered(items):
+    return sorted(items)
+"""
+
+KEY_PASSED = """\
+def ordered(items):
+    return sorted(items, key=by_length)
+
+
+def by_length(text):
+    return len(text)
+"""
+
+KEY_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import by_length
+
+
+class KeyTests(unittest.TestCase):
+    def test_the_key_exists(self):
+        self.assertIs(by_length, by_length)
+"""
+
+# UNCALLED: a function registered in a descriptor table is not called.
+TABLE_REGISTERED = """\
+def _files(kind):
+    return kind
+
+
+TABLE = {"files": _files}
+"""
+
+# UNCALLED: a function called once by name is called, and an edited existing
+# function is not added.
+CALLED_BASE = """\
+def entry(value):
+    return value
+"""
+
+CALLED_BY_NAME = """\
+def entry(value):
+    return helper(value)
+
+
+def helper(value):
+    return value + 1
+"""
+
+EDITED_BASE = """\
+def edited(value):
+    return value
+"""
+
+EDITED = """\
+def edited(value):
+    if value:
+        return value + 1
+    return value
+"""
+
+
 def chain_module(links: int) -> str:
     """A dispatcher plus LINKS single-caller functions, each with real work."""
     lines = ["def run(value):", "    first = value + 1", "    return _chain_1(first)", ""]
@@ -660,6 +772,93 @@ class RuleTests(ShapeCase):
             ),
         })
         self.accepted()
+
+
+class UncalledTests(ShapeCase):
+    """An added function named but not called and not tested is refused."""
+
+    def uncalled_subjects(self, check: dict[str, Any]) -> list[str]:
+        return [finding["subject"] for finding in check["findings"]]
+
+    def assert_uncalled(self, name: str) -> None:
+        result, _document, check = self.run_shape()
+        self.assertEqual(result.returncode, 1, output(result))
+        subjects = self.uncalled_subjects(check)
+        self.assertEqual(len(subjects), 1, subjects)
+        self.assertTrue(
+            subjects[0].startswith(f"UNCALLED pkg/app.py:{name} "), subjects
+        )
+
+    def test_a_dispatch_table_of_uncalled_functions_is_refused(self) -> None:
+        self.base_commit({"pkg/app.py": DISPATCH_BASE})
+        self.commit({"pkg/app.py": DISPATCH_TABLE})
+        result, _document, check = self.run_shape()
+        self.assertEqual(result.returncode, 1, output(result))
+        subjects = self.uncalled_subjects(check)
+        self.assertEqual(len(subjects), 3, subjects)
+        for name in ("_run_check", "_run_files", "_run_tool"):
+            self.assertEqual(
+                sum(
+                    subject.startswith(f"UNCALLED pkg/app.py:{name} ")
+                    for subject in subjects
+                ),
+                1,
+                subjects,
+            )
+        finding = check["findings"][0]
+        self.assertEqual(
+            finding["measurement"],
+            {
+                "rule": "UNCALLED",
+                "file": "pkg/app.py",
+                "name": "_run_check",
+                "call_sites": 0,
+                "direct_test": False,
+            },
+        )
+        self.assertIn(
+            "expected a direct test, a call by name, or the decision kept as "
+            "data in its one owner",
+            finding["subject"],
+        )
+
+    def test_a_direct_test_naming_each_table_entry_passes(self) -> None:
+        self.base_commit({"pkg/app.py": DISPATCH_BASE})
+        self.commit({
+            "pkg/app.py": DISPATCH_TABLE, "tests/test_app.py": DISPATCH_TEST,
+        })
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["added"], 3)
+
+    def test_a_function_called_once_by_name_is_not_uncalled(self) -> None:
+        self.base_commit({"pkg/app.py": CALLED_BASE})
+        self.commit({"pkg/app.py": CALLED_BY_NAME})
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["added"], 1)
+
+    def test_a_function_only_passed_as_a_keyword_is_uncalled(self) -> None:
+        self.base_commit({"pkg/app.py": KEY_BASE})
+        self.commit({"pkg/app.py": KEY_PASSED})
+        self.assert_uncalled("by_length")
+
+    def test_a_function_only_registered_in_a_table_is_uncalled(self) -> None:
+        self.base_commit({"pkg/app.py": "TABLE = {}\n"})
+        self.commit({"pkg/app.py": TABLE_REGISTERED})
+        self.assert_uncalled("_files")
+
+    def test_a_direct_test_naming_the_passed_function_passes(self) -> None:
+        self.base_commit({"pkg/app.py": KEY_BASE})
+        self.commit({
+            "pkg/app.py": KEY_PASSED, "tests/test_app.py": KEY_TEST,
+        })
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["added"], 1)
+
+    def test_an_edited_existing_function_is_not_added(self) -> None:
+        self.base_commit({"pkg/app.py": EDITED_BASE})
+        self.commit({"pkg/app.py": EDITED})
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["added"], 0)
 
 
 class DiffBaseTests(ShapeCase):
@@ -1192,6 +1391,35 @@ class HelperTests(unittest.TestCase):
         )
         tokens = {first.identity: ("ID",), second.identity: ()}
         self.assertIsNone(_clone_finding(data, first, second, tokens))
+
+    def test_uncalled_findings_need_a_mention_but_no_call_or_test(self) -> None:
+        recursive = shape_function(
+            "def recursive():\n    return recursive()\n"
+        )
+        named = shape_function("def named():\n    return 1\n")
+        tested = shape_function("def tested():\n    return 2\n")
+        data = ShapeInput(
+            (recursive, named, tested), {}, (),
+            (recursive, named, tested),
+            {
+                "recursive": (
+                    CallSite(
+                        "recursive", "recursive", "pkg/app.py", 2,
+                        recursive.identity,
+                    ),
+                ),
+                "named": (
+                    CallSite("named", "named", "pkg/other.py", 1, "entry"),
+                ),
+            },
+            frozenset({"tested"}), SHAPE_SPEC, 6,
+            frozenset({"recursive", "named", "tested"}),
+        )
+        findings = _uncalled_findings(data)
+        self.assertEqual(
+            [item.measurement["name"] for item in findings], ["recursive"]
+        )
+        self.assertEqual(findings[0].value, 1)
 
     def test_findings_are_in_subject_order(self) -> None:
         before = SimpleNamespace(subject="b")
