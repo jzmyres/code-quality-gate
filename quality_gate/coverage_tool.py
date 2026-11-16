@@ -21,7 +21,7 @@ from .tools import installed_tool_dir
 
 COVERAGE_CONFIG_NAME = "coverage.ini"
 REGISTRY_NAME = "registry"
-PRAGMA_NO_COVER = "pragma: no cover"
+PRAGMA_NO_COVER = r"#\s*pragma:\s*no cover"
 
 
 def coverage_config_text(root: Path) -> str:
@@ -43,7 +43,7 @@ def coverage_config_text(root: Path) -> str:
         "sigterm = true\n"
         f"source =\n    {source}\n"
         "[report]\n"
-        f"exclude_lines =\n    {PRAGMA_NO_COVER}\n"
+        f"exclude_lines = {PRAGMA_NO_COVER}\n"
     )
 
 

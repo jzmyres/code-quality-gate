@@ -381,7 +381,8 @@ expands in place to a prefix that starts the current interpreter under coverage:
 version and payload digest from the effective tool lock, the gate-owned coverage configuration path,
 and the registry directory. The adapter writes and every child uses one
 gate-owned coverage configuration (line mode, `branch = False`, `sigterm = true`, `source` the
-repository root, `exclude_lines` exactly the `pragma: no cover` expression) for collection,
+repository root, `exclude_lines` exactly the comment-anchored `#\s*pragma:\s*no cover`
+expression, so a line is excluded only when it carries the pragma as a comment) for collection,
 combination and analysis. Repository roots containing spaces or non-ASCII letters are supported.
 Before coverage runs, a pure rule refuses roots containing a comma, `$`, any `str.splitlines()`
 separator (including LF, CR, vertical tab, U+0085, U+2028 and U+2029), or leading or trailing
@@ -1271,9 +1272,12 @@ Notes:
   `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.
   A reference to a check without test evidence is a configuration error; for a command the error
   identifies its missing `tests_pattern`. Without `requires` every earlier test-producing check is used. It
-  measures executed tests (a `min` floor) and skipped tests from those results, and `pragma: no cover`
-  lines, inline `# noqa` comments and file-wide lint suppressions for the selected Python files, without
-  running the tests again. A selected file is Python when its name ends in `.py`, or when it is a
+  measures executed tests (a `min` floor) and skipped tests from those results, and inline `# noqa`
+  comments and file-wide lint suppressions for the selected Python files, without running the tests
+  again. It counts `#\s*pragma:\s*no cover` lines only in files whose coverage a `python_crap` check
+  measures, using coverage's comment-anchored pattern, so an exclusion counts only where it removes
+  lines from a measured value; exclusions in other files, such as tests, are not counted. A selected
+  file is Python when its name ends in `.py`, or when it is a
   regular file whose shebang interpreter is `python`, `python3` or `python3.N` for one or more
   digits N (as `env` and its options resolve), so an executable Python program without the suffix
   is measured too; `python3-config` and `pythonw` are not Python interpreters here. Any other
@@ -1391,8 +1395,9 @@ This repository gates itself with `quality-gate.toml`:
   requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
   and a worklist reason;
 * `verification` uses the `tests` counts and measures inline `# noqa`, file-wide lint suppressions and
-  `pragma: no cover` lines in the Python source; `quality-gate-verification.toml` floors the executed
-  tests and ceilings the skips and exclusions measured at adoption;
+  `#\s*pragma:\s*no cover` lines only in the files the `crap` check measures;
+  `quality-gate-verification.toml` floors the executed tests and ceilings the skips and exclusions
+  measured at adoption;
 * the `elisp` class lists `elisp-tests`, `elisp-crap`, `elisp-compile` and `elisp-checkdoc`, so this
   repository gates its Emacs Lisp helpers with the gate's own Elisp checks; the ERT suite
   `tests/elisp/qg-elisp-tests.el` exercises the complexity, child and lint helpers, `elisp-crap` scores

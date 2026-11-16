@@ -21,6 +21,8 @@ from support import (
     output,
 )
 
+PRAGMA_TEXT = "pragma: " "no cover"
+
 
 def crap_config(
     *,
@@ -342,7 +344,7 @@ class PythonCrapTests(FixtureCase):
             "pkg/pragma.py",
             "def with_pragma():\n"
             "    value = 1\n"
-            "    return value  # pragma: no cover\n",
+            f"    return value  # {PRAGMA_TEXT}\n",
         )
         self.add_tests(
             "    def test_pragma(self):\n"
@@ -353,6 +355,22 @@ class PythonCrapTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         finding = self.findings(check)["pkg/pragma.py:with_pragma"]
         self.assertIn(3, finding["measurement"]["excluded_lines"])
+
+    def test_pragma_text_without_a_comment_is_not_excluded(self) -> None:
+        self.add_file(
+            "pkg/pragma_text.py",
+            "def with_text():\n"
+            f"    return '{PRAGMA_TEXT}'\n",
+        )
+        self.add_tests(
+            "    def test_text(self):\n"
+            "        import pkg.pragma_text\n"
+            f"        self.assertEqual(pkg.pragma_text.with_text(), '{PRAGMA_TEXT}')\n"
+        )
+        result, _document, check = self.run_crap()
+        self.assertEqual(result.returncode, 0, output(result))
+        finding = self.findings(check)["pkg/pragma_text.py:with_text"]
+        self.assertNotIn(2, finding["measurement"]["excluded_lines"])
 
     def test_entry_outside_the_measured_files_is_unmeasured_and_kept(
         self,
@@ -471,8 +489,8 @@ class PythonCrapTests(FixtureCase):
         self.add_default_test()
         self.add_file(
             "pkg/excluded.py",
-            "def empty():  # pragma: no cover\n"
-            "    pass  # pragma: no cover\n",
+            f"def empty():  # {PRAGMA_TEXT}\n"
+            f"    pass  # {PRAGMA_TEXT}\n",
         )
         result, _document, check = self.run_crap()
         self.assertEqual(result.returncode, 1, output(result))

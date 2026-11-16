@@ -144,8 +144,10 @@ def _file_suppression_location(relative: str, directives: list[tuple[int, str]])
     return f"{relative}:{line} ({directive})"
 
 
-def measure_exclusions(relative: str, source: str) -> list[Finding]:
-    no_cover = _no_cover_lines(source)
+def measure_exclusions(
+    relative: str, source: str, count_no_cover: bool = True
+) -> list[Finding]:
+    no_cover = _no_cover_lines(source) if count_no_cover else []
     noqa, file_suppressions = _noqa_lines(relative, source)
     return [
         Finding(
@@ -198,6 +200,7 @@ def measure_verification(
     root: Path,
     files: list[str],
     test_counts: list[tuple[str, int, int]],
+    no_cover_files: set[str],
 ) -> list[Finding]:
     findings: list[Finding] = []
     for check_id, ran, skipped in test_counts:
@@ -207,7 +210,9 @@ def measure_verification(
             source = (root / relative).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise GateError(f"cannot read {relative}: {error}") from error
-        findings.extend(measure_exclusions(relative, source))
+        findings.extend(
+            measure_exclusions(relative, source, relative in no_cover_files)
+        )
     findings.sort(key=lambda item: item.subject)
     return findings
 
@@ -285,6 +290,20 @@ def _verification_files(root: Path, selected: list[str]) -> list[str]:
     ]
 
 
+def _crap_selected_files(
+    config: Config,
+    files: list[str],
+    classes: dict[str, str],
+) -> set[str]:
+    from .checks import _select_files
+
+    measured: set[str] = set()
+    for check in config.checks.values():
+        if check.adapter == "python_crap":
+            measured.update(_select_files(config, check, files, classes)[0])
+    return measured
+
+
 def _verification_domain(findings: list[Any]) -> Domain:
     return Domain.of_subjects(
         [finding.subject for finding in findings],
@@ -296,6 +315,7 @@ def _verification_findings(
     root: Path,
     check: CheckDef,
     files: list[str],
+    no_cover_files: set[str],
     prior: dict[str, Any],
     start: float,
     prefix: str,
@@ -316,7 +336,7 @@ def _verification_findings(
     assert counts is not None
     mark_step("verification analysis")
     try:
-        return measure_verification(root, files, counts)
+        return measure_verification(root, files, counts, no_cover_files)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
 
@@ -335,13 +355,14 @@ def _verification_measurement(
 
     mark_step("file selection")
     selected, _names = _select_files(config, check, files, classes)
+    no_cover_files = _crap_selected_files(config, files, classes)
     mark_step("Python file selection")
     try:
         python_files = _verification_files(root, selected)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
     return _verification_findings(
-        root, check, python_files, prior, start, prefix
+        root, check, python_files, no_cover_files, prior, start, prefix
     )
 
 
