@@ -936,6 +936,25 @@ The command exits 0 after writing the report. It exits 1, ranking nothing, when 
 it requires does not pass, or when Git fails or its output is truncated; the error names the problem. It exits 2 for an unknown or repeated check id, or a check with no baseline
 or threshold.
 
+### debt
+
+    python3 -I qg.py debt
+    python3 -I qg.py debt --json
+    python3 -I qg.py --repo /path/to/repo debt --revision HEAD~5
+
+`debt` lists every baseline entry that still excuses a finding, without running a check, tool or test.
+Without `--revision` it reads `quality-gate.toml` and each baseline from the working tree; with
+`--revision REV` it reads them from that commit through `git show REV:PATH` and never checks anything
+out. An entry is debt when its direction is `max` and either its check has no threshold or its bound is
+above the threshold; a `min` floor is not debt. Clones use a threshold of 0, so every clone entry with a
+positive bound counts.
+
+The human report prints `CHECK: N debt entries of M` for every check with a baseline, in policy order,
+then `debt: N entries`. `--json` writes one document whose schema is in `docs/SCHEMA.md`; `revision` is
+the commit's SHA, or null for the working tree. A policy with no baseline reports `debt: 0` and no
+checks. An unreadable revision, a policy or baseline that cannot be read or parsed, or a baseline named
+by the policy that is missing at that revision exits 2 with a message naming the revision and path.
+
 ### Locations
 
 The `python_crap`, `elisp_crap` and `clones` adapters provide complete locations: respectively the entire

@@ -1092,7 +1092,7 @@ class HelperTests(unittest.TestCase):
         )
         tokens = {function.identity: ("ID", "ID") for function in functions}
         self.assertEqual(
-            _clone_pairs(tuple(functions), tokens, 2),
+            _clone_pairs(tuple(reversed(functions)), tokens, 2),
             [(functions[0].identity, functions[1].identity)],
         )
 

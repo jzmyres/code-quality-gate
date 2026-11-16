@@ -14,13 +14,14 @@ from unittest import mock
 
 from support import (
     BASE_CONFIG, GATE, FixtureCase, PYTHON_TEST_HEADER, baseline_text, output,
+    with_clones,
 )
 from test_python_crap import crap_config
 from test_verification import (
     executed_entry, exclusion_entry, verification_baseline, verification_config,
 )
 
-from quality_gate import adapters, checks, policy, worklist
+from quality_gate import adapters, checks, files, policy, worklist
 from test_check import SLEEP_STUB
 
 
@@ -114,6 +115,21 @@ def write_debt_fixture(case: FixtureCase, *, test_body: str = PASSING_TEST) -> N
     case.commit_all("beta change two")
 
 
+def write_crap_fixture(
+    case: FixtureCase,
+    entries: list[dict[str, object]],
+    *,
+    threshold: int | None = None,
+    message: str = "fixture",
+) -> None:
+    (case.repo / "a.py").unlink()
+    case.write_config(crap_config(threshold=threshold))
+    case.add_file("pkg/alpha.py", SIMPLE)
+    case.add_file("tests/test_sample.py", PASSING_TEST)
+    case.add_file("quality-gate-crap.toml", python_baseline(entries))
+    case.commit_all(message)
+
+
 def combined_config() -> str:
     text = crap_config().replace('patterns = ["*.py"]', 'patterns = ["*.py", "*.el"]')
     extra = '''\
@@ -182,6 +198,26 @@ def run_worklist(
     return case.run_qg(
         "worklist", *args, env=env or case.default_tool_env()
     )
+
+
+def run_debt(
+    case: FixtureCase, *args: str, env: dict[str, str] | None = None
+):
+    return case.run_qg("debt", *args, env=env or case.default_tool_env())
+
+
+def documented_json(case: FixtureCase, command, section: str):
+    schema = (GATE / "docs/SCHEMA.md").read_text(encoding="utf-8")
+    example = json.loads(
+        schema.split(f"## Result: `{section} --json`", 1)[1]
+        .split("```json\n", 1)[1].split("```", 1)[0]
+    )
+    result = command(case, "--json")
+    case.assertEqual(result.returncode, 0, output(result))
+    document = case.parse_json(result)
+    case.assertEqual(set(document), set(example))
+    case.assertEqual(document["schema"], example["schema"])
+    return document, example
 
 
 def _run_directories(root: Path) -> list[Path]:
@@ -330,28 +366,21 @@ class WorklistElispTests(FixtureCase):
 class WorklistNoteTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
-        (self.repo / "a.py").unlink()
-        self.write_config(crap_config())
-        self.add_file("pkg/alpha.py", SIMPLE)
-        self.add_file("tests/test_sample.py", PASSING_TEST)
-        self.add_file(
-            "quality-gate-crap.toml",
-            python_baseline(
-                [
-                    {
-                        "subject": "pkg/alpha.py:removed",
-                        "bound": 25,
-                        "reason": "removed debt",
-                    },
-                    {
-                        "subject": "pkg/ghost.py:ghost",
-                        "bound": 15,
-                        "reason": "untracked debt",
-                    },
-                ]
-            ),
+        write_crap_fixture(
+            self,
+            [
+                {
+                    "subject": "pkg/alpha.py:removed",
+                    "bound": 25,
+                    "reason": "removed debt",
+                },
+                {
+                    "subject": "pkg/ghost.py:ghost",
+                    "bound": 15,
+                    "reason": "untracked debt",
+                },
+            ],
         )
-        self.commit_all()
         self.add_file("pkg/ghost.py", GHOST)
 
     def test_removed_subject_and_untracked_file_are_notes(self) -> None:
@@ -752,14 +781,7 @@ class WorklistSchemaTests(FixtureCase):
         self.add_file("pkg/ghost.py", GHOST)
 
     def test_json_keys_and_states_agree_with_schema(self) -> None:
-        schema = (GATE / "docs/SCHEMA.md").read_text(encoding="utf-8")
-        section = schema.split('## Result: `worklist --json`', 1)[1]
-        example = json.loads(section.split("```json\n", 1)[1].split("```", 1)[0])
-        result = run_worklist(self, "--json")
-        self.assertEqual(result.returncode, 0, output(result))
-        document = self.parse_json(result)
-        self.assertEqual(set(document), set(example))
-        self.assertEqual(document["schema"], example["schema"])
+        document, example = documented_json(self, run_worklist, "worklist")
         for name in ("rows", "slack"):
             self.assertTrue(document[name], name)
             for item in document[name]:
@@ -835,20 +857,211 @@ class WorklistCheckErrorTests(FixtureCase):
 
 class WorklistRunLimitTests(FixtureCase):
     def test_a_stopped_selected_check_reports_the_run_limit(self) -> None:
-        root = self.base / "tmp"
-        root.mkdir()
         self.write_config(slow_config())
         self.add_file(
             "slow.toml", 'check = "slow"\nmetric_version = "sleep/1"\n'
         )
         with mock.patch.dict(adapters.ADAPTERS, {SLEEP_STUB.name: SLEEP_STUB}), \
                 mock.patch.object(checks, "RUN_ALLOWANCE_SECONDS", 0):
-            result = self.run_qg(
-                "worklist", "--json", "slow", env={"TMPDIR": str(root)}
-            )
+            result, root = run_worklist_with_tmpdir(self, "--json", "slow")
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("the run exceeded its 1 s limit", result.stderr)
         self.assertEqual(_run_directories(root), [])
+
+
+def write_threshold_debt_fixture(case: FixtureCase) -> None:
+    write_crap_fixture(
+        case,
+        [
+            {"subject": "pkg/alpha.py:above", "bound": 7, "reason": "above"},
+            {"subject": "pkg/alpha.py:at", "bound": 6, "reason": "at"},
+        ],
+        threshold=6,
+    )
+
+
+class DebtSelectionTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_threshold_debt_fixture(self)
+
+    def test_crap_counts_only_the_entries_above_its_threshold(self) -> None:
+        result = run_debt(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.parse_json(result)["checks"][0]
+        self.assertEqual(check["entries"], 2)
+        self.assertEqual(check["debt"], 1)
+        self.assertEqual(
+            [row["subject"] for row in check["rows"]],
+            ["pkg/alpha.py:above"],
+        )
+        self.assertEqual(check["rows"][0]["threshold"], 6)
+
+    def test_human_report_has_one_line_per_baseline_and_a_total(self) -> None:
+        result = run_debt(self)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("crap: 1 debt entries of 2\n", result.stdout)
+        self.assertIn("debt: 1 entries\n", result.stdout)
+
+
+class DebtCloneTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.write_config(with_clones())
+        self.add_file("quality-gate-clones.toml", baseline_text([
+            {"subject": "first", "bound": 1, "reason": "first"},
+            {"subject": "second", "bound": 3, "reason": "second"},
+        ]))
+        self.commit_all()
+
+    def test_a_clone_baseline_counts_every_entry(self) -> None:
+        result = run_debt(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        document = self.parse_json(result)
+        check = document["checks"][0]
+        self.assertEqual((check["id"], check["entries"], check["debt"]),
+                         ("clones", 2, 2))
+        self.assertEqual([row["threshold"] for row in check["rows"]], [0, 0])
+        self.assertEqual(document["debt"], 2)
+
+
+class DebtFloorTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.write_config(verification_config())
+        self.add_file("pkg/mod.py", "VALUE = 1\n")
+        self.add_file("tests/test_sample.py", PASSING_TEST)
+        self.add_file(
+            "quality-gate-verification.toml",
+            verification_baseline([executed_entry(1)]),
+        )
+        self.commit_all()
+
+    def test_a_verification_minimum_counts_no_debt(self) -> None:
+        result = run_debt(self, "--json")
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.parse_json(result)["checks"][0]
+        self.assertEqual((check["entries"], check["debt"], check["rows"]),
+                         (1, 0, []))
+
+
+class DebtRevisionTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_crap_fixture(
+            self,
+            [{"subject": "pkg/alpha.py:old", "bound": 8, "reason": "old"}],
+            threshold=6,
+            message="old baseline",
+        )
+        self.old = self.git("rev-parse", "HEAD").stdout.strip()
+        self.add_file("quality-gate-crap.toml", python_baseline([
+            {"subject": "pkg/alpha.py:new", "bound": 9, "reason": "new"},
+        ]))
+        self.commit_all("new baseline")
+
+    def test_an_older_revision_reports_that_commits_entries(self) -> None:
+        old = run_debt(self, "--json", "--revision", self.old)
+        self.assertEqual(old.returncode, 0, output(old))
+        old_document = self.parse_json(old)
+        self.assertEqual(old_document["revision"], self.old)
+        self.assertEqual(
+            [row["subject"] for row in old_document["checks"][0]["rows"]],
+            ["pkg/alpha.py:old"],
+        )
+        current = run_debt(self, "--json")
+        self.assertEqual(current.returncode, 0, output(current))
+        current_document = self.parse_json(current)
+        self.assertIsNone(current_document["revision"])
+        self.assertEqual(
+            [row["subject"] for row in current_document["checks"][0]["rows"]],
+            ["pkg/alpha.py:new"],
+        )
+
+    def test_the_run_starts_no_subprocess_other_than_git(self) -> None:
+        with mock.patch.object(worklist, "run", wraps=worklist.run) as debt_run, \
+                mock.patch.object(files, "run", wraps=files.run) as files_run:
+            result = run_debt(self, "--json", "--revision", self.old)
+        self.assertEqual(result.returncode, 0, output(result))
+        calls = debt_run.call_args_list + files_run.call_args_list
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call.args[0][0], "git")
+
+
+class DebtFailureTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_crap_fixture(
+            self,
+            [{"subject": "pkg/alpha.py:alpha", "bound": 8, "reason": "debt"}],
+            message="with baseline",
+        )
+        (self.repo / "quality-gate-crap.toml").unlink()
+        self.commit_all("without baseline")
+        self.missing = self.git("rev-parse", "HEAD").stdout.strip()
+        self.add_file("quality-gate-crap.toml", "entry = [\n")
+        self.commit_all("invalid baseline")
+        self.invalid_baseline = self.git("rev-parse", "HEAD").stdout.strip()
+        self.add_file("quality-gate.toml", "schema = [\n")
+        self.commit_all("invalid policy")
+        self.invalid_policy = self.git("rev-parse", "HEAD").stdout.strip()
+
+    def test_a_missing_baseline_at_the_revision_exits_two_and_names_it(self) -> None:
+        result = run_debt(self, "--revision", self.missing)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("quality-gate-crap.toml", result.stderr)
+        self.assertIn(self.missing, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_an_unknown_revision_exits_two_and_names_it(self) -> None:
+        result = run_debt(self, "--revision", "no-such-revision")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("no-such-revision", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_an_unparseable_baseline_at_the_revision_exits_two(self) -> None:
+        result = run_debt(self, "--revision", self.invalid_baseline)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("quality-gate-crap.toml", result.stderr)
+        self.assertIn(self.invalid_baseline, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_an_unparseable_policy_at_the_revision_exits_two(self) -> None:
+        result = run_debt(self, "--revision", self.invalid_policy)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("quality-gate.toml", result.stderr)
+        self.assertIn(self.invalid_policy, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
+class DebtSchemaTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        write_threshold_debt_fixture(self)
+
+    def test_json_matches_the_documented_shape(self) -> None:
+        document, example = documented_json(self, run_debt, "debt")
+        self.assertTrue(document["checks"])
+        for check in document["checks"]:
+            self.assertEqual(set(check), set(example["checks"][0]))
+            for row in check["rows"]:
+                self.assertEqual(set(row), set(example["checks"][0]["rows"][0]))
+
+
+class DebtEmptyTests(FixtureCase):
+    def test_a_policy_without_a_baseline_has_no_debt(self) -> None:
+        machine = run_debt(self, "--json")
+        self.assertEqual(machine.returncode, 0, output(machine))
+        self.assertEqual(
+            self.parse_json(machine),
+            {"schema": 1, "revision": None, "checks": [], "debt": 0},
+        )
+        human = run_debt(self)
+        self.assertEqual(human.returncode, 0, output(human))
+        self.assertEqual(human.stdout, "debt: 0 entries\n")
 
 
 if __name__ == "__main__":

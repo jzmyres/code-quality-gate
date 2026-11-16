@@ -20,7 +20,7 @@ from .tools import (
     load_tools,
 )
 from .trust import prepare_trust
-from .worklist import command_worklist
+from .worklist import command_debt, command_worklist
 
 
 class _Parser(argparse.ArgumentParser):
@@ -113,6 +113,19 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="check id (default: every check with a baseline)",
     )
+    debt = commands.add_parser(
+        "debt", help="list baseline debt without running any check"
+    )
+    debt.add_argument(
+        "--revision",
+        metavar="REV",
+        help="read the policy and baselines at this commit",
+    )
+    debt.add_argument(
+        "--json",
+        action="store_true",
+        help="write one JSON debt document to stdout",
+    )
     return parser
 
 
@@ -158,6 +171,8 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         return command_hygiene(root, config)
     if args.command == "worklist":
         return command_worklist(root, config, args.check_ids, args.json)
+    if args.command == "debt":
+        return command_debt(root, args.revision, args.json)
     return command_check(
         root,
         config,
@@ -229,6 +244,8 @@ def _run_gate(root: Path, args: Any) -> int:
         raise UsageError(
             "qg.py: --allow-protected: expected --policy-from"
         )
+    if args.command == "debt":
+        return command_debt(root, args.revision, args.json)
     config = load_config(root)
     load_tools(_default_lock_path())
     return _dispatch(root, config, args)

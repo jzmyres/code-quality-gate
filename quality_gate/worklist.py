@@ -4,19 +4,29 @@ from __future__ import annotations
 import contextlib
 import json
 import sys
+import tempfile
+import tomllib
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, cast
 
 from .checks import (
     CheckResult,
+    _baseline_entries,
     _inventory_check,
     _needed_order,
     _require_distinct,
     _run_policy_checks,
 )
 from .files import git_argv
-from .policy import CheckDef, Config, GateError, UsageError
+from .policy import (
+    CheckDef,
+    Config,
+    GateError,
+    UsageError,
+    _config_from_data,
+    load_config,
+)
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
 from .runner import RunResult, run
 
@@ -204,12 +214,13 @@ def _churn(root: Path, file: str, cache: dict[str, int | None]) -> int | None:
 
 
 def _debt_entries(
-    entries: list[BaselineEntry], threshold: float
+    entries: list[BaselineEntry], threshold: float | None
 ) -> list[BaselineEntry]:
     return [
         entry
         for entry in entries
-        if entry.direction == "max" and entry.bound > threshold
+        if entry.direction == "max"
+        and (threshold is None or entry.bound > threshold)
     ]
 
 
@@ -435,3 +446,221 @@ def command_worklist(
     if code == 0:
         _print_report(rows, slack, notes)
     return code
+
+
+POLICY_NAME = "quality-gate.toml"
+
+
+@dataclass(frozen=True)
+class DebtRow:
+    subject: str
+    bound: float
+    threshold: float | None
+    reason: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "subject": self.subject,
+            "bound": self.bound,
+            "threshold": self.threshold,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class CheckDebt:
+    id: str
+    baseline: str
+    entries: int
+    rows: tuple[DebtRow, ...]
+
+    @property
+    def debt(self) -> int:
+        return len(self.rows)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "baseline": self.baseline,
+            "entries": self.entries,
+            "debt": self.debt,
+            "rows": [row.to_json() for row in self.rows],
+        }
+
+
+def _git(root: Path, *args: str) -> RunResult:
+    return run(
+        git_argv(root, *args),
+        cwd=str(root),
+        budget_seconds=GIT_BUDGET_SECONDS,
+        capture_limit=None,
+    )
+
+
+def _failure(result: RunResult) -> str:
+    if result.execution == "error":
+        return str(result.error)
+    if result.execution != "completed":
+        return f"git {result.execution}"
+    return result.stderr_text.strip() or f"git exited {result.returncode}"
+
+
+def _content(root: Path, revision: str, name: str, label: str) -> bytes:
+    result = _git(root, "show", f"{revision}:{name}")
+    if result.execution != "completed" or result.returncode != 0:
+        raise UsageError(f"{label}: expected readable content, got {_failure(result)}")
+    return result.stdout
+
+
+def _relative_name(root: Path, name: str, label: str) -> str:
+    path = Path(name)
+    try:
+        relative = path.relative_to(root) if path.is_absolute() else path
+        if ".." in relative.parts:
+            raise ValueError
+        return relative.as_posix()
+    except ValueError:
+        raise UsageError(
+            f"{label}: expected a path inside the repository, got {name}"
+        ) from None
+
+
+def _policy_data(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        return tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise UsageError(f"{label}: expected valid TOML, got {error}") from error
+
+
+def _named_baselines(data: dict[str, Any]) -> dict[str, str]:
+    checks = data.get("checks")
+    if not isinstance(checks, dict):
+        return {}
+    return {
+        name: raw["baseline"]
+        for name, raw in checks.items()
+        if isinstance(raw, dict) and isinstance(raw.get("baseline"), str)
+    }
+
+
+def _stage(temporary: Path, name: str, raw: bytes) -> None:
+    target = temporary.joinpath(*PurePosixPath(name).parts)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+
+
+def _revision_config(
+    root: Path, revision: str, temporary: Path
+) -> tuple[str, Config, dict[str, str]]:
+    resolved = _git(root, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    if resolved.execution != "completed" or resolved.returncode != 0:
+        raise UsageError(
+            f"{revision}: expected a readable revision, got {_failure(resolved)}"
+        )
+    sha = resolved.stdout_text.strip()
+    label = f"{revision} ({sha})"
+    raw = _content(root, sha, POLICY_NAME, f"{label}:{POLICY_NAME}")
+    data = _policy_data(raw, f"{label}:{POLICY_NAME}")
+    names = _named_baselines(data)
+    _stage(temporary, POLICY_NAME, raw)
+    checks = cast(dict[str, Any], data.get("checks", {}))
+    for name, baseline in names.items():
+        relative = _relative_name(root, baseline, f"{label}:{baseline}")
+        _stage(
+            temporary,
+            relative,
+            _content(root, sha, relative, f"{label}:{baseline}"),
+        )
+        checks[name]["baseline"] = relative
+    try:
+        config = _config_from_data(
+            temporary, root / POLICY_NAME, data, candidate_root=root
+        )
+    except UsageError as error:
+        raise UsageError(f"{label}: {error}") from error
+    return sha, config, names
+
+
+def _baseline_label(
+    check: CheckDef, config: Config, names: dict[str, str] | None
+) -> str:
+    if names is not None and check.id in names:
+        return names[check.id]
+    assert check.baseline is not None
+    try:
+        return check.baseline.relative_to(config.root).as_posix()
+    except ValueError:
+        return str(check.baseline)
+
+
+def _debt_check(
+    check: CheckDef, entries: list[BaselineEntry], baseline: str
+) -> CheckDebt:
+    rows = tuple(
+        DebtRow(entry.subject, entry.bound, check.threshold, entry.reason)
+        for entry in _debt_entries(entries, check.threshold)
+    )
+    return CheckDebt(check.id, baseline, len(entries), rows)
+
+
+def _check_debts(
+    config: Config, names: dict[str, str] | None, revision: str | None
+) -> list[CheckDebt]:
+    reports: list[CheckDebt] = []
+    for check in config.checks.values():
+        if check.baseline is None:
+            continue
+        baseline = _baseline_label(check, config, names)
+        try:
+            entries = _baseline_entries(check)
+        except GateError as error:
+            location = f"{revision}:{baseline}" if revision else baseline
+            raise UsageError(f"{location}: {error}") from error
+        reports.append(_debt_check(check, entries, baseline))
+    return reports
+
+
+def _debt_total(reports: list[CheckDebt]) -> int:
+    return sum(report.debt for report in reports)
+
+
+def _print_debt_report(reports: list[CheckDebt]) -> None:
+    for report in reports:
+        print(
+            f"{report.id}: {report.debt} debt entries of {report.entries}"
+        )
+    print(f"debt: {_debt_total(reports)} entries")
+
+
+def _debt_document(
+    revision: str | None, reports: list[CheckDebt]
+) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "revision": revision,
+        "checks": [report.to_json() for report in reports],
+        "debt": _debt_total(reports),
+    }
+
+
+def command_debt(
+    root: Path, revision: str | None, json_output: bool
+) -> int:
+    try:
+        if revision is None:
+            reports = _check_debts(load_config(root), None, None)
+            sha = None
+        else:
+            with tempfile.TemporaryDirectory(prefix="qg-debt-") as temporary:
+                sha, config, names = _revision_config(
+                    root, revision, Path(temporary)
+                )
+                reports = _check_debts(config, names, f"{revision} ({sha})")
+    except UsageError as error:
+        print(f"debt: {error}", file=sys.stderr)
+        return 2
+    if json_output:
+        print(json.dumps(_debt_document(sha, reports), indent=2, allow_nan=False))
+    else:
+        _print_debt_report(reports)
+    return 0

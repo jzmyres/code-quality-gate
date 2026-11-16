@@ -706,6 +706,57 @@ A missing current finding alone does not mean a subject no longer exists: the ra
 domain determines which of the first three states applies. A Git command that fails makes the command
 exit 1 and write no document.
 
+## Result: `debt --json`
+
+`debt --json` reads the policy and every baseline it names without running any check and writes exactly
+one JSON document to stdout. Its schema is 1:
+
+```json
+{
+  "schema": 1,
+  "revision": "0123456789abcdef0123456789abcdef01234567",
+  "checks": [
+    {
+      "id": "crap",
+      "baseline": "quality-gate-crap.toml",
+      "entries": 2,
+      "debt": 1,
+      "rows": [
+        {
+          "subject": "pkg/alpha.py:alpha",
+          "bound": 8,
+          "threshold": 6,
+          "reason": "measured above the threshold"
+        }
+      ]
+    }
+  ],
+  "debt": 1
+}
+```
+
+`revision` is the resolved commit SHA read by `--revision`, or null when the policy and baselines come
+from the working tree. `checks` follows policy order and holds one object per check with a baseline,
+including a check with no debt. A policy with no baseline has an empty `checks` array and `debt` 0.
+`debt` is the sum of every check's `debt`.
+
+| Check field | JSON type | Meaning |
+| --- | --- | --- |
+| `id` | string | Check id. |
+| `baseline` | string | Baseline path as the policy names it. |
+| `entries` | integer | Number of baseline entries. |
+| `debt` | integer | Number of entries that excuse a finding. |
+| `rows` | array | One object per debt entry, in baseline order. |
+
+An entry is debt when its direction is `max` and either the check has no threshold or its bound is
+strictly above the threshold. A `min` entry is a floor and never appears. Every row has `subject`
+(string), `bound` (number), `threshold` (number, or null when the check has no threshold) and `reason`
+(string).
+
+An unreadable revision, a policy or baseline that cannot be read or parsed, or a baseline the policy
+names that is missing at that revision exits 2 with a message naming the revision and path. It never
+reports zero for an error.
+
 ## Versions and superseded proposals
 
 * Policy: `schema = 2`.
@@ -713,6 +764,7 @@ exit 1 and write no document.
 * Baseline: the `check`/`metric_version` header above; no separate baseline
   schema number.
 * Worklist result: `schema = 1`.
+* Debt result: `schema = 1`.
 * Metric versions: `command-exit/1`, `test-count/1`,
   `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `elisp-lint/1`, `verification/1`,
   `inventory/1`, `hygiene/1`.
