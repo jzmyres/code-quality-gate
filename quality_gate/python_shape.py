@@ -436,13 +436,13 @@ def _scan_files(
 def _uses(
     indexes: list[FileIndex], names: set[str]
 ) -> tuple[dict[str, tuple[CallSite, ...]], frozenset[str]]:
-    """The call sites outside each body, and the names the tests mention."""
+    """The production call sites outside each body, and the names tests mention."""
     calls: dict[str, list[CallSite]] = {}
     tests: set[str] = set()
     for index in indexes:
         tests.update(index.tests)
         for site in index.calls:
-            if site.name in names:
+            if site.name in names and not _is_test_path(site.path):
                 calls.setdefault(site.name, []).append(site)
     return (
         {name: tuple(sites) for name, sites in calls.items()},

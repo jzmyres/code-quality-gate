@@ -100,10 +100,17 @@ def _literal_flags(node: ast.AST) -> tuple[bool, bool]:
 def _display_elements(node: ast.AST) -> int:
     if not isinstance(node, (ast.Tuple, ast.List)):
         return 0
-    total = len(node.elts)
-    for element in node.elts:
-        if isinstance(element, ast.Starred):
-            total += _display_elements(element.value)
+    total = 0
+    pending = [node]
+    while pending:
+        display = pending.pop()
+        for element in display.elts:
+            if isinstance(element, ast.Starred) and isinstance(
+                element.value, (ast.Tuple, ast.List)
+            ):
+                pending.append(element.value)
+            else:
+                total += 1
     return max(0, total - 1)
 
 

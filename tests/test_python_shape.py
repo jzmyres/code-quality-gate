@@ -39,9 +39,11 @@ from quality_gate.python_shape import (
     _clone_finding,
     _clone_pairs,
     _collect_definitions,
+    _cpf_findings,
     _cpf_targets,
     _crap_limit,
     _diff_lines,
+    _file_index,
     _findings,
     _forwarded,
     _hunks,
@@ -1378,6 +1380,97 @@ def shape_function(
         cc=cc,
         final_name=node.name,
     )
+
+
+CPF_HELPER_SOURCE = {
+    False: "def step(value):\n    return value\n",
+    True: "class Registry:\n    def step(self, value):\n        return value\n",
+}
+CPF_CALL = {
+    False: "step(value)",
+    True: "Registry().step(value)",
+}
+CPF_IMPORT = {False: "step", True: "Registry"}
+
+
+class ProductionCallerTests(unittest.TestCase):
+    """CPF counts production call sites, not calls made from test files."""
+
+    def helper(self, method: bool) -> ShapeFunction:
+        source = CPF_HELPER_SOURCE[method]
+        return _file_index("pkg/app.py", source).functions[-1]
+
+    def caller_source(self, method: bool, count: int) -> str:
+        call = CPF_CALL[method]
+        blocks = [
+            f"def use_{index}(value):\n    return {call}\n"
+            for index in range(1, count + 1)
+        ]
+        return "\n\n".join(blocks) if blocks else "VALUE = 0\n"
+
+    def direct_test(self, method: bool) -> str:
+        name = CPF_IMPORT[method]
+        reference = f"{name}.step" if method else name
+        return (
+            "import unittest\n\n"
+            f"from pkg.app import {name}\n\n\n"
+            "class DirectTests(unittest.TestCase):\n"
+            "    def test_name(self):\n"
+            f"        self.assertIs({reference}, {reference})\n"
+        )
+
+    def indirect_test(self, method: bool) -> str:
+        name = CPF_IMPORT[method]
+        call = CPF_CALL[method].replace("value", "1")
+        return (
+            "import unittest\n\n"
+            f"from pkg.app import {name}\n\n\n"
+            "def exercise(value):\n"
+            f"    return {call}\n\n\n"
+            "class ExerciseTests(unittest.TestCase):\n"
+            "    def test_exercise(self):\n"
+            "        self.assertTrue(exercise(1))\n"
+        )
+
+    def cpf_findings(
+        self, method: bool, production: int, test_kind: str
+    ) -> list[Any]:
+        helper = self.helper(method)
+        indexes = [
+            _file_index(
+                "pkg/caller.py", self.caller_source(method, production)
+            )
+        ]
+        if test_kind == "direct":
+            indexes.append(
+                _file_index("tests/test_app.py", self.direct_test(method))
+            )
+        elif test_kind == "indirect":
+            indexes.append(
+                _file_index("tests/test_app.py", self.indirect_test(method))
+            )
+        calls, tests = _uses(indexes, {helper.final_name})
+        data = ShapeInput(
+            (helper,), {}, (helper,), (helper,), calls, tests, SHAPE_SPEC, 6,
+        )
+        return _cpf_findings(data)
+
+    def test_cpf_counts_only_production_callers(self) -> None:
+        for method in (False, True):
+            for production in range(3):
+                for test_kind in ("none", "indirect", "direct"):
+                    expected = production == 1 and test_kind != "direct"
+                    with self.subTest(
+                        method=method,
+                        production=production,
+                        test_kind=test_kind,
+                    ):
+                        self.assertEqual(
+                            len(self.cpf_findings(
+                                method, production, test_kind
+                            )),
+                            int(expected),
+                        )
 
 
 class HelperTests(unittest.TestCase):

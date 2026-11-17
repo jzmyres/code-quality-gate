@@ -1432,6 +1432,35 @@ class CyclomaticComplexityTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.complexity(source), expected)
 
+    def test_starred_displays_expand_to_their_written_elements(self) -> None:
+        cases = {
+            "def f(a, b):\n    return any((a, *[], b))\n": 2,
+            "def f(a, b, c):\n    return any((a, *[b], c))\n": 3,
+            "def f(a, b, c, d, e):\n"
+            "    return any((a, *[b, c, d], e))\n": 5,
+            "def f(a, b, c):\n    return any((a, *[*[], b], c))\n": 3,
+            "def f(items, a, b):\n    return any((a, *items, b))\n": 3,
+            "def f(a, b, c, d, e, g):\n"
+            "    return any((a, *[], b, c, d, e, g))\n": 6,
+            "def f(a, b):\n    return all((a, *[], b))\n": 2,
+            "def f(a, b, c):\n    return all((a, *[b], c))\n": 3,
+            "def f(a, b, c, d, e):\n"
+            "    return all((a, *[b, c, d], e))\n": 5,
+            "def f(a, b, c):\n    return all((a, *[*[], b], c))\n": 3,
+            "def f(items, a, b):\n    return all((a, *items, b))\n": 3,
+            "def f(a, b, index):\n    return (a, *[], b)[index]\n": 2,
+            "def f(a, b, c, index):\n    return (a, *[b], c)[index]\n": 3,
+            "def f(a, b, c, d, e, index):\n"
+            "    return (a, *[b, c, d], e)[index]\n": 5,
+            "def f(a, b, c, index):\n"
+            "    return (a, *[*[], b], c)[index]\n": 3,
+            "def f(items, a, b, index):\n"
+            "    return (a, *items, b)[index]\n": 3,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
     def test_dict_display_selection_counts_keys_and_get_default(self) -> None:
         cases = {
             "def f(x, name):\n"
@@ -1456,6 +1485,14 @@ class CyclomaticComplexityTests(unittest.TestCase):
             "    return values.get(name, fallback)\n": 1,
             "def f(name):\n    return {}[name]\n": 1,
             "def f(x, name):\n    return {'a': x}[name]\n": 1,
+            "def f(x, values, name):\n"
+            "    return {'a': x, **values}.get(name)\n": 2,
+            "def f(x, values, name, fallback):\n"
+            "    return {'a': x, **values}.get(name, fallback)\n": 3,
+            "def f(x, values, name):\n"
+            "    return {'a': x, **values}[name]\n": 2,
+            "def f(x, values, name):\n"
+            "    return {**values, 'a': x, 'b': x}[name]\n": 3,
         }
         for source, expected in cases.items():
             with self.subTest(source=source):

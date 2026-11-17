@@ -601,7 +601,7 @@ module-level definition). The rules are one data table in `quality_gate/python_c
 | `except` handler (including `except*`) | One per handler. |
 | `match` case | One, except an unguarded irrefutable pattern. |
 | `and`/`or` | One per operand after the first. |
-| `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements. |
+| `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements, recursively, so an empty one adds none. |
 | subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
 | subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. |
 | `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing. |
@@ -611,7 +611,9 @@ module-level definition). The rules are one data table in `quality_gate/python_c
 | `map` | One, a loop as a comprehension's `for`. |
 | `filter`, `itertools.filterfalse`, `itertools.dropwhile`, `itertools.takewhile` | Two, a loop and its condition. |
 
-A starred element whose length the source does not write counts as one element. Calls are recognised
+A starred element whose length the source does not write counts as one element, and a written
+empty display contributes none. In a dict display, each `**` entry counts as one key whatever it
+unpacks, the same unwritten-length limit. Calls are recognised
 by the called name, so a user function with one of these names counts too; a call imported under
 another name, such as `from itertools import filterfalse as reject`, is not recognised. This is the
 same name-based limit the `shape` check's rules share.
@@ -653,8 +655,11 @@ finding has value `1`, so any finding fails the check. The five rules are:
   and after in a changed file has complexity above the CRAP limit before and at most it after, and
   the commit adds a helper whose only call site is inside that function and which no test
   references. An added method, or an added function whose only call site is in another module, with
-  exactly one production caller and no direct test also fails as a single-use helper. The CRAP limit
-  is the `threshold` of the check named by `crap_check`, so the limit has one source.
+  exactly one production caller and no direct test also fails as a single-use helper. Only call
+  sites outside test files are production callers: a call from a test file neither makes a helper
+  single-use nor prevents it from being reported, a test still counts only by naming the function,
+  and a function called only from test files is not single-use (the UNCALLED rule decides it). The
+  CRAP limit is the `threshold` of the check named by `crap_check`, so the limit has one source.
 * **PTW-SU**, pass-through wrapper, single-use, untested. An added function's body, after an
   optional docstring, is exactly one call (or `return CALL`, with or without `await`) that forwards
   each of its own parameters exactly once and whose other values are constants, the callee is not
@@ -685,11 +690,12 @@ test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` 
 SCC and LTC judge only the functions the diff adds, not every function it changes. `scope = "tree"`
 evaluates every function of the selected production files, so a function the commit does not touch
 can fail SCC, LTC or UNCALLED there. CPF is not a tree property, so it compares against `base` in
-both scopes (a clean tree with `base = "HEAD"` has no CPF finding). A helper's call sites are
-counted in every enumerated Python file, with or without a `.py` suffix, so a caller outside the
-check's own scope still counts. Python embedded in a shell script is not read. A missing or invalid
-input is a configuration error, never a skipped rule: unknown keys, a `scope` other than `changed`
-or `tree`, a missing or non-existent `base`, `max_chain` below 1, `clone_min_tokens` outside 20-49,
+both scopes (a clean tree with `base = "HEAD"` has no CPF finding). A helper's production call
+sites are counted in every enumerated Python file outside test files, with or without a `.py`
+suffix, so a caller outside the check's own scope still counts. Python embedded in a shell script is
+not read. A missing or invalid input is a configuration error, never a skipped rule: unknown keys,
+a `scope` other than `changed` or `tree`, a missing or non-existent `base`, `max_chain` below 1,
+`clone_min_tokens` outside 20-49,
 `clone_similarity` outside 0.5-1.0, and a `crap_check` naming no check or a check that is not a
 `python_crap` check are all rejected. An unparsable changed file or a path Git still quotes is an
 error naming it.

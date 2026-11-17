@@ -183,6 +183,17 @@ class CommandCheckTests(FixtureCase):
         self.assertIn("unknown tool 'mystery'", result.stderr)
         self.assertIn("tools fetch", result.stderr)
 
+    def test_unknown_tool_reason_names_the_lock_and_pinned_tools(self) -> None:
+        self.write_config(with_command('["{tool:mystery}"]'))
+        result, check = self.failed_lint()
+        reason = (
+            f"{GATE / 'tools.lock.toml'}: unknown tool 'mystery' "
+            "(pinned tools: coverage, jscpd, ruff); "
+            "run 'python3 -I qg.py tools fetch'"
+        )
+        self.assertEqual(check["reason"], reason)
+        self.assertIn(reason, result.stderr)
+
     def test_unfetched_tool_is_unsupported(self) -> None:
         self.write_config(with_command('["{tool:ruff}", "--version"]'))
         result, check = self.failed_lint(
