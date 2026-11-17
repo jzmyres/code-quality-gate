@@ -283,7 +283,7 @@ def _verification_counts(
 ) -> tuple[list[tuple[str, int, int]] | None, str | None]:
     from .checks import _test_check_dependencies
 
-    identifiers = _test_check_dependencies(check, prior)
+    identifiers = _test_check_dependencies(check.spec.requires, prior.values())
     if not identifiers:
         return None, "no test adapter check to measure"
     counts: list[tuple[str, int, int]] = []

@@ -601,14 +601,20 @@ module-level definition). The rules are one data table in `quality_gate/python_c
 | `except` handler (including `except*`) | One per handler. |
 | `match` case | One, except an unguarded irrefutable pattern. |
 | `and`/`or` | One per operand after the first. |
-| `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`. |
-| subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. |
+| `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements. |
+| subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
+| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. |
+| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing. |
 | `getattr` with three arguments | One, the default is a branch. |
+| `next` with two arguments | One, the default is a branch. |
+| a string literal or tuple/list display multiplied by a non-constant on either side | One, the repetition chooses a length or count. |
 | `map` | One, a loop as a comprehension's `for`. |
 | `filter`, `itertools.filterfalse`, `itertools.dropwhile`, `itertools.takewhile` | Two, a loop and its condition. |
 
-Calls are recognised by the called name, so a user function with one of these names counts too; this
-is the same name-based limit the `shape` check's rules share.
+A starred element whose length the source does not write counts as one element. Calls are recognised
+by the called name, so a user function with one of these names counts too; a call imported under
+another name, such as `from itertools import filterfalse as reject`, is not recognised. This is the
+same name-based limit the `shape` check's rules share.
 
 Coverage comes from coverage's own analysis of the combined data (`Coverage.analysis2`) under the same
 gate-owned configuration as collection and combination, which also reports files the tests never imported
@@ -643,10 +649,12 @@ a duplicate. One parse of the selected production files feeds five structural ru
 finding is enforced with no `baseline` key and no suppression: the check's threshold is `0` and each
 finding has value `1`, so any finding fails the check. The five rules are:
 
-* **CPF**, CRAP-payoff fragmentation. A function present before and after in a changed file has
-  complexity above the CRAP limit before and at most it after, and the commit adds a helper whose
-  only call site is inside that function and which no test references. The CRAP limit is the
-  `threshold` of the check named by `crap_check`, so the limit has one source.
+* **CPF**, CRAP-payoff fragmentation and an untested single-use helper. A function present before
+  and after in a changed file has complexity above the CRAP limit before and at most it after, and
+  the commit adds a helper whose only call site is inside that function and which no test
+  references. An added method, or an added function whose only call site is in another module, with
+  exactly one production caller and no direct test also fails as a single-use helper. The CRAP limit
+  is the `threshold` of the check named by `crap_check`, so the limit has one source.
 * **PTW-SU**, pass-through wrapper, single-use, untested. An added function's body, after an
   optional docstring, is exactly one call (or `return CALL`, with or without `await`) that forwards
   each of its own parameters exactly once and whose other values are constants, the callee is not

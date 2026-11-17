@@ -82,10 +82,29 @@ def _called_name(node: ast.Call) -> str | None:
     return getattr(node.func, field) if field is not None else None
 
 
-def _display_elements(node: ast.AST) -> int:
+def _literal_flags(node: ast.AST) -> tuple[bool, bool]:
+    """Whether a node is a constant, and whether it is a repeatable literal."""
     if isinstance(node, (ast.Tuple, ast.List)):
-        return max(0, len(node.elts) - 1)
-    return 0
+        return False, True
+    if isinstance(node, ast.Constant):
+        return True, isinstance(node.value, str)
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.UAdd, ast.USub))
+    ):
+        constant, _sequence = _literal_flags(node.operand)
+        return constant, False
+    return False, False
+
+
+def _display_elements(node: ast.AST) -> int:
+    if not isinstance(node, (ast.Tuple, ast.List)):
+        return 0
+    total = len(node.elts)
+    for element in node.elts:
+        if isinstance(element, ast.Starred):
+            total += _display_elements(element.value)
+    return max(0, total - 1)
 
 
 def _any_all_operands(node: ast.Call) -> int:
@@ -98,8 +117,11 @@ def _any_all_operands(node: ast.Call) -> int:
 
 
 def _display_selection(node: ast.Subscript) -> int:
-    if isinstance(node.slice, ast.Constant):
+    constant, _sequence = _literal_flags(node.slice)
+    if constant:
         return 0
+    if isinstance(node.value, ast.Dict):
+        return max(0, len(node.value.keys) - 1)
     return _display_elements(node.value)
 
 
@@ -108,6 +130,14 @@ def _getattr_default(node: ast.Call) -> int:
         _called_name(node) == "getattr"
         and len(node.args) == 3
     )
+
+
+def _dict_get(node: ast.Call) -> int:
+    display = getattr(node.func, "value", None)
+    if not isinstance(display, ast.Dict) or _called_name(node) != "get":
+        return 0
+    keys = max(0, len(display.keys) - 1)
+    return keys + int(len(node.args) >= 2)
 
 
 _LOOP_CALL_COUNTS = {
@@ -121,6 +151,22 @@ _LOOP_CALL_COUNTS = {
 
 def _loop_call(node: ast.Call) -> int:
     return _LOOP_CALL_COUNTS.get(_called_name(node) or "", 0)
+
+
+def _next_default(node: ast.Call) -> int:
+    return int((_called_name(node), len(node.args)) == ("next", 2))
+
+
+def _repetition(node: ast.BinOp) -> int:
+    if not isinstance(node.op, ast.Mult):
+        return 0
+    left_constant, left_sequence = _literal_flags(node.left)
+    right_constant, right_sequence = _literal_flags(node.right)
+    return min(
+        1,
+        int(left_sequence and not right_constant)
+        + int(right_sequence and not left_constant),
+    )
 
 
 def _irrefutable(pattern: ast.AST) -> bool:
@@ -154,8 +200,11 @@ CC_RULES: tuple[
     (ast.BoolOp, _bool_operands),
     (ast.Call, _any_all_operands),
     (ast.Call, _getattr_default),
+    (ast.Call, _dict_get),
     (ast.Call, _loop_call),
+    (ast.Call, _next_default),
     (ast.Subscript, _display_selection),
+    (ast.BinOp, _repetition),
 )
 
 

@@ -9,7 +9,7 @@ import signal
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -447,15 +447,15 @@ def _tests_result(
 
 
 def _test_check_dependencies(
-    check: CheckDef, prior: Mapping[str, CheckResult | CheckDef]
+    requires: str | None,
+    earlier: Iterable[CheckDef | CheckResult],
 ) -> list[str]:
-    requires = check.spec.requires
+    """The configured test check, or every earlier check producing tests."""
     if requires is not None:
         return [requires]
     return [
-        identifier
-        for identifier, result in prior.items()
-        if "tests" in result.evidence
+        check.id for check in earlier
+        if "tests" in check.evidence
     ]
 
 
@@ -954,7 +954,10 @@ def _prune_targets_refusal(
 
 
 def _first_unsatisfied(results: list[CheckResult]) -> CheckResult | None:
-    return next((result for result in results if not result.is_satisfied()), None)
+    for result in results:
+        if not result.is_satisfied():
+            return result
+    return None
 
 
 def _prune_destinations(
@@ -1013,12 +1016,13 @@ def _rejection_lines(
 ) -> list[str]:
     """The rejection summary, then a consequences line when there is one."""
     entries = _failure_entries(results, obligations)
-    roots = [name for name, caused_by in entries if caused_by is None]
-    consequences = [
-        f"{name} because {', '.join(caused_by)}"
-        for name, caused_by in entries
-        if caused_by is not None
-    ]
+    roots: list[str] = []
+    consequences: list[str] = []
+    for name, caused_by in entries:
+        if caused_by is None:
+            roots.append(name)
+        else:
+            consequences.append(f"{name} because {', '.join(caused_by)}")
     lines = [f"check: failed ({', '.join(roots)})"]
     if consequences:
         lines.append(f"check: consequences ({'; '.join(consequences)})")
@@ -1074,8 +1078,11 @@ def _prune_id_problem(config: Config, prune_id: str) -> str | None:
 
 
 def _prune_request_problem(config: Config, requested: list[str]) -> str | None:
-    return next((problem for identifier in requested
-                 if (problem := _prune_id_problem(config, identifier)) is not None), None)
+    for identifier in requested:
+        problem = _prune_id_problem(config, identifier)
+        if problem is not None:
+            return problem
+    return None
 
 
 def _expand_prune_ids(config: Config, requested: list[str]) -> list[str]:
@@ -1170,11 +1177,9 @@ def _check_decision(
     obligations: list[dict[str, Any]],
     partial: bool,
 ) -> tuple[str, str | None]:
-    configuration_error = next(
-        (result.reason for result in results if result.configuration_error), None
-    )
-    if configuration_error is not None:
-        return "error", configuration_error
+    for result in results:
+        if result.configuration_error:
+            return "error", result.reason
     return gate_result.decision(results, obligations, partial=partial), None
 
 

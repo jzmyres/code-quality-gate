@@ -565,6 +565,17 @@ class InventoryTests(FixtureCase):
         self.assertIsNone(files._shebang_interpreter("#!/usr/bin/env -i"))
         self.assertIsNone(files._shebang_interpreter("not a shebang"))
 
+    def test_env_interpreter_scan_returns_the_first_command(self) -> None:
+        self.assertEqual(
+            files._env_interpreter(["-S", "python3", "-u"]), "python3"
+        )
+        self.assertEqual(
+            files._env_interpreter(["-u", "VAR", "python3"]), "VAR"
+        )
+        self.assertEqual(files._env_interpreter(["VAR=1", "bash"]), "bash")
+        self.assertIsNone(files._env_interpreter(["-i"]))
+        self.assertIsNone(files._env_interpreter([]))
+
     def test_non_code_shebang_in_non_code_class_passes(self) -> None:
         self.write_config(
             BASE_CONFIG

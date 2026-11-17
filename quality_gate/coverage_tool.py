@@ -22,6 +22,14 @@ from .tools import installed_tool_dir
 COVERAGE_CONFIG_NAME = "coverage.ini"
 REGISTRY_NAME = "registry"
 PRAGMA_NO_COVER = r"#[ \t]*pragma:[ \t]*no cover"
+_COVERAGE_FILE_KINDS = {
+    "d": "directory",
+    "p": "FIFO",
+    "l": "symlink",
+    "s": "socket",
+    "c": "character device",
+    "b": "block device",
+}
 
 
 def coverage_config_text(root: Path) -> str:
@@ -78,10 +86,10 @@ def coverage_config_path(data_dir: Path) -> Path:
 
 
 def _coverage_file_kind(mode: int) -> str:
-    return {
-        "d": "directory", "p": "FIFO", "l": "symlink", "s": "socket",
-        "c": "character device", "b": "block device",
-    }.get(stat.filemode(mode)[0], "non-regular file")
+    kind = _COVERAGE_FILE_KINDS.get(stat.filemode(mode)[0])
+    if kind is not None:
+        return kind
+    return "non-regular file"
 
 
 def _open_coverage_config(path: Path) -> int:

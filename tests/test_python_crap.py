@@ -1399,6 +1399,97 @@ class CyclomaticComplexityTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.complexity(source), expected)
 
+    def test_signed_and_parenthesised_numeric_subscripts_count_nothing(
+        self,
+    ) -> None:
+        cases = {
+            "def f(a, b, c):\n    return (a, b, c)[-1]\n": 1,
+            "def f(a, b, c):\n    return [a, b, c][+2]\n": 1,
+            "def f(a, b, c):\n    return (a, b, c)[(-1)]\n": 1,
+            "def f(a, b, c):\n    return (a, b, c)[- 1]\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_starred_displays_count_their_written_elements(self) -> None:
+        cases = {
+            "def f(a, b, c, d):\n"
+            "    return any((*[a, b, c, d],))\n": 4,
+            "def f(a, b, c):\n    return all((a, *[b, c]))\n": 3,
+            "def f(a, b, c, d):\n"
+            "    return any((*[a, *[b, c]], d))\n": 4,
+            "def f(items):\n    return any((*items,))\n": 1,
+            "def f(a):\n    return any((*[a],))\n": 1,
+            "def f():\n    return any(())\n": 1,
+            "def f(a):\n    return any((a,))\n": 1,
+            "def f(a, b, c):\n    return (*[a, b, c],)[0]\n": 1,
+            "def f(a, b, c, index):\n"
+            "    return (*[a, b, c],)[index]\n": 3,
+            "def f(items, index):\n    return (*items,)[index]\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_dict_display_selection_counts_keys_and_get_default(self) -> None:
+        cases = {
+            "def f(x, name):\n"
+            "    return {'a': x}.get(name)\n": 1,
+            "def f(x, y, name):\n"
+            "    return {'a': x, 'b': y}.get(name)\n": 2,
+            "def f(x, name, fallback):\n"
+            "    return {'a': x}.get(name, fallback)\n": 2,
+            "def f(x, y, name, fallback):\n"
+            "    return {'a': x, 'b': y}.get(name, fallback)\n": 3,
+            "def f(x, y, z, name, fallback):\n"
+            "    return {'a': x, 'b': y, 'c': z}.get(name, fallback)\n": 4,
+            "def f(x, y, name):\n"
+            "    return {'a': x, 'b': y}[name]\n": 2,
+            "def f(x, y, name):\n"
+            "    return {'a': x, 'b': y}['a']\n": 1,
+            "def f(x, y, name):\n"
+            "    values = {'a': x, 'b': y}\n"
+            "    return values[name]\n": 1,
+            "def f(x, y, name, fallback):\n"
+            "    values = {'a': x, 'b': y}\n"
+            "    return values.get(name, fallback)\n": 1,
+            "def f(name):\n    return {}[name]\n": 1,
+            "def f(x, name):\n    return {'a': x}[name]\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_next_with_a_default_counts_a_branch(self) -> None:
+        cases = {
+            "def f(items):\n    return next(items)\n": 1,
+            "def f(items, fallback):\n    return next(items, fallback)\n": 2,
+            "def f(items, fallback):\n"
+            "    return next(iter(items), fallback)\n": 2,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_repetition_by_a_nonconstant_counts_a_branch(self) -> None:
+        cases = {
+            "def f(rows):\n    return '-' * bool(rows)\n": 2,
+            "def f(rows):\n    return bool(rows) * '-'\n": 2,
+            "def f(rows):\n    return ['-'] * bool(rows)\n": 2,
+            "def f(rows):\n    return bool(rows) * ['-']\n": 2,
+            "def f(rows):\n    return ('-',) * bool(rows)\n": 2,
+            "def f():\n    return '-' * 3\n": 1,
+            "def f():\n    return ['-'] * 3\n": 1,
+            "def f():\n    return 3 * '-'\n": 1,
+            "def f():\n    return 3 * ['-']\n": 1,
+            "def f(rows):\n    return '-' + str(rows)\n": 1,
+            "def f(rows, columns):\n    return rows * columns\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
     def test_three_argument_getattr_counts_a_branch(self) -> None:
         cases = {
             "def f(value):\n    return getattr(value, 'name', None)\n": 2,
@@ -1451,6 +1542,27 @@ class CyclomaticComplexityTests(unittest.TestCase):
         )
         self.assertEqual(
             python_crap._loop_call(call("map(str, values)")), 1
+        )
+        self.assertEqual(
+            python_crap._literal_flags(
+                ast.parse("'-'").body[0].value
+            ),
+            (True, True),
+        )
+        self.assertEqual(
+            python_crap._dict_get(
+                call("{'a': 1, 'b': 2}.get(name, fallback)")
+            ),
+            2,
+        )
+        self.assertEqual(
+            python_crap._next_default(call("next(items, None)")), 1
+        )
+        self.assertEqual(
+            python_crap._repetition(
+                ast.parse("'-' * bool(rows)").body[0].value
+            ),
+            1,
         )
 
     def test_nested_lambdas_add_to_their_enclosing_function(self) -> None:

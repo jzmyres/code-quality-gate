@@ -583,18 +583,33 @@ def _render_int(value):
     return "int"
 """
 
+SINGLEDISPATCH_RENDER_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import render
+
+
+class RenderTests(unittest.TestCase):
+    def test_the_renderer_exists(self):
+        self.assertIs(render, render)
+"""
+
 SINGLEDISPATCH_TEST = """\
 import sys
 import unittest
 
 sys.path.insert(0, ".")
 
-from pkg.app import _render_int
+from pkg.app import _render_int, render
 
 
 class HandlerTests(unittest.TestCase):
     def test_the_handler_exists(self):
         self.assertIs(_render_int, _render_int)
+        self.assertIs(render, render)
 """
 
 # UNCALLED: a method reached only through getattr, whose name is a string.
@@ -621,6 +636,42 @@ from pkg.app import Handler
 class HandlerTests(unittest.TestCase):
     def test_the_handler_exists(self):
         self.assertIs(Handler.handle, Handler.handle)
+"""
+
+# CPF: an added method and static method each have one caller in another
+# module and no direct test.
+SINGLE_USE_METHOD_CALLER = """\
+from pkg.app import Registry
+
+
+def use(value):
+    registry = Registry()
+    return registry.required(value) + Registry.dependency(value)
+"""
+
+SINGLE_USE_METHODS = """\
+class Registry:
+    def required(self, value):
+        return value + 1
+
+    @staticmethod
+    def dependency(value):
+        return value * 2
+"""
+
+SINGLE_USE_METHOD_TEST = """\
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from pkg.app import Registry
+
+
+class RegistryTests(unittest.TestCase):
+    def test_the_methods_exist(self):
+        self.assertIs(Registry.required, Registry.required)
+        self.assertIs(Registry.dependency, Registry.dependency)
 """
 
 # UNCALLED: a function called once by name is called, and an edited existing
@@ -905,6 +956,34 @@ class RuleTests(ShapeCase):
         self.accepted()
 
 
+class SingleUseMethodTests(ShapeCase):
+    """An added method with one caller and no direct test is refused."""
+
+    def test_an_added_method_and_static_method_with_one_caller_fail(self) -> None:
+        self.base_commit({"pkg/caller.py": SINGLE_USE_METHOD_CALLER})
+        self.commit({"pkg/app.py": SINGLE_USE_METHODS})
+        result, _document, check = self.run_shape()
+        self.assertEqual(result.returncode, 1, output(result))
+        subjects = [finding["subject"] for finding in check["findings"]]
+        self.assertEqual(len(subjects), 2, subjects)
+        for name in ("Registry.required", "Registry.dependency"):
+            self.assertTrue(
+                any(
+                    subject.startswith(f"CPF pkg/app.py:{name} ")
+                    for subject in subjects
+                ),
+                subjects,
+            )
+
+    def test_a_direct_test_naming_each_method_passes(self) -> None:
+        self.base_commit({"pkg/caller.py": SINGLE_USE_METHOD_CALLER})
+        self.commit({
+            "pkg/app.py": SINGLE_USE_METHODS,
+            "tests/test_app.py": SINGLE_USE_METHOD_TEST,
+        })
+        self.accepted()
+
+
 class UncalledTests(ShapeCase):
     """An added function named but not called and not tested is refused."""
 
@@ -991,7 +1070,10 @@ class UncalledTests(ShapeCase):
 
     def test_a_singledispatch_handler_is_uncalled(self) -> None:
         self.base_commit({"pkg/driver.py": SINGLEDISPATCH_BASE})
-        self.commit({"pkg/app.py": SINGLEDISPATCH})
+        self.commit({
+            "pkg/app.py": SINGLEDISPATCH,
+            "tests/test_app.py": SINGLEDISPATCH_RENDER_TEST,
+        })
         self.assert_uncalled("_render_int")
 
     def test_a_direct_test_naming_a_singledispatch_handler_passes(self) -> None:
@@ -1801,8 +1883,11 @@ MUTATIONS = {
         "        False",
     ),
     "changed scope judges the added": (
-        "candidates = {\"tree\": functions, \"changed\": added}[spec.scope]",
-        "candidates = functions",
+        "    if spec.scope == \"tree\":\n"
+        "        candidates = functions\n"
+        "    else:\n"
+        "        candidates = added",
+        "    candidates = functions",
     ),
 }
 

@@ -91,22 +91,13 @@ class AdapterDescriptor:
         self, requires: str | None, earlier: list[Any]
     ) -> tuple[str, ...]:
         """The earlier check ids a check of this adapter depends on."""
+        from .checks import _test_check_dependencies
+
         if not self.requires_tests:
             return () if requires is None else (requires,)
         return (
-            *self._test_dependencies(requires, earlier),
+            *_test_check_dependencies(requires, earlier),
             *(check.id for check in earlier if check.adapter == "python_crap"),
-        )
-
-    @staticmethod
-    def _test_dependencies(
-        requires: str | None, earlier: list[Any]
-    ) -> tuple[str, ...]:
-        """The configured test check, or every earlier check producing tests."""
-        if requires is not None:
-            return (requires,)
-        return tuple(
-            check.id for check in earlier if "tests" in check.evidence
         )
 
 

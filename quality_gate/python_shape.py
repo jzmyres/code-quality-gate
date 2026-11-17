@@ -129,6 +129,7 @@ class ShapeFunction:
     end_line: int
     cc: int
     final_name: str
+    is_method: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,7 +186,7 @@ def _is_test_path(relative: str) -> bool:
 
 def _collect_definitions(
     nodes: list[ast.AST], prefix: str, path: str,
-    found: list[ShapeFunction],
+    found: list[ShapeFunction], in_class: bool = False,
 ) -> None:
     for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -201,14 +202,19 @@ def _collect_definitions(
                     ast.Module(body=node.body, type_ignores=[])
                 ),
                 final_name=node.name,
+                is_method=in_class,
             )
             found.append(function)
             _collect_definitions(node.body, f"{function.name}.", path, found)
             continue
         if isinstance(node, ast.ClassDef):
-            _collect_definitions(node.body, f"{prefix}{node.name}.", path, found)
+            _collect_definitions(
+                node.body, f"{prefix}{node.name}.", path, found, True
+            )
             continue
-        _collect_definitions(list(ast.iter_child_nodes(node)), prefix, path, found)
+        _collect_definitions(
+            list(ast.iter_child_nodes(node)), prefix, path, found, in_class
+        )
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -491,15 +497,17 @@ def _shape_input(
             & diff.added.get(function.path, frozenset())
         ),
     )
-    candidates = {"tree": functions, "changed": added}[spec.scope]
+    if spec.scope == "tree":
+        candidates = functions
+    else:
+        candidates = added
     names = {function.final_name for function in candidates}
     scanned = _scan_files(context, scoped, names)
     parsed = [*indexes.values(), *scanned.values()]
     # CPF is the one rule that compares against the before tree, and only for
     # the files the diff touches; every other rule reads the after tree alone.
     before = _before_complexities(
-        context.root, base.commit,
-        [path for path in scoped if path in diff.paths],
+        context.root, base.commit, sorted(diff.paths.intersection(scoped))
     )
     calls, tests = _uses(parsed, names)
     return ShapeInput(
@@ -524,15 +532,15 @@ def _crap_limit(config: Any, spec: ShapeSpec) -> float:
 
 
 def _single_call_site(
-    data: ShapeInput, function: ShapeFunction
+    data: ShapeInput, function: ShapeFunction, *, untested: bool = False
 ) -> CallSite | None:
     """The function's one call site outside its own body, if it has exactly one."""
+    if untested and function.final_name in data.tests:
+        return None
     sites = [
         site for site in data.calls.get(function.final_name, ())
-        if not (
-            site.path == function.path
-            and function.start_line <= site.line <= function.end_line
-        )
+        if (site.path, function.start_line <= site.line <= function.end_line)
+        != (function.path, True)
     ]
     return sites[0] if len(sites) == 1 else None
 
@@ -671,38 +679,62 @@ def _uncalled_findings(data: ShapeInput) -> list[Finding]:
 
 
 def _cpf_findings(data: ShapeInput) -> list[Finding]:
-    """Each added untested single-use helper inside a function that paid off."""
+    """Each added untested single-use helper, and each one inside a payoff target."""
     targets = _cpf_targets(data)
     findings = []
     for helper in data.added:
-        site = _single_call_site(data, helper)
-        target = targets.get(site.caller) if site is not None else None
-        if target is None or helper.final_name in data.tests:
+        site = _single_call_site(data, helper, untested=True)
+        if site is None:
             continue
-        before, function = target
+        target = targets.get(site.caller)
+        if target is not None:
+            before, function = target
+            subject = (
+                f"CPF {function.identity} CC {before} -> {function.cc}, helper "
+                f"{helper.identity} (1 call site, no direct test; limit "
+                f"{_number_text(data.limit)} CC; expected the helper to have a direct "
+                "test or a second caller, or the function to stay unsplit)"
+            )
+            measurement = {
+                "rule": "CPF",
+                "call_sites": 1,
+                "direct_test": False,
+                "file": function.path,
+                "name": function.name,
+                "caller": function.identity,
+                "helper": helper.identity,
+                "helper_file": helper.path,
+                "helper_name": helper.name,
+                "cc_before": before,
+                "cc_after": function.cc,
+                "limit": data.limit,
+            }
+            findings.append(Finding(
+                subject, 1, _span(function), measurement,
+                (_location(function), _location(helper)),
+            ))
+            continue
+        if not helper.is_method and site.path == helper.path:
+            continue
         subject = (
-            f"CPF {function.identity} CC {before} -> {function.cc}, helper "
-            f"{helper.identity} (1 call site, no direct test; limit "
-            f"{_number_text(data.limit)} CC; expected the helper to have a direct "
-            "test or a second caller, or the function to stay unsplit)"
+            f"CPF {helper.identity} -> {site.caller} (1 call site, no direct "
+            "test; limit 1 call site with no direct test; expected a direct "
+            "test, a second caller, or the function to stay with its caller)"
         )
         measurement = {
             "rule": "CPF",
             "call_sites": 1,
             "direct_test": False,
-            "file": function.path,
-            "name": function.name,
-            "caller": function.identity,
+            "file": helper.path,
+            "name": helper.name,
+            "caller": site.caller,
             "helper": helper.identity,
             "helper_file": helper.path,
             "helper_name": helper.name,
-            "cc_before": before,
-            "cc_after": function.cc,
-            "limit": data.limit,
         }
         findings.append(Finding(
-            subject, 1, _span(function), measurement,
-            (_location(function), _location(helper)),
+            subject, 1, _span(helper), measurement,
+            (_location(helper),),
         ))
     return findings
 

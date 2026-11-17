@@ -1,7 +1,6 @@
 """Configure and run command checks, including tool and file expansion."""
 from __future__ import annotations
 
-import functools
 import re
 import time
 from dataclasses import dataclass
@@ -9,12 +8,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import output_patterns, policy
-from .files import _known_names
 from .policy import (
     DEFAULT_BUDGET_SECONDS, CheckDef, UnsupportedError, UsageError, _config_error, _integer, _string,
 )
 from .runner import Diagnostics, RunResult, mark_step, run
-from .tools import current_tools, tool_binary
+from .tools import tool_binary
 
 
 if TYPE_CHECKING:
@@ -92,7 +90,6 @@ def _file_argument(name: str) -> str:
 @dataclass
 class _RunExpansion:
     files: list[str]
-    tools: Any = None
 
 
 _EXPANSION = re.compile(
@@ -107,35 +104,21 @@ def _expand_run(
     check: CheckDef, files: list[str]
 ) -> tuple[list[str], str | None]:
     spec = check.spec
-    state = _RunExpansion(
-        [_file_argument(name) for name in files],
-        functools.cache(current_tools),
-    )
+    state = _RunExpansion([_file_argument(name) for name in files])
     expanded: list[str] = []
     for argument in spec.run:
         match = _EXPANSION.fullmatch(argument)
         assert match is not None
         if match.lastgroup == "tool":
-            name = match.group("name")
-            tools = state.tools()[1]
-            if name not in tools:
-                known = _known_names(sorted(tools))
-                return (
-                    [],
-                    f"unknown tool {name!r} (pinned tools: {known}); "
-                    "run 'python3 -I qg.py tools fetch'",
-                )
             try:
-                expanded.append(str(tool_binary(name)))
+                expanded.append(str(tool_binary(match.group("name"))))
             except UnsupportedError as error:
                 return [], str(error)
             continue
-        expanded.extend(
-            {
-                "files": state.files,
-                "literal": [argument],
-            }.get(match.lastgroup, [])
-        )
+        if match.lastgroup == "files":
+            expanded.extend(state.files)
+        else:
+            expanded.append(argument)
     return expanded, None
 
 

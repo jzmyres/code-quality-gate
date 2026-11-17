@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from support import GATE, baseline_text, stub_check_result, with_clones
@@ -210,6 +211,56 @@ class AdapterRegistrationTests(unittest.TestCase):
                     self.assertIs(adapters.register_adapter(descriptor), descriptor)
                     self.assertIs(adapters.adapter_for(descriptor.name), descriptor)
             self.assertEqual(adapters.adapter_names(), names)
+
+
+class CheckDependencyTests(unittest.TestCase):
+    def earlier(self) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                id="lint", adapter="command", evidence=("static",)
+            ),
+            SimpleNamespace(
+                id="unit", adapter="python_tests", evidence=("tests",)
+            ),
+            SimpleNamespace(
+                id="crap", adapter="python_crap", evidence=("crap",)
+            ),
+            SimpleNamespace(
+                id="acceptance", adapter="python_tests", evidence=("tests",)
+            ),
+        ]
+
+    def descriptor(self, *, requires_tests: bool) -> adapters.AdapterDescriptor:
+        return adapters.AdapterDescriptor(
+            "stub", (), parse_stub, run_stub, requires_tests=requires_tests
+        )
+
+    def test_test_dependencies_use_the_configured_check(self) -> None:
+        self.assertEqual(
+            checks._test_check_dependencies("tests", self.earlier()),
+            ["tests"],
+        )
+
+    def test_test_dependencies_take_each_earlier_test_producer(self) -> None:
+        self.assertEqual(
+            checks._test_check_dependencies(None, self.earlier()),
+            ["unit", "acceptance"],
+        )
+
+    def test_required_checks_adds_earlier_crap_checks(self) -> None:
+        self.assertEqual(
+            self.descriptor(requires_tests=True).required_checks(
+                None, self.earlier()
+            ),
+            ("unit", "acceptance", "crap"),
+        )
+
+    def test_required_checks_without_tests_keeps_its_own_requires(self) -> None:
+        descriptor = self.descriptor(requires_tests=False)
+        self.assertEqual(
+            descriptor.required_checks("tests", self.earlier()), ("tests",)
+        )
+        self.assertEqual(descriptor.required_checks(None, self.earlier()), ())
 
 
 class StubAdapterTests(unittest.TestCase):

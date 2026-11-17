@@ -17,7 +17,12 @@ from .runner import run
 SHEBANG_LIMIT = 4096
 DIFF_BASE_ENV = "QG_DIFF_BASE"
 _SHEBANG_ENV = "env"
-_ENV_INTERPRETER_DEFAULT = {_SHEBANG_ENV: None}
+_TYPE_NAMES = {
+    stat.S_IFIFO: "FIFO",
+    stat.S_IFSOCK: "socket",
+    stat.S_IFCHR: "character device",
+    stat.S_IFBLK: "block device",
+}
 
 
 @dataclass(frozen=True)
@@ -282,31 +287,28 @@ def enumerate_files(root: Path) -> list[str]:
     return [entry.path for entry in enumerate_entries(root)]
 
 
+def _env_interpreter(arguments: list[str]) -> str | None:
+    for word in arguments:
+        if word.startswith("-") or "=" in word:
+            continue
+        return PurePosixPath(word).name
+    return None
+
+
 def _shebang_interpreter(first_line: str) -> str | None:
-    words = first_line[2:].strip().split() if first_line.startswith("#!") else []
-    name = next(
-        (PurePosixPath(word).name for word in words[:1]), None
-    )
-    candidates = {
-        _SHEBANG_ENV: (
-            PurePosixPath(word).name
-            for word in words[1:]
-            if not word.startswith("-") and "=" not in word
-        ),
-    }.get(name, iter(()))
-    return next(candidates, _ENV_INTERPRETER_DEFAULT.get(name, name))
+    if not first_line.startswith("#!"):
+        return None
+    words = first_line[2:].strip().split()
+    if not words:
+        return None
+    name = PurePosixPath(words[0]).name
+    if name != _SHEBANG_ENV:
+        return name
+    return _env_interpreter(words[1:])
 
 
 def _type_name(mode: int) -> str | None:
-    if stat.S_ISFIFO(mode):
-        return "FIFO"
-    if stat.S_ISSOCK(mode):
-        return "socket"
-    if stat.S_ISCHR(mode):
-        return "character device"
-    if stat.S_ISBLK(mode):
-        return "block device"
-    return None
+    return _TYPE_NAMES.get(stat.S_IFMT(mode))
 
 
 def _entry_type(path: Path) -> str | None:
@@ -554,6 +556,11 @@ _INVENTORY_KINDS = {
     (False, False, False): "summary",
 }
 
+_INVENTORY_LINE_KEYS = {
+    "violations": "violations_lines",
+    "listing": "listing_lines",
+}
+
 
 _INVENTORY_OUTCOMES = {
     "unknown_class": _InventoryOutcome(
@@ -581,7 +588,7 @@ def _inventory_lines(
     kind: str, values: dict[str, object]
 ) -> tuple[int, str, tuple[str, ...]]:
     outcome = _INVENTORY_OUTCOMES[kind]
-    lines = values.get("lines")
+    lines = values.get(_INVENTORY_LINE_KEYS.get(kind, ""))
     if not lines:
         lines = tuple(
             template.format(**values) for template in outcome.templates
@@ -615,10 +622,8 @@ def _inventory_outcome(
             "rules": len(config.rules),
             "value": repr(list_class),
             "known": _known_names(sorted(config.classes)),
-            "lines": {
-                "violations": violations_lines,
-                "listing": listing_lines,
-            }.get(kind, ()),
+            "violations_lines": violations_lines,
+            "listing_lines": listing_lines,
         },
     )
 
