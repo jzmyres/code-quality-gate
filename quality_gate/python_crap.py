@@ -169,7 +169,7 @@ def _boolean_key(node: ast.AST) -> bool:
 
 
 def _boolean_keys(node: ast.AST) -> int | None:
-    if not isinstance(node, ast.Dict):
+    if not isinstance(node, ast.Dict) or not node.keys:
         return None
     for key in node.keys:
         if key is None or not _boolean_key(key):
@@ -253,7 +253,7 @@ def _record_boolean_table(
             invalid.add(target.id)
         else:
             valid.add(id(target))
-            tables[target.id] = keys
+            tables[target.id] = max(tables.get(target.id, 0), keys)
 
 
 _SCOPES = (
@@ -554,8 +554,11 @@ def _function_complexity(
     # Defaults, decorators and annotations run at definition time and belong
     # to the enclosing owner, so only the executable body counts here.
     tables = _boolean_tables(node.body)
+    for name, count in _boolean_tables(node.body, scoped=True).items():
+        tables[name] = max(tables.get(name, 0), count)
     if module_tables:
-        tables = {**module_tables, **tables}
+        for name, count in module_tables.items():
+            tables[name] = max(tables.get(name, 0), count)
     return cyclomatic_complexity(
         ast.Module(body=node.body, type_ignores=[]), tables
     )
@@ -719,7 +722,9 @@ def _lambda_lines(node: ast.Lambda) -> tuple[int, ...]:
 def _lambda_subject(
     node: ast.Lambda, relative: str, module_tables: dict[str, int]
 ) -> MeasuredFunction | None:
-    tables = {**module_tables, **_boolean_tables(node)}
+    tables = _boolean_tables(node)
+    for name, count in module_tables.items():
+        tables[name] = max(tables.get(name, 0), count)
     cc = cyclomatic_complexity(node, tables)
     if cc == 1:
         return None

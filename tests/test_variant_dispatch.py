@@ -1145,6 +1145,16 @@ class ReaderHelperTests(VariantCase):
                 try_load.body[0].body[0].value, try_functions
             ),
         )
+        bare_return = ast.parse("def load():\n    return\n").body[0]
+        other_statement = ast.parse("def load():\n    pass\n").body[0]
+        self.assertIsNone(
+            variant_dispatch._single_return(bare_return.body, try_functions)
+        )
+        self.assertIsNone(
+            variant_dispatch._single_return(
+                other_statement.body, try_functions
+            )
+        )
         self.assertEqual(
             variant_dispatch._matching_calls(
                 (first, argument), (second, argument)

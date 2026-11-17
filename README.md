@@ -546,7 +546,7 @@ module-level definition). The construct rules and the named-table selections are
 | `and`/`or` | One per operand after the first. |
 | `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements, recursively, so an empty one adds none. |
 | subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
-| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name counts the same way when the name is bound at module level to such a table, or is bound in the same function to one. Names are not scope-resolved: a parameter, local, lambda or comprehension variable, nested binding or default that reuses a module table's name is counted as that table. |
+| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name counts the most decisions of any such table bound to that name at module level or in the function's body. A binding that is not such a table (an empty dict, a string-keyed dict, anything else) removes that scope's table but never lowers another scope's count, and a binding inside a nested function or class never lowers the count. Names are not scope-resolved: a parameter, local, lambda or comprehension variable, nested binding or default that reuses a module table's name is counted as that table. |
 | `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, or tuples of one length with a boolean position, when it counts like the display, by the same name rule as the subscript row. |
 | `getattr` with three arguments | One, the default is a branch. |
 | `next` with two arguments | One, the default is a branch. |
@@ -554,7 +554,7 @@ module-level definition). The construct rules and the named-table selections are
 | `map` | One, a loop as a comprehension's `for`. |
 | `filter`, `itertools.filterfalse`, `itertools.dropwhile`, `itertools.takewhile` | Two, a loop and its condition. |
 
-Shadowing a table's name is itself a defect, and renaming it is the fix; the count never resolves a name to a scope.
+Shadowing a table's name is itself a defect, and renaming it is the fix; the count never resolves a name to a scope, and a table of the same name never lowers another scope's count.
 
 A starred element whose length the source does not write counts as one element, and a written
 empty display contributes none. In a dict display, each `**` entry counts as one key whatever it

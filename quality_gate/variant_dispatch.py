@@ -575,15 +575,6 @@ def _assigned_call(
     return None
 
 
-def _returned_call(
-    statement: ast.AST,
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> tuple[ast.AST, ast.AST] | None:
-    if not isinstance(statement, ast.Return) or statement.value is None:
-        return None
-    return _module_call(statement.value, functions)
-
-
 def _guard_name(test: ast.AST) -> str | None:
     match test:
         case ast.UnaryOp(op=ast.Not(), operand=ast.Name(id=name)):
@@ -660,7 +651,10 @@ def _single_return(
 ) -> tuple[ast.AST, ast.AST] | None:
     if len(body) != 1:
         return None
-    return _returned_call(body[0], functions)
+    statement = body[0]
+    if not isinstance(statement, ast.Return) or statement.value is None:
+        return None
+    return _module_call(statement.value, functions)
 
 
 def _single_handler(statement: ast.AST) -> ast.ExceptHandler | None:

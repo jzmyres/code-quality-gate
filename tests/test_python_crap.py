@@ -1906,7 +1906,56 @@ class BooleanTableTests(unittest.TestCase):
             "    return TABLE[flag]\n"
         )
         self.assertEqual(self.complexity(source, "outer"), 5)
-        self.assertEqual(self.complexity(source, "shadowed"), 1)
+        self.assertEqual(self.complexity(source, "shadowed"), 3)
+
+    def test_a_binding_never_lowers_the_module_table(self):
+        selections = ", ".join(["TABLE[flag]"] * 6)
+        reads = ", ".join(["TABLE.get(flag)"] * 6)
+        cases = {
+            "nested empty": (
+                "TABLE = {True: 1, False: 2}\n"
+                "def choose(flag):\n"
+                "    def hidden():\n"
+                "        TABLE = {}\n"
+                "        return TABLE\n"
+                f"    return ({selections})\n",
+                7,
+            ),
+            "nested smaller": (
+                "TABLE = {True: 1, False: 2}\n"
+                "def choose(flag):\n"
+                "    def hidden():\n"
+                "        TABLE = {True: 3}\n"
+                "        return TABLE\n"
+                f"    return ({selections})\n",
+                7,
+            ),
+            "nested empty get": (
+                "TABLE = {True: 1, False: 2}\n"
+                "def choose(flag):\n"
+                "    def hidden():\n"
+                "        TABLE = {}\n"
+                "        return TABLE\n"
+                f"    return ({reads})\n",
+                7,
+            ),
+            "local empty": (
+                "TABLE = {True: 1, False: 2}\n"
+                "def choose(flag):\n"
+                "    TABLE = {}\n"
+                f"    return ({selections})\n",
+                7,
+            ),
+            "local table": (
+                "def choose(flag):\n"
+                "    TABLE = {True: 1, False: 2, (True, False): 3}\n"
+                f"    return ({selections})\n",
+                13,
+            ),
+        }
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(self.complexity(source, "choose"), expected)
 
     def test_a_name_rebound_to_something_else_is_not_counted(self):
         cases = {
