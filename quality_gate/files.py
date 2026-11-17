@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import re
 import stat
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
-from itertools import product
+from itertools import dropwhile, product
 from pathlib import Path, PurePosixPath
 
 from .policy import Config, ConfigError, GateError, Rule, UsageError
@@ -281,49 +280,27 @@ def enumerate_files(root: Path) -> list[str]:
     return [entry.path for entry in enumerate_entries(root)]
 
 
-# The env options this reader knows, by whether env gives them an argument.
-# Each option word is still skipped alone: the word after it remains the
-# interpreter candidate, exactly as the original reader left it.
-_ENV_OPTIONS = {
-    "-u": "argument",
-    "--unset": "argument",
-    "-C": "argument",
-    "--chdir": "argument",
-    "--block-signal": "argument",
-    "--default-signal": "argument",
-    "--ignore-signal": "argument",
-    "-i": "flag",
-    "--ignore-environment": "flag",
-    "-0": "flag",
-    "--null": "flag",
-    "-v": "flag",
-    "--debug": "flag",
-    "-S": "flag",
-    "--split-string": "flag",
-    "--list-signal-handling": "flag",
-}
-_ENV_OPTION = re.compile(r"^-|=")
-
-
-def _interpreter_word(words: list[str]) -> str | None:
-    """The interpreter named by an already split env shebang."""
-    name = PurePosixPath(words[0]).name
-    if name != "env":
-        return name
-    for index, word in enumerate(words[1:], 1):
-        if word in _ENV_OPTIONS or _ENV_OPTION.search(word):
-            continue
-        return PurePosixPath(words[index]).name
-    return None
-
-
 def _shebang_interpreter(first_line: str) -> str | None:
     if not first_line.startswith("#!"):
         return None
     words = first_line[2:].strip().split()
     if not words:
         return None
-    return _interpreter_word(words)
+    name = PurePosixPath(words[0]).name
+    if name != "env":
+        return name
+    interpreter = next(
+        dropwhile(
+            lambda word: any(
+                (word.startswith("-"), "=" in word)
+            ),
+            words[1:],
+        ),
+        None,
+    )
+    if interpreter is None:
+        return None
+    return PurePosixPath(interpreter).name
 
 
 def _type_name(mode: int) -> str | None:
@@ -446,6 +423,7 @@ class _InventoryValidator:
     violations: list[str]
     matched: list[int]
     classes: dict[str, str]
+    gitlinks: set[str]
 
     def validate(self) -> tuple[list[str], dict[str, str], list[str]]:
         files = [entry.path for entry in self.entries]
@@ -521,7 +499,7 @@ class _InventoryValidator:
         if class_def is None:
             return
         self.classes[relative] = rule.class_name
-        if entry.gitlink:
+        if relative in self.gitlinks:
             return
         try:
             code = _is_code(self.root / relative, relative, self.config)
@@ -554,6 +532,7 @@ def validate_inventory(
         violations,
         [0] * len(config.rules),
         {},
+        {entry.path for entry in entries if entry.gitlink},
     ).validate()
 
 
@@ -644,16 +623,21 @@ def _inventory_outcome(
 def command_inventory(
     root: Path, config: Config, list_class: str | None = None
 ) -> int:
-    try:
-        files, classes, violations = validate_inventory(root, config)
-    except GateError as error:
-        status, stream, lines = _inventory_lines(
-            "error", {"value": error}
+    if list_class is not None and list_class not in config.classes:
+        status, stream, lines = _inventory_outcome(
+            [], {}, [], config, list_class
         )
     else:
-        status, stream, lines = _inventory_outcome(
-            files, classes, violations, config, list_class
-        )
+        try:
+            files, classes, violations = validate_inventory(root, config)
+        except GateError as error:
+            status, stream, lines = _inventory_lines(
+                "error", {"value": error}
+            )
+        else:
+            status, stream, lines = _inventory_outcome(
+                files, classes, violations, config, list_class
+            )
     for line in lines:
         print(line, file=getattr(sys, stream))
     return status

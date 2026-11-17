@@ -262,34 +262,33 @@ def _required(context: Any, start: float) -> tuple[Any, Any]:
     return None, _ratchet_result(context.check, start, "unsupported", reason=reason)
 
 
-def _domain(selected: list[str], files: list[str], entries: list[Any]) -> Domain:
+def _domain(context: Any, selected: list[str], entries: list[Any]) -> Domain:
+    mark_step("Elisp measured domain")
     # Both paths and symbol names can contain colons.  Use the longest actual
     # inventory path so an unselected file cannot masquerade as a symbol.
     subjects = []
     for entry in entries:
-        candidates = [name for name in files if entry.subject.startswith(f"{name}:")]
+        candidates = [
+            name
+            for name in context.files
+            if entry.subject.startswith(f"{name}:")
+        ]
         if candidates and max(candidates, key=len) in selected:
             subjects.append(entry.subject)
     return Domain.of_subjects(subjects, "the selected files")
 
 
 def _ratchet(context: Any, start: float, selected: list[str], findings: list[Finding]) -> Any:
-    from .checks import _baseline_entries, _evaluate_ratchet, _ratchet_error, _ratchet_result
+    from .checks import _finish_crap_ratchet
 
-    try:
-        mark_step("baseline loading")
-        entries = _baseline_entries(context.check)
-    except GateError as error:
-        return _ratchet_error(context.check, start, context.prefix, error)
-    mark_step("Elisp measured domain")
-    domain = _domain(selected, context.files, entries)
-    ratchet, failure = _evaluate_ratchet(findings, entries, context.check, context.prefix, domain)
-    if ratchet is None:
-        return _ratchet_result(context.check, start, failure or "error", reason=failure)
-    if ratchet.satisfied:
-        print(f"{context.prefix}: {len(findings)} functions within threshold", flush=True)
-    return _ratchet_result(context.check, start, ratchet.outcome, ratchet=ratchet,
-                           measurement={"functions": len(findings)})
+    return _finish_crap_ratchet(
+        context.check,
+        findings,
+        context.prefix,
+        start,
+        lambda entries: _domain(context, selected, entries),
+        ("functions", "functions"),
+    )
 
 
 def run_crap(context: Any) -> Any:

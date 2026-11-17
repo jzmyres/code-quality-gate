@@ -282,13 +282,95 @@ class InventoryTests(FixtureCase):
             violations,
             [0] * len(config.rules),
             {},
+            {entry.path for entry in entries if entry.gitlink},
         )
         names, classes, reported = validator.validate()
         self.assertIn("a.py", names)
         self.assertNotIn("a.py", classes)
-        self.assertTrue(
-            any("unknown class 'mystery'" in item for item in reported)
+        self.assertEqual(
+            reported,
+            [
+                "rule[0] (pattern '*.py'): unknown class 'mystery' "
+                "(known classes: config, doc, python)"
+            ],
         )
+
+    def inventory_validator(
+        self, config: object, entries: list[files.GitFile] | None = None
+    ) -> files._InventoryValidator:
+        entries = [] if entries is None else entries
+        return files._InventoryValidator(
+            self.repo,
+            config,
+            entries,
+            [],
+            [0] * len(config.rules),
+            {},
+            {entry.path for entry in entries if entry.gitlink},
+        )
+
+    def test_validator_check_classes_names_every_unknown_check(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace('checks = ["smoke"]', 'checks = ["missing"]')
+        )
+        validator = self.inventory_validator(policy.load_config(self.repo))
+        validator._check_classes()
+        self.assertEqual(
+            validator.violations,
+            [
+                "classes.python: unknown check 'missing' "
+                "(known checks: smoke)"
+            ],
+        )
+
+    def test_validator_check_rules_names_every_invalid_rule(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace('class = "python"', 'class = "mystery"', 1)
+        )
+        validator = self.inventory_validator(policy.load_config(self.repo))
+        validator._check_rules()
+        self.assertEqual(
+            validator.violations,
+            [
+                "rule[0] (pattern '*.py'): unknown class 'mystery' "
+                "(known classes: config, doc, python)"
+            ],
+        )
+
+    def test_validator_classify_files_records_hits_and_unclassified(
+        self,
+    ) -> None:
+        validator = self.inventory_validator(
+            policy.load_config(self.repo),
+            [
+                files.GitFile("a.py", "100644"),
+                files.GitFile("mystery.zzz", None),
+            ],
+        )
+        validator._classify_files()
+        self.assertEqual(validator.classes, {"a.py": "python"})
+        self.assertEqual(validator.matched, [1, 0, 0, 0])
+        self.assertEqual(
+            validator.violations,
+            ["mystery.zzz: unclassified (no rule matches)"],
+        )
+
+    def test_validator_classify_skips_a_path_with_a_gitlink_stage(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[[rule]]\npattern = "script"\nclass = "doc"\n'
+            'reason = "an unmerged shell script"\n'
+        )
+        self.add_file("script", "#!/bin/sh\necho hi\n")
+        config = policy.load_config(self.repo)
+        entries = [
+            files.GitFile("script", "100644"),
+            files.GitFile("script", "160000"),
+        ]
+        validator = self.inventory_validator(config, entries)
+        validator._classify(entries[0], config.rules[-1])
+        self.assertEqual(validator.classes, {"script": "doc"})
+        self.assertEqual(validator.violations, [])
 
     def test_inventory_outcome_is_the_one_output_chooser(self) -> None:
         self.write_config(BASE_CONFIG)
@@ -305,8 +387,17 @@ class InventoryTests(FixtureCase):
         status, stream, lines = files._inventory_outcome(
             [], {}, [], config, "missing"
         )
-        self.assertEqual((status, stream), (2, "stderr"))
-        self.assertIn("unknown class 'missing'", lines[0])
+        self.assertEqual(
+            (status, stream, lines),
+            (
+                2,
+                "stderr",
+                (
+                    "inventory: unknown class 'missing'; "
+                    "known classes: config, doc, python",
+                ),
+            ),
+        )
         status, stream, lines = files._inventory_outcome(
             [], {}, [], config, None
         )
@@ -322,6 +413,18 @@ class InventoryTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
         self.assertIn("unknown class 'mystery'", text)
+
+    def test_unknown_class_is_reported_before_file_enumeration(self) -> None:
+        (self.repo / ".git" / "index").write_bytes(b"corrupt index\n")
+        result = self.run_qg("inventory", "--list", "missing")
+        text = output(result)
+        self.assertEqual(result.returncode, 2, text)
+        self.assertEqual(
+            result.stderr,
+            "inventory: unknown class 'missing'; "
+            "known classes: config, doc, python\n",
+        )
+        self.assertEqual(result.stdout, "")
 
     def test_list_known_but_empty_class_prints_nothing(self) -> None:
         self.write_config(
@@ -443,25 +546,24 @@ class InventoryTests(FixtureCase):
             self.assertIn(name, text)
         self.assertIn("code file classified as 'doc'", text)
 
-    def test_env_options_leave_the_next_word_as_the_interpreter(self) -> None:
+    def test_shebang_interpreter_skips_env_options_and_assignments(
+        self,
+    ) -> None:
         self.assertEqual(
-            files._interpreter_word(
-                ["/usr/bin/env", "-S", "python3", "-u"]
-            ),
+            files._shebang_interpreter("#!/usr/bin/env -S python3 -u"),
             "python3",
         )
         self.assertEqual(
-            files._interpreter_word(
-                ["/usr/bin/env", "-u", "VAR", "python3"]
-            ),
+            files._shebang_interpreter("#!/usr/bin/env -u VAR python3"),
             "VAR",
         )
         self.assertEqual(
-            files._interpreter_word(["/usr/bin/env", "VAR=1", "bash"]),
+            files._shebang_interpreter("#!/usr/bin/env VAR=1 bash"),
             "bash",
         )
-        self.assertEqual(files._interpreter_word(["/bin/sh", "-e"]), "sh")
-        self.assertIsNone(files._interpreter_word(["/usr/bin/env", "-i"]))
+        self.assertEqual(files._shebang_interpreter("#!/bin/sh -e"), "sh")
+        self.assertIsNone(files._shebang_interpreter("#!/usr/bin/env -i"))
+        self.assertIsNone(files._shebang_interpreter("not a shebang"))
 
     def test_non_code_shebang_in_non_code_class_passes(self) -> None:
         self.write_config(
@@ -623,6 +725,33 @@ class InventoryTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 0, text)
         self.assertIn("inventory: 5 files match 5 rules", result.stdout)
+
+    def test_a_gitlink_stage_excludes_the_path_from_shebang_reads(self) -> None:
+        self.write_config(
+            BASE_CONFIG
+            + '\n[[rule]]\npattern = "script"\nclass = "doc"\n'
+            'reason = "an unmerged shell script"\n'
+        )
+        self.add_file("script", "#!/bin/sh\necho hi\n")
+        self.git("add", "script")
+        blob = self.git("hash-object", "-w", "script").stdout.strip()
+        self.git("update-index", "--force-remove", "script")
+        info = (
+            f"100644 {blob} 1\tscript\n"
+            f"160000 {'1' * 40} 2\tscript\n"
+        )
+        subprocess.run(
+            ["git", "update-index", "--index-info"],
+            cwd=self.repo,
+            env=self.env(),
+            input=info,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        result = self.run_qg("inventory")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(result.stderr, "")
 
     def test_gate_submodule_passes_the_quick_start_inventory(self) -> None:
         source = self.base / "gate-source"

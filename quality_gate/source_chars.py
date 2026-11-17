@@ -278,7 +278,13 @@ def _run_source_chars(context: Any) -> Any:
         "the selected source files and code points",
     )
     result = _finish_ratchet(
-        check, findings, entries, context.prefix, start, domain, "character"
+        check,
+        findings,
+        entries,
+        context.prefix,
+        start,
+        domain,
+        f"{len(findings)} character subjects within baseline",
     )
     result.measurement = (
         None if base is None else {"base": base.measurement()}

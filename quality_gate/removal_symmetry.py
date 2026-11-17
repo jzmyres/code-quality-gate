@@ -513,7 +513,13 @@ def _run_removal_symmetry(context: Any) -> Any:
         "the removed tokens and selected scan files",
     )
     result = _finish_ratchet(
-        check, findings, entries, context.prefix, start, domain, "removed-token"
+        check,
+        findings,
+        entries,
+        context.prefix,
+        start,
+        domain,
+        f"{len(findings)} removed-token subjects within baseline",
     )
     result.measurement = {"base": base.measurement()}
     return result

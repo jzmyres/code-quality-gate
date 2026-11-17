@@ -252,19 +252,22 @@ class ToolsTests(FixtureCase):
             env={"QG_TOOLS_DIR": str(tools)},
         )
 
-    def fetch_refused(self, archive: Path, needle: str) -> Path:
+    def fetch_refused(self, archive: Path, message: str) -> Path:
         lock = self.write_lock(archive.as_uri(), self.sha256(archive))
         tools = self.base / "tools"
         result = self.fetch(lock, tools)
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn(needle, text)
+        self.assertEqual(
+            result.stderr,
+            f"tools: jscpd {VERSION}: {message}\n",
+        )
         return tools
 
     def assert_not_installed(self, tools: Path) -> None:
         self.assertFalse((tools / f"jscpd-{VERSION}").exists())
 
-    def fetch_wheel_refused(self, wheel: Path, needle: str) -> None:
+    def fetch_wheel_refused(self, wheel: Path, message: str) -> None:
         lock = self.write_lock(
             wheel.as_uri(),
             self.sha256(wheel),
@@ -275,11 +278,14 @@ class ToolsTests(FixtureCase):
         result = self.fetch(lock, tools)
         text = output(result)
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn(needle, text)
+        self.assertEqual(
+            result.stderr,
+            f"tools: jscpd {VERSION}: {message}\n",
+        )
         self.assert_not_installed(tools)
 
     def extract_refused(
-        self, extractor, archive: Path, needle: str, outside: Path
+        self, extractor, archive: Path, message: str, outside: Path
     ) -> None:
         destination = self.base / "destination"
         destination.mkdir(exist_ok=True)
@@ -291,8 +297,12 @@ class ToolsTests(FixtureCase):
             payload_sha256="0" * 64,
             binary="jscpd",
         )
-        with self.assertRaisesRegex(GateError, needle):
+        with self.assertRaises(GateError) as raised:
             extractor(archive, destination, tool)
+        self.assertEqual(
+            str(raised.exception),
+            f"tools: jscpd {VERSION}: {message}",
+        )
         self.assertFalse(outside.exists())
         self.assertEqual(list(destination.rglob("*")), [])
 
@@ -402,17 +412,24 @@ class ToolsTests(FixtureCase):
         archive = self.make_tarball(
             files={"../escape": b"evil\n", "jscpd": b"binary\n"}
         )
-        tools = self.fetch_refused(archive, "unsafe archive member")
+        tools = self.fetch_refused(
+            archive,
+            "unsafe archive member '../escape'; nothing installed",
+        )
         self.assertFalse((self.base / "escape").exists())
         self.assert_not_installed(tools)
 
     def test_fetch_refuses_absolute_member(self) -> None:
+        outside = self.base / "absolute-escape"
         archive = self.make_tarball(
             files={"jscpd": b"binary\n"},
-            absolute=[str(self.base / "absolute-escape")],
+            absolute=[str(outside)],
         )
-        tools = self.fetch_refused(archive, "unsafe archive member")
-        self.assertFalse((self.base / "absolute-escape").exists())
+        tools = self.fetch_refused(
+            archive,
+            f"unsafe archive member {str(outside)!r}; nothing installed",
+        )
+        self.assertFalse(outside.exists())
         self.assert_not_installed(tools)
 
     def test_fetch_refuses_symlink_member(self) -> None:
@@ -421,7 +438,11 @@ class ToolsTests(FixtureCase):
             files={"jscpd": b"binary\n"},
             links={"linked": str(outside)},
         )
-        tools = self.fetch_refused(archive, "is a link")
+        tools = self.fetch_refused(
+            archive,
+            "unsafe archive member 'linked' is a link; "
+            "nothing installed",
+        )
         self.assertFalse(outside.exists())
         self.assert_not_installed(tools)
 
@@ -431,7 +452,11 @@ class ToolsTests(FixtureCase):
             files={"jscpd": b"binary\n"},
             hardlinks={"linked": str(outside)},
         )
-        tools = self.fetch_refused(archive, "is a link")
+        tools = self.fetch_refused(
+            archive,
+            "unsafe archive member 'linked' is a link; "
+            "nothing installed",
+        )
         self.assertFalse(outside.exists())
         self.assert_not_installed(tools)
 
@@ -440,7 +465,11 @@ class ToolsTests(FixtureCase):
             files={"jscpd": b"binary\n"},
             devices=["device"],
         )
-        tools = self.fetch_refused(archive, "not a regular file")
+        tools = self.fetch_refused(
+            archive,
+            "unsafe archive member 'device' is not a regular file; "
+            "nothing installed",
+        )
         self.assert_not_installed(tools)
 
     def test_fetch_refuses_non_regular_member(self) -> None:
@@ -454,7 +483,11 @@ class ToolsTests(FixtureCase):
             fifo = tarfile.TarInfo("pipe")
             fifo.type = tarfile.FIFOTYPE
             tar.addfile(fifo)
-        tools = self.fetch_refused(archive, "not a regular file")
+        tools = self.fetch_refused(
+            archive,
+            "unsafe archive member 'pipe' is not a regular file; "
+            "nothing installed",
+        )
         self.assert_not_installed(tools)
 
     def test_fetch_keeps_an_existing_install(self) -> None:
@@ -769,7 +802,10 @@ class ToolsTests(FixtureCase):
 
     def test_fetch_archive_without_binary_installs_nothing(self) -> None:
         archive = self.make_tarball(files={"LICENSE": b"MIT\n"})
-        tools = self.fetch_refused(archive, "does not contain 'jscpd'")
+        tools = self.fetch_refused(
+            archive,
+            "archive does not contain 'jscpd'; nothing installed",
+        )
         self.assert_not_installed(tools)
 
     def test_fetch_lock_without_payload_digest_exits_2(self) -> None:
@@ -921,7 +957,10 @@ class ToolsTests(FixtureCase):
                 "pkg/__init__.py": b"VALUE = 1\n",
             }
         )
-        self.fetch_wheel_refused(wheel, "unsafe archive member")
+        self.fetch_wheel_refused(
+            wheel,
+            "unsafe archive member '../escape'; nothing installed",
+        )
         self.assertFalse((self.base / "escape").exists())
 
     def test_fetch_wheel_refuses_absolute_member(self) -> None:
@@ -932,7 +971,10 @@ class ToolsTests(FixtureCase):
                 "pkg/__init__.py": b"VALUE = 1\n",
             }
         )
-        self.fetch_wheel_refused(wheel, "unsafe archive member")
+        self.fetch_wheel_refused(
+            wheel,
+            f"unsafe archive member {str(outside)!r}; nothing installed",
+        )
         self.assertFalse(outside.exists())
 
     def test_fetch_wheel_refuses_symlink_member(self) -> None:
@@ -941,7 +983,11 @@ class ToolsTests(FixtureCase):
             files={"pkg/__init__.py": b"VALUE = 1\n"},
             links={"pkg/link": str(outside)},
         )
-        self.fetch_wheel_refused(wheel, "is a link")
+        self.fetch_wheel_refused(
+            wheel,
+            "unsafe archive member 'pkg/link' is a link; "
+            "nothing installed",
+        )
         self.assertFalse(outside.exists())
 
     def test_fetch_wheel_refuses_device_member(self) -> None:
@@ -952,7 +998,11 @@ class ToolsTests(FixtureCase):
             },
             modes={"pkg/device": stat.S_IFCHR | 0o644},
         )
-        self.fetch_wheel_refused(wheel, "not a regular file")
+        self.fetch_wheel_refused(
+            wheel,
+            "unsafe archive member 'pkg/device' is not a regular file; "
+            "nothing installed",
+        )
 
     def test_wheel_member_path_reads_the_shared_member_table(self) -> None:
         tool = Tool(
@@ -967,16 +1017,31 @@ class ToolsTests(FixtureCase):
         link = zipfile.ZipInfo("pkg/link")
         link.create_system = 3
         link.external_attr = (stat.S_IFLNK | 0o777) << 16
-        with self.assertRaisesRegex(GateError, "is a link"):
+        with self.assertRaises(GateError) as raised:
             _wheel_member_path(link, tool)
+        self.assertEqual(
+            str(raised.exception),
+            f"tools: jscpd {VERSION}: unsafe archive member 'pkg/link' "
+            "is a link; nothing installed",
+        )
         device = zipfile.ZipInfo("pkg/device")
         device.create_system = 3
         device.external_attr = (stat.S_IFCHR | 0o644) << 16
-        with self.assertRaisesRegex(GateError, "not a regular file"):
+        with self.assertRaises(GateError) as raised:
             _wheel_member_path(device, tool)
+        self.assertEqual(
+            str(raised.exception),
+            f"tools: jscpd {VERSION}: unsafe archive member 'pkg/device' "
+            "is not a regular file; nothing installed",
+        )
         escape = zipfile.ZipInfo("../escape")
-        with self.assertRaisesRegex(GateError, "unsafe archive member"):
+        with self.assertRaises(GateError) as raised:
             _wheel_member_path(escape, tool)
+        self.assertEqual(
+            str(raised.exception),
+            f"tools: jscpd {VERSION}: unsafe archive member '../escape'; "
+            "nothing installed",
+        )
         directory = zipfile.ZipInfo("pkg/")
         directory.create_system = 3
         directory.external_attr = (stat.S_IFDIR | 0o755) << 16
@@ -987,7 +1052,7 @@ class ToolsTests(FixtureCase):
         self.extract_refused(
             _extract_tar,
             tar_path,
-            "unsafe archive member",
+            "unsafe archive member '../tar-escape'; nothing installed",
             self.base / "tar-escape",
         )
         tar_link = self.make_tarball(
@@ -997,7 +1062,8 @@ class ToolsTests(FixtureCase):
         self.extract_refused(
             _extract_tar,
             tar_link,
-            "is a link",
+            "unsafe archive member 'tar-link' is a link; "
+            "nothing installed",
             self.base / "tar-link",
         )
         tar_device = self.make_tarball(
@@ -1007,14 +1073,15 @@ class ToolsTests(FixtureCase):
         self.extract_refused(
             _extract_tar,
             tar_device,
-            "not a regular file",
+            "unsafe archive member 'tar-device' is not a regular file; "
+            "nothing installed",
             self.base / "tar-device",
         )
         wheel_path = self.make_wheel(files={"../wheel-escape": b"evil\n"})
         self.extract_refused(
             _extract_wheel,
             wheel_path,
-            "unsafe archive member",
+            "unsafe archive member '../wheel-escape'; nothing installed",
             self.base / "wheel-escape",
         )
         wheel_link = self.make_wheel(
@@ -1024,7 +1091,8 @@ class ToolsTests(FixtureCase):
         self.extract_refused(
             _extract_wheel,
             wheel_link,
-            "is a link",
+            "unsafe archive member 'pkg/link' is a link; "
+            "nothing installed",
             self.base / "wheel-link",
         )
         wheel_device = self.make_wheel(
@@ -1037,7 +1105,8 @@ class ToolsTests(FixtureCase):
         self.extract_refused(
             _extract_wheel,
             wheel_device,
-            "not a regular file",
+            "unsafe archive member 'pkg/device' is not a regular file; "
+            "nothing installed",
             self.base / "wheel-device",
         )
 

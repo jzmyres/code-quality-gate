@@ -265,13 +265,25 @@ def _adapter_selection(
 
 
 def _ratchet_reason(
-    ratchet: RatchetResult | None, reason: str | None
+    ratchet: RatchetResult | None,
+    reason: str | None,
+    execution: str,
+    start: float,
 ) -> str | None:
-    if ratchet is None or ratchet.outcome == "pass":
-        return reason
-    return reason or (
-        "ratchet findings did not satisfy the threshold or baseline"
-    )
+    if all(
+        (
+            execution == "budget",
+            reason is not None,
+            "deadline:" not in (reason or ""),
+        )
+    ):
+        reason = _budget_detail(reason, start, RATCHET_BUDGET_SECONDS)
+    if reason is None and getattr(ratchet, "outcome", None) not in (
+        None,
+        "pass",
+    ):
+        return "ratchet findings did not satisfy the threshold or baseline"
+    return reason
 
 
 def _ratchet_result(
@@ -300,7 +312,7 @@ def _ratchet_result(
         ratchet=ratchet,
         measurement=measurement,
         diagnostics=diagnostics or Diagnostics(),
-        reason=_ratchet_reason(ratchet, _ratchet_budget_reason(reason, execution, start)),
+        reason=_ratchet_reason(ratchet, reason, execution, start),
     )
 
 
@@ -311,27 +323,54 @@ def _finish_ratchet(
     prefix: str,
     start: float,
     domain: Domain,
-    noun: str,
+    message: str,
+    measurement: dict[str, Any] | None = None,
 ) -> CheckResult:
     ratchet, failure = _evaluate_ratchet(
         findings, entries, check, prefix, domain
     )
-    outcome = ratchet.outcome if ratchet is not None else (failure or "error")
+    if ratchet is None:
+        outcome = failure or "error"
+        measurement = None
+    else:
+        outcome = ratchet.outcome
     result = _ratchet_result(
-        check, start, outcome, ratchet=ratchet, reason=failure
+        check,
+        start,
+        outcome,
+        ratchet=ratchet,
+        measurement=measurement,
+        reason=failure,
     )
     if ratchet is not None and ratchet.satisfied:
-        print(
-            f"{prefix}: {len(findings)} {noun} subjects within baseline",
-            flush=True,
-        )
+        print(f"{prefix}: {message}", flush=True)
     return result
 
 
-def _ratchet_budget_reason(reason: str | None, execution: str, start: float) -> str | None:
-    if execution == "budget" and reason is not None and "deadline:" not in reason:
-        return _budget_detail(reason, start, RATCHET_BUDGET_SECONDS)
-    return reason
+def _finish_crap_ratchet(
+    check: CheckDef,
+    findings: list[Any],
+    prefix: str,
+    start: float,
+    domain_for: Any,
+    nouns: tuple[str, str],
+) -> CheckResult:
+    try:
+        mark_step("baseline loading")
+        entries = _baseline_entries(check)
+    except GateError as error:
+        return _ratchet_error(check, start, prefix, error)
+    noun = nouns[len(findings) == 1]
+    return _finish_ratchet(
+        check,
+        findings,
+        entries,
+        prefix,
+        start,
+        domain_for(entries),
+        f"{len(findings)} {noun} within threshold",
+        measurement={"functions": len(findings)},
+    )
 
 
 def _ratchet_error(

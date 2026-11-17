@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import types
@@ -28,6 +29,7 @@ from support import (
 
 sys.path.insert(0, str(GATE))
 python_crap = importlib.import_module("quality_gate.python_crap")
+checks = importlib.import_module("quality_gate.checks")
 
 
 def crap_config(
@@ -1279,63 +1281,113 @@ class CrapRunTests(unittest.TestCase):
 
     def test_run_reports_no_files_selected(self) -> None:
         context = self.context()
-        with mock.patch("sys.stderr", new=io.StringIO()):
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", new=stderr):
             result = python_crap._run_python_crap(context)
+        reason = (
+            "no files selected (classes: none); "
+            "zero inputs is not a pass"
+        )
         self.assertEqual(result.outcome, "fail")
-        self.assertIn("no files selected", result.reason)
+        self.assertEqual(result.reason, reason)
+        self.assertEqual(stderr.getvalue(), f"crap: {reason}\n")
 
-    def test_require_records_unreliable_coverage(self) -> None:
-        run = python_crap._CrapRun(self.context())
-        run.selection = (
+    def test_run_reports_unreliable_coverage(self) -> None:
+        context = self.context()
+        selection = (
             types.SimpleNamespace(requires="tests"),
             0.0,
             ["pkg/example.py"],
-            [],
+            ["python"],
         )
-        with mock.patch("sys.stderr", new=io.StringIO()):
-            run.require()
-        self.assertIn(
-            "coverage unreliable: tests did not pass", run.coverage[3]
-        )
+        stderr = io.StringIO()
+        with mock.patch.object(
+            checks,
+            "_adapter_selection",
+            return_value=selection,
+        ), mock.patch("sys.stderr", new=stderr):
+            result = python_crap._run_python_crap(context)
+        message = "coverage unreliable: tests did not pass"
+        self.assertEqual(result.outcome, "unsupported")
+        self.assertEqual(result.reason, message)
+        self.assertEqual(stderr.getvalue(), f"crap: {message}\n")
 
-    def test_failures_result_keeps_every_failure_tail(self) -> None:
-        run = python_crap._CrapRun(self.context())
-        run.selection = (None, 0.0, ["pkg/example.py"], [])
-        run.measured = (
-            python_crap.CrapMeasurement([], ["first", "second"]),
-            None,
+    def test_run_returns_a_measurement_failure(self) -> None:
+        context = self.context()
+        failure = checks._ratchet_result(
+            context.check, 0.0, "fail", reason="first"
         )
-        with mock.patch("sys.stderr", new=io.StringIO()):
-            result = run.failures_result()
-        self.assertEqual(result.outcome, "fail")
-        self.assertIn("first", result.diagnostics.output_tail)
-        self.assertIn("second", result.diagnostics.output_tail)
+        selection = (None, 0.0, ["pkg/example.py"], ["python"])
+        with mock.patch.object(
+            checks, "_adapter_selection", return_value=selection
+        ), mock.patch.object(
+            python_crap,
+            "_crap_required",
+            return_value=(Path("evidence"), "settings", None, None),
+        ), mock.patch.object(
+            python_crap,
+            "_crap_measure",
+            return_value=(None, failure),
+        ):
+            result = python_crap._run_python_crap(context)
+        self.assertIs(result, failure)
+
+    def test_measure_reports_every_measurement_failure(self) -> None:
+        context = self.context()
+        stderr = io.StringIO()
+        measurement = python_crap.CrapMeasurement(
+            [], ["first", "second"]
+        )
+        with mock.patch.object(
+            python_crap, "measure_crap", return_value=measurement
+        ), mock.patch("sys.stderr", new=stderr):
+            result, failure = python_crap._crap_measure(
+                context.root,
+                ["pkg/example.py"],
+                Path("evidence"),
+                "settings",
+                context.check,
+                0.0,
+                "crap",
+            )
+        self.assertIsNone(result)
+        self.assertEqual(failure.outcome, "fail")
+        self.assertEqual(stderr.getvalue(), "crap: first\ncrap: second\n")
+        self.assertEqual(failure.reason, "first\nsecond")
 
 
 class FunctionCollectionTests(unittest.TestCase):
-    def test_visitor_measures_functions_and_prefixes_classes(self) -> None:
-        found: list[python_crap.MeasuredFunction] = []
-        collector = python_crap._FunctionCollector(
-            "pkg/example.py", found, set(), set()
+    def test_measured_function_builds_itself_from_a_node(self) -> None:
+        node = ast.parse(
+            "def one(value):\n    return 1 if value else 2\n"
+        ).body[0]
+        item = python_crap.MeasuredFunction.from_node(
+            node, "pkg/example.py", "Thing."
         )
-        collector.visit_FunctionDef(
-            ast.parse(
-                "def one(value):\n    return 1 if value else 2\n"
-            ).body[0]
-        )
-        collector.visit_ClassDef(
-            ast.parse(
-                "class Thing:\n"
-                "    def method(self):\n"
-                "        return 1\n"
-            ).body[0]
-        )
+        self.assertEqual(item.identity, "pkg/example.py:Thing.one")
+        self.assertEqual(item.name, "Thing.one")
+        self.assertEqual(item.start_line, 1)
+        self.assertEqual(item.end_line, 2)
+        self.assertEqual(item.cc, 2)
+
+    def test_deep_expression_uses_one_frame_per_nesting_level(self) -> None:
+        source = "value = " + " + ".join(["1"] * 600) + "\n"
+        found = python_crap.collect_functions("pkg/example.py", source)
         self.assertEqual(
-            [item.identity for item in found],
-            ["pkg/example.py:one", "pkg/example.py:Thing.method"],
+            [(item.name, item.cc) for item in found],
+            [("<module>", 1)],
         )
-        self.assertEqual([item.cc for item in found], [2, 1])
-        self.assertEqual(collector.prefix, "")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "huge.py").write_text(source, encoding="utf-8")
+            parsed, failures = python_crap._parse_selected(
+                root, ["huge.py"]
+            )
+            self.assertEqual(failures, [])
+            self.assertEqual(
+                [(item.name, item.cc) for item in parsed["huge.py"][1]],
+                [("<module>", 1)],
+            )
 
 
 if __name__ == "__main__":
