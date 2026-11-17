@@ -796,15 +796,18 @@ operator set:
 
 The operator label in a finding is the new spelling (`!=`, `>=`, `or`, `return False`, `n+1`,
 `empty string`, ...), except that negation is `not` and deletion is `delete`. One table holds each
-operator's complement and its display text. At most `function_mutants` mutants are generated per
-function: the first that many generated mutants ordered by source position (line, then column),
-not counting a suppressed candidate.
+operator's complement and its display text. Each mutant is produced by applying the change to the
+module's syntax tree and printing it with `ast.unparse`, then compiled with
+`compile(source, PATH, "exec")`; a mutant that does not compile is not generated. Messages keep
+the original line numbers and show the original line with the mutated expression. At most
+`function_mutants` mutants are generated per function: the first that many generated mutants
+ordered by source position (line, then column), not counting a suppressed candidate.
 
 An equivalent mutant is not generated, and the JSON records it with outcome `not generated` and the
 rule that suppressed it:
 
-* `unparsed source unchanged`: `ast.unparse` of the mutated function equals the original's;
-* `does not compile`: the mutated source does not parse, so the mutant is not counted as killed;
+* `unparsed source unchanged`: `ast.unparse` of the mutated module equals the original's;
+* `does not compile`: the mutated source fails `compile`, so the mutant is not counted as killed;
 * `self-comparison`: both sides are the same plain name or the same constant, as in `x == x`;
 * `constant statement`: a statement that is a bare constant, or a string that is not the first
   statement of a function body, cannot change behaviour and is not mutated;
@@ -821,25 +824,32 @@ check discovers whose parsed source names the function or imports the function's
 `from pkg.mod import *` all select it. When the policy configures no `python_tests` check, every
 selected test-shaped Python file is considered. A function no such file names is a finding with
 `no test names it`: it has no tests, and mutation testing cannot show its tests can fail. Each
-mutant is applied to a copy of the repository in a temporary directory; the working tree is never
-written. The mutant's environment sets `PWD` to the copy and rewrites every inherited value that is
-a path inside the source repository to the same path inside the copy, so a test writing under either
-path cannot reach the source tree. The selected test files run in that copy with the bounded runner
-as `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
+mutant is written to a copy of the repository in a temporary directory; the working tree is never
+written. The mutant run, and the baseline run of the unmutated copy, get a fresh allowlisted
+environment: `PATH`, `LANG` and `LC_ALL` from the gate's own environment, the `QG_PYTHON` and
+`PYTHONDONTWRITEBYTECODE` values `_test_environment` adds, and `PWD`, `HOME` and `TMPDIR` set to
+directories inside the copy. No other variable is inherited, so no inherited path or relative
+traversal can reach the source tree. A baseline that fails in this environment is a check error
+naming the failing test and saying the mutation environment is allowlisted, never a pass. The
+selected test files run in that copy with the bounded runner as
+`python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
 
 Each run makes the check process a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)` on Linux). After
 the mutant's process group is stopped, every remaining descendant the check adopted is stopped and
 reaped, including a child a test started with `start_new_session=True`. Where the subreaper is
-unavailable the check is an error naming why, never a pass.
+unavailable, or the process table cannot be enumerated to confirm the adopted descendants stopped,
+the check is an error naming why, never a pass or a completed run.
 
 `mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
 mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering
-generation, copying, test runs and cleanup. The deadline is checked after generation and before
-every copy and run. A mutant that exceeds its run is `timed out` and counts as killed only when the
+generation, copying, test runs and cleanup. The deadline is checked after every copy, run, cleanup
+and temporary-directory removal, the last removal included, and each run gets the time remaining
+after its copy. A mutant that exceeds its run is `timed out` and counts as killed only when the
 original tests passed within `mutant_seconds`; if the original tests fail or exceed their own time,
-the check is an error, never a pass. A check that reaches `run_seconds` stops, reports every
-function it did not finish as an `over budget` finding, and records every generated mutant that did
-not run as `not run (over budget)`; it never passes. An invalid `base` is a check error, never a pass.
+the check is an error, never a pass. A check whose total time reaches `run_seconds` stops, reports
+every function it did not finish as an `over budget` finding, and records every generated mutant
+that did not run as `not run (over budget)`; it never passes. An invalid `base` is a check error,
+never a pass.
 
 A surviving mutant is one finding, value `1` against threshold `0`, with the exact message:
 

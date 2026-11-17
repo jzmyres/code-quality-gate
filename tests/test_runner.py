@@ -202,11 +202,45 @@ class ChildProcessTests(unittest.TestCase):
         self.addCleanup(_kill_and_reap, process)
         self.assertIn(process.pid, runner._children(os.getpid()))
 
-    def test_children_of_an_unreadable_proc_is_empty(self) -> None:
+    def test_children_of_an_unreadable_proc_is_an_error(self) -> None:
         with mock.patch.object(
             runner.os, "listdir", side_effect=OSError("denied")
-        ):
-            self.assertEqual(runner._children(os.getpid()), set())
+        ), self.assertRaises(OSError):
+            runner._children(os.getpid())
+
+    def test_an_unreadable_process_table_with_a_detached_child_is_an_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "child.pid"
+            program = (
+                "import subprocess\n"
+                "import sys\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+                "    start_new_session=True,\n"
+                ")\n"
+                f"open({str(pid_file)!r}, 'w', encoding='utf-8').write("
+                "str(child.pid))\n"
+            )
+            real_listdir = os.listdir
+
+            def listing(path: str) -> list[str]:
+                if path == "/proc" and pid_file.exists():
+                    raise PermissionError("process table hidden")
+                return real_listdir(path)
+
+            with mock.patch.object(
+                runner.os, "listdir", side_effect=listing
+            ):
+                result = runner.run(
+                    [sys.executable, "-c", program], budget_seconds=5
+                )
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            runner._kill_adopted({pid})
+        self.assertEqual(result.execution, "error", result)
+        self.assertIn("process table", result.error or "")
+        self.assertIn("PermissionError", result.error or "")
 
     def test_kill_adopted_stops_and_reaps_a_child(self) -> None:
         process = subprocess.Popen(["sleep", "30"])
@@ -224,11 +258,42 @@ class ChildProcessTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertFalse(Path(f"/proc/{process.pid}").exists())
 
+    def test_stop_adopted_checks_remaining_at_the_deadline(self) -> None:
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [0.0, 2.0]
+        with mock.patch.object(
+            runner, "_children", return_value={99}
+        ), mock.patch.object(
+            runner, "_kill_adopted"
+        ) as kill, mock.patch.object(
+            runner, "time", clock
+        ), mock.patch.object(
+            runner, "_stop_remaining", return_value=None
+        ) as remaining:
+            self.assertIsNone(runner._stop_adopted(set()))
+        kill.assert_called_once_with({99})
+        remaining.assert_called_once_with(set())
+
+    def test_stop_remaining_names_a_child_or_an_unreadable_table(self) -> None:
+        with mock.patch.object(runner, "_children", return_value={99}):
+            self.assertEqual(
+                runner._stop_remaining(set()), runner.DESCENDANT_ERROR
+            )
+        with mock.patch.object(runner, "_children", return_value=set()):
+            self.assertIsNone(runner._stop_remaining(set()))
+        with mock.patch.object(
+            runner, "_children", side_effect=PermissionError("denied")
+        ):
+            reason = runner._stop_remaining(set())
+        self.assertIn("process table", reason or "")
+        self.assertIn("PermissionError", reason or "")
+
     def test_cleanup_error_names_the_failed_cleanup(self) -> None:
-        self.assertIsNone(runner._cleanup_error(True, True))
-        self.assertEqual(runner._cleanup_error(False, True), runner.CLEANUP_ERROR)
+        self.assertIsNone(runner._cleanup_error(True, None))
+        self.assertEqual(runner._cleanup_error(False, None), runner.CLEANUP_ERROR)
         self.assertEqual(
-            runner._cleanup_error(True, False), runner.DESCENDANT_ERROR
+            runner._cleanup_error(True, runner.DESCENDANT_ERROR),
+            runner.DESCENDANT_ERROR,
         )
 
     def test_execution_fields_maps_each_outcome(self) -> None:
@@ -256,7 +321,7 @@ class ChildProcessTests(unittest.TestCase):
         with mock.patch.object(
             runner, "_kill_and_wait", return_value=False
         ), mock.patch.object(
-            runner, "_stop_adopted", return_value=False
+            runner, "_stop_adopted", return_value=runner.DESCENDANT_ERROR
         ), contextlib.redirect_stderr(captured):
             runner._finish_interrupted(error, process, set())
         notes = getattr(error, "__notes__", [])

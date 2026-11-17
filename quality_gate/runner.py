@@ -266,12 +266,20 @@ def _child_pid(name: str, pid: int) -> int | None:
     return int(name) if fields[1] == str(pid) else None
 
 
+def _enumeration_error(error: OSError) -> str:
+    return (
+        f"cannot enumerate the process table: "
+        f"{type(error).__name__}: {error}"
+    )
+
+
 def _children(pid: int) -> set[int]:
-    """The pids whose parent is PID, read from /proc."""
-    try:
-        names = [name for name in os.listdir("/proc") if name.isdigit()]
-    except OSError:
-        return set()
+    """The pids whose parent is PID, read from /proc.
+
+    An unreadable or absent process table raises OSError: treating it as an
+    empty set would confirm a cleanup that was never seen.
+    """
+    names = [name for name in os.listdir("/proc") if name.isdigit()]
     found: set[int] = set()
     for name in names:
         child = _child_pid(name, pid)
@@ -337,17 +345,32 @@ def _kill_adopted(adopted: set[int]) -> None:
             pass
 
 
-def _stop_adopted(known: set[int]) -> bool:
-    """Kill and reap every child this process adopted during the run."""
+def _stop_remaining(known: set[int]) -> str | None:
+    """Tell whether an adopted child remains, or why that cannot be seen."""
+    try:
+        remaining = _children(os.getpid()) - known
+    except OSError as error:
+        return _enumeration_error(error)
+    if remaining:
+        return DESCENDANT_ERROR
+    return None
+
+
+def _stop_adopted(known: set[int]) -> str | None:
+    """Kill and reap every adopted child, or return why absence is unconfirmed."""
     deadline = time.monotonic() + CLEANUP_SECONDS
     while True:
-        adopted = _children(os.getpid()) - known
+        try:
+            adopted = _children(os.getpid()) - known
+        except OSError as error:
+            return _enumeration_error(error)
         if not adopted:
-            return True
+            return None
         _kill_adopted(adopted)
-        if time.monotonic() >= deadline:
-            return not (_children(os.getpid()) - known)
-        time.sleep(0.01)
+        if time.monotonic() < deadline:
+            time.sleep(0.01)
+            continue
+        return _stop_remaining(known)
 
 
 @dataclass
@@ -524,11 +547,11 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
     )
 
 
-def _cleanup_error(group_gone: bool, adopted_gone: bool) -> str | None:
+def _cleanup_error(group_gone: bool, adopted_error: str | None) -> str | None:
     """The cleanup failure that wins over the drained execution, if any."""
-    if group_gone and adopted_gone:
+    if group_gone and adopted_error is None:
         return None
-    return CLEANUP_ERROR if not group_gone else DESCENDANT_ERROR
+    return CLEANUP_ERROR if not group_gone else adopted_error
 
 
 def _finish_interrupted(
@@ -539,10 +562,10 @@ def _finish_interrupted(
         note = f"process group {process.pid}: {CLEANUP_ERROR}"
         error.add_note(note)
         print(note, file=sys.stderr, flush=True)
-    if not _stop_adopted(known):
-        note = DESCENDANT_ERROR
-        error.add_note(note)
-        print(note, file=sys.stderr, flush=True)
+    adopted_error = _stop_adopted(known)
+    if adopted_error is not None:
+        error.add_note(adopted_error)
+        print(adopted_error, file=sys.stderr, flush=True)
 
 
 def _execution_fields(
@@ -639,7 +662,15 @@ def run(
             ),
             started=started,
         )
-    known = _children(os.getpid())
+    try:
+        known = _children(os.getpid())
+    except OSError as error:
+        return _empty(
+            argv_tuple,
+            execution="error",
+            error=_enumeration_error(error),
+            started=started,
+        )
     budget_seconds, grace_seconds = _run_budget(budget_seconds, grace_seconds)
     deadline = started + max(0.0, budget_seconds)
     process, failure = _spawn(argv_tuple, cwd, env, started)
@@ -651,13 +682,13 @@ def run(
             process, deadline, grace_seconds, capture_limit
         )
         group_gone = _reap(process)
-        adopted_gone = _stop_adopted(known)
+        adopted_error = _stop_adopted(known)
         returncode = process.poll()
         # Cleanup that could not show the group or its adopted descendants gone
         # wins over the drained execution: the run must never report a silent
         # success in that case.
         execution, error, timed_out = _execution_fields(
-            execution, returncode, _cleanup_error(group_gone, adopted_gone)
+            execution, returncode, _cleanup_error(group_gone, adopted_error)
         )
         return RunResult(
             argv=argv_tuple,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
@@ -155,6 +156,15 @@ class MutationCase(FixtureCase):
         self.assertEqual(document["decision"], "error")
         self.assertEqual(check["outcome"], "error")
         return check
+
+    def assert_over_budget(
+        self, result: subprocess.CompletedProcess[str], check: dict[str, Any]
+    ) -> None:
+        self.assertNotEqual(result.returncode, 0, output(result))
+        self.assertTrue(any(
+            "over budget" in finding["subject"]
+            for finding in check["findings"]
+        ), check["findings"])
 
 
 class OperatorTests(MutationCase):
@@ -393,10 +403,8 @@ class EquivalenceAndSelectionTests(MutationCase):
         flips = [record for record in records if record.operator == "!="]
         self.assertEqual(len(flips), 1, records)
         self.assertIsNone(flips[0].rule)
-        mutated = python_mutation._apply_mutation(CALL_COMPARISON, flips[0])
         self.assertEqual(
-            mutated.splitlines()[1].strip(),
-            "if next(it) != next(it):",
+            flips[0].mutated_line, "if next(it) != next(it):"
         )
 
     def test_a_plain_name_compared_with_itself_is_suppressed(self) -> None:
@@ -921,6 +929,64 @@ class BudgetTests(MutationCase):
         check = self.assert_check_error()
         self.assertNotIn("pass", check.get("outcome"))
 
+    def test_a_delayed_final_descendant_cleanup_is_over_budget(self) -> None:
+        self.write_config(mutation_config(
+            mutant_seconds=5, run_seconds=1, function_mutants=1,
+        ))
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": COUNTDOWN,
+            "tests/test_app.py": COUNTDOWN_TEST,
+        })
+        real_run = python_mutation.run
+        calls = {"count": 0}
+
+        def delayed(*args: Any, **options: Any) -> RunResult:
+            calls["count"] += 1
+            result = real_run(*args, **options)
+            if calls["count"] == 2:
+                time.sleep(1.2)
+            return result
+
+        with mock.patch.object(
+            python_mutation, "run", side_effect=delayed
+        ):
+            result, _document, check = self.run_mutation()
+        self.assert_over_budget(result, check)
+
+    def test_a_delayed_temporary_directory_removal_is_over_budget(self) -> None:
+        self.write_config(mutation_config(
+            mutant_seconds=5, run_seconds=1, function_mutants=1,
+        ))
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": COUNTDOWN,
+            "tests/test_app.py": COUNTDOWN_TEST,
+        })
+        real = tempfile.TemporaryDirectory
+
+        class Delayed:
+            def __init__(self, *args: Any, **options: Any) -> None:
+                self.directory = real(*args, **options)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.directory, name)
+
+            def __enter__(self) -> str:
+                return self.directory.__enter__()
+
+            def __exit__(self, *exc: Any) -> Any:
+                name = self.directory.name
+                try:
+                    return self.directory.__exit__(*exc)
+                finally:
+                    if Path(name).name.startswith("qg-mutation-"):
+                        time.sleep(1.2)
+
+        with mock.patch.object(tempfile, "TemporaryDirectory", Delayed):
+            result, _document, check = self.run_mutation()
+        self.assert_over_budget(result, check)
+
 
 class FindingTests(MutationCase):
     def test_the_survivor_message_is_exact(self) -> None:
@@ -990,7 +1056,7 @@ class FindingTests(MutationCase):
         self.assertEqual(self.read_file("pkg/app.py"), before_app)
         self.assertEqual(self.read_file("tests/test_app.py"), before_tests)
 
-ISOLATED_WRITE_TEST = """\
+ALLOWLIST_TEST = """\
 import os
 import pathlib
 import sys
@@ -1001,14 +1067,31 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from pkg.app import classify
 
 
-class IsolationTests(unittest.TestCase):
-    def test_writes_stay_in_the_copy(self):
-        pathlib.Path(os.environ["PWD"], "pwd-write.txt").write_text("pwd")
-        inherited = pathlib.Path(
-            os.environ["QG_FIXTURE_SOURCE"], "inherited-write.txt"
-        )
-        inherited.write_text("inherited")
-        classify(1)
+class AllowlistTests(unittest.TestCase):
+    def test_the_environment_is_allowlisted(self):
+        for name in ("QG_LEXICAL_ESCAPE", "QG_RELATIVE_TRAVERSAL"):
+            self.assertNotIn(name, os.environ)
+        self.assertEqual(classify(1), "positive")
+        self.assertEqual(classify(0), "other")
+        self.assertEqual(classify(-1), "other")
+"""
+
+
+UNLISTED_ENVIRONMENT_TEST = """\
+import os
+import pathlib
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import classify
+
+
+class UnlistedTests(unittest.TestCase):
+    def test_reads_unlisted_variable(self):
+        os.environ["QG_FIXTURE_UNLISTED"]
+        self.assertEqual(classify(1), "positive")
 """
 
 
@@ -1042,7 +1125,7 @@ class DetachedTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         with open(
-            os.environ["QG_DETACHED_PIDS"], "a", encoding="utf-8"
+            "__PIDS_FILE__", "a", encoding="utf-8"
         ) as stream:
             stream.write(f"{child.pid}\\n")
         self.assertEqual(spin(0), 0)
@@ -1060,22 +1143,35 @@ def _process_running(pid: int) -> bool:
 
 
 class IsolationTests(MutationCase):
-    def test_writes_under_the_environment_stay_out_of_the_source_tree(self) -> None:
+    def test_the_mutant_and_baseline_environment_is_allowlisted(self) -> None:
         self.base_commit()
         self.commit({
             "pkg/app.py": CLASSIFY,
-            "tests/test_app.py": ISOLATED_WRITE_TEST,
+            "tests/test_app.py": ALLOWLIST_TEST,
         })
-        before = self.git("status", "--porcelain").stdout
-        result, _document, _check = self.run_mutation(env={
-            "PWD": str(self.repo),
-            "QG_FIXTURE_SOURCE": str(self.repo),
+        result, _document, check = self.run_mutation(env={
+            "QG_LEXICAL_ESCAPE": (
+                f"{self.repo}-sibling/../{self.repo.name}"
+            ),
+            "QG_RELATIVE_TRAVERSAL": f"../{self.repo.name}",
         })
-        self.assertFalse((self.repo / "pwd-write.txt").exists(), output(result))
-        self.assertFalse(
-            (self.repo / "inherited-write.txt").exists(), output(result)
-        )
-        self.assertEqual(self.git("status", "--porcelain").stdout, before)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass", output(result))
+
+    def test_an_unlisted_variable_is_an_allowlisted_baseline_error(self) -> None:
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY,
+            "tests/test_app.py": UNLISTED_ENVIRONMENT_TEST,
+        })
+        result, document, check = self.run_mutation(env={
+            "QG_FIXTURE_UNLISTED": "1",
+        })
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("test_reads_unlisted_variable", check["reason"])
+        self.assertIn("allowlisted", check["reason"])
 
     def test_a_detached_child_is_gone_after_the_mutant_times_out(self) -> None:
         pids_file = self.base / "detached-pids.txt"
@@ -1083,10 +1179,13 @@ class IsolationTests(MutationCase):
             mutant_seconds=1, function_mutants=2,
         ))
         self.base_commit()
-        self.commit({"pkg/app.py": SPIN, "tests/test_app.py": DETACHED_TEST})
-        result, _document, check = self.run_mutation(env={
-            "QG_DETACHED_PIDS": str(pids_file),
+        self.commit({
+            "pkg/app.py": SPIN,
+            "tests/test_app.py": DETACHED_TEST.replace(
+                "__PIDS_FILE__", str(pids_file)
+            ),
         })
+        result, _document, check = self.run_mutation()
         self.assertTrue(any(
             record["outcome"] == "timed out" for record in self.mutants(check)
         ), self.mutants(check))
@@ -1121,6 +1220,44 @@ def outer():
 """
 
 
+PARENTHESIZED_DECORATOR = """\
+def outer():
+    @(
+        marker
+    )
+    def decorated():
+        return 1
+
+    return decorated()
+"""
+
+
+NONLOCAL = """\
+def outer():
+    x = 1
+    def inner():
+        nonlocal x
+        return x
+    return inner()
+"""
+
+
+NONLOCAL_TEST = """\
+import pathlib
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import outer
+
+
+class NonlocalTests(unittest.TestCase):
+    def test_outer(self):
+        self.assertEqual(outer(), 1)
+"""
+
+
 class GeneratorTests(unittest.TestCase):
     def generated(
         self, source: str, limit: int = 100,
@@ -1152,10 +1289,7 @@ class GeneratorTests(unittest.TestCase):
         for line, (operator, text) in expected.items():
             record = by_line[line]
             self.assertEqual(record.operator, operator, record)
-            mutated = python_mutation._apply_mutation(SAMPLE, record)
-            self.assertEqual(
-                mutated.splitlines()[line - 1].strip(), text, mutated
-            )
+            self.assertEqual(record.mutated_line, text, record)
 
     def test_a_signed_integer_literal_is_one_constant(self) -> None:
         source = "def signed():\n    return -1\n"
@@ -1164,10 +1298,7 @@ class GeneratorTests(unittest.TestCase):
             record for record in records if record.operator == "n+1"
         ]
         self.assertEqual(len(constants), 1, records)
-        mutated = python_mutation._apply_mutation(source, constants[0])
-        self.assertEqual(
-            mutated.splitlines()[1].strip(), "return 0", mutated
-        )
+        self.assertEqual(constants[0].mutated_line, "return 0")
 
     def test_the_cap_takes_constants_in_source_order(self) -> None:
         pairs = ", ".join(
@@ -1197,26 +1328,39 @@ class GeneratorTests(unittest.TestCase):
                 or "decorated" in DECORATED_NESTED.splitlines()[record.line - 1]
             )
         )
-        mutated = python_mutation._apply_mutation(DECORATED_NESTED, deletion)
+        mutated = deletion.mutated_source
         self.assertNotIn("@first", mutated)
         self.assertNotIn("@second", mutated)
-        ast.parse(mutated)
+        self.assertNotIn("def decorated", mutated)
+        compile(mutated, "pkg/app.py", "exec")
 
-    def test_a_mutant_whose_source_does_not_compile_is_not_generated(self) -> None:
-        source = "def work():\n    return 1\n"
-        function = ast.parse(source).body[0]
-        with mock.patch.object(
-            python_mutation, "_apply_text",
-            return_value="def work(:\n    return 1\n",
-        ):
-            records = python_mutation._mutations(function, source, 100)
-        compiled = [
+    def test_a_parenthesized_multi_line_decorator_is_removed_with_its_function(
+        self,
+    ) -> None:
+        function = ast.parse(PARENTHESIZED_DECORATOR).body[0]
+        records = python_mutation._mutations(
+            function, PARENTHESIZED_DECORATOR, 100
+        )
+        removed = [
             record for record in records
-            if record.rule == "does not compile"
+            if record.operator == "delete"
+            and "def decorated" not in record.mutated_source
         ]
-        self.assertTrue(compiled, records)
-        self.assertFalse(
-            [record for record in records if record.rule is None], records
+        self.assertTrue(removed, records)
+        self.assertNotIn("@(", removed[0].mutated_source)
+        self.assertNotIn("marker", removed[0].mutated_source)
+        compile(removed[0].mutated_source, "pkg/app.py", "exec")
+
+    def test_a_mutant_that_does_not_compile_is_not_generated(self) -> None:
+        function = ast.parse(NONLOCAL).body[0]
+        records = python_mutation._mutations(function, NONLOCAL, 1)
+        deletion = next(
+            record for record in records if record.operator == "delete"
+        )
+        self.assertEqual(deletion.rule, "does not compile")
+        generated = [record for record in records if record.rule is None]
+        self.assertEqual(
+            [record.operator for record in generated], ["n+1"], records
         )
 
 
@@ -1248,6 +1392,18 @@ class ContractTests(unittest.TestCase):
             ) if item.operator == "n+1"
         )
         return source, function, mutation
+
+    def work_ast_change(self) -> tuple[Any, ...]:
+        source = "def work():\n    return 1\n"
+        module = ast.parse(source)
+        function = module.body[0]
+        index = python_mutation._function_index(module, function)
+        parents = python_mutation._parents(function)
+        change = next(
+            item for item in python_mutation._raw_changes(function)
+            if item.operator == "n+1"
+        )
+        return module, function, index, parents, change
 
     def test_self_comparison_needs_a_plain_name_or_a_constant(self) -> None:
         self.assertTrue(python_mutation._self_comparison(
@@ -1399,26 +1555,39 @@ class ContractTests(unittest.TestCase):
 
     def test_ast_mutated_replaces_the_target(self) -> None:
         source = "def only():\n    return 1\n"
-        function = ast.parse(source).body[0]
+        module = ast.parse(source)
+        function = module.body[0]
+        index = python_mutation._function_index(module, function)
+        self.assertEqual(index, 1)
         change = python_mutation._raw_changes(function)[0]
-        mutated = python_mutation._ast_mutated(function, change)
+        mutated = python_mutation._ast_mutated(module, index, change)
         self.assertEqual(ast.unparse(mutated), "def only():\n    pass")
 
-    def test_text_offsets_line_and_compile(self) -> None:
-        source = "def work():\n    return 1\n"
+    def test_enclosing_statement_finds_the_containing_statement(self) -> None:
+        source = "def work():\n    return 1 + 2\n"
         function = ast.parse(source).body[0]
-        change = next(
-            item for item in python_mutation._raw_changes(function)
-            if item.operator == "n+1"
+        parents = python_mutation._parents(function)
+        statement = function.body[0]
+        change = python_mutation._Change(
+            "n+1", statement.value, "3", ast.Constant(value=3)
         )
-        mutated = python_mutation._apply_text(source, change, False)
-        self.assertIn("return 2", mutated)
+        self.assertIs(
+            python_mutation._enclosing_statement(change, parents), statement
+        )
+
+    def test_mutated_line_and_generated_rule_use_the_ast(self) -> None:
+        module, _function, index, parents, change = self.work_ast_change()
         self.assertEqual(
-            python_mutation._mutated_line(source, change, False, 2),
+            python_mutation._mutated_line(change, parents, False),
             "return 2",
         )
-        self.assertTrue(python_mutation._compiles(mutated))
-        self.assertFalse(python_mutation._compiles("def broken(:\n"))
+        mutated = ast.unparse(
+            python_mutation._ast_mutated(module, index, change)
+        )
+        self.assertIn("return 2", mutated)
+        self.assertIsNone(python_mutation._generated_rule(
+            mutated, ast.unparse(module), "pkg/app.py"
+        ))
 
     def test_generated_rule_names_unchanged_and_uncompilable(self) -> None:
         source = (
@@ -1427,46 +1596,42 @@ class ContractTests(unittest.TestCase):
             "        pass\n"
             "    return 1\n"
         )
-        function = ast.parse(source).body[0]
-        parents = python_mutation._parents(function)
+        module = ast.parse(source)
+        function = module.body[0]
+        index = python_mutation._function_index(module, function)
+        original = ast.unparse(module)
         delete = next(
             item for item in python_mutation._raw_changes(function)
             if item.operator == "delete"
             and isinstance(item.target, ast.Pass)
         )
-        delete_pass = python_mutation._statement_list(
-            function, delete.target, parents
-        ) == [delete.target]
         self.assertEqual(
             python_mutation._generated_rule(
-                function, delete, source, ast.unparse(function), delete_pass
+                ast.unparse(
+                    python_mutation._ast_mutated(module, index, delete)
+                ),
+                original,
+                "pkg/app.py",
             ),
             "unparsed source unchanged",
         )
-        constant = next(
-            item for item in python_mutation._raw_changes(function)
-            if item.operator == "n+1"
-        )
-        self.assertIsNone(
+        self.assertEqual(
             python_mutation._generated_rule(
-                function, constant, source, ast.unparse(function), False
-            )
+                "def broken(:\n", original, "pkg/app.py"
+            ),
+            "does not compile",
         )
 
     def test_mutation_records_the_line_and_the_rule(self) -> None:
-        source = "def work():\n    return 1\n"
-        function = ast.parse(source).body[0]
-        parents = python_mutation._parents(function)
-        change = next(
-            item for item in python_mutation._raw_changes(function)
-            if item.operator == "n+1"
-        )
+        module, function, index, parents, change = self.work_ast_change()
         mutation = python_mutation._mutation(
-            function, change, parents, source, ast.unparse(function)
+            function, change, parents, module, index,
+            "pkg/app.py", ast.unparse(module),
         )
         self.assertEqual((mutation.operator, mutation.line), ("n+1", 2))
         self.assertIsNone(mutation.rule)
         self.assertEqual(mutation.mutated_line, "return 2")
+        self.assertIn("return 2", mutation.mutated_source)
 
     def test_test_references_reads_names_and_imports(self) -> None:
         names, modules = python_mutation._test_references(
@@ -1489,38 +1654,41 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(modules, {"pkg.app"})
 
-    def test_inside_copy_rewrites_only_the_source_prefix(self) -> None:
-        self.assertEqual(
-            python_mutation._inside_copy("/src/pkg", "/src", "/copy"),
-            "/copy/pkg",
-        )
-        self.assertEqual(
-            python_mutation._inside_copy("/src2", "/src", "/copy"), "/src2"
-        )
-        self.assertEqual(
-            python_mutation._inside_copy("/other", "/src", "/copy"), "/other"
-        )
+    def test_copy_directory_makes_a_directory_inside_the_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = python_mutation._copy_directory(root, "home")
+            self.assertEqual(path, root / "home")
+            self.assertTrue(path.is_dir())
 
-    def test_ignored_environment_names_the_gate_owned_keys(self) -> None:
-        for key in ("PWD", "PYTHONPATH", "COVERAGE_RUN"):
-            self.assertTrue(
-                python_mutation._ignored_environment(key), key
+    def test_environment_is_the_allowlist_with_paths_inside_the_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            copy_root = Path(directory)
+            with mock.patch.dict(os.environ, {
+                "PATH": "/bin",
+                "LANG": "C",
+                "LC_ALL": "C.UTF-8",
+                "PWD": "/src",
+                "MY_DIR": "/src/pkg",
+                "OTHER": "/tmp",
+                "QG_PYTHON": "inherited",
+            }, clear=True):
+                environment = python_mutation._environment(copy_root)
+            self.assertEqual(set(environment), {
+                "PATH", "LANG", "LC_ALL", "QG_PYTHON",
+                "PYTHONDONTWRITEBYTECODE", "PWD", "HOME", "TMPDIR",
+            })
+            self.assertEqual(environment["PATH"], "/bin")
+            self.assertEqual(
+                json.loads(environment["QG_PYTHON"]),
+                [sys.executable, "-I", "-B"],
             )
-        self.assertFalse(python_mutation._ignored_environment("HOME"))
-
-    def test_environment_points_every_source_path_at_the_copy(self) -> None:
-        with mock.patch.dict(os.environ, {
-            "PWD": "/src",
-            "MY_DIR": "/src/pkg",
-            "OTHER": "/tmp",
-        }, clear=True):
-            environment = python_mutation._environment(
-                Path("/src"), Path("/copy")
-            )
-        self.assertEqual(environment["PWD"], "/copy")
-        self.assertEqual(environment["MY_DIR"], "/copy/pkg")
-        self.assertEqual(environment["OTHER"], "/tmp")
-
+            self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
+            self.assertEqual(environment["PWD"], str(copy_root))
+            for name in ("HOME", "TMPDIR"):
+                path = Path(environment[name])
+                self.assertTrue(path.is_dir(), path)
+                self.assertEqual(path.parent, copy_root)
 
     def test_changed_functions_uses_the_shared_definition_selection(self) -> None:
         source = (
@@ -1647,7 +1815,7 @@ class ContractTests(unittest.TestCase):
 
     def test_run_one_test_past_its_deadline_is_a_budget_result(self) -> None:
         result = python_mutation._run_one_test(
-            Path("."), Path("."), "tests/test_app.py", time.monotonic() - 1
+            Path("."), "tests/test_app.py", time.monotonic() - 1
         )
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.argv, tuple(
@@ -1683,6 +1851,32 @@ class ContractTests(unittest.TestCase):
             function, ("tests/test_app.py",), root, work,
             1, spec, time.monotonic() - 11,
         ))
+
+    def test_a_slow_baseline_copy_leaves_no_time_for_its_run(self) -> None:
+        source = "def work():\n    return 1\n"
+        function = self.function(source)
+        spec = python_mutation.MutationSpec("changed", "HEAD", 5, 20, 1)
+        root, work = self.source_tree(source)
+        real_copy = python_mutation._fresh_copy
+
+        def slow_copy(source_root: Path, destination: Path, number: int) -> Path:
+            copied = real_copy(source_root, destination, number)
+            time.sleep(1.1)
+            return copied
+
+        with mock.patch.object(
+            python_mutation, "_fresh_copy", side_effect=slow_copy
+        ), mock.patch.object(
+            python_mutation, "_run_unittest",
+            return_value=RunResult(
+                (), execution="completed", returncode=0
+            ),
+        ) as run_tests:
+            self.assertFalse(python_mutation._baseline(
+                function, ("tests/test_app.py",), root, work,
+                0, spec, time.monotonic(),
+            ))
+        run_tests.assert_not_called()
 
     def test_result_or_failure_prefers_the_first_failure(self) -> None:
         result = RunResult((), execution="completed", returncode=0)
@@ -1790,7 +1984,7 @@ class ContractTests(unittest.TestCase):
             ),
         ):
             outcome, over_budget = python_mutation._run_mutant(
-                function, mutation, ("tests/test_app.py",), source,
+                function, mutation, ("tests/test_app.py",),
                 spec, time.monotonic(), root, work, numbers,
             )
         self.assertEqual((outcome, over_budget), ("killed", False))
@@ -1805,7 +1999,7 @@ class ContractTests(unittest.TestCase):
             return_value=("survived", False),
         ):
             records, findings, finished = python_mutation._run_generated(
-                function, [mutation], ("tests/test_app.py",), source, spec,
+                function, [mutation], ("tests/test_app.py",), spec,
                 time.monotonic(), Path("."), Path("."), [0], records,
             )
         self.assertTrue(finished)
@@ -1813,7 +2007,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         cut = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 1)
         records, findings, finished = python_mutation._run_generated(
-            function, [mutation], ("tests/test_app.py",), source, cut,
+            function, [mutation], ("tests/test_app.py",), cut,
             time.monotonic() - 2, Path("."), Path("."), [0], [],
         )
         self.assertFalse(finished)
@@ -1848,6 +2042,28 @@ class ContractTests(unittest.TestCase):
                 python_mutation._source_for(root, "pkg/app.py", sources),
                 "first",
             )
+
+    def test_unfinished_after_cleanup_adds_the_last_function_on_an_overrun(
+        self,
+    ) -> None:
+        function = self.function("def work():\n    return 1\n")
+        finished = python_mutation.MutationSpec(
+            "changed", "HEAD", 10, 20, 10
+        )
+        self.assertEqual(python_mutation._unfinished_after_cleanup(
+            [function], [], time.monotonic(), finished
+        ), [])
+        self.assertEqual(python_mutation._unfinished_after_cleanup(
+            [], [], time.monotonic(), finished
+        ), [])
+        unfinished = [function]
+        self.assertIs(python_mutation._unfinished_after_cleanup(
+            [function], unfinished, time.monotonic(), finished
+        ), unfinished)
+        over = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 0)
+        self.assertEqual(python_mutation._unfinished_after_cleanup(
+            [function], [], time.monotonic(), over
+        ), [function])
 
     def test_measure_runs_each_function_and_reports_none_unfinished(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2026,6 +2242,31 @@ class SlowTests(unittest.TestCase):
 
 
 class BaselineTests(MutationCase):
+    def test_an_uncompilable_deletion_does_not_fill_the_cap(self) -> None:
+        self.write_config(mutation_config(function_mutants=1))
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": NONLOCAL,
+            "tests/test_app.py": NONLOCAL_TEST,
+        })
+        _result, _document, check = self.run_mutation()
+        records = [
+            record for record in self.mutants(check)
+            if record["function"] == "outer"
+        ]
+        deletion = next(
+            record for record in records if record["operator"] == "delete"
+        )
+        self.assertEqual(deletion["rule"], "does not compile", records)
+        generated = [
+            record for record in records
+            if record["outcome"] != "not generated"
+        ]
+        self.assertEqual(
+            [record["operator"] for record in generated], ["n+1"], records
+        )
+        self.assertEqual(generated[0]["outcome"], "killed", records)
+
     def test_failing_original_tests_are_a_check_error(self) -> None:
         self.base_commit()
         self.commit({
@@ -2045,8 +2286,4 @@ class BaselineTests(MutationCase):
             "tests/test_app.py": SLOW_TEST,
         })
         result, _document, check = self.run_mutation()
-        self.assertNotEqual(result.returncode, 0, output(result))
-        self.assertTrue(any(
-            "over budget" in finding["subject"]
-            for finding in check["findings"]
-        ), check["findings"])
+        self.assert_over_budget(result, check)
