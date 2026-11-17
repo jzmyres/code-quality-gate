@@ -369,16 +369,16 @@ def _diff_lines(root: Path, base: str) -> Diff:
     )
 
 
-def _before_complexities(
+def _base_functions(
     root: Path, base: str, paths: list[str]
-) -> dict[str, dict[str, int]]:
-    """The before tree's per-function complexity, for CPF's comparison."""
+) -> dict[str, dict[str, ShapeFunction]]:
+    """The base tree's definitions, by file and qualified name."""
     existing = set(_split_nul(_git(
         root,
         ["ls-tree", "-r", "-z", "--name-only", base, "--"],
         "python-shape base tree",
     )))
-    before: dict[str, dict[str, int]] = {}
+    before: dict[str, dict[str, ShapeFunction]] = {}
     for relative in paths:
         if relative not in existing:
             before[relative] = {}
@@ -395,9 +395,28 @@ def _before_complexities(
         functions: list[ShapeFunction] = []
         _collect_definitions(_parse_tree(relative, source).body, "", relative, functions)
         before[relative] = {
-            function.identity: function.cc for function in functions
+            function.identity: function for function in functions
         }
     return before
+
+
+def _base_complexities(
+    before: dict[str, dict[str, ShapeFunction]],
+) -> dict[str, dict[str, int]]:
+    """The before tree's definitions reduced to per-function complexity."""
+    return {
+        relative: {
+            identity: function.cc for identity, function in functions.items()
+        }
+        for relative, functions in before.items()
+    }
+
+
+def _before_complexities(
+    root: Path, base: str, paths: list[str]
+) -> dict[str, dict[str, int]]:
+    """The before tree's per-function complexity, for CPF's comparison."""
+    return _base_complexities(_base_functions(root, base, paths))
 
 
 def _touched(
@@ -409,6 +428,54 @@ def _touched(
     return any(
         function.start_line <= line <= function.end_line
         for line in diff.added.get(function.path, frozenset())
+    )
+
+
+def _changed_functions(
+    indexes: dict[str, FileIndex],
+    before: dict[str, dict[str, ShapeFunction]],
+) -> tuple[ShapeFunction, ...]:
+    """The definitions that are new or differ from the base tree's.
+
+    A definition is compared with the base revision's definition of the same
+    qualified name after 'ast.dump', so a moved function is unchanged while a
+    decorator, a removed line or a renamed definition changes it.
+    """
+    changed: list[ShapeFunction] = []
+    for relative, index in indexes.items():
+        previous = before.get(relative, {})
+        changed.extend(
+            function for function in index.functions
+            if function.identity not in previous
+            or ast.dump(previous[function.identity].node)
+            != ast.dump(function.node)
+        )
+    return tuple(changed)
+
+
+def _tree_selection(
+    indexes: dict[str, FileIndex], diff: Diff,
+) -> tuple[tuple[ShapeFunction, ...], tuple[ShapeFunction, ...]]:
+    """Every measured function, and the definitions the diff adds."""
+    functions = _selected_functions(indexes, lambda function: True)
+    added = _selected_functions(
+        indexes,
+        lambda function: function.path in diff.whole or bool(
+            {function.start_line, function.node.lineno}
+            & diff.added.get(function.path, frozenset())
+        ),
+    )
+    return functions, added
+
+
+def _added_functions(
+    functions: tuple[ShapeFunction, ...],
+    before: dict[str, dict[str, ShapeFunction]],
+) -> tuple[ShapeFunction, ...]:
+    """The functions whose qualified name is absent from the base tree."""
+    return tuple(
+        function for function in functions
+        if function.identity not in before.get(function.path, {})
     )
 
 
@@ -487,28 +554,22 @@ def _shape_input(
         path: _file_index(path, _read_source(context.root, path))
         for path in scoped
     }
-    functions = _selected_functions(
-        indexes, lambda function: _touched(spec, diff, function)
-    )
-    added = _selected_functions(
-        indexes,
-        lambda function: function.path in diff.whole or bool(
-            {function.start_line, function.node.lineno}
-            & diff.added.get(function.path, frozenset())
-        ),
+    # CPF is the one rule that compares against the before tree, and only for
+    # the files the diff touches; every other rule reads the after tree alone.
+    base_functions = _base_functions(
+        context.root, base.commit, sorted(diff.paths.intersection(scoped))
     )
     if spec.scope == "tree":
+        functions, added = _tree_selection(indexes, diff)
         candidates = functions
     else:
+        functions = _changed_functions(indexes, base_functions)
+        added = _added_functions(functions, base_functions)
         candidates = added
+    before = _base_complexities(base_functions)
     names = {function.final_name for function in candidates}
     scanned = _scan_files(context, scoped, names)
     parsed = [*indexes.values(), *scanned.values()]
-    # CPF is the one rule that compares against the before tree, and only for
-    # the files the diff touches; every other rule reads the after tree alone.
-    before = _before_complexities(
-        context.root, base.commit, sorted(diff.paths.intersection(scoped))
-    )
     calls, tests = _uses(parsed, names)
     return ShapeInput(
         functions, before, added, candidates, calls, tests, spec, limit

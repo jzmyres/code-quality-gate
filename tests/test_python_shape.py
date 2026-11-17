@@ -30,9 +30,11 @@ from quality_gate.python_shape import (
     ShapeFunction,
     ShapeInput,
     ShapeSpec,
+    _added_functions,
     _added_lines,
     _after_path,
     _arguments,
+    _base_complexities,
     _before_complexities,
     _body_value,
     _chain_edges,
@@ -58,6 +60,7 @@ from quality_gate.python_shape import (
     _test_functions,
     _token_text,
     _touched,
+    _tree_selection,
     _uncalled_findings,
     _uses,
     _wrapper,
@@ -1206,6 +1209,112 @@ class ScopeTests(ShapeCase):
             {"functions": 1, "added": 1, "base": self.policy_base()},
         )
 
+    def test_changed_scope_selects_a_deletion_inside_a_function(self) -> None:
+        self.base_commit({
+            "pkg/app.py": (
+                "def process(value):\n"
+                "    total = value + 1\n"
+                "    total = total * 2\n"
+                "    return total\n"
+            ),
+            "tests/test_app.py": self.names_test("process"),
+        })
+        self.commit({"pkg/app.py": (
+            "def process(value):\n"
+            "    total = value + 1\n"
+            "    return total\n"
+        )})
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["functions"], 1)
+        self.assertEqual(check["measurement"]["added"], 0)
+
+    def test_changed_scope_ignores_a_moved_unchanged_function(self) -> None:
+        both = (
+            "def first(value):\n"
+            "    return value + 1\n"
+            "\n\n"
+            "def second(value):\n"
+            "    return value + 2\n"
+        )
+        moved = (
+            "def second(value):\n"
+            "    return value + 2\n"
+            "\n\n"
+            "def first(value):\n"
+            "    return value + 1\n"
+        )
+        self.base_commit({
+            "pkg/app.py": both,
+            "tests/test_app.py": self.names_test("first", "second"),
+        })
+        self.commit({"pkg/app.py": moved})
+        check = self.accepted()
+        self.assertEqual(
+            check["measurement"],
+            {"functions": 0, "added": 0, "base": self.policy_base()},
+        )
+
+    def test_changed_scope_selects_a_renamed_function(self) -> None:
+        self.base_commit({"pkg/app.py": (
+            "def before(value):\n"
+            "    return value + 1\n"
+        )})
+        self.commit({
+            "pkg/app.py": (
+                "def after(value):\n"
+                "    return value + 1\n"
+            ),
+            "tests/test_app.py": self.names_test("after"),
+        })
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["functions"], 1)
+        self.assertEqual(check["measurement"]["added"], 1)
+
+    def test_changed_scope_selects_a_decorator_change(self) -> None:
+        self.base_commit({"pkg/app.py": (
+            "def marker(function):\n"
+            "    return function\n"
+            "\n\n"
+            "def decorated(value):\n"
+            "    return value + 1\n"
+        )})
+        self.commit({
+            "pkg/app.py": (
+                "def marker(function):\n"
+                "    return function\n"
+                "\n\n"
+                "@marker\n"
+                "def decorated(value):\n"
+                "    return value + 1\n"
+            ),
+            "tests/test_app.py": self.names_test("decorated"),
+        })
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["functions"], 1)
+        self.assertEqual(check["measurement"]["added"], 0)
+
+    def test_changed_scope_selects_a_nested_function_change(self) -> None:
+        self.base_commit({"pkg/app.py": (
+            "def outer(value):\n"
+            "    def inner(item):\n"
+            "        return item + 1\n"
+            "\n"
+            "    return inner(value)\n"
+        )})
+        self.commit({
+            "pkg/app.py": (
+                "def outer(value):\n"
+                "    def inner(item):\n"
+                "        return item + 2\n"
+                "\n"
+                "    return inner(value)\n"
+            ),
+            "tests/test_app.py": self.names_test("outer"),
+        })
+        check = self.accepted()
+        self.assertEqual(check["measurement"]["functions"], 2)
+        self.assertEqual(check["measurement"]["added"], 0)
+
     def test_changed_scope_judges_only_the_added_functions(self) -> None:
         base = chain_module(6)
         self.base_commit({"pkg/chain.py": base})
@@ -1800,6 +1909,37 @@ class HelperInputTests(ShapeCase):
         self.assertEqual(before["pkg/app.py"], {"pkg/app.py:process": 7})
         self.assertEqual(before["pkg/new.py"], {})
 
+    def test_base_complexities_reduces_the_definitions(self) -> None:
+        function = shape_function("def f():\n    return 1\n", cc=7)
+        self.assertEqual(
+            _base_complexities({"pkg/app.py": {function.identity: function}}),
+            {"pkg/app.py": {function.identity: 7}},
+        )
+
+    def test_tree_selection_reads_every_and_added_function(self) -> None:
+        index = _file_index(
+            "pkg/app.py",
+            "def first():\n    return 1\n\n\ndef second():\n    return 2\n",
+        )
+        diff = Diff(
+            frozenset({"pkg/app.py"}),
+            {"pkg/app.py": frozenset({1})},
+            frozenset(),
+        )
+        functions, added = _tree_selection({"pkg/app.py": index}, diff)
+        self.assertEqual(
+            [function.name for function in functions], ["first", "second"]
+        )
+        self.assertEqual([function.name for function in added], ["first"])
+
+    def test_added_functions_need_a_new_qualified_name(self) -> None:
+        first = shape_function("def first():\n    return 1\n")
+        second = shape_function("def second():\n    return 2\n")
+        added = _added_functions(
+            (first, second), {"pkg/app.py": {first.identity: first}}
+        )
+        self.assertEqual([function.name for function in added], ["second"])
+
     def test_scan_files_reads_python_programs_only(self) -> None:
         self.add_file("pkg/app.py", "VALUE = 0\n")
         self.add_file(
@@ -1813,33 +1953,41 @@ class HelperInputTests(ShapeCase):
         indexes = _scan_files(context, [], {"render_json"})
         self.assertEqual(set(indexes), {"pkg/helper"})
 
-    def test_shape_input_assembles_the_selected_scope(self) -> None:
-        self.add_file(
-            "pkg/app.py",
-            "def first():\n    return 1\n\n\ndef second():\n    return 2\n",
+    def test_shape_input_selects_the_changed_definitions(self) -> None:
+        source = (
+            "def first():\n    return 1\n\n\ndef second():\n    return 2\n"
         )
+        self.add_file("pkg/app.py", source)
         diff = Diff(
             frozenset({"pkg/app.py"}),
             {"pkg/app.py": frozenset({1})},
             frozenset(),
         )
         context = SimpleNamespace(root=self.repo, files=["pkg/app.py"])
+        before = {
+            "pkg/app.py": {
+                function.identity: function
+                for function in _file_index(
+                    "pkg/app.py", "def first():\n    return 1\n"
+                ).functions
+            }
+        }
         with mock.patch.multiple(
             "quality_gate.python_shape",
             _diff_lines=mock.Mock(return_value=diff),
             _measured_paths=mock.Mock(return_value=["pkg/app.py"]),
             _scan_files=mock.Mock(return_value={}),
-            _before_complexities=mock.Mock(return_value={}),
+            _base_functions=mock.Mock(return_value=before),
         ):
             data = _shape_input(context, SHAPE_SPEC, 6, DiffBase("HEAD", "base"))
         self.assertEqual(
-            [function.name for function in data.functions], ["first"]
+            [function.name for function in data.functions], ["second"]
         )
         self.assertEqual(
-            [function.name for function in data.added], ["first"]
+            [function.name for function in data.added], ["second"]
         )
         self.assertEqual(
-            [function.name for function in data.candidates], ["first"]
+            [function.name for function in data.candidates], ["second"]
         )
         self.assertEqual(data.calls, {})
         self.assertEqual(data.tests, frozenset())
@@ -1976,11 +2124,8 @@ MUTATIONS = {
         "        False",
     ),
     "changed scope judges the added": (
-        "    if spec.scope == \"tree\":\n"
-        "        candidates = functions\n"
-        "    else:\n"
         "        candidates = added",
-        "    candidates = functions",
+        "        candidates = functions",
     ),
 }
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import ctypes
 import os
 import selectors
 import signal
@@ -34,6 +35,11 @@ CLEANUP_SECONDS = 1.0
 CLEANUP_ERROR = (
     f"cleanup did not confirm the process group gone within {CLEANUP_SECONDS:g} s"
 )
+DESCENDANT_ERROR = (
+    "cleanup did not confirm the adopted descendants gone within "
+    f"{CLEANUP_SECONDS:g} s"
+)
+_PR_SET_CHILD_SUBREAPER = 36
 _PIPE_READ = 65536
 
 
@@ -223,15 +229,55 @@ def _signal_group(pid: int, number: int) -> None:
         pass
 
 
-def _proc_group_member(path: str, group: int) -> bool:
+def _proc_fields(path: str) -> list[str] | None:
+    """The fields after a process's name in /proc/PID/stat, or None if gone."""
     try:
         with open(path, encoding="utf-8") as stream:
-            fields = stream.read().rpartition(")")[2].split()
+            return stream.read().rpartition(")")[2].split()
     except FileNotFoundError:
-        return False
+        return None
+
+
+def _proc_group_member(path: str, group: int) -> bool:
+    try:
+        fields = _proc_fields(path)
     except OSError:
         return True
-    return len(fields) < 3 or (fields[2] == str(group) and fields[0] not in ("Z", "X"))
+    if fields is None:
+        return False
+    return len(fields) < 3 or (
+        fields[2] == str(group) and fields[0] not in ("Z", "X")
+    )
+
+
+def _fields_of(name: str) -> list[str] | None:
+    """One process's /proc fields, or None when it is gone or unreadable."""
+    try:
+        return _proc_fields(f"/proc/{name}/stat")
+    except OSError:
+        return None
+
+
+def _child_pid(name: str, pid: int) -> int | None:
+    """The pid NAME names, when its parent is PID."""
+    fields = _fields_of(name)
+    if fields is None or len(fields) < 2:
+        return None
+    return int(name) if fields[1] == str(pid) else None
+
+
+def _children(pid: int) -> set[int]:
+    """The pids whose parent is PID, read from /proc."""
+    try:
+        names = [name for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return set()
+    found: set[int] = set()
+    for name in names:
+        child = _child_pid(name, pid)
+        if child is not None:
+            found.add(child)
+    return found
 
 
 def _proc_group_running(pid: int) -> bool:
@@ -259,6 +305,49 @@ def _group_alive(pid: int) -> bool:
         return _proc_group_running(pid)
     except OSError:
         return True
+
+
+def _subreaper_failure() -> str | None:
+    """Why this process cannot adopt orphaned descendants, or None."""
+    if not sys.platform.startswith("linux"):
+        return f"PR_SET_CHILD_SUBREAPER is unavailable on {sys.platform}"
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    except (OSError, AttributeError) as error:
+        return f"prctl(PR_SET_CHILD_SUBREAPER) is unavailable: {error}"
+    if result != 0:
+        return (
+            "prctl(PR_SET_CHILD_SUBREAPER) failed: "
+            f"{os.strerror(ctypes.get_errno())}"
+        )
+    return None
+
+
+def _kill_adopted(adopted: set[int]) -> None:
+    """Stop and non-blockingly reap the children this process adopted."""
+    for pid in adopted:
+        _signal_group(pid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    for pid in adopted:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def _stop_adopted(known: set[int]) -> bool:
+    """Kill and reap every child this process adopted during the run."""
+    deadline = time.monotonic() + CLEANUP_SECONDS
+    while True:
+        adopted = _children(os.getpid()) - known
+        if not adopted:
+            return True
+        _kill_adopted(adopted)
+        if time.monotonic() >= deadline:
+            return not (_children(os.getpid()) - known)
+        time.sleep(0.01)
 
 
 @dataclass
@@ -435,6 +524,38 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
     )
 
 
+def _cleanup_error(group_gone: bool, adopted_gone: bool) -> str | None:
+    """The cleanup failure that wins over the drained execution, if any."""
+    if group_gone and adopted_gone:
+        return None
+    return CLEANUP_ERROR if not group_gone else DESCENDANT_ERROR
+
+
+def _finish_interrupted(
+    error: BaseException, process: subprocess.Popen[bytes], known: set[int],
+) -> None:
+    """Kill what an interrupted run left, and note any unconfirmed cleanup."""
+    if not _kill_and_wait(process):
+        note = f"process group {process.pid}: {CLEANUP_ERROR}"
+        error.add_note(note)
+        print(note, file=sys.stderr, flush=True)
+    if not _stop_adopted(known):
+        note = DESCENDANT_ERROR
+        error.add_note(note)
+        print(note, file=sys.stderr, flush=True)
+
+
+def _execution_fields(
+    execution: str, returncode: int | None, cleanup_error: str | None,
+) -> tuple[str, str | None, bool]:
+    """The run's outcome split into execution, error and timeout flag."""
+    if cleanup_error is not None:
+        return "error", cleanup_error, True
+    if _was_signalled(execution, returncode):
+        return "signal", None, False
+    return execution, None, execution == "budget"
+
+
 def _run_budget(
     budget_seconds: float, grace_seconds: float
 ) -> tuple[float, float]:
@@ -505,9 +626,21 @@ def run(
     grace_seconds: float = GRACE_SECONDS,
 ) -> RunResult:
     """Run ARGV in its own process group within BUDGET_SECONDS."""
-    budget_seconds, grace_seconds = _run_budget(budget_seconds, grace_seconds)
     argv_tuple = tuple(argv)
     started = time.monotonic()
+    subreaper_failure = _subreaper_failure()
+    if subreaper_failure is not None:
+        return _empty(
+            argv_tuple,
+            execution="error",
+            error=(
+                "cannot make the check a child subreaper: "
+                f"{subreaper_failure}"
+            ),
+            started=started,
+        )
+    known = _children(os.getpid())
+    budget_seconds, grace_seconds = _run_budget(budget_seconds, grace_seconds)
     deadline = started + max(0.0, budget_seconds)
     process, failure = _spawn(argv_tuple, cwd, env, started)
     if failure is not None:
@@ -517,17 +650,15 @@ def run(
         execution, capture = _capture_process(
             process, deadline, grace_seconds, capture_limit
         )
-        cleaned = _reap(process)
+        group_gone = _reap(process)
+        adopted_gone = _stop_adopted(known)
         returncode = process.poll()
-        # Cleanup that could not show the group gone wins over the drained
-        # execution: the run must never report a silent success in that case.
-        if not cleaned:
-            execution = "error"
-            error, timed_out = CLEANUP_ERROR, True
-        elif _was_signalled(execution, returncode):
-            execution, error, timed_out = "signal", None, False
-        else:
-            error, timed_out = None, execution == "budget"
+        # Cleanup that could not show the group or its adopted descendants gone
+        # wins over the drained execution: the run must never report a silent
+        # success in that case.
+        execution, error, timed_out = _execution_fields(
+            execution, returncode, _cleanup_error(group_gone, adopted_gone)
+        )
         return RunResult(
             argv=argv_tuple,
             execution=execution,
@@ -542,8 +673,5 @@ def run(
             timed_out=timed_out,
         )
     except BaseException as error:
-        if not _kill_and_wait(process):
-            note = f"process group {process.pid}: {CLEANUP_ERROR}"
-            error.add_note(note)
-            print(note, file=sys.stderr, flush=True)
+        _finish_interrupted(error, process, known)
         raise

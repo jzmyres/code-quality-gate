@@ -10,7 +10,6 @@ from __future__ import annotations
 import ast
 import copy
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -116,24 +115,28 @@ class _Change:
     index: int = -1
 
 
-_FLIPS = {
-    ast.Eq: ast.NotEq,
-    ast.NotEq: ast.Eq,
-    ast.Lt: ast.LtE,
-    ast.LtE: ast.Lt,
-    ast.Gt: ast.GtE,
-    ast.GtE: ast.Gt,
-    ast.In: ast.NotIn,
-    ast.NotIn: ast.In,
-    ast.Is: ast.IsNot,
-    ast.IsNot: ast.Is,
+# Every comparison operator's complement and the complement's text.
+_FLIPS: dict[type[ast.cmpop], tuple[type[ast.cmpop], str]] = {
+    ast.Eq: (ast.NotEq, "!="),
+    ast.NotEq: (ast.Eq, "=="),
+    ast.Lt: (ast.GtE, ">="),
+    ast.LtE: (ast.Gt, ">"),
+    ast.Gt: (ast.LtE, "<="),
+    ast.GtE: (ast.Lt, "<"),
+    ast.In: (ast.NotIn, "not in"),
+    ast.NotIn: (ast.In, "in"),
+    ast.Is: (ast.IsNot, "is not"),
+    ast.IsNot: (ast.Is, "is"),
 }
 
-_OPERATOR_TEXT = {
-    ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
-    ast.Gt: ">", ast.GtE: ">=", ast.In: "in", ast.NotIn: "not in",
-    ast.Is: "is", ast.IsNot: "is not",
-}
+
+def _self_comparison(left: ast.AST, right: ast.AST) -> bool:
+    """Whether both sides are the same plain name or the same constant."""
+    if isinstance(left, ast.Name) and isinstance(right, ast.Name):
+        return left.id == right.id
+    if isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+        return ast.dump(left) == ast.dump(right)
+    return False
 
 
 def _comparison_changes(node: ast.Compare) -> list[_Change]:
@@ -142,16 +145,17 @@ def _comparison_changes(node: ast.Compare) -> list[_Change]:
         flipped = _FLIPS.get(type(operator))
         if flipped is None:
             continue
+        flipped_type, text = flipped
         changed = copy.deepcopy(node)
-        changed.ops[position] = flipped()
+        changed.ops[position] = flipped_type()
         left = node.left if position == 0 else node.comparators[position - 1]
         right = node.comparators[position]
         rule = (
-            "self-comparison" if ast.dump(left) == ast.dump(right) else None
+            "self-comparison"
+            if _self_comparison(left, right) else None
         )
         changes.append(_Change(
-            _OPERATOR_TEXT[flipped], node, ast.unparse(changed), changed,
-            rule=rule,
+            text, node, ast.unparse(changed), changed, rule=rule,
         ))
     return changes
 
@@ -193,11 +197,40 @@ def _return_changes(node: ast.Return) -> list[_Change]:
     return [_Change("return None", value, "None", changed, rule=rule)]
 
 
+def _integer_literal(value: int) -> ast.expr:
+    """The expression source for an integer, negative sign included."""
+    return ast.parse(str(value), mode="eval").body
+
+
+def _signed_constant(node: ast.AST) -> int | None:
+    """The value of a minus before an integer, or None for another node."""
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and not isinstance(node.operand.value, bool)
+        and isinstance(node.operand.value, int)
+    ):
+        return -node.operand.value
+    return None
+
+
+def _signed_constant_changes(node: ast.UnaryOp) -> list[_Change]:
+    """A minus before an integer is one constant, so -1 becomes 0."""
+    signed = _signed_constant(node)
+    if signed is None:
+        return []
+    value = signed + 1
+    return [
+        _Change("n+1", node, str(value), _integer_literal(value))
+    ]
+
+
 def _constant_changes(node: ast.Constant) -> list[_Change]:
     if isinstance(node.value, bool) or node.value is None:
         return []
     if isinstance(node.value, int):
-        changed = ast.Constant(value=node.value + 1)
+        changed = _integer_literal(node.value + 1)
         return [_Change("n+1", node, str(node.value + 1), changed)]
     if isinstance(node.value, str):
         changed = ast.Constant(value="")
@@ -213,6 +246,7 @@ _CHANGE_BUILDERS = (
     (ast.IfExp, _condition_changes),
     (ast.comprehension, _comprehension_changes),
     (ast.Return, _return_changes),
+    (ast.UnaryOp, _signed_constant_changes),
     (ast.Constant, _constant_changes),
 )
 
@@ -228,22 +262,36 @@ def _node_changes(node: ast.AST) -> list[_Change]:
     return changes
 
 
+def _skip_children(node: ast.AST) -> bool:
+    """A nested definition's body and a signed literal's digit are not walked."""
+    return isinstance(
+        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    ) or _signed_constant(node) is not None
+
+
 def _walk(function: ast.FunctionDef | ast.AsyncFunctionDef):
     """The function's own nodes in source order, not a nested definition's."""
     pending = list(reversed(function.body))
     while pending:
         node = pending.pop()
         yield node
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        if _skip_children(node):
             continue
         pending.extend(reversed(list(ast.iter_child_nodes(node))))
 
 
 def _raw_changes(function: ast.FunctionDef | ast.AsyncFunctionDef):
+    """Every candidate change, ordered by the source position it targets."""
     indexes = {id(node): index for index, node in enumerate(ast.walk(function))}
-    for node in _walk(function):
-        for change in _node_changes(node):
-            yield replace(change, index=indexes[id(change.target)])
+    changes = [
+        replace(change, index=indexes[id(change.target)])
+        for node in _walk(function)
+        for change in _node_changes(node)
+    ]
+    return sorted(
+        changes,
+        key=lambda change: (change.target.lineno, change.target.col_offset),
+    )
 
 
 def _child_nodes(value: Any) -> list[ast.AST]:
@@ -291,13 +339,42 @@ def _is_function_only_statement(
     return statements == [target]
 
 
+def _statement(
+    target: ast.AST, parents: dict[int, tuple[ast.AST, str]]
+) -> ast.AST:
+    """The statement TARGET is, or the constant expression statement holding it."""
+    if isinstance(target, ast.stmt):
+        return target
+    parent, name = parents.get(id(target), (None, ""))
+    if parent is not None and isinstance(parent, ast.Expr) and name == "value":
+        return parent
+    return target
+
+
 def _docstring_change(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, target: ast.AST,
+    parents: dict[int, tuple[ast.AST, str]],
+) -> bool:
+    """Whether TARGET is the first statement's string, the only docstring."""
+    statement = _statement(target, parents)
+    return (
+        bool(function.body)
+        and function.body[0] is statement
+        and isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    )
+
+
+def _constant_statement_change(
     target: ast.AST, parents: dict[int, tuple[ast.AST, str]]
 ) -> bool:
-    if python_shape._is_docstring(target):
-        return True
-    parent, _name = parents.get(id(target), (None, ""))
-    return parent is not None and python_shape._is_docstring(parent)
+    """Whether TARGET is a bare constant statement, which cannot change behaviour."""
+    statement = _statement(target, parents)
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+    )
 
 
 def _suppression(
@@ -306,8 +383,10 @@ def _suppression(
 ) -> str | None:
     if change.rule is not None:
         return change.rule
-    if _docstring_change(change.target, parents):
+    if _docstring_change(function, change.target, parents):
         return "docstring"
+    if _constant_statement_change(change.target, parents):
+        return "constant statement"
     if (
         change.delete
         and _is_function_only_statement(function, change.target, parents)
@@ -349,9 +428,23 @@ def _offset(source: str, line: int, column: int) -> int:
     return before + len(prefix)
 
 
+def _statement_start(node: ast.AST, source: str) -> tuple[int, int]:
+    """A statement's start, including the decorators a definition carries."""
+    decorators = getattr(node, "decorator_list", ())
+    if decorators:
+        first = decorators[0]
+        line = source.splitlines()[first.lineno - 1]
+        return first.lineno, line.index("@")
+    return node.lineno, node.col_offset
+
+
 def _apply_text(source: str, change: _Change, delete_pass: bool) -> str:
     target = change.target
-    start = _offset(source, target.lineno, target.col_offset)
+    line, column = (
+        _statement_start(target, source)
+        if change.delete else (target.lineno, target.col_offset)
+    )
+    start = _offset(source, line, column)
     end = _offset(source, target.end_lineno, target.end_col_offset)
     replacement = change.replacement
     if change.delete:
@@ -381,6 +474,27 @@ def _mutated_line(
     return "pass" if delete_pass else "(statement deleted)"
 
 
+def _compiles(source: str) -> bool:
+    try:
+        ast.parse(source)
+    except SyntaxError:
+        return False
+    return True
+
+
+def _generated_rule(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, change: _Change,
+    source: str, original: str, delete_pass: bool,
+) -> str | None:
+    """The rule that suppresses a mutant, when the mutated source is not one."""
+    mutated = _ast_mutated(function, change)
+    if ast.unparse(mutated) == original:
+        return "unparsed source unchanged"
+    if not _compiles(_apply_text(source, change, delete_pass)):
+        return "does not compile"
+    return None
+
+
 def _mutation(
     function: ast.FunctionDef | ast.AsyncFunctionDef, change: _Change,
     parents: dict[int, tuple[ast.AST, str]], source: str, original: str,
@@ -392,13 +506,17 @@ def _mutation(
         and _statement_list(function, target, parents) == [target]
     )
     if rule is None:
-        mutated = _ast_mutated(function, change)
-        if ast.unparse(mutated) == original:
-            rule = "unparsed source unchanged"
+        rule = _generated_rule(
+            function, change, source, original, delete_pass
+        )
+    line, column = (
+        _statement_start(target, source)
+        if change.delete else (target.lineno, target.col_offset)
+    )
     return Mutation(
         change.operator,
-        target.lineno,
-        target.col_offset,
+        line,
+        column,
         target.end_lineno or target.lineno,
         target.end_col_offset or target.col_offset,
         change.replacement,
@@ -407,7 +525,7 @@ def _mutation(
         change.delete,
         delete_pass,
         rule,
-        _mutated_line(source, change, delete_pass, target.lineno),
+        _mutated_line(source, change, delete_pass, line),
     )
 
 
@@ -433,18 +551,19 @@ def _changed_functions(
 ) -> list[python_shape.ShapeFunction]:
     diff = python_shape._diff_lines(context.root, base.commit)
     paths = python_shape._measured_paths(context, spec, diff)
-    found: list[python_shape.ShapeFunction] = []
-    for relative in paths:
-        tree = python_shape._parse_tree(
+    indexes = {
+        relative: python_shape._file_index(
             relative, python_shape._read_source(context.root, relative)
         )
-        definitions: list[python_shape.ShapeFunction] = []
-        python_shape._collect_definitions(tree.body, "", relative, definitions)
-        found.extend(
-            function for function in definitions
-            if python_shape._touched(spec, diff, function)
-        )
-    return sorted(found, key=lambda function: (function.path, function.start_line))
+        for relative in paths
+    }
+    before = python_shape._base_functions(
+        context.root, base.commit, sorted(diff.paths.intersection(paths))
+    )
+    return sorted(
+        python_shape._changed_functions(indexes, before),
+        key=lambda function: (function.path, function.start_line),
+    )
 
 
 def _selected_test_files(context: Any) -> list[str]:
@@ -521,41 +640,87 @@ def _module_name(relative: str) -> str:
     return relative.removesuffix(".py").replace("/", ".")
 
 
-def _mentioned(source: str, name: str) -> bool:
-    return re.search(
-        rf"(?<!\w){re.escape(name)}(?!\w)", source
-    ) is not None
-
-
-def _mentions(source: str, function: python_shape.ShapeFunction) -> bool:
-    return (
-        _mentioned(source, function.final_name)
-        or _mentioned(source, _module_name(function.path))
+def _imported_from(node: ast.ImportFrom) -> set[str]:
+    """The module names one 'from' import makes available."""
+    base = node.module or ""
+    modules = {base} if base else set()
+    modules.update(
+        f"{base}.{alias.name}" if base else alias.name
+        for alias in node.names if alias.name != "*"
     )
+    return modules
+
+
+def _imported_modules(
+    node: ast.Import | ast.ImportFrom, modules: set[str],
+) -> None:
+    """Add the module names one import statement makes available."""
+    if isinstance(node, ast.Import):
+        modules.update(alias.name for alias in node.names)
+        return
+    modules.update(_imported_from(node))
+
+
+def _test_references(
+    relative: str, source: str,
+) -> tuple[set[str], set[str]]:
+    """The names a test file mentions and the modules it imports."""
+    tree = python_shape._parse_tree(relative, source)
+    names: set[str] = set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            _imported_modules(node, modules)
+    return names, modules
 
 
 def _tests_by_function(
     root: Path, functions: list[python_shape.ShapeFunction],
     test_files: list[str],
 ) -> dict[str, tuple[str, ...]]:
-    contents = {
-        relative: python_shape._read_source(root, relative)
+    references = {
+        relative: _test_references(
+            relative, python_shape._read_source(root, relative)
+        )
         for relative in test_files
     }
     return {
         function.identity: tuple(
-            relative for relative, source in contents.items()
-            if _mentions(source, function)
+            relative for relative, (names, modules) in references.items()
+            if function.final_name in names
+            or _module_name(function.path) in modules
         )
         for function in functions
     }
 
 
-def _environment() -> dict[str, str]:
-    return {
-        key: value for key, value in os.environ.items()
-        if not key.startswith("COVERAGE_") and key != "PYTHONPATH"
-    }
+def _inside_copy(value: str, prefix: str, copied: str) -> str:
+    """VALUE rewritten into the copy when it is a path inside the source tree."""
+    if value == prefix or value.startswith(prefix + os.sep):
+        return copied + value[len(prefix):]
+    return value
+
+
+def _ignored_environment(key: str) -> bool:
+    """A variable the gate owns, or the copy's own working directory."""
+    return key == "PWD" or key == "PYTHONPATH" or key.startswith("COVERAGE_")
+
+
+def _environment(source: Path, copy_root: Path) -> dict[str, str]:
+    """The mutant's environment, with every source path pointing into its copy."""
+    prefix = str(source)
+    copied = str(copy_root)
+    environment: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if _ignored_environment(key):
+            continue
+        environment[key] = _inside_copy(value, prefix, copied)
+    environment["PWD"] = copied
+    return environment
 
 
 def _discover_argv(relative: str) -> list[str]:
@@ -573,12 +738,17 @@ def _budget_result(argv: list[str]) -> RunResult:
     )
 
 
-def _run_one_test(root: Path, relative: str, deadline: float) -> RunResult:
+def _run_one_test(
+    source: Path, copy_root: Path, relative: str, deadline: float
+) -> RunResult:
     argv = _discover_argv(relative)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return _budget_result(argv)
-    return run(argv, cwd=root, env=_environment(), budget_seconds=remaining)
+    return run(
+        argv, cwd=copy_root, env=_environment(source, copy_root),
+        budget_seconds=remaining,
+    )
 
 
 def _first_failure(
@@ -596,13 +766,13 @@ def _result_or_failure(
 
 
 def _run_unittest(
-    root: Path, tests: tuple[str, ...], seconds: float
+    source: Path, copy_root: Path, tests: tuple[str, ...], seconds: float
 ) -> RunResult:
     deadline = time.monotonic() + seconds
     result: RunResult | None = None
     failure: RunResult | None = None
     for relative in tests:
-        result = _run_one_test(root, relative, deadline)
+        result = _run_one_test(source, copy_root, relative, deadline)
         if not execution_outcome(result.execution).completed:
             return result
         failure = _first_failure(failure, result)
@@ -628,24 +798,40 @@ def _passed(result: Any) -> bool:
     )
 
 
-def _baseline(
-    function: python_shape.ShapeFunction, tests: tuple[str, ...],
-    root: Path, work: Path, number: int, allowance: float,
-    mutant_seconds: int,
+def _baseline_passed(
+    function: python_shape.ShapeFunction, result: RunResult,
+    allowance: float, mutant_seconds: int,
 ) -> bool:
-    copy_root = _fresh_copy(root, work, number)
-    result = _run_unittest(copy_root, tests, allowance)
+    """Whether the baseline passed, was cut by the budget, or was an error."""
     if _passed(result):
         return True
-    if (
-        execution_outcome(result.execution).budget
-        and allowance < mutant_seconds
-    ):
+    execution = execution_outcome(result.execution)
+    if execution.error:
+        raise GateError(
+            f"python-mutation: the original tests for {function.identity} "
+            f"could not run: {result.error}"
+        )
+    if execution.budget and allowance < mutant_seconds:
         return False
     detail = result.stderr_text.strip() or result.stdout_text.strip()
     raise GateError(
         f"python-mutation: the original tests do not pass for "
         f"{function.identity} within {allowance:g} s: {detail[-500:]}"
+    )
+
+
+def _baseline(
+    function: python_shape.ShapeFunction, tests: tuple[str, ...],
+    root: Path, work: Path, number: int, spec: MutationSpec, start: float,
+) -> bool:
+    remaining = _remaining(start, spec)
+    if remaining <= 0:
+        return False
+    copy_root = _fresh_copy(root, work, number)
+    allowance = min(spec.mutant_seconds, remaining)
+    result = _run_unittest(root, copy_root, tests, allowance)
+    return _baseline_passed(
+        function, result, allowance, spec.mutant_seconds
     )
 
 
@@ -750,11 +936,23 @@ def _generated_mutations(mutations: list[Mutation]) -> list[Mutation]:
     return [mutation for mutation in mutations if mutation.rule is None]
 
 
+def _not_run_records(
+    function: python_shape.ShapeFunction, mutations: list[Mutation],
+    tests: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    return [
+        _record(function, mutation, tests, "not run (over budget)")
+        for mutation in mutations
+    ]
+
+
 def _run_mutant(
     function: python_shape.ShapeFunction, mutation: Mutation,
     tests: tuple[str, ...], source: str, spec: MutationSpec,
     start: float, root: Path, work: Path, numbers: list[int],
 ) -> tuple[str, bool]:
+    if _remaining(start, spec) <= 0:
+        return "not run (over budget)", True
     copy_root = _fresh_copy(root, work, numbers[0])
     numbers[0] += 1
     (copy_root / function.path).write_text(
@@ -762,9 +960,9 @@ def _run_mutant(
     )
     remaining = _remaining(start, spec)
     if remaining <= 0:
-        return "timed out", True
+        return "not run (over budget)", True
     allowance = min(spec.mutant_seconds, remaining)
-    result = _run_unittest(copy_root, tests, allowance)
+    result = _run_unittest(root, copy_root, tests, allowance)
     outcome = _outcome(result, function)
     return outcome, (
         outcome == "timed out" and allowance < spec.mutant_seconds
@@ -778,8 +976,11 @@ def _run_generated(
     records: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     findings: list[Finding] = []
-    for mutation in mutations:
+    for position, mutation in enumerate(mutations):
         if _remaining(start, spec) <= 0:
+            records.extend(
+                _not_run_records(function, mutations[position:], tests)
+            )
             return records, findings, False
         outcome, over_budget = _run_mutant(
             function, mutation, tests, source, spec, start,
@@ -787,6 +988,9 @@ def _run_generated(
         )
         records.append(_record(function, mutation, tests, outcome))
         if over_budget:
+            records.extend(
+                _not_run_records(function, mutations[position + 1:], tests)
+            )
             return records, findings, False
         if outcome == "survived":
             findings.append(_survived_finding(function, mutation, tests))
@@ -803,16 +1007,12 @@ def _run_function(
     mutations = _mutations(function.node, source, spec.function_mutants)
     records = _suppressed_records(function, mutations, tests)
     generated = _generated_mutations(mutations)
+    if _remaining(start, spec) <= 0:
+        return records + _not_run_records(function, generated, tests), [], False
     if not generated:
         return records, [], True
-    baseline_allowance = min(
-        spec.mutant_seconds, _remaining(start, spec)
-    )
-    if not _baseline(
-        function, tests, root, work, numbers[0], baseline_allowance,
-        spec.mutant_seconds,
-    ):
-        return records, [], False
+    if not _baseline(function, tests, root, work, numbers[0], spec, start):
+        return records + _not_run_records(function, generated, tests), [], False
     numbers[0] += 1
     return _run_generated(
         function, generated, tests, source, spec, start,

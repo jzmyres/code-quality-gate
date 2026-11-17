@@ -2,15 +2,22 @@
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
+import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from support import BASE_CONFIG, FixtureCase, _add_check_to_class, output
 
 from quality_gate import python_mutation
+from quality_gate.files import DiffBase
+from quality_gate.runner import RunResult
 
 
 TEST_CHECK = (
@@ -124,8 +131,10 @@ class MutationCase(FixtureCase):
             self.add_file(relative, content)
         self.commit_all(message)
 
-    def run_mutation(self) -> tuple[subprocess.CompletedProcess[str], dict[str, Any], dict[str, Any]]:
-        result, document = self.run_json("--only", "mutation")
+    def run_mutation(
+        self, env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any], dict[str, Any]]:
+        result, document = self.run_json("--only", "mutation", env=env)
         return result, document, self.check_by_id(document, "mutation")
 
     def mutants(self, check: dict[str, Any]) -> list[dict[str, Any]]:
@@ -352,6 +361,125 @@ class StrongTests(unittest.TestCase):
 """
 
 
+CALL_COMPARISON = """\
+def calling(it):
+    if next(it) == next(it):
+        return 1
+    return 2
+"""
+
+CONSTANT_STATEMENT = """\
+def constants():
+    0
+    "later"
+    return 1
+"""
+
+FIRST_STRING = """\
+def documented():
+    "first"
+    "later"
+    return 1
+"""
+
+
+class EquivalenceAndSelectionTests(MutationCase):
+    def records_for(self, source: str) -> list[Any]:
+        function = ast.parse(source).body[0]
+        return python_mutation._mutations(function, source, 100)
+
+    def test_a_call_compared_with_itself_is_generated(self) -> None:
+        records = self.records_for(CALL_COMPARISON)
+        flips = [record for record in records if record.operator == "!="]
+        self.assertEqual(len(flips), 1, records)
+        self.assertIsNone(flips[0].rule)
+        mutated = python_mutation._apply_mutation(CALL_COMPARISON, flips[0])
+        self.assertEqual(
+            mutated.splitlines()[1].strip(),
+            "if next(it) != next(it):",
+        )
+
+    def test_a_plain_name_compared_with_itself_is_suppressed(self) -> None:
+        source = "def same(value):\n    if value == value:\n        return 1\n    return 2\n"
+        records = self.records_for(source)
+        flips = [record for record in records if record.operator == "!="]
+        self.assertEqual(
+            [record.rule for record in flips], ["self-comparison"], records
+        )
+
+    def test_a_bare_constant_statement_is_not_mutated(self) -> None:
+        records = self.records_for(CONSTANT_STATEMENT)
+        on_statement = [
+            record for record in records if record.line == 2
+        ]
+        self.assertTrue(on_statement, records)
+        self.assertEqual(
+            {record.rule for record in on_statement},
+            {"constant statement"},
+            on_statement,
+        )
+        self.assertFalse(
+            [record for record in on_statement if record.rule is None]
+        )
+
+    def test_only_the_first_string_statement_is_a_docstring(self) -> None:
+        records = self.records_for(FIRST_STRING)
+        first = [record for record in records if record.line == 2]
+        later = [record for record in records if record.line == 3]
+        self.assertTrue(first, records)
+        self.assertTrue(later, records)
+        self.assertEqual({record.rule for record in first}, {"docstring"})
+        self.assertEqual(
+            {record.rule for record in later}, {"constant statement"}, later
+        )
+
+    def test_each_module_import_form_selects_the_test_file(self) -> None:
+        forms = {
+            "import pkg.app\n": True,
+            "import pkg.app as application\n": True,
+            "from pkg import app\n": True,
+            "from pkg.app import helper\n": True,
+            "from pkg.app import *\n": True,
+            "from pkg import other\n": False,
+        }
+        node = ast.parse("def classify(value):\n    return value\n").body[0]
+        function = python_mutation.python_shape.ShapeFunction(
+            "pkg/app.py:classify", "pkg/app.py", "classify", node, 1, 2, 1,
+            "classify",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            for source, selected in forms.items():
+                with self.subTest(source=source):
+                    relative = "tests/test_form.py"
+                    (root / relative).write_text(source, encoding="utf-8")
+                    tests = python_mutation._tests_by_function(
+                        root, [function], [relative],
+                    )
+                    self.assertEqual(
+                        bool(tests[function.identity]), selected, tests
+                    )
+
+    def test_a_from_pkg_import_test_selects_the_function(self) -> None:
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY + "\nRESULT = classify(1)\n",
+            "tests/test_app.py": (
+                "import pathlib\n"
+                "import sys\n"
+                "import unittest\n"
+                "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))\n"
+                "from pkg import app\n\n"
+                "class ModuleTests(unittest.TestCase):\n"
+                "    def test_result(self):\n"
+                "        self.assertIn(app.RESULT, ('positive', 'other'))\n"
+            ),
+        })
+        result, _document, check = self.run_mutation()
+        self.assert_function_was_mutated(result, check)
+
+
 class SelectionTests(MutationCase):
     def test_a_weak_test_reports_a_survivor(self) -> None:
         self.base_commit()
@@ -486,6 +614,179 @@ class SelectionTests(MutationCase):
         self.assert_function_was_mutated(result, check)
 
 
+DELETION_BASE = """\
+def process(value):
+    total = value + 1
+    total = total * 2
+    return total
+"""
+
+DELETION_CHANGE = """\
+def process(value):
+    total = value + 1
+    return total
+"""
+
+PROCESS_TEST = """\
+import pathlib
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import process
+
+
+class ProcessTests(unittest.TestCase):
+    def test_process(self):
+        self.assertEqual(process(1), 2)
+"""
+
+MOVE_BASE = """\
+def first(value):
+    return value + 1
+
+
+def second(value):
+    return value + 2
+"""
+
+MOVE_CHANGE = """\
+def second(value):
+    return value + 2
+
+
+def first(value):
+    return value + 1
+"""
+
+MOVE_TEST = """\
+import pathlib
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import first, second
+
+
+class MoveTests(unittest.TestCase):
+    def test_both(self):
+        self.assertEqual(first(1), 2)
+        self.assertEqual(second(1), 3)
+"""
+
+RENAME_BASE = """\
+def before(value):
+    return value + 1
+"""
+
+RENAME_CHANGE = """\
+def after(value):
+    return value + 1
+"""
+
+DECORATOR_BASE = """\
+def marker(function):
+    return function
+
+
+def decorated(value):
+    return value + 1
+"""
+
+DECORATOR_CHANGE = """\
+def marker(function):
+    return function
+
+
+@marker
+def decorated(value):
+    return value + 1
+"""
+
+NESTED_BASE = """\
+def outer(value):
+    def inner(item):
+        return item + 1
+
+    return inner(value)
+"""
+
+NESTED_CHANGE = """\
+def outer(value):
+    def inner(item):
+        return item + 2
+
+    return inner(value)
+"""
+
+
+class ChangedSelectionTests(MutationCase):
+    def selected(self) -> tuple[Any, Any, dict[str, Any]]:
+        return self.run_mutation()
+
+    def test_a_deletion_only_change_selects_the_function(self) -> None:
+        self.base_commit({
+            "pkg/app.py": DELETION_BASE, "tests/test_app.py": PROCESS_TEST,
+        })
+        self.commit({"pkg/app.py": DELETION_CHANGE})
+        result, _document, check = self.selected()
+        self.assertEqual(
+            {record["function"] for record in self.mutants(check)},
+            {"process"},
+        )
+        self.assert_function_was_mutated(result, check)
+
+    def test_a_moved_unchanged_function_is_not_changed(self) -> None:
+        self.base_commit({
+            "pkg/app.py": MOVE_BASE, "tests/test_app.py": MOVE_TEST,
+        })
+        self.commit({"pkg/app.py": MOVE_CHANGE})
+        result, _document, check = self.selected()
+        self.assertEqual(self.mutants(check), [])
+        self.assertEqual(check["measurement"]["functions"], 0)
+        self.assertEqual(result.returncode, 0, output(result))
+
+    def test_a_rename_changes_the_function(self) -> None:
+        self.base_commit({"pkg/app.py": RENAME_BASE})
+        self.commit({
+            "pkg/app.py": RENAME_CHANGE,
+            "tests/test_app.py": PROCESS_TEST.replace("process", "after"),
+        })
+        _result, _document, check = self.selected()
+        self.assertEqual(
+            {record["function"] for record in self.mutants(check)},
+            {"after"},
+        )
+
+    def test_a_decorator_change_changes_the_function(self) -> None:
+        self.base_commit({"pkg/app.py": DECORATOR_BASE})
+        self.commit({
+            "pkg/app.py": DECORATOR_CHANGE,
+            "tests/test_app.py": PROCESS_TEST.replace("process", "decorated"),
+        })
+        _result, _document, check = self.selected()
+        self.assertEqual(
+            {record["function"] for record in self.mutants(check)},
+            {"decorated"},
+        )
+
+    def test_a_nested_function_change_changes_both_definitions(self) -> None:
+        self.base_commit({"pkg/app.py": NESTED_BASE})
+        self.commit({
+            "pkg/app.py": NESTED_CHANGE,
+            "tests/test_app.py": PROCESS_TEST.replace(
+                "process", "outer"
+            ).replace("(outer(1), 2)", "(outer(1), 3)"),
+        })
+        _result, _document, check = self.selected()
+        self.assertEqual(
+            {record["function"] for record in self.mutants(check)},
+            {"outer", "outer.inner"},
+        )
+
+
 COUNTDOWN = """\
 def countdown(value):
     while value > 0:
@@ -564,6 +865,52 @@ class BudgetTests(MutationCase):
             subjects,
         )
 
+    def test_generation_past_run_seconds_is_over_budget_with_no_mutants(self) -> None:
+        self.write_config(mutation_config(run_seconds=1))
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY,
+            "tests/test_app.py": WEAK_CLASSIFY,
+        })
+
+        def slow_generation(*_args: Any) -> list[Any]:
+            time.sleep(1.2)
+            return []
+
+        with mock.patch.object(
+            python_mutation, "_mutations", slow_generation
+        ):
+            result, _document, check = self.run_mutation()
+        self.assertNotEqual(result.returncode, 0, output(result))
+        subjects = [finding["subject"] for finding in check["findings"]]
+        self.assertTrue(
+            any("over budget" in subject for subject in subjects), subjects
+        )
+
+    def test_a_cutoff_records_every_generated_mutant(self) -> None:
+        self.write_config(mutation_config(mutant_seconds=5, run_seconds=1))
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": COUNTDOWN,
+            "tests/test_app.py": SLOW_TEST,
+        })
+        result, _document, check = self.run_mutation()
+        self.assertNotEqual(result.returncode, 0, output(result))
+        records = [
+            record for record in self.mutants(check)
+            if record["outcome"] != "not generated"
+        ]
+        self.assertEqual(len(records), 8, records)
+        self.assertEqual(
+            {record["outcome"] for record in records},
+            {"not run (over budget)"},
+            records,
+        )
+        self.assertTrue(any(
+            "over budget" in finding["subject"]
+            for finding in check["findings"]
+        ), check["findings"])
+
     def test_an_invalid_base_is_a_check_error(self) -> None:
         self.write_config(mutation_config(base="no-such-revision"))
         self.base_commit()
@@ -584,8 +931,8 @@ class FindingTests(MutationCase):
         })
         _result, _document, check = self.run_mutation()
         expected = (
-            "python-mutation: pkg/app.py:2 classify survives >= "
-            "(if value >= 0:); tests run: tests/test_app.py. Add a test that "
+            "python-mutation: pkg/app.py:2 classify survives <= "
+            "(if value <= 0:); tests run: tests/test_app.py. Add a test that "
             "fails on this change, or fix the generation rule if the mutant "
             "cannot change behaviour."
         )
@@ -642,6 +989,927 @@ class FindingTests(MutationCase):
         self.assertEqual(self.git("status", "--porcelain").stdout, before)
         self.assertEqual(self.read_file("pkg/app.py"), before_app)
         self.assertEqual(self.read_file("tests/test_app.py"), before_tests)
+
+ISOLATED_WRITE_TEST = """\
+import os
+import pathlib
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import classify
+
+
+class IsolationTests(unittest.TestCase):
+    def test_writes_stay_in_the_copy(self):
+        pathlib.Path(os.environ["PWD"], "pwd-write.txt").write_text("pwd")
+        inherited = pathlib.Path(
+            os.environ["QG_FIXTURE_SOURCE"], "inherited-write.txt"
+        )
+        inherited.write_text("inherited")
+        classify(1)
+"""
+
+
+SPIN = """\
+def spin(value):
+    while value > 0:
+        value -= 1
+    return value
+"""
+
+
+DETACHED_TEST = """\
+import os
+import pathlib
+import subprocess
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import spin
+
+
+class DetachedTests(unittest.TestCase):
+    def test_a_detached_child(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with open(
+            os.environ["QG_DETACHED_PIDS"], "a", encoding="utf-8"
+        ) as stream:
+            stream.write(f"{child.pid}\\n")
+        self.assertEqual(spin(0), 0)
+"""
+
+
+def _process_running(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(
+            encoding="utf-8"
+        ).rpartition(")")[2].split()[0]
+    except (FileNotFoundError, IndexError):
+        return False
+    return state not in ("Z", "X")
+
+
+class IsolationTests(MutationCase):
+    def test_writes_under_the_environment_stay_out_of_the_source_tree(self) -> None:
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY,
+            "tests/test_app.py": ISOLATED_WRITE_TEST,
+        })
+        before = self.git("status", "--porcelain").stdout
+        result, _document, _check = self.run_mutation(env={
+            "PWD": str(self.repo),
+            "QG_FIXTURE_SOURCE": str(self.repo),
+        })
+        self.assertFalse((self.repo / "pwd-write.txt").exists(), output(result))
+        self.assertFalse(
+            (self.repo / "inherited-write.txt").exists(), output(result)
+        )
+        self.assertEqual(self.git("status", "--porcelain").stdout, before)
+
+    def test_a_detached_child_is_gone_after_the_mutant_times_out(self) -> None:
+        pids_file = self.base / "detached-pids.txt"
+        self.write_config(mutation_config(
+            mutant_seconds=1, function_mutants=2,
+        ))
+        self.base_commit()
+        self.commit({"pkg/app.py": SPIN, "tests/test_app.py": DETACHED_TEST})
+        result, _document, check = self.run_mutation(env={
+            "QG_DETACHED_PIDS": str(pids_file),
+        })
+        self.assertTrue(any(
+            record["outcome"] == "timed out" for record in self.mutants(check)
+        ), self.mutants(check))
+        self.assertTrue(pids_file.exists(), output(result))
+        recorded = [
+            int(line) for line in pids_file.read_text().split()
+        ]
+        self.assertTrue(recorded, output(result))
+        deadline = time.monotonic() + 3
+        while (
+            any(_process_running(pid) for pid in recorded)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        self.assertEqual(
+            [pid for pid in recorded if _process_running(pid)],
+            [], output(result),
+        )
+
+
+DECORATED_NESTED = """\
+def outer():
+    def plain():
+        return 1
+
+    @first
+    @second
+    def decorated():
+        return 2
+
+    return plain() + decorated()
+"""
+
+
+class GeneratorTests(unittest.TestCase):
+    def generated(
+        self, source: str, limit: int = 100,
+    ) -> tuple[ast.FunctionDef, list[Any]]:
+        function = ast.parse(source).body[0]
+        records = python_mutation._mutations(function, source, limit)
+        return function, records
+
+    def test_every_comparison_flips_to_its_complement(self) -> None:
+        _function, records = self.generated(SAMPLE)
+        expected = {
+            2: ("!=", "if a != b:"),
+            4: ("==", "if a == b:"),
+            6: (">=", "if a >= b:"),
+            8: ("<", "if a < b:"),
+            10: ("<=", "if a <= b:"),
+            12: (">", "if a > b:"),
+            14: ("not in", "if a not in items:"),
+            16: ("in", "if a in items:"),
+            18: ("is not", "if a is not b:"),
+            20: ("is", "if a is b:"),
+        }
+        by_line = {
+            record.line: record for record in records
+            if record.line in expected
+            and record.operator in {text for text, _line in expected.values()}
+        }
+        self.assertEqual(sorted(by_line), sorted(expected))
+        for line, (operator, text) in expected.items():
+            record = by_line[line]
+            self.assertEqual(record.operator, operator, record)
+            mutated = python_mutation._apply_mutation(SAMPLE, record)
+            self.assertEqual(
+                mutated.splitlines()[line - 1].strip(), text, mutated
+            )
+
+    def test_a_signed_integer_literal_is_one_constant(self) -> None:
+        source = "def signed():\n    return -1\n"
+        _function, records = self.generated(source)
+        constants = [
+            record for record in records if record.operator == "n+1"
+        ]
+        self.assertEqual(len(constants), 1, records)
+        mutated = python_mutation._apply_mutation(source, constants[0])
+        self.assertEqual(
+            mutated.splitlines()[1].strip(), "return 0", mutated
+        )
+
+    def test_the_cap_takes_constants_in_source_order(self) -> None:
+        pairs = ", ".join(
+            f"{number}: {number + 1}" for number in range(1, 24, 2)
+        )
+        source = (
+            "def mapping():\n"
+            f"    value = {{{pairs}}}\n"
+            "    return value\n"
+        )
+        _function, records = self.generated(source, 20)
+        generated = [record for record in records if record.rule is None]
+        self.assertEqual(len(generated), 20, records)
+        constants = [
+            int(record.replacement) - 1
+            for record in generated if record.operator == "n+1"
+        ]
+        self.assertEqual(constants, list(range(1, 20)), constants)
+
+    def test_deleting_a_decorated_definition_removes_its_decorators(self) -> None:
+        _function, records = self.generated(DECORATED_NESTED)
+        deletion = next(
+            record for record in records
+            if record.operator == "delete"
+            and (
+                record.line == 5
+                or "decorated" in DECORATED_NESTED.splitlines()[record.line - 1]
+            )
+        )
+        mutated = python_mutation._apply_mutation(DECORATED_NESTED, deletion)
+        self.assertNotIn("@first", mutated)
+        self.assertNotIn("@second", mutated)
+        ast.parse(mutated)
+
+    def test_a_mutant_whose_source_does_not_compile_is_not_generated(self) -> None:
+        source = "def work():\n    return 1\n"
+        function = ast.parse(source).body[0]
+        with mock.patch.object(
+            python_mutation, "_apply_text",
+            return_value="def work(:\n    return 1\n",
+        ):
+            records = python_mutation._mutations(function, source, 100)
+        compiled = [
+            record for record in records
+            if record.rule == "does not compile"
+        ]
+        self.assertTrue(compiled, records)
+        self.assertFalse(
+            [record for record in records if record.rule is None], records
+        )
+
+
+class ContractTests(unittest.TestCase):
+    """Direct tests of the adapter's helpers, one contract each."""
+
+    def function(
+        self, source: str, path: str = "pkg/app.py",
+    ) -> Any:
+        node = ast.parse(source).body[0]
+        return python_mutation.python_shape.ShapeFunction(
+            f"{path}:{node.name}", path, node.name, node, node.lineno,
+            node.end_lineno or node.lineno, 1, node.name,
+        )
+
+    def source_tree(self, source: str) -> tuple[Path, Path]:
+        source_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        work_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (source_root / "pkg").mkdir()
+        (source_root / "pkg/app.py").write_text(source, encoding="utf-8")
+        return source_root, work_root
+
+    def work_mutation(self) -> tuple[str, Any, Any]:
+        source = "def work():\n    return 1\n"
+        function = self.function(source)
+        mutation = next(
+            item for item in python_mutation._mutations(
+                function.node, source, 10
+            ) if item.operator == "n+1"
+        )
+        return source, function, mutation
+
+    def test_self_comparison_needs_a_plain_name_or_a_constant(self) -> None:
+        self.assertTrue(python_mutation._self_comparison(
+            ast.parse("value", mode="eval").body,
+            ast.parse("value", mode="eval").body,
+        ))
+        self.assertTrue(python_mutation._self_comparison(
+            ast.Constant(value=1), ast.Constant(value=1)
+        ))
+        self.assertFalse(python_mutation._self_comparison(
+            ast.parse("next(it)", mode="eval").body,
+            ast.parse("next(it)", mode="eval").body,
+        ))
+
+    def test_negation_wraps_the_test(self) -> None:
+        change = python_mutation._negation(
+            ast.parse("flag", mode="eval").body
+        )
+        self.assertEqual(change.operator, "not")
+        self.assertEqual(change.replacement, "not (flag)")
+
+    def test_signed_constant_and_its_change(self) -> None:
+        signed = ast.parse("-1", mode="eval").body
+        self.assertEqual(python_mutation._signed_constant(signed), -1)
+        self.assertIsNone(python_mutation._signed_constant(
+            ast.parse("1", mode="eval").body
+        ))
+        changes = python_mutation._signed_constant_changes(signed)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(
+            (changes[0].operator, changes[0].replacement), ("n+1", "0")
+        )
+
+    def test_node_changes_adds_a_delete_for_a_statement(self) -> None:
+        change = python_mutation._node_changes(
+            ast.parse("value = 1").body[0]
+        )[0]
+        self.assertEqual(change.operator, "delete")
+        self.assertTrue(change.delete)
+
+    def test_skip_children_stops_at_definitions_and_signed_literals(self) -> None:
+        self.assertTrue(python_mutation._skip_children(
+            ast.parse("def inner():\n    pass\n").body[0]
+        ))
+        self.assertTrue(python_mutation._skip_children(
+            ast.parse("-1", mode="eval").body
+        ))
+        self.assertFalse(python_mutation._skip_children(
+            ast.parse("value = 1").body[0]
+        ))
+
+    def test_walk_keeps_source_order_and_skips_a_nested_body(self) -> None:
+        source = (
+            "def outer():\n"
+            "    first = 1\n"
+            "    def inner():\n"
+            "        hidden = 2\n"
+            "    return first\n"
+        )
+        function = ast.parse(source).body[0]
+        walked = list(python_mutation._walk(function))
+        self.assertTrue(any(
+            isinstance(node, ast.FunctionDef) for node in walked
+        ))
+        self.assertEqual(
+            [node.lineno for node in walked if isinstance(node, ast.Assign)],
+            [2],
+        )
+
+    def test_raw_changes_follow_source_position(self) -> None:
+        source = (
+            "def mapping():\n"
+            "    value = {1: 2, 3: 4}\n"
+            "    return value\n"
+        )
+        function = ast.parse(source).body[0]
+        positions = [
+            (change.target.lineno, change.target.col_offset)
+            for change in python_mutation._raw_changes(function)
+        ]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_child_nodes_keeps_ast_children_only(self) -> None:
+        names = [ast.Name(id="a"), ast.Name(id="b")]
+        self.assertEqual(
+            python_mutation._child_nodes([*names, "text"]), names
+        )
+        children = python_mutation._child_nodes(ast.Constant(value=1))
+        self.assertEqual(len(children), 1)
+        self.assertIsInstance(children[0], ast.Constant)
+        self.assertEqual(python_mutation._child_nodes("text"), [])
+
+    def test_is_function_only_statement_needs_one_statement(self) -> None:
+        one = ast.parse("def only(value):\n    return value\n").body[0]
+        self.assertTrue(python_mutation._is_function_only_statement(
+            one, one.body[0], python_mutation._parents(one)
+        ))
+        two = ast.parse(
+            "def pair(value):\n    value = 1\n    return value\n"
+        ).body[0]
+        self.assertFalse(python_mutation._is_function_only_statement(
+            two, two.body[0], python_mutation._parents(two)
+        ))
+
+    def test_statement_and_docstring_and_constant_statement(self) -> None:
+        source = (
+            "def documented():\n"
+            "    'first'\n"
+            "    'later'\n"
+            "    return 1\n"
+        )
+        function = ast.parse(source).body[0]
+        parents = python_mutation._parents(function)
+        first, later = function.body[0], function.body[1]
+        self.assertIs(python_mutation._statement(first, parents), first)
+        self.assertIs(python_mutation._statement(first.value, parents), first)
+        self.assertTrue(
+            python_mutation._docstring_change(function, first, parents)
+        )
+        self.assertFalse(
+            python_mutation._docstring_change(function, later, parents)
+        )
+        self.assertTrue(
+            python_mutation._constant_statement_change(later.value, parents)
+        )
+
+    def test_suppression_names_each_rule(self) -> None:
+        source = "def empty():\n    0\n"
+        function = ast.parse(source).body[0]
+        parents = python_mutation._parents(function)
+        delete = python_mutation._node_changes(function.body[0])[0]
+        self.assertEqual(
+            python_mutation._suppression(function, delete, parents),
+            "constant statement",
+        )
+        rule = python_mutation._Change(
+            "delete", function.body[0], "", rule="a rule"
+        )
+        self.assertEqual(
+            python_mutation._suppression(function, rule, parents), "a rule"
+        )
+        only = ast.parse("def only():\n    return 1\n").body[0]
+        only_parents = python_mutation._parents(only)
+        only_delete = python_mutation._node_changes(only.body[0])[0]
+        self.assertEqual(
+            python_mutation._suppression(only, only_delete, only_parents),
+            "only statement",
+        )
+
+    def test_ast_mutated_replaces_the_target(self) -> None:
+        source = "def only():\n    return 1\n"
+        function = ast.parse(source).body[0]
+        change = python_mutation._raw_changes(function)[0]
+        mutated = python_mutation._ast_mutated(function, change)
+        self.assertEqual(ast.unparse(mutated), "def only():\n    pass")
+
+    def test_text_offsets_line_and_compile(self) -> None:
+        source = "def work():\n    return 1\n"
+        function = ast.parse(source).body[0]
+        change = next(
+            item for item in python_mutation._raw_changes(function)
+            if item.operator == "n+1"
+        )
+        mutated = python_mutation._apply_text(source, change, False)
+        self.assertIn("return 2", mutated)
+        self.assertEqual(
+            python_mutation._mutated_line(source, change, False, 2),
+            "return 2",
+        )
+        self.assertTrue(python_mutation._compiles(mutated))
+        self.assertFalse(python_mutation._compiles("def broken(:\n"))
+
+    def test_generated_rule_names_unchanged_and_uncompilable(self) -> None:
+        source = (
+            "def block(value):\n"
+            "    if value:\n"
+            "        pass\n"
+            "    return 1\n"
+        )
+        function = ast.parse(source).body[0]
+        parents = python_mutation._parents(function)
+        delete = next(
+            item for item in python_mutation._raw_changes(function)
+            if item.operator == "delete"
+            and isinstance(item.target, ast.Pass)
+        )
+        delete_pass = python_mutation._statement_list(
+            function, delete.target, parents
+        ) == [delete.target]
+        self.assertEqual(
+            python_mutation._generated_rule(
+                function, delete, source, ast.unparse(function), delete_pass
+            ),
+            "unparsed source unchanged",
+        )
+        constant = next(
+            item for item in python_mutation._raw_changes(function)
+            if item.operator == "n+1"
+        )
+        self.assertIsNone(
+            python_mutation._generated_rule(
+                function, constant, source, ast.unparse(function), False
+            )
+        )
+
+    def test_mutation_records_the_line_and_the_rule(self) -> None:
+        source = "def work():\n    return 1\n"
+        function = ast.parse(source).body[0]
+        parents = python_mutation._parents(function)
+        change = next(
+            item for item in python_mutation._raw_changes(function)
+            if item.operator == "n+1"
+        )
+        mutation = python_mutation._mutation(
+            function, change, parents, source, ast.unparse(function)
+        )
+        self.assertEqual((mutation.operator, mutation.line), ("n+1", 2))
+        self.assertIsNone(mutation.rule)
+        self.assertEqual(mutation.mutated_line, "return 2")
+
+    def test_test_references_reads_names_and_imports(self) -> None:
+        names, modules = python_mutation._test_references(
+            "tests/test_app.py",
+            "from pkg import app\napp.classify()\n",
+        )
+        self.assertIn("classify", names)
+        self.assertIn("pkg.app", modules)
+
+    def test_imported_from_and_imported_modules_build_names(self) -> None:
+        self.assertEqual(
+            python_mutation._imported_from(
+                ast.parse("from pkg import app").body[0]
+            ),
+            {"pkg", "pkg.app"},
+        )
+        modules: set[str] = set()
+        python_mutation._imported_modules(
+            ast.parse("import pkg.app").body[0], modules
+        )
+        self.assertEqual(modules, {"pkg.app"})
+
+    def test_inside_copy_rewrites_only_the_source_prefix(self) -> None:
+        self.assertEqual(
+            python_mutation._inside_copy("/src/pkg", "/src", "/copy"),
+            "/copy/pkg",
+        )
+        self.assertEqual(
+            python_mutation._inside_copy("/src2", "/src", "/copy"), "/src2"
+        )
+        self.assertEqual(
+            python_mutation._inside_copy("/other", "/src", "/copy"), "/other"
+        )
+
+    def test_ignored_environment_names_the_gate_owned_keys(self) -> None:
+        for key in ("PWD", "PYTHONPATH", "COVERAGE_RUN"):
+            self.assertTrue(
+                python_mutation._ignored_environment(key), key
+            )
+        self.assertFalse(python_mutation._ignored_environment("HOME"))
+
+    def test_environment_points_every_source_path_at_the_copy(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "PWD": "/src",
+            "MY_DIR": "/src/pkg",
+            "OTHER": "/tmp",
+        }, clear=True):
+            environment = python_mutation._environment(
+                Path("/src"), Path("/copy")
+            )
+        self.assertEqual(environment["PWD"], "/copy")
+        self.assertEqual(environment["MY_DIR"], "/copy/pkg")
+        self.assertEqual(environment["OTHER"], "/tmp")
+
+
+    def test_changed_functions_uses_the_shared_definition_selection(self) -> None:
+        source = (
+            "def first():\n    return 1\n\n\ndef second():\n    return 2\n"
+        )
+        previous = python_mutation.python_shape._file_index(
+            "pkg/app.py", "def first():\n    return 1\n"
+        )
+        before = {"pkg/app.py": {
+            function.identity: function for function in previous.functions
+        }}
+        diff = python_mutation.python_shape.Diff(
+            frozenset({"pkg/app.py"}), {}, frozenset()
+        )
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        with mock.patch.multiple(
+            python_mutation.python_shape,
+            _diff_lines=mock.Mock(return_value=diff),
+            _measured_paths=mock.Mock(return_value=["pkg/app.py"]),
+            _read_source=mock.Mock(return_value=source),
+            _base_functions=mock.Mock(return_value=before),
+        ):
+            found = python_mutation._changed_functions(
+                SimpleNamespace(root=Path(".")), spec, DiffBase("HEAD", "base")
+            )
+        self.assertEqual([function.name for function in found], ["second"])
+
+    def test_selected_test_files_reads_python_tests_checks(self) -> None:
+        check = SimpleNamespace(adapter="python_tests")
+        context = SimpleNamespace(
+            config=SimpleNamespace(checks={"tests": check}),
+            files=["pkg/app.py"], classes={},
+        )
+        with mock.patch(
+            "quality_gate.checks._select_files",
+            return_value=(["tests/test_app.py"], []),
+        ):
+            self.assertEqual(
+                python_mutation._selected_test_files(context),
+                ["tests/test_app.py"],
+            )
+
+    def test_test_directories_reads_the_discover_directory(self) -> None:
+        check = SimpleNamespace(
+            adapter="python_tests",
+            spec=SimpleNamespace(run=(
+                "python", "-m", "unittest", "discover", "-s", "tests",
+            )),
+        )
+        context = SimpleNamespace(
+            config=SimpleNamespace(checks={"tests": check})
+        )
+        self.assertEqual(python_mutation._test_directories(context), ["tests"])
+
+    def test_in_any_directory_checks_each_directory(self) -> None:
+        self.assertTrue(python_mutation._in_any_directory(
+            "tests/test_app.py", ["tests"]
+        ))
+        self.assertFalse(python_mutation._in_any_directory(
+            "pkg/app.py", ["tests"]
+        ))
+
+    def test_fallback_test_paths_keeps_test_shaped_files(self) -> None:
+        context = SimpleNamespace(
+            files=["pkg/app.py", "tests/test_app.py", "tests/helper.py"]
+        )
+        with mock.patch.object(
+            python_mutation, "_selected_test_files",
+            return_value=["pkg/app.py", "tests/test_app.py"],
+        ):
+            self.assertEqual(
+                python_mutation._fallback_test_paths(context),
+                ["tests/test_app.py"],
+            )
+
+    def test_selected_test_paths_uses_the_directory_or_the_fallback(self) -> None:
+        context = SimpleNamespace(
+            files=["pkg/app.py", "tests/test_app.py", "other/test_other.py"]
+        )
+        with mock.patch.object(
+            python_mutation, "_fallback_test_paths",
+            return_value=["fallback"],
+        ):
+            self.assertEqual(
+                python_mutation._selected_test_paths(context, []), ["fallback"]
+            )
+        self.assertEqual(
+            python_mutation._selected_test_paths(context, ["tests"]),
+            ["tests/test_app.py"],
+        )
+
+    def test_test_file_paths_keeps_python_files_sorted(self) -> None:
+        context = SimpleNamespace(
+            files=[], config=SimpleNamespace(checks={})
+        )
+        with mock.patch.object(
+            python_mutation, "_selected_test_paths",
+            return_value=["tests/test_b.py", "tests/helper.txt", "tests/test_a.py"],
+        ):
+            self.assertEqual(
+                python_mutation._test_file_paths(context),
+                ["tests/test_a.py", "tests/test_b.py"],
+            )
+
+    def test_module_name_is_the_dotted_path(self) -> None:
+        self.assertEqual(
+            python_mutation._module_name("pkg/app.py"), "pkg.app"
+        )
+
+    def test_discover_argv_runs_one_discovered_file(self) -> None:
+        self.assertEqual(
+            python_mutation._discover_argv("tests/test_app.py"),
+            [
+                sys.executable, "-I", "-B", "-m", "unittest", "discover",
+                "-s", "tests", "-p", "test_app.py",
+            ],
+        )
+
+    def test_budget_result_is_a_timed_out_run(self) -> None:
+        result = python_mutation._budget_result(["python"])
+        self.assertEqual((result.execution, result.timed_out), ("budget", True))
+        self.assertIsNone(result.returncode)
+        self.assertEqual(result.argv, ("python",))
+
+    def test_run_one_test_past_its_deadline_is_a_budget_result(self) -> None:
+        result = python_mutation._run_one_test(
+            Path("."), Path("."), "tests/test_app.py", time.monotonic() - 1
+        )
+        self.assertEqual(result.execution, "budget")
+        self.assertEqual(result.argv, tuple(
+            python_mutation._discover_argv("tests/test_app.py")
+        ))
+
+    def test_first_failure_keeps_the_earliest_failure(self) -> None:
+        passed = RunResult((), execution="completed", returncode=0)
+        failed = RunResult((), execution="completed", returncode=1)
+        self.assertIsNone(python_mutation._first_failure(None, passed))
+        self.assertIs(
+            python_mutation._first_failure(failed, passed), failed
+        )
+        self.assertIs(python_mutation._first_failure(None, failed), failed)
+
+    def test_baseline_copies_the_tree_and_reports_its_budget_cut(self) -> None:
+        source = "def work():\n    return 1\n"
+        function = self.function(source)
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        root, work = self.source_tree(source)
+        with mock.patch.object(
+            python_mutation, "_run_unittest",
+            return_value=RunResult(
+                (), execution="completed", returncode=0
+            ),
+        ):
+            self.assertTrue(python_mutation._baseline(
+                function, ("tests/test_app.py",), root, work,
+                0, spec, time.monotonic(),
+            ))
+        self.assertTrue((work / "copy-0000/pkg/app.py").exists())
+        self.assertFalse(python_mutation._baseline(
+            function, ("tests/test_app.py",), root, work,
+            1, spec, time.monotonic() - 11,
+        ))
+
+    def test_result_or_failure_prefers_the_first_failure(self) -> None:
+        result = RunResult((), execution="completed", returncode=0)
+        failure = RunResult((), execution="budget", returncode=None)
+        self.assertIs(
+            python_mutation._result_or_failure(result, None), result
+        )
+        self.assertIs(
+            python_mutation._result_or_failure(result, failure), failure
+        )
+
+    def test_passed_needs_a_completed_zero_exit(self) -> None:
+        self.assertTrue(python_mutation._passed(
+            RunResult((), execution="completed", returncode=0)
+        ))
+        self.assertFalse(python_mutation._passed(
+            RunResult((), execution="completed", returncode=1)
+        ))
+        self.assertFalse(python_mutation._passed(
+            RunResult((), execution="budget", returncode=None)
+        ))
+
+    def test_baseline_passed_names_a_cut_and_a_failure(self) -> None:
+        function = self.function("def work():\n    return 1\n")
+        self.assertTrue(python_mutation._baseline_passed(
+            function, RunResult((), execution="completed", returncode=0), 1, 10
+        ))
+        self.assertFalse(python_mutation._baseline_passed(
+            function, RunResult((), execution="budget", returncode=None), 1, 10
+        ))
+        with self.assertRaises(python_mutation.GateError):
+            python_mutation._baseline_passed(
+                function,
+                RunResult((), execution="completed", returncode=1), 1, 10,
+            )
+        with self.assertRaisesRegex(python_mutation.GateError, "boom"):
+            python_mutation._baseline_passed(
+                function,
+                RunResult((), execution="error", returncode=None, error="boom"),
+                1, 10,
+            )
+
+    def test_outcome_maps_the_execution_and_failures(self) -> None:
+        function = self.function("def work():\n    return 1\n")
+        self.assertEqual(python_mutation._outcome(
+            RunResult((), execution="budget", returncode=None), function
+        ), "timed out")
+        self.assertEqual(python_mutation._outcome(
+            RunResult((), execution="completed", returncode=0), function
+        ), "survived")
+        self.assertEqual(python_mutation._outcome(
+            RunResult((), execution="completed", returncode=1), function
+        ), "killed")
+        with self.assertRaises(python_mutation.GateError):
+            python_mutation._outcome(
+                RunResult((), execution="error", returncode=None, error="x"),
+                function,
+            )
+
+    def test_the_findings_name_their_rule(self) -> None:
+        _source, function, mutation = self.work_mutation()
+        survived = python_mutation._survived_finding(
+            function, mutation, ("tests/test_app.py",)
+        )
+        self.assertTrue(
+            survived.subject.startswith(
+                "python-mutation: pkg/app.py:2 work survives n+1"
+            ),
+            survived.subject,
+        )
+        self.assertIn("no test names it", python_mutation._no_test_finding(
+            function
+        ).subject)
+        over = python_mutation._over_budget_finding(
+            function, python_mutation.MutationSpec(
+                "changed", "HEAD", 10, 20, 10
+            )
+        )
+        self.assertIn("over budget", over.subject)
+
+    def test_records_split_suppressed_and_generated_mutants(self) -> None:
+        source = (
+            "def documented():\n"
+            "    'first'\n"
+            "    return 1\n"
+        )
+        function = self.function(source)
+        mutations = python_mutation._mutations(
+            function.node, source, 10
+        )
+        self.assertTrue(python_mutation._suppressed_records(
+            function, mutations, ("tests/test_app.py",)
+        ))
+        self.assertTrue(python_mutation._generated_mutations(mutations))
+
+    def test_run_mutant_copies_and_reports_the_outcome(self) -> None:
+        source, function, mutation = self.work_mutation()
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        root, work = self.source_tree(source)
+        numbers = [0]
+        with mock.patch.object(
+            python_mutation, "_run_unittest",
+            return_value=RunResult(
+                (), execution="completed", returncode=1
+            ),
+        ):
+            outcome, over_budget = python_mutation._run_mutant(
+                function, mutation, ("tests/test_app.py",), source,
+                spec, time.monotonic(), root, work, numbers,
+            )
+        self.assertEqual((outcome, over_budget), ("killed", False))
+        self.assertEqual(numbers, [1])
+
+    def test_run_generated_records_a_survivor_and_a_cutoff(self) -> None:
+        source, function, mutation = self.work_mutation()
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        records: list[Any] = []
+        with mock.patch.object(
+            python_mutation, "_run_mutant",
+            return_value=("survived", False),
+        ):
+            records, findings, finished = python_mutation._run_generated(
+                function, [mutation], ("tests/test_app.py",), source, spec,
+                time.monotonic(), Path("."), Path("."), [0], records,
+            )
+        self.assertTrue(finished)
+        self.assertEqual(records[0]["outcome"], "survived")
+        self.assertEqual(len(findings), 1)
+        cut = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 1)
+        records, findings, finished = python_mutation._run_generated(
+            function, [mutation], ("tests/test_app.py",), source, cut,
+            time.monotonic() - 2, Path("."), Path("."), [0], [],
+        )
+        self.assertFalse(finished)
+        self.assertEqual(records[0]["outcome"], "not run (over budget)")
+        self.assertEqual(findings, [])
+
+    def test_run_function_without_generated_mutants_finishes(self) -> None:
+        source = "def empty():\n    0\n"
+        function = self.function(source)
+        records, findings, finished = python_mutation._run_function(
+            function, ("tests/test_app.py",), source,
+            python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10),
+            time.monotonic(), Path("."), Path("."), [0],
+        )
+        self.assertTrue(finished)
+        self.assertTrue(records)
+        self.assertEqual(findings, [])
+
+    def test_source_for_reads_once_and_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg").mkdir()
+            path = root / "pkg/app.py"
+            path.write_text("first", encoding="utf-8")
+            sources: dict[str, str] = {}
+            self.assertEqual(
+                python_mutation._source_for(root, "pkg/app.py", sources),
+                "first",
+            )
+            path.write_text("second", encoding="utf-8")
+            self.assertEqual(
+                python_mutation._source_for(root, "pkg/app.py", sources),
+                "first",
+            )
+
+    def test_measure_runs_each_function_and_reports_none_unfinished(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = SimpleNamespace(root=Path(directory))
+            function = self.function("def empty():\n    0\n")
+            with mock.patch.object(
+                python_mutation, "_source_for", return_value=(
+                    "def empty():\n    0\n"
+                ),
+            ):
+                records, findings, unfinished = python_mutation._measure(
+                    context,
+                    python_mutation.MutationSpec(
+                        "changed", "HEAD", 10, 20, 10
+                    ),
+                    [function],
+                    {function.identity: ("tests/test_app.py",)},
+                    time.monotonic(),
+                )
+        self.assertTrue(records)
+        self.assertEqual(findings, [])
+        self.assertEqual(unfinished, [])
+
+    def test_the_entry_point_reports_a_configuration_error(self) -> None:
+        spec = python_mutation.MutationSpec("changed", "no-such", 10, 20, 10)
+        check = SimpleNamespace(spec=spec)
+        context = SimpleNamespace(
+            root=Path("."), check=check, base_override=None, prefix="check"
+        )
+        stub = SimpleNamespace(configuration_error=False, budget_seconds=None)
+        with mock.patch.object(
+            python_mutation, "diff_base",
+            side_effect=python_mutation.GateError("no such revision"),
+        ), mock.patch(
+            "quality_gate.checks._ratchet_error", return_value=stub
+        ):
+            result = python_mutation._run_python_mutation(context)
+        self.assertIs(result, stub)
+        self.assertTrue(result.configuration_error)
+        self.assertEqual(result.budget_seconds, spec.run_seconds)
+
+    def test_mutation_result_records_the_run_budget(self) -> None:
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        check = SimpleNamespace(spec=spec)
+        context = SimpleNamespace(prefix="check", check=check)
+        measured = python_mutation.Domain.of_files(
+            ["pkg/app.py"], "the measured production files"
+        )
+        stub = SimpleNamespace(budget_seconds=None)
+        with mock.patch(
+            "quality_gate.checks._evaluate_ratchet",
+            return_value=(None, "failure"),
+        ), mock.patch(
+            "quality_gate.checks._ratchet_result", return_value=stub
+        ):
+            result = python_mutation._mutation_result(
+                context, check, time.monotonic(), [], [], [],
+                DiffBase("HEAD", "base"), measured, [],
+            )
+        self.assertIs(result, stub)
+        self.assertEqual(result.budget_seconds, spec.run_seconds)
+
 
 class AdapterUnitTests(unittest.TestCase):
     def test_the_spec_defaults_match_the_documented_budgets(self) -> None:

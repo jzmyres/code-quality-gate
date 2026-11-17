@@ -632,8 +632,11 @@ A test file is a path with a `tests/` component, a `test_*.py` name or a `*_test
 files are excluded from every rule's scope, and a function is a "direct test" of a name only when a
 test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` class) names it.
 
-`scope = "changed"` evaluates only the functions the diff adds or changes, and UNCALLED, PTW-SU,
-SCC and LTC judge only the functions the diff adds, not every function it changes. `scope = "tree"`
+`scope = "changed"` evaluates the functions whose definition is new or differs from the base
+revision's definition with the same qualified name, compared after `ast.dump` with decorators
+included, exactly as `python_mutation` selects them: a moved unchanged function is not evaluated and
+a deletion inside a function is. UNCALLED, PTW-SU, SCC and LTC still judge only the functions the
+commit adds (a new qualified name), not every function it changes. `scope = "tree"`
 evaluates every function of the selected production files, so a function the commit does not touch
 can fail SCC, LTC or UNCALLED there. CPF is not a tree property, so it compares against `base` in
 both scopes (a clean tree with `base = "HEAD"` has no CPF finding). A helper's production call
@@ -666,7 +669,7 @@ The `measurement` carries the measured values per rule: `rule`, `file`, `name`, 
 `call_sites`, `direct_test`, `callee`, `forwarded`, `constants`, `cc_before`, `cc_after`, `limit`,
 `chain_depth`, `chain`, `longest`, `ratio` and `tokens`. The check reports
 `{"functions": N, "added": M}` in its measurement, so a run shows how much it measured. The metric
-version is `python-shape/1`. The adapter itself is 49 functions and scores at most CC 6; no
+version is `python-shape/1`. The adapter itself is 54 functions and scores at most CC 6; no
 function of it scores above CRAP 6 measured over its test module, and its own change passes every
 rule at `scope = "changed"`.
 
@@ -772,51 +775,71 @@ table:
 
 `python_mutation` refuses a change whose tests survive a mutation of a function the diff adds or
 changes. It selects the production functions exactly as `python_shape` does with `scope = "changed"`
-and `base`: the selected files the diff touches, and in them each function or method an added line
-falls inside, or every function of a new file. Test files are never mutated. A function with no
-mutants is not reported merely for that; a function no test names is a finding (see below).
+and `base`: the selected files the diff touches, and in them each function or method whose
+definition is new or differs from the base revision's definition with the same qualified name.
+Definitions are compared after `ast.dump`, decorators included, so a moved unchanged function is
+not selected and a deletion inside a function selects it. Test files are never mutated. A function
+with no mutants is not reported merely for that; a function no test names is a finding (see below).
 
 For each selected function, in source order, the adapter generates these mutants from a fixed
 operator set:
 
-* a comparison operator flipped: `==`/`!=`, `<`/`>=`, `>`/`<=`, `in`/`not in`, `is`/`is not`;
+* a comparison operator flipped to its complement: `==`/`!=`, `<`/`>=`, `>`/`<=`, `in`/`not in`,
+  `is`/`is not`, in both directions;
 * `and` and `or` swapped;
 * a condition negated: an `if`, `while`, ternary or comprehension `if` test;
 * a `return` value replaced by `None`, or `True` and `False` swapped for a boolean constant;
-* one statement deleted, replaced by `pass` when deleting it would leave an empty block;
+* one whole statement deleted, decorators included, replaced by `pass` when deleting it would
+  leave an empty block;
 * an integer constant `n` changed to `n + 1`, and a string constant changed to the empty string.
+  A signed integer literal is one constant, so `-1` becomes `0`.
 
 The operator label in a finding is the new spelling (`!=`, `>=`, `or`, `return False`, `n+1`,
-`empty string`, ...), except that negation is `not` and deletion is `delete`. At most
-`function_mutants` mutants are generated per function: the first that many generated mutants in
-source order, not counting a suppressed candidate.
+`empty string`, ...), except that negation is `not` and deletion is `delete`. One table holds each
+operator's complement and its display text. At most `function_mutants` mutants are generated per
+function: the first that many generated mutants ordered by source position (line, then column),
+not counting a suppressed candidate.
 
 An equivalent mutant is not generated, and the JSON records it with outcome `not generated` and the
 rule that suppressed it:
 
 * `unparsed source unchanged`: `ast.unparse` of the mutated function equals the original's;
-* `self-comparison`: the mutation compares a value with itself, as in `x == x`;
+* `does not compile`: the mutated source does not parse, so the mutant is not counted as killed;
+* `self-comparison`: both sides are the same plain name or the same constant, as in `x == x`;
+* `constant statement`: a statement that is a bare constant, or a string that is not the first
+  statement of a function body, cannot change behaviour and is not mutated;
 * `only statement`: deleting it would remove the only non-docstring statement of a function body;
-* `docstring`: the mutation would change a docstring;
+* `docstring`: the mutation would change the first statement's string;
 * `return None`: the return is already `return None` or a bare `return`.
 
 There is no suppression list and no baseline: a surviving mutant is answered with a test or by
 fixing a generation rule here.
 
 The test files for a function are the Python files under the test directory a `python_tests`
-check discovers whose source names the function or imports its module's dotted path; when the policy
-configures no `python_tests` check, every selected test-shaped Python file is considered. A function
-no such file names is a finding with `no test names it`: it has no tests, and mutation testing cannot
-show its tests can fail. Each mutant is applied to a copy of the repository in a temporary directory;
-the working tree is never written. The selected test files run in that copy with the bounded runner
+check discovers whose parsed source names the function or imports the function's module in any form:
+`import pkg.mod`, `import pkg.mod as m`, `from pkg import mod`, `from pkg.mod import name` and
+`from pkg.mod import *` all select it. When the policy configures no `python_tests` check, every
+selected test-shaped Python file is considered. A function no such file names is a finding with
+`no test names it`: it has no tests, and mutation testing cannot show its tests can fail. Each
+mutant is applied to a copy of the repository in a temporary directory; the working tree is never
+written. The mutant's environment sets `PWD` to the copy and rewrites every inherited value that is
+a path inside the source repository to the same path inside the copy, so a test writing under either
+path cannot reach the source tree. The selected test files run in that copy with the bounded runner
 as `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
 
+Each run makes the check process a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)` on Linux). After
+the mutant's process group is stopped, every remaining descendant the check adopted is stopped and
+reaped, including a child a test started with `start_new_session=True`. Where the subreaper is
+unavailable the check is an error naming why, never a pass.
+
 `mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
-mutants per function (default 20), and `run_seconds` bounds the whole check (default 300). A mutant
-that exceeds its run is `timed out` and counts as killed only when the original tests passed within
-`mutant_seconds`; if the original tests fail or exceed their own time, the check is an error, never
-a pass. A check that reaches `run_seconds` stops and reports every function it did not finish as an
-`over budget` finding. An invalid `base` is a check error, never a pass.
+mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering
+generation, copying, test runs and cleanup. The deadline is checked after generation and before
+every copy and run. A mutant that exceeds its run is `timed out` and counts as killed only when the
+original tests passed within `mutant_seconds`; if the original tests fail or exceed their own time,
+the check is an error, never a pass. A check that reaches `run_seconds` stops, reports every
+function it did not finish as an `over budget` finding, and records every generated mutant that did
+not run as `not run (over budget)`; it never passes. An invalid `base` is a check error, never a pass.
 
 A surviving mutant is one finding, value `1` against threshold `0`, with the exact message:
 
@@ -833,15 +856,16 @@ For example, a weak test that only asserts the result is one of the possible str
         def test_classify(self):
             self.assertIn(classify(1), ("positive", "other"))
 
-reports the boundary flip that takes the same branch for `1`:
+reports the complement that takes the same branch for `1`:
 
-    check: mutation: python-mutation: pkg/app.py:2 classify survives >= (if value >= 0:); tests run: tests/test_app.py. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.: value 1 exceeds threshold 0 at pkg/app.py:1-3
+    check: mutation: python-mutation: pkg/app.py:2 classify survives <= (if value <= 0:); tests run: tests/test_app.py. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.: value 1 exceeds threshold 0 at pkg/app.py:1-3
 
 The finding's `measurement` carries `subject` (`FILE:FUNCTION`), `file`, `function`, `operator`,
 `line`, `mutated`, `outcome` and `tests`. The check's JSON `measurement` carries every mutant in
 `mutants`, each with those fields plus `rule` (the suppressed rule, otherwise null), and the
 `functions` count, the `test_files` considered and the `base` commit. Outcomes are `killed`,
-`survived`, `timed out` and `not generated`. The metric version is `python-mutation/1`.
+`survived`, `timed out`, `not generated` and `not run (over budget)`. The metric version is
+`python-mutation/1`.
 
 This repository does not enable `python_mutation` in this commit: the trusted gate that judges the
 change predates the adapter. A later item enables it.

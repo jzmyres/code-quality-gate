@@ -176,6 +176,104 @@ class GroupAliveTests(unittest.TestCase):
         self.assertLess(float(duration), 5.0)
 
 
+class ChildProcessTests(unittest.TestCase):
+    """The subreaper's reads of /proc and its cleanup decisions."""
+
+    def test_fields_of_a_missing_process_is_none(self) -> None:
+        self.assertIsNone(runner._fields_of("missing-process"))
+
+    def test_fields_of_an_unreadable_stat_is_none(self) -> None:
+        with mock.patch.object(
+            runner, "_proc_fields", side_effect=OSError("denied")
+        ):
+            self.assertIsNone(runner._fields_of("123"))
+
+    def test_child_pid_names_only_a_direct_child(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(_kill_and_reap, process)
+        self.assertEqual(
+            runner._child_pid(str(process.pid), os.getpid()), process.pid
+        )
+        self.assertIsNone(runner._child_pid(str(process.pid), 0))
+        self.assertIsNone(runner._child_pid("missing-process", os.getpid()))
+
+    def test_children_lists_the_direct_children(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(_kill_and_reap, process)
+        self.assertIn(process.pid, runner._children(os.getpid()))
+
+    def test_children_of_an_unreadable_proc_is_empty(self) -> None:
+        with mock.patch.object(
+            runner.os, "listdir", side_effect=OSError("denied")
+        ):
+            self.assertEqual(runner._children(os.getpid()), set())
+
+    def test_kill_adopted_stops_and_reaps_a_child(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(_kill_and_reap, process)
+        runner._kill_adopted({process.pid})
+        try:
+            process.wait(timeout=5.0)
+        except ChildProcessError:
+            pass
+        deadline = time.monotonic() + 5.0
+        while (
+            Path(f"/proc/{process.pid}").exists()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        self.assertFalse(Path(f"/proc/{process.pid}").exists())
+
+    def test_cleanup_error_names_the_failed_cleanup(self) -> None:
+        self.assertIsNone(runner._cleanup_error(True, True))
+        self.assertEqual(runner._cleanup_error(False, True), runner.CLEANUP_ERROR)
+        self.assertEqual(
+            runner._cleanup_error(True, False), runner.DESCENDANT_ERROR
+        )
+
+    def test_execution_fields_maps_each_outcome(self) -> None:
+        self.assertEqual(
+            runner._execution_fields("completed", 0, None),
+            ("completed", None, False),
+        )
+        self.assertEqual(
+            runner._execution_fields("budget", None, None),
+            ("budget", None, True),
+        )
+        self.assertEqual(
+            runner._execution_fields("completed", -9, None),
+            ("signal", None, False),
+        )
+        self.assertEqual(
+            runner._execution_fields("completed", 0, "broken"),
+            ("error", "broken", True),
+        )
+
+    def test_an_interrupted_cleanup_notes_each_failure(self) -> None:
+        process = SimpleNamespace(pid=4242)
+        error = TimeoutError("test timer")
+        captured = io.StringIO()
+        with mock.patch.object(
+            runner, "_kill_and_wait", return_value=False
+        ), mock.patch.object(
+            runner, "_stop_adopted", return_value=False
+        ), contextlib.redirect_stderr(captured):
+            runner._finish_interrupted(error, process, set())
+        notes = getattr(error, "__notes__", [])
+        self.assertTrue(any(
+            runner.CLEANUP_ERROR in note for note in notes
+        ), notes)
+        self.assertTrue(any(
+            runner.DESCENDANT_ERROR in note for note in notes
+        ), notes)
+        self.assertIn(runner.CLEANUP_ERROR, captured.getvalue())
+
+    def test_a_command_that_cannot_start_is_an_error(self) -> None:
+        result = runner.run(["/no/such/command"], budget_seconds=1)
+        self.assertEqual(result.execution, "error")
+        self.assertIn("cannot run command", result.error or "")
+
+
 class ProcGroupMemberTests(unittest.TestCase):
     group = 77
 
@@ -280,10 +378,14 @@ class InterruptCleanupTests(unittest.TestCase):
             side_effect=OSError("denied"),
         ))
 
-    def test_the_non_linux_branch_still_returns(self) -> None:
-        self._assert_bounded_and_reaped(
-            mock.patch.object(runner.sys, "platform", "darwin")
-        )
+    def test_a_platform_without_a_subreaper_is_an_error_naming_it(self) -> None:
+        with mock.patch.object(runner.sys, "platform", "darwin"):
+            result = runner.run(
+                [sys.executable, "-c", "print(1)"], budget_seconds=1
+            )
+        self.assertEqual(result.execution, "error")
+        self.assertIn("PR_SET_CHILD_SUBREAPER", result.error or "")
+        self.assertIn("darwin", result.error or "")
 
 
 class UnconfirmedCleanupTests(unittest.TestCase):
