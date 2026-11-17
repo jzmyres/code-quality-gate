@@ -134,7 +134,6 @@ tier = 1
 enforcement = "enforced"
 requires = "tests"
 threshold = 6
-baseline = "quality-gate-crap.toml"
 
 [checks.shape]
 adapter = "python_shape"

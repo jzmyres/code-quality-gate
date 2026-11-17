@@ -1,18 +1,23 @@
 """Tests for the python_crap adapter, its CC table and its ratchet."""
 from __future__ import annotations
 
+import ast
 import configparser
+import importlib
+import io
 import json
 import os
 import subprocess
 import sys
 import time
 import tomllib
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from support import (
+    GATE,
     PYTHON_COMMON_RULE_LINES,
     PYTHON_TEST_HEADER,
     FixtureCase,
@@ -20,6 +25,9 @@ from support import (
     copy_tree_writable,
     output,
 )
+
+sys.path.insert(0, str(GATE))
+python_crap = importlib.import_module("quality_gate.python_crap")
 
 
 def crap_config(
@@ -1242,6 +1250,92 @@ class CoverageConfigurationAttackTests(FixtureCase):
         result, document = self.run_attack(tamper=False)
         self.assertEqual(result.returncode, 0, output(result))
         self.assert_risky_score(document)
+
+
+class CrapRunTests(unittest.TestCase):
+    def check(self) -> object:
+        return python_crap.CheckDef(
+            id="crap",
+            adapter="python_crap",
+            tier=1,
+            enforcement="enforced",
+            metric_version="python-lines/1",
+            evidence=("tests", "crap"),
+            spec=None,
+            threshold=6,
+            baseline=None,
+        )
+
+    def context(self) -> object:
+        return types.SimpleNamespace(
+            root=Path("."),
+            check=self.check(),
+            prefix="crap",
+            prior={},
+            config=types.SimpleNamespace(classes={}),
+            files=[],
+            classes={},
+        )
+
+    def test_run_reports_no_files_selected(self) -> None:
+        context = self.context()
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            result = python_crap._run_python_crap(context)
+        self.assertEqual(result.outcome, "fail")
+        self.assertIn("no files selected", result.reason)
+
+    def test_require_records_unreliable_coverage(self) -> None:
+        run = python_crap._CrapRun(self.context())
+        run.selection = (
+            types.SimpleNamespace(requires="tests"),
+            0.0,
+            ["pkg/example.py"],
+            [],
+        )
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            run.require()
+        self.assertIn(
+            "coverage unreliable: tests did not pass", run.coverage[3]
+        )
+
+    def test_failures_result_keeps_every_failure_tail(self) -> None:
+        run = python_crap._CrapRun(self.context())
+        run.selection = (None, 0.0, ["pkg/example.py"], [])
+        run.measured = (
+            python_crap.CrapMeasurement([], ["first", "second"]),
+            None,
+        )
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            result = run.failures_result()
+        self.assertEqual(result.outcome, "fail")
+        self.assertIn("first", result.diagnostics.output_tail)
+        self.assertIn("second", result.diagnostics.output_tail)
+
+
+class FunctionCollectionTests(unittest.TestCase):
+    def test_visitor_measures_functions_and_prefixes_classes(self) -> None:
+        found: list[python_crap.MeasuredFunction] = []
+        collector = python_crap._FunctionCollector(
+            "pkg/example.py", found, set(), set()
+        )
+        collector.visit_FunctionDef(
+            ast.parse(
+                "def one(value):\n    return 1 if value else 2\n"
+            ).body[0]
+        )
+        collector.visit_ClassDef(
+            ast.parse(
+                "class Thing:\n"
+                "    def method(self):\n"
+                "        return 1\n"
+            ).body[0]
+        )
+        self.assertEqual(
+            [item.identity for item in found],
+            ["pkg/example.py:one", "pkg/example.py:Thing.method"],
+        )
+        self.assertEqual([item.cc for item in found], [2, 1])
+        self.assertEqual(collector.prefix, "")
 
 
 if __name__ == "__main__":

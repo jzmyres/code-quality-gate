@@ -297,44 +297,107 @@ def _verify_sha256(tool: Tool, archive: Path) -> None:
         )
 
 
-def _unsafe_member(tool: Tool, name: str) -> GateError:
-    return GateError(
-        f"tools: {tool.name} {tool.version}: unsafe archive member "
-        f"{name!r}; nothing installed"
+@dataclass(frozen=True)
+class _MemberRule:
+    writes: bool
+    message: str = ""
+
+
+_MEMBER_RULES = {
+    "unsafe": _MemberRule(
+        False, "unsafe archive member {name!r}; nothing installed"
+    ),
+    "link": _MemberRule(
+        False,
+        "unsafe archive member {name!r} is a link; nothing installed",
+    ),
+    "directory": _MemberRule(False),
+    "regular": _MemberRule(True),
+    "other": _MemberRule(
+        False,
+        "unsafe archive member {name!r} is not a regular file; "
+        "nothing installed",
+    ),
+}
+
+_ROOT_PATHS = (PurePosixPath("."), PurePosixPath("./"))
+
+_TAR_MEMBER_KINDS = (
+    (lambda member: member.issym(), "link"),
+    (lambda member: member.islnk(), "link"),
+    (lambda member: member.isdir(), "directory"),
+    (lambda member: member.isreg(), "regular"),
+)
+
+_WHEEL_MEMBER_KINDS = (
+    (lambda member: stat.S_ISLNK(member.external_attr >> 16), "link"),
+    (
+        lambda member: member.is_dir()
+        or stat.S_ISDIR(member.external_attr >> 16),
+        "directory",
+    ),
+    (
+        lambda member: stat.S_IFMT(member.external_attr >> 16)
+        in (0, stat.S_IFREG),
+        "regular",
+    ),
+)
+
+
+def _member_rule(kind: str, name: str, tool: Tool) -> _MemberRule:
+    rule = _MEMBER_RULES[kind]
+    if rule.message:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: "
+            f"{rule.message.format(name=name)}"
+        )
+    return rule
+
+
+def _member_kind(
+    member: Any, kinds: tuple[tuple[Any, str], ...]
+) -> str:
+    return next(
+        (kind for matches, kind in kinds if matches(member)), "other"
     )
 
 
-def _member_path(member: tarfile.TarInfo, tool: Tool) -> PurePosixPath:
-    path = PurePosixPath(member.name)
-    if member.isdir() and path in (PurePosixPath("."), PurePosixPath("./")):
+def _member_path(
+    name: str, tool: Tool, *, root: bool = False
+) -> PurePosixPath:
+    path = PurePosixPath(name)
+    if root and path in _ROOT_PATHS:
         return PurePosixPath()
     if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise _unsafe_member(tool, member.name)
+        _member_rule("unsafe", name, tool)
     return path
+
+
+def _write_member(target: Path, source: Any, mode: int) -> None:
+    with source, target.open("wb") as stream:
+        shutil.copyfileobj(source, stream)
+    if mode:
+        os.chmod(target, mode)
 
 
 def _extract_tar(archive_path: Path, destination: Path, tool: Tool) -> None:
     try:
         with tarfile.open(archive_path, "r:*") as archive:
             members = archive.getmembers()
+            records = []
             for member in members:
-                _member_path(member, tool)
-                if member.issym() or member.islnk():
-                    raise GateError(
-                        f"tools: {tool.name} {tool.version}: unsafe archive member "
-                        f"{member.name!r} is a link; nothing installed"
-                    )
-                if member.isdir():
-                    continue
-                if not member.isreg():
-                    raise GateError(
-                        f"tools: {tool.name} {tool.version}: unsafe archive member "
-                        f"{member.name!r} is not a regular file; nothing installed"
-                    )
-            for member in members:
-                if not member.isreg():
-                    continue
-                relative = _member_path(member, tool)
+                path = _member_path(
+                    member.name, tool, root=member.isdir()
+                )
+                rule = _member_rule(
+                    _member_kind(member, _TAR_MEMBER_KINDS),
+                    member.name,
+                    tool,
+                )
+                records.append((member, path, rule))
+            for member, relative, _rule in filter(
+                lambda record: record[2].writes, records
+            ):
                 target = destination.joinpath(*relative.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source = archive.extractfile(member)
@@ -343,55 +406,46 @@ def _extract_tar(archive_path: Path, destination: Path, tool: Tool) -> None:
                         f"tools: {tool.name} {tool.version}: cannot read archive "
                         f"member {member.name!r}"
                     )
-                with source, target.open("wb") as stream:
-                    shutil.copyfileobj(source, stream)
-                mode = member.mode & 0o777
-                if mode:
-                    os.chmod(target, mode)
+                _write_member(target, source, member.mode & 0o777)
     except (tarfile.TarError, OSError) as error:
         raise GateError(
             f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"
         ) from error
 
 
+def _wheel_member_record(
+    member: zipfile.ZipInfo, tool: Tool
+) -> tuple[PurePosixPath, _MemberRule]:
+    path = _member_path(member.filename, tool)
+    rule = _member_rule(
+        _member_kind(member, _WHEEL_MEMBER_KINDS),
+        member.filename,
+        tool,
+    )
+    return path, rule
+
+
 def _wheel_member_path(member: zipfile.ZipInfo, tool: Tool) -> PurePosixPath:
-    path = PurePosixPath(member.filename)
-    if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise _unsafe_member(tool, member.filename)
-    mode = member.external_attr >> 16
-    if stat.S_ISLNK(mode):
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: unsafe archive member "
-            f"{member.filename!r} is a link; nothing installed"
-        )
-    if member.is_dir() or stat.S_ISDIR(mode):
-        return path
-    file_type = stat.S_IFMT(mode)
-    if file_type not in (0, stat.S_IFREG):
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: unsafe archive member "
-            f"{member.filename!r} is not a regular file; nothing installed"
-        )
-    return path
+    return _wheel_member_record(member, tool)[0]
 
 
 def _extract_wheel(archive_path: Path, destination: Path, tool: Tool) -> None:
     try:
         with zipfile.ZipFile(archive_path) as archive:
-            members = archive.infolist()
-            for member in members:
-                _wheel_member_path(member, tool)
-            for member in members:
-                path = _wheel_member_path(member, tool)
-                if member.is_dir() or stat.S_ISDIR(member.external_attr >> 16):
-                    continue
+            records = [
+                (member, *_wheel_member_record(member, tool))
+                for member in archive.infolist()
+            ]
+            for member, path, _rule in filter(
+                lambda record: record[2].writes, records
+            ):
                 target = destination.joinpath(*path.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(member) as source, target.open("wb") as stream:
-                    shutil.copyfileobj(source, stream)
-                mode = (member.external_attr >> 16) & 0o777
-                if mode:
-                    os.chmod(target, mode)
+                _write_member(
+                    target,
+                    archive.open(member),
+                    (member.external_attr >> 16) & 0o777,
+                )
     except (zipfile.BadZipFile, OSError, EOFError) as error:
         raise GateError(
             f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"

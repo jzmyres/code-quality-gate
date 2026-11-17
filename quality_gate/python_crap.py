@@ -211,6 +211,44 @@ def _function_complexity(
     )
 
 
+@dataclass
+class _FunctionCollector(ast.NodeVisitor):
+    path: str
+    found: list[MeasuredFunction]
+    overload_names: set[str]
+    typing_modules: set[str]
+    prefix: str = ""
+
+    def visit_FunctionDef(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        if _is_overload(node, self.overload_names, self.typing_modules):
+            return
+        identity = _function_identity(node, self.prefix)
+        self.found.append(
+            MeasuredFunction(
+                identity=f"{self.path}:{identity}",
+                path=self.path,
+                name=identity,
+                node=node,
+                start_line=_start_line(node),
+                end_line=(node.lineno, node.end_lineno)[
+                    bool(node.end_lineno)
+                ],
+                cc=_function_complexity(node),
+            )
+        )
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        prefix = self.prefix
+        self.prefix = f"{prefix}{node.name}."
+        for child in node.body:
+            self.visit(child)
+        self.prefix = prefix
+
+
 def _collect_functions(
     nodes: list[ast.AST],
     prefix: str,
@@ -219,42 +257,10 @@ def _collect_functions(
     overload_names: set[str],
     typing_modules: set[str],
 ) -> None:
-    for node in nodes:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _is_overload(node, overload_names, typing_modules):
-                continue
-            start = _start_line(node)
-            found.append(
-                MeasuredFunction(
-                    identity=f"{path}:{_function_identity(node, prefix)}",
-                    path=path,
-                    name=_function_identity(node, prefix),
-                    node=node,
-                    start_line=start,
-                    end_line=node.end_lineno or node.lineno,
-                    cc=_function_complexity(node),
-                )
-            )
-            continue
-        if isinstance(node, ast.ClassDef):
-            _collect_functions(
-                node.body,
-                f"{prefix}{node.name}.",
-                path,
-                found,
-                overload_names,
-                typing_modules,
-            )
-            continue
-        for child in ast.iter_child_nodes(node):
-            _collect_functions(
-                [child],
-                prefix,
-                path,
-                found,
-                overload_names,
-                typing_modules,
-            )
+    collector = _FunctionCollector(
+        path, found, overload_names, typing_modules, prefix
+    )
+    list(map(collector.visit, nodes))
 
 
 def _argument_defaults(arguments: ast.arguments) -> list[ast.AST]:
@@ -706,100 +712,198 @@ def _crap_measure(
     return measurement, None
 
 
-def _run_python_crap(context: Any) -> Any:
-    from .checks import (
-        _adapter_selection,
-        _baseline_entries,
-        _class_text,
-        _evaluate_ratchet,
-        _ratchet_result,
-        _tail_diagnostics,
-    )
+@dataclass(frozen=True)
+class _CrapStep:
+    advance: Callable[[Any], None]
+    failed: Callable[[Any], bool]
+    result: Callable[[Any], Any]
 
-    root, check = context.root, context.check
-    prefix, prior = context.prefix, context.prior
-    spec, start, selected, names = _adapter_selection(context)
-    if not selected:
-        class_text = _class_text(names)
-        reason = (
-            f"no files selected (classes: {class_text}); "
-            "zero inputs is not a pass"
+
+@dataclass
+class _CrapRun:
+    context: Any
+    selection: Any = None
+    coverage: Any = None
+    measured: Any = None
+    baseline: Any = None
+    ratchet: Any = None
+
+    def run(self, steps: tuple[_CrapStep, ...]) -> Any:
+        for step in steps:
+            step.advance(self)
+            if step.failed(self):
+                return step.result(self)
+        return self.finish()
+
+    def select(self) -> None:
+        from .checks import _adapter_selection
+
+        self.selection = _adapter_selection(self.context)
+
+    def require(self) -> None:
+        mark_step("coverage evidence validation")
+        self.coverage = _crap_required(
+            self.context.prior,
+            self.selection[0],
+            self.context.prefix,
         )
-        print(f"{prefix}: {reason}", file=sys.stderr)
-        return _ratchet_result(check, start, "fail", reason=reason)
 
-    mark_step("coverage evidence validation")
-    evidence_path, settings, failure_diagnostics, message = _crap_required(
-        prior, spec, prefix
-    )
-    if message is not None:
-        return _ratchet_result(
-            check,
+    def measure(self) -> None:
+        _spec, start, selected, _names = self.selection
+        evidence_path, settings, _diagnostics, _message = self.coverage
+        self.measured = _crap_measure(
+            self.context.root,
+            selected,
+            evidence_path,
+            settings,
+            self.context.check,
             start,
-            "unsupported",
-            diagnostics=failure_diagnostics,
-            reason=message,
+            self.context.prefix,
         )
 
-    measurement, failure = _crap_measure(
-        root,
-        selected,
-        evidence_path,
-        settings,
-        check,
-        start,
-        prefix,
-    )
-    if failure is not None:
-        return failure
-    assert measurement is not None
-    if measurement.failures:
-        for failure in measurement.failures:
-            print(f"{prefix}: {failure}", file=sys.stderr)
+    def failures_result(self) -> Any:
+        from .checks import _ratchet_result, _tail_diagnostics
+
+        failures = self.measured[0].failures
+        list(
+            map(
+                lambda failure: print(
+                    f"{self.context.prefix}: {failure}", file=sys.stderr
+                ),
+                failures,
+            )
+        )
         diagnostics = _tail_diagnostics(
-            measurement.failures, argv=None, exit_code=1
+            failures, argv=None, exit_code=1
         )
         return _ratchet_result(
-            check,
-            start,
+            self.context.check,
+            self.selection[1],
             "fail",
             diagnostics=diagnostics,
             reason=diagnostics.output_tail,
         )
 
-    try:
-        mark_step("baseline loading")
-        entries = _baseline_entries(check)
-    except GateError as error:
-        print(f"{prefix}: {error}", file=sys.stderr)
-        return _ratchet_result(
-            check,
+    def load_baseline(self) -> None:
+        from .checks import _baseline_entries
+
+        try:
+            mark_step("baseline loading")
+            self.baseline = (_baseline_entries(self.context.check), None)
+        except GateError as error:
+            self.baseline = ([], error)
+
+    def evaluate(self) -> None:
+        from .checks import _evaluate_ratchet
+
+        _spec, _start, selected, _names = self.selection
+        self.ratchet = _evaluate_ratchet(
+            self.measured[0].findings,
+            self.baseline[0],
+            self.context.check,
+            self.context.prefix,
+            Domain.of_files(selected),
+        )
+
+    def finish(self) -> Any:
+        from .checks import _ratchet_result
+
+        _spec, start, _selected, _names = self.selection
+        measurement = self.measured[0]
+        ratchet = self.ratchet[0]
+        outcome = _ratchet_result(
+            self.context.check,
             start,
-            "error",
-            execution="error",
-            diagnostics=Diagnostics(error=str(error)),
-            reason=str(error),
+            ratchet.outcome,
+            ratchet=ratchet,
+            measurement={"functions": len(measurement.findings)},
         )
-    ratchet, failure = _evaluate_ratchet(
-        measurement.findings,
-        entries,
-        check,
-        prefix,
-        Domain.of_files(selected),
+        if ratchet.satisfied:
+            noun = ("functions", "function")[
+                len(measurement.findings) == 1
+            ]
+            print(
+                f"{self.context.prefix}: {len(measurement.findings)} "
+                f"{noun} within threshold",
+                flush=True,
+            )
+        return outcome
+
+
+def _run_python_crap(context: Any) -> Any:
+    from .checks import _class_text, _ratchet_result
+
+    steps = (
+        _CrapStep(
+            lambda run: run.select(),
+            lambda run: not run.selection[2],
+            lambda run: (
+                print(
+                    f"{run.context.prefix}: no files selected "
+                    f"(classes: {_class_text(run.selection[3])}); "
+                    "zero inputs is not a pass",
+                    file=sys.stderr,
+                ),
+                _ratchet_result(
+                    run.context.check,
+                    run.selection[1],
+                    "fail",
+                    reason=(
+                        f"no files selected (classes: "
+                        f"{_class_text(run.selection[3])}); "
+                        "zero inputs is not a pass"
+                    ),
+                ),
+            )[1],
+        ),
+        _CrapStep(
+            lambda run: run.require(),
+            lambda run: run.coverage[3] is not None,
+            lambda run: _ratchet_result(
+                run.context.check,
+                run.selection[1],
+                "unsupported",
+                diagnostics=run.coverage[2],
+                reason=run.coverage[3],
+            ),
+        ),
+        _CrapStep(
+            lambda run: run.measure(),
+            lambda run: run.measured[1] is not None,
+            lambda run: run.measured[1],
+        ),
+        _CrapStep(
+            lambda run: None,
+            lambda run: bool(run.measured[0].failures),
+            lambda run: run.failures_result(),
+        ),
+        _CrapStep(
+            lambda run: run.load_baseline(),
+            lambda run: run.baseline[1] is not None,
+            lambda run: (
+                print(
+                    f"{run.context.prefix}: {run.baseline[1]}",
+                    file=sys.stderr,
+                ),
+                _ratchet_result(
+                    run.context.check,
+                    run.selection[1],
+                    "error",
+                    execution="error",
+                    diagnostics=Diagnostics(error=str(run.baseline[1])),
+                    reason=str(run.baseline[1]),
+                ),
+            )[1],
+        ),
+        _CrapStep(
+            lambda run: run.evaluate(),
+            lambda run: run.ratchet[0] is None,
+            lambda run: _ratchet_result(
+                run.context.check,
+                run.selection[1],
+                ("error", run.ratchet[1])[bool(run.ratchet[1])],
+                reason=run.ratchet[1],
+            ),
+        ),
     )
-    if ratchet is None:
-        return _ratchet_result(check, start, failure or "error", reason=failure)
-    outcome = _ratchet_result(
-        check,
-        start,
-        ratchet.outcome,
-        ratchet=ratchet,
-        measurement={"functions": len(measurement.findings)},
-    )
-    if ratchet.satisfied:
-        noun = "function" if len(measurement.findings) == 1 else "functions"
-        print(
-            f"{prefix}: {len(measurement.findings)} {noun} within threshold",
-            flush=True,
-        )
-    return outcome
+    return _CrapRun(context).run(steps)

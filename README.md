@@ -1414,8 +1414,8 @@ This repository gates itself with `quality-gate.toml`:
 * `clones` uses jscpd with `min_tokens = 50` and the generic baseline format;
 * `tests` runs the gate's own unittest suite under the pinned coverage wheel;
 * `crap` measures every function and each module/class body in `qg.py` and `quality_gate/*.py` and
-  requires `tests`; `quality-gate-crap.toml` lists the subjects above 6, each with its measured bound
-  and a worklist reason;
+  requires `tests`; the gate's own CRAP check has no baseline, because every measured subject is at
+  or below CRAP 6;
 * `verification` uses the `tests` counts and measures inline `# noqa` and file-wide lint suppressions
   in its selected Python files; its `no-cover` subjects are the lines the `crap` check's coverage
   excluded in measured functions, one subject per file; `quality-gate-verification.toml` floors the

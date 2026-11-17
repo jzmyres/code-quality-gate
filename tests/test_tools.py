@@ -21,8 +21,15 @@ from support import BASE_CONFIG, GATE, RUFF_VERSION, FixtureCase, output
 
 from quality_gate.cli import main
 from quality_gate.payload import PayloadError, payload_digest
-from quality_gate.policy import UnsupportedError
-from quality_gate.tools import lock_override, verify_tool_directory
+from quality_gate.policy import GateError, UnsupportedError
+from quality_gate.tools import (
+    Tool,
+    _extract_tar,
+    _extract_wheel,
+    _wheel_member_path,
+    lock_override,
+    verify_tool_directory,
+)
 
 VERSION = "9.9.9"
 
@@ -56,6 +63,8 @@ class ToolsTests(FixtureCase):
         *,
         files: dict[str, bytes] | None = None,
         links: dict[str, str] | None = None,
+        hardlinks: dict[str, str] | None = None,
+        devices: list[str] | None = None,
         absolute: list[str] | None = None,
         directories: list[str] | None = None,
         executable: bool = True,
@@ -87,6 +96,17 @@ class ToolsTests(FixtureCase):
                 info.type = tarfile.SYMTYPE
                 info.linkname = target
                 archive.addfile(info)
+            for member, target in (hardlinks or {}).items():
+                info = tarfile.TarInfo(member)
+                info.type = tarfile.LNKTYPE
+                info.linkname = target
+                archive.addfile(info)
+            for member in devices or []:
+                info = tarfile.TarInfo(member)
+                info.type = tarfile.CHRTYPE
+                info.devmajor = 1
+                info.devminor = 3
+                archive.addfile(info)
             for member in absolute or []:
                 info = tarfile.TarInfo(member)
                 info.size = 4
@@ -100,6 +120,7 @@ class ToolsTests(FixtureCase):
         *,
         files: dict[str, bytes] | None = None,
         links: dict[str, str] | None = None,
+        modes: dict[str, int] | None = None,
     ) -> Path:
         path = self.base / name
         contents = files
@@ -112,7 +133,10 @@ class ToolsTests(FixtureCase):
             for member, content in contents.items():
                 info = zipfile.ZipInfo(member)
                 info.create_system = 3
-                info.external_attr = (stat.S_IFREG | 0o644) << 16
+                mode = (modes or {}).get(
+                    member, stat.S_IFREG | 0o644
+                )
+                info.external_attr = mode << 16
                 archive.writestr(info, content)
             for member, target in (links or {}).items():
                 info = zipfile.ZipInfo(member)
@@ -254,6 +278,24 @@ class ToolsTests(FixtureCase):
         self.assertIn(needle, text)
         self.assert_not_installed(tools)
 
+    def extract_refused(
+        self, extractor, archive: Path, needle: str, outside: Path
+    ) -> None:
+        destination = self.base / "destination"
+        destination.mkdir(exist_ok=True)
+        tool = Tool(
+            name="jscpd",
+            version=VERSION,
+            url=archive.as_uri(),
+            sha256="0" * 64,
+            payload_sha256="0" * 64,
+            binary="jscpd",
+        )
+        with self.assertRaisesRegex(GateError, needle):
+            extractor(archive, destination, tool)
+        self.assertFalse(outside.exists())
+        self.assertEqual(list(destination.rglob("*")), [])
+
     def fetch_ok(self, archive: Path) -> tuple[Path, object]:
         lock = self.write_lock(
             archive.as_uri(),
@@ -374,11 +416,31 @@ class ToolsTests(FixtureCase):
         self.assert_not_installed(tools)
 
     def test_fetch_refuses_symlink_member(self) -> None:
+        outside = self.base / "symlink-escape"
         archive = self.make_tarball(
             files={"jscpd": b"binary\n"},
-            links={"linked": "/etc/passwd"},
+            links={"linked": str(outside)},
         )
         tools = self.fetch_refused(archive, "is a link")
+        self.assertFalse(outside.exists())
+        self.assert_not_installed(tools)
+
+    def test_fetch_refuses_hardlink_member(self) -> None:
+        outside = self.base / "hardlink-escape"
+        archive = self.make_tarball(
+            files={"jscpd": b"binary\n"},
+            hardlinks={"linked": str(outside)},
+        )
+        tools = self.fetch_refused(archive, "is a link")
+        self.assertFalse(outside.exists())
+        self.assert_not_installed(tools)
+
+    def test_fetch_refuses_device_member(self) -> None:
+        archive = self.make_tarball(
+            files={"jscpd": b"binary\n"},
+            devices=["device"],
+        )
+        tools = self.fetch_refused(archive, "not a regular file")
         self.assert_not_installed(tools)
 
     def test_fetch_refuses_non_regular_member(self) -> None:
@@ -863,17 +925,121 @@ class ToolsTests(FixtureCase):
         self.assertFalse((self.base / "escape").exists())
 
     def test_fetch_wheel_refuses_absolute_member(self) -> None:
+        outside = self.base / "wheel-absolute"
         wheel = self.make_wheel(
             files={
-                "/absolute-escape": b"evil\n",
+                str(outside): b"evil\n",
                 "pkg/__init__.py": b"VALUE = 1\n",
             }
         )
         self.fetch_wheel_refused(wheel, "unsafe archive member")
+        self.assertFalse(outside.exists())
 
     def test_fetch_wheel_refuses_symlink_member(self) -> None:
-        wheel = self.make_wheel(links={"pkg/link": "/etc/passwd"})
+        outside = self.base / "wheel-link"
+        wheel = self.make_wheel(
+            files={"pkg/__init__.py": b"VALUE = 1\n"},
+            links={"pkg/link": str(outside)},
+        )
         self.fetch_wheel_refused(wheel, "is a link")
+        self.assertFalse(outside.exists())
+
+    def test_fetch_wheel_refuses_device_member(self) -> None:
+        wheel = self.make_wheel(
+            files={
+                "pkg/__init__.py": b"VALUE = 1\n",
+                "pkg/device": b"",
+            },
+            modes={"pkg/device": stat.S_IFCHR | 0o644},
+        )
+        self.fetch_wheel_refused(wheel, "not a regular file")
+
+    def test_wheel_member_path_reads_the_shared_member_table(self) -> None:
+        tool = Tool(
+            name="jscpd",
+            version=VERSION,
+            url="file:///unused",
+            sha256="0" * 64,
+            payload_sha256="0" * 64,
+            binary="pkg/__init__.py",
+            format="wheel",
+        )
+        link = zipfile.ZipInfo("pkg/link")
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        with self.assertRaisesRegex(GateError, "is a link"):
+            _wheel_member_path(link, tool)
+        device = zipfile.ZipInfo("pkg/device")
+        device.create_system = 3
+        device.external_attr = (stat.S_IFCHR | 0o644) << 16
+        with self.assertRaisesRegex(GateError, "not a regular file"):
+            _wheel_member_path(device, tool)
+        escape = zipfile.ZipInfo("../escape")
+        with self.assertRaisesRegex(GateError, "unsafe archive member"):
+            _wheel_member_path(escape, tool)
+        directory = zipfile.ZipInfo("pkg/")
+        directory.create_system = 3
+        directory.external_attr = (stat.S_IFDIR | 0o755) << 16
+        self.assertEqual(str(_wheel_member_path(directory, tool)), "pkg")
+
+    def test_direct_extractors_refuse_member_kinds_without_writes(self) -> None:
+        tar_path = self.make_tarball(files={"../tar-escape": b"evil\n"})
+        self.extract_refused(
+            _extract_tar,
+            tar_path,
+            "unsafe archive member",
+            self.base / "tar-escape",
+        )
+        tar_link = self.make_tarball(
+            files={"jscpd": b"binary\n"},
+            links={"tar-link": str(self.base / "tar-link")},
+        )
+        self.extract_refused(
+            _extract_tar,
+            tar_link,
+            "is a link",
+            self.base / "tar-link",
+        )
+        tar_device = self.make_tarball(
+            files={"jscpd": b"binary\n"},
+            devices=["tar-device"],
+        )
+        self.extract_refused(
+            _extract_tar,
+            tar_device,
+            "not a regular file",
+            self.base / "tar-device",
+        )
+        wheel_path = self.make_wheel(files={"../wheel-escape": b"evil\n"})
+        self.extract_refused(
+            _extract_wheel,
+            wheel_path,
+            "unsafe archive member",
+            self.base / "wheel-escape",
+        )
+        wheel_link = self.make_wheel(
+            files={"pkg/__init__.py": b"VALUE = 1\n"},
+            links={"pkg/link": str(self.base / "wheel-link")},
+        )
+        self.extract_refused(
+            _extract_wheel,
+            wheel_link,
+            "is a link",
+            self.base / "wheel-link",
+        )
+        wheel_device = self.make_wheel(
+            files={
+                "pkg/__init__.py": b"VALUE = 1\n",
+                "pkg/device": b"",
+            },
+            modes={"pkg/device": stat.S_IFCHR | 0o644},
+        )
+        self.extract_refused(
+            _extract_wheel,
+            wheel_device,
+            "not a regular file",
+            self.base / "wheel-device",
+        )
 
     def test_fetch_rejects_unknown_archive_format(self) -> None:
         lock = self.write_lock(

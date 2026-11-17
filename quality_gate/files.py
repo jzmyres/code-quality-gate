@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import stat
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path, PurePosixPath
 
-from .policy import Config, ConfigError, GateError, UsageError
+from .policy import Config, ConfigError, GateError, Rule, UsageError
 from .runner import run
 
 
@@ -278,25 +281,49 @@ def enumerate_files(root: Path) -> list[str]:
     return [entry.path for entry in enumerate_entries(root)]
 
 
+# The env options this reader knows, by whether env gives them an argument.
+# Each option word is still skipped alone: the word after it remains the
+# interpreter candidate, exactly as the original reader left it.
+_ENV_OPTIONS = {
+    "-u": "argument",
+    "--unset": "argument",
+    "-C": "argument",
+    "--chdir": "argument",
+    "--block-signal": "argument",
+    "--default-signal": "argument",
+    "--ignore-signal": "argument",
+    "-i": "flag",
+    "--ignore-environment": "flag",
+    "-0": "flag",
+    "--null": "flag",
+    "-v": "flag",
+    "--debug": "flag",
+    "-S": "flag",
+    "--split-string": "flag",
+    "--list-signal-handling": "flag",
+}
+_ENV_OPTION = re.compile(r"^-|=")
+
+
+def _interpreter_word(words: list[str]) -> str | None:
+    """The interpreter named by an already split env shebang."""
+    name = PurePosixPath(words[0]).name
+    if name != "env":
+        return name
+    for index, word in enumerate(words[1:], 1):
+        if word in _ENV_OPTIONS or _ENV_OPTION.search(word):
+            continue
+        return PurePosixPath(words[index]).name
+    return None
+
+
 def _shebang_interpreter(first_line: str) -> str | None:
     if not first_line.startswith("#!"):
         return None
     words = first_line[2:].strip().split()
     if not words:
         return None
-    name = PurePosixPath(words[0]).name
-    if name != "env":
-        return name
-    index = 1
-    while index < len(words):
-        word = words[index]
-        if word.startswith("-") or "=" in word:
-            index += 1
-            continue
-        break
-    if index >= len(words):
-        return None
-    return PurePosixPath(words[index]).name
+    return _interpreter_word(words)
 
 
 def _type_name(mode: int) -> str | None:
@@ -368,25 +395,150 @@ def _reject_special_files(
     return kept, violations
 
 
-def _rule_violations(config: Config) -> list[str]:
-    violations: list[str] = []
-    known_classes = ", ".join(sorted(config.classes)) or "none"
-    for rule in config.rules:
-        if not rule.pattern:
-            violations.append(
-                f"rule[{rule.index}]: empty pattern (expected a non-empty pattern)"
+def _known_names(names: Iterable[str]) -> str:
+    return ", ".join(names) or "none"
+
+
+_CLASS_MESSAGES = {
+    (True, False): (
+        "classes.{name}: code class lists no check "
+        "(expected at least one check id)"
+    ),
+}
+
+_FILE_CLASS_MESSAGES = {
+    (True, False): (
+        "{relative}: code file classified as {class_name} "
+        "(rule {pattern})"
+    ),
+}
+
+_RULE_CHECKS = (
+    (
+        lambda rule, config: not rule.pattern,
+        "rule[{index}]: empty pattern (expected a non-empty pattern)",
+    ),
+    (
+        lambda rule, config: not rule.reason.strip(),
+        "rule[{index}] (pattern {pattern}): empty reason "
+        "(expected a non-empty reason)",
+    ),
+    (
+        lambda rule, config: rule.class_name not in config.classes,
+        "rule[{index}] (pattern {pattern}): unknown class {class_name} "
+        "(known classes: {known_classes})",
+    ),
+)
+
+_STALE_RULE_CHECKS = (
+    (
+        lambda matched: matched == 0,
+        "rule[{index}] (pattern {pattern}): matches no file",
+    ),
+)
+
+
+@dataclass
+class _InventoryValidator:
+    root: Path
+    config: Config
+    entries: list[GitFile]
+    violations: list[str]
+    matched: list[int]
+    classes: dict[str, str]
+
+    def validate(self) -> tuple[list[str], dict[str, str], list[str]]:
+        files = [entry.path for entry in self.entries]
+        self._check_classes()
+        self._check_rules()
+        self._classify_files()
+        for index, rule in enumerate(self.config.rules):
+            values = {
+                "index": rule.index,
+                "pattern": repr(rule.pattern),
+            }
+            for invalid, message in _STALE_RULE_CHECKS:
+                if invalid(self.matched[index]):
+                    self.violations.append(message.format(**values))
+        return files, self.classes, self.violations
+
+    def _check_classes(self) -> None:
+        known = _known_names(self.config.checks)
+        for name, class_def in self.config.classes.items():
+            for check_id in class_def.checks:
+                if check_id not in self.config.checks:
+                    self.violations.append(
+                        f"classes.{name}: unknown check {check_id!r} "
+                        f"(known checks: {known})"
+                    )
+            message = _CLASS_MESSAGES.get(
+                (class_def.code, bool(class_def.checks))
             )
-        if not rule.reason.strip():
-            violations.append(
-                f"rule[{rule.index}] (pattern {rule.pattern!r}): "
-                "empty reason (expected a non-empty reason)"
+            if message is not None:
+                self.violations.append(message.format(name=name))
+
+    def _check_rules(self) -> None:
+        known = _known_names(sorted(self.config.classes))
+        for rule, (invalid, message) in product(
+            self.config.rules, _RULE_CHECKS
+        ):
+            if invalid(rule, self.config):
+                self.violations.append(
+                    message.format(
+                        index=rule.index,
+                        pattern=repr(rule.pattern),
+                        class_name=repr(rule.class_name),
+                        known_classes=known,
+                    )
+                )
+
+    def _classify_files(self) -> None:
+        for entry in self.entries:
+            relative = entry.path
+            hits = []
+            for index, rule in enumerate(self.config.rules):
+                if fnmatch.fnmatchcase(relative, rule.pattern):
+                    hits.append((index, rule))
+                    self.matched[index] += 1
+            if not hits:
+                self.violations.append(
+                    f"{relative}: unclassified (no rule matches)"
+                )
+                continue
+            if len(hits) > 1:
+                patterns = ", ".join(
+                    map(lambda hit: repr(hit[1].pattern), hits)
+                )
+                self.violations.append(
+                    f"{relative}: matches {len(hits)} rules ({patterns})"
+                )
+                continue
+            self._classify(entry, hits[0][1])
+
+    def _classify(self, entry: GitFile, rule: Rule) -> None:
+        relative = entry.path
+        class_def = self.config.classes.get(rule.class_name)
+        if class_def is None:
+            return
+        self.classes[relative] = rule.class_name
+        if entry.gitlink:
+            return
+        try:
+            code = _is_code(self.root / relative, relative, self.config)
+        except OSError as error:
+            self.violations.append(
+                f"{relative}: cannot read shebang: {error}"
             )
-        if rule.class_name not in config.classes:
-            violations.append(
-                f"rule[{rule.index}] (pattern {rule.pattern!r}): "
-                f"unknown class {rule.class_name!r} (known classes: {known_classes})"
+            return
+        message = _FILE_CLASS_MESSAGES.get((code, class_def.code))
+        if message is not None:
+            self.violations.append(
+                message.format(
+                    relative=relative,
+                    class_name=repr(rule.class_name),
+                    pattern=repr(rule.pattern),
+                )
             )
-    return violations
 
 
 def validate_inventory(
@@ -395,97 +547,116 @@ def validate_inventory(
     entries, violations = _reject_special_files(
         root, enumerate_entries(root)
     )
-    files = [entry.path for entry in entries]
-    gitlinks = {entry.path for entry in entries if entry.gitlink}
-    matched = [0] * len(config.rules)
-    classes: dict[str, str] = {}
-    known_checks = ", ".join(config.checks) or "none"
-    for name, class_def in config.classes.items():
-        for check_id in class_def.checks:
-            if check_id not in config.checks:
-                violations.append(
-                    f"classes.{name}: unknown check {check_id!r} "
-                    f"(known checks: {known_checks})"
+    return _InventoryValidator(
+        root,
+        config,
+        entries,
+        violations,
+        [0] * len(config.rules),
+        {},
+    ).validate()
+
+
+@dataclass(frozen=True)
+class _InventoryOutcome:
+    status: int
+    stream: str
+    templates: tuple[str, ...]
+
+
+_INVENTORY_OUTCOMES = {
+    "unknown_class": _InventoryOutcome(
+        2,
+        "stderr",
+        (
+            "inventory: unknown class {value}; "
+            "known classes: {known}",
+        ),
+    ),
+    "error": _InventoryOutcome(
+        1, "stderr", ("inventory: {value}",)
+    ),
+    "violations": _InventoryOutcome(1, "stderr", ()),
+    "listing": _InventoryOutcome(0, "stdout", ()),
+    "summary": _InventoryOutcome(
+        0,
+        "stdout",
+        ("inventory: {files} files match {rules} rules",),
+    ),
+}
+
+
+def _inventory_lines(
+    kind: str, values: dict[str, object]
+) -> tuple[int, str, tuple[str, ...]]:
+    outcome = _INVENTORY_OUTCOMES[kind]
+    lines = values.get("lines") or tuple(
+        map(lambda template: template.format(**values), outcome.templates)
+    )
+    return outcome.status, outcome.stream, tuple(lines)
+
+
+def _inventory_outcome(
+    files: list[str],
+    classes: dict[str, str],
+    violations: list[str],
+    config: Config,
+    list_class: str | None,
+) -> tuple[int, str, tuple[str, ...]]:
+    if list_class is not None and list_class not in config.classes:
+        return _inventory_lines(
+            "unknown_class",
+            {
+                "value": repr(list_class),
+                "known": _known_names(sorted(config.classes)),
+            },
+        )
+    if violations:
+        return _inventory_lines(
+            "violations",
+            {
+                "lines": list(
+                    map(
+                        lambda violation: f"inventory: {violation}",
+                        violations,
+                    )
                 )
-        if not class_def.code:
-            continue
-        if not class_def.checks:
-            violations.append(
-                f"classes.{name}: code class lists no check "
-                "(expected at least one check id)"
-            )
-
-    violations.extend(_rule_violations(config))
-
-    for relative in files:
-        hits = [
-            (index, rule)
-            for index, rule in enumerate(config.rules)
-            if fnmatch.fnmatchcase(relative, rule.pattern)
-        ]
-        for index, _rule in hits:
-            matched[index] += 1
-        if not hits:
-            violations.append(f"{relative}: unclassified (no rule matches)")
-            continue
-        if len(hits) > 1:
-            patterns = ", ".join(repr(rule.pattern) for _index, rule in hits)
-            violations.append(
-                f"{relative}: matches {len(hits)} rules ({patterns})"
-            )
-            continue
-        rule = hits[0][1]
-        class_def = config.classes.get(rule.class_name)
-        if class_def is None:
-            continue
-        classes[relative] = rule.class_name
-        if relative in gitlinks:
-            continue
-        try:
-            code = _is_code(root / relative, relative, config)
-        except OSError as error:
-            violations.append(f"{relative}: cannot read shebang: {error}")
-            continue
-        if code and not class_def.code:
-            violations.append(
-                f"{relative}: code file classified as {rule.class_name!r} "
-                f"(rule {rule.pattern!r})"
-            )
-
-    for index, rule in enumerate(config.rules):
-        if matched[index] == 0:
-            violations.append(
-                f"rule[{rule.index}] (pattern {rule.pattern!r}): matches no file"
-            )
-    return files, classes, violations
+            },
+        )
+    if list_class is not None:
+        return _inventory_lines(
+            "listing",
+            {
+                "lines": tuple(
+                    filter(
+                        lambda relative: classes[relative] == list_class,
+                        sorted(classes),
+                    )
+                )
+            },
+        )
+    return _inventory_lines(
+        "summary",
+        {"files": len(files), "rules": len(config.rules)},
+    )
 
 
 def command_inventory(
     root: Path, config: Config, list_class: str | None = None
 ) -> int:
-    if list_class is not None and list_class not in config.classes:
-        known = ", ".join(sorted(config.classes)) or "none"
-        print(
-            f"inventory: unknown class {list_class!r}; known classes: {known}",
-            file=sys.stderr,
-        )
-        return 2
     try:
         files, classes, violations = validate_inventory(root, config)
     except GateError as error:
-        print(f"inventory: {error}", file=sys.stderr)
-        return 1
-    if violations:
-        for violation in violations:
-            print(f"inventory: {violation}", file=sys.stderr)
-        return 1
-    if list_class is not None:
-        for relative in sorted(classes):
-            if classes[relative] == list_class:
-                print(relative)
-        return 0
-    print(f"inventory: {len(files)} files match {len(config.rules)} rules")
-    return 0
+        status, stream, lines = _inventory_lines(
+            "error", {"value": error}
+        )
+    else:
+        status, stream, lines = _inventory_outcome(
+            files, classes, violations, config, list_class
+        )
+    for line in lines:
+        print(line, file=getattr(sys, stream))
+    return status
 
 
 def _ignored_tracked_files(root: Path) -> list[str]:

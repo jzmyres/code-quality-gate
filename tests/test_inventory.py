@@ -14,6 +14,7 @@ from support import BASE_CONFIG, GATE, FixtureCase, output
 
 sys.path.insert(0, str(GATE))
 files = importlib.import_module("quality_gate.files")
+policy = importlib.import_module("quality_gate.policy")
 
 
 class InventoryTrustTests(FixtureCase):
@@ -266,6 +267,56 @@ class InventoryTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(result.stdout, "a.py\nb.py\n")
 
+    def test_inventory_validator_is_the_one_validation_owner(self) -> None:
+        self.write_config(
+            BASE_CONFIG.replace('class = "python"', 'class = "mystery"')
+        )
+        config = policy.load_config(self.repo)
+        entries, violations = files._reject_special_files(
+            self.repo, files.enumerate_entries(self.repo)
+        )
+        validator = files._InventoryValidator(
+            self.repo,
+            config,
+            entries,
+            violations,
+            [0] * len(config.rules),
+            {},
+        )
+        names, classes, reported = validator.validate()
+        self.assertIn("a.py", names)
+        self.assertNotIn("a.py", classes)
+        self.assertTrue(
+            any("unknown class 'mystery'" in item for item in reported)
+        )
+
+    def test_inventory_outcome_is_the_one_output_chooser(self) -> None:
+        self.write_config(BASE_CONFIG)
+        config = policy.load_config(self.repo)
+        status, stream, lines = files._inventory_outcome(
+            ["a.py"], {"a.py": "python"}, [], config, "python"
+        )
+        self.assertEqual((status, stream, lines), (0, "stdout", ("a.py",)))
+        status, stream, lines = files._inventory_outcome(
+            ["a.py"], {}, ["bad"], config, None
+        )
+        self.assertEqual((status, stream), (1, "stderr"))
+        self.assertEqual(lines, ("inventory: bad",))
+        status, stream, lines = files._inventory_outcome(
+            [], {}, [], config, "missing"
+        )
+        self.assertEqual((status, stream), (2, "stderr"))
+        self.assertIn("unknown class 'missing'", lines[0])
+        status, stream, lines = files._inventory_outcome(
+            [], {}, [], config, None
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(stream, "stdout")
+        self.assertEqual(
+            lines,
+            (f"inventory: 0 files match {len(config.rules)} rules",),
+        )
+
     def test_list_unknown_class_exits_2(self) -> None:
         result = self.run_qg("inventory", "--list", "mystery")
         text = output(result)
@@ -391,6 +442,26 @@ class InventoryTests(FixtureCase):
         for name in ("script-env", "script-assignment", "script-direct"):
             self.assertIn(name, text)
         self.assertIn("code file classified as 'doc'", text)
+
+    def test_env_options_leave_the_next_word_as_the_interpreter(self) -> None:
+        self.assertEqual(
+            files._interpreter_word(
+                ["/usr/bin/env", "-S", "python3", "-u"]
+            ),
+            "python3",
+        )
+        self.assertEqual(
+            files._interpreter_word(
+                ["/usr/bin/env", "-u", "VAR", "python3"]
+            ),
+            "VAR",
+        )
+        self.assertEqual(
+            files._interpreter_word(["/usr/bin/env", "VAR=1", "bash"]),
+            "bash",
+        )
+        self.assertEqual(files._interpreter_word(["/bin/sh", "-e"]), "sh")
+        self.assertIsNone(files._interpreter_word(["/usr/bin/env", "-i"]))
 
     def test_non_code_shebang_in_non_code_class_passes(self) -> None:
         self.write_config(
