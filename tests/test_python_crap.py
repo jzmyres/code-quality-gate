@@ -8,6 +8,7 @@ import io
 import json
 import os
 import subprocess
+import symtable
 import sys
 import tempfile
 import time
@@ -1792,6 +1793,58 @@ class BooleanTableTests(unittest.TestCase):
         )
         self.assertEqual(self.complexity(source, "choose"), 1)
 
+    def test_a_comprehension_target_does_not_hide_the_module_table(self):
+        selections = ", ".join(["TABLE[flag]"] * 6)
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose(flag, rows):\n"
+            "    values = [TABLE[flag] for TABLE in rows]\n"
+            f"    return ({selections})\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 8)
+
+    def test_a_lambda_parameter_shadows_the_module_table(self):
+        selections = ", ".join(["TABLE[flag]"] * 6)
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose(flag, rows):\n"
+            f"    return (lambda TABLE: ({selections}))(rows)\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 1)
+
+    def test_a_global_declaration_reads_the_module_table(self):
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose(flag):\n"
+            "    global TABLE\n"
+            "    return TABLE[flag]\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 2)
+
+    def test_a_nonlocal_table_is_not_the_module_table(self):
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def outer():\n"
+            "    TABLE = {True: 1, False: 2, (True, False): 3}\n"
+            "    def inner(flag):\n"
+            "        nonlocal TABLE\n"
+            "        return TABLE[flag]\n"
+            "    return inner\n"
+        )
+        self.assertEqual(self.complexity(source, "outer"), 1)
+
+    def test_a_class_body_table_is_read_in_the_class_scope(self):
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "class Table:\n"
+            "    TABLE = {True: 1, False: 2, (True, False): 3}\n"
+            "    value = TABLE[flag]\n"
+            "def choose(flag):\n"
+            "    return TABLE[flag]\n"
+        )
+        self.assertEqual(self.complexity(source, "<module>"), 3)
+        self.assertEqual(self.complexity(source, "choose"), 2)
+
     def test_a_nested_function_binding_counts_in_its_enclosing_function(self):
         source = (
             "TABLE = {True: 1, False: 2}\n"
@@ -1806,8 +1859,8 @@ class BooleanTableTests(unittest.TestCase):
             "        return TABLE[flag]\n"
             "    return TABLE[flag]\n"
         )
-        self.assertEqual(self.complexity(source, "outer"), 5)
-        self.assertEqual(self.complexity(source, "shadowed"), 1)
+        self.assertEqual(self.complexity(source, "outer"), 4)
+        self.assertEqual(self.complexity(source, "shadowed"), 2)
 
     def test_a_name_rebound_to_something_else_is_not_counted(self):
         cases = {
@@ -1827,6 +1880,145 @@ class BooleanTableTests(unittest.TestCase):
         for source, expected in cases.items():
             with self.subTest(source=source):
                 self.assertEqual(self.complexity(source, "choose"), expected)
+
+
+class ScopeHelperTests(unittest.TestCase):
+    def test_binding_and_target_helpers(self):
+        tree = ast.parse(
+            "x = 1\n"
+            "y: int = 2\n"
+            "for z in []:\n"
+            "    pass\n"
+            "if flag:\n"
+            "    def f():\n"
+            "        pass\n"
+            "class C:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            python_crap._binding_name(tree.body[0].targets[0]), "x"
+        )
+        self.assertIsNone(python_crap._binding_name(tree.body[0].value))
+        self.assertEqual(
+            python_crap._binding_name(tree.body[3].body[0]), "f"
+        )
+        self.assertEqual(
+            python_crap._scope_bindings(tree.body),
+            {"x", "y", "z", "f", "C"},
+        )
+        target = ast.parse("for a, *b in []:\n    pass\n").body[0].target
+        self.assertEqual(python_crap._target_names(target), {"a", "b"})
+        self.assertEqual(
+            python_crap._target_names(ast.Name(id="c")), {"c"}
+        )
+        comprehension = ast.parse(
+            "[x for x in rows for y, z in pairs]"
+        ).body[0].value
+        self.assertEqual(
+            python_crap._comprehension_targets(comprehension),
+            {"x", "y", "z"},
+        )
+
+    def test_selection_display_reads_subscripts_and_gets(self):
+        subscript = ast.parse("TABLE[key]").body[0].value
+        get = ast.parse("TABLE.get(key)").body[0].value
+        other = ast.parse("other(key)").body[0].value
+        no_args = ast.parse("TABLE.get()").body[0].value
+        name = ast.parse("TABLE").body[0].value
+        self.assertIs(
+            python_crap._selection_display(subscript), subscript.value
+        )
+        self.assertIs(
+            python_crap._selection_display(get), get.func.value
+        )
+        self.assertIsNone(python_crap._selection_display(other))
+        self.assertIsNone(python_crap._selection_display(no_args))
+        self.assertIsNone(python_crap._selection_display(name))
+
+    def test_scope_keys_follow_globals_locals_comprehensions_and_nonlocals(self):
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose(flag, rows):\n"
+            "    return [TABLE[flag] for TABLE in rows], TABLE[flag]\n"
+            "def only_comp(flag, rows):\n"
+            "    return [TABLE[flag] for TABLE in rows]\n"
+            "def outer(flag):\n"
+            "    local = {True: 1, False: 2, (True, True): 3}\n"
+            "    def inner():\n"
+            "        nonlocal local\n"
+            "        return local[flag]\n"
+            "    global TABLE\n"
+            "    return TABLE[flag], local[flag]\n"
+        )
+        tree = ast.parse(source)
+        table = symtable.symtable(source, "pkg/example.py", "exec")
+        module = python_crap._Scope(
+            "module",
+            table,
+            None,
+            python_crap._boolean_tables(tree.body, scoped=True),
+            python_crap._scope_bindings(tree.body),
+            set(),
+        )
+        choose_node = tree.body[1]
+        only_node = tree.body[2]
+        outer_node = tree.body[3]
+        choose = python_crap._scope_for(choose_node, module, table)
+        only_comp = python_crap._scope_for(only_node, module, table)
+        outer = python_crap._scope_for(outer_node, module, table)
+        only_listcomp = python_crap._scope_for(
+            only_node.body[0].value, only_comp, only_comp.table
+        )
+        inner_node = outer_node.body[1]
+        inner = python_crap._scope_for(inner_node, outer, outer.table)
+        self.assertEqual(python_crap._module_keys(outer, "TABLE"), 2)
+        self.assertEqual(python_crap._resolved_keys(outer, "TABLE"), 2)
+        self.assertEqual(python_crap._resolved_keys(outer, "local"), 3)
+        self.assertEqual(python_crap._resolved_keys(choose, "TABLE"), 2)
+        self.assertIsNone(python_crap._scope_keys(only_comp, "TABLE"))
+        self.assertTrue(
+            python_crap._comp_only(
+                only_comp, "TABLE",
+                python_crap._table_symbol(only_comp, "TABLE"),
+            )
+        )
+        self.assertEqual(
+            python_crap._resolved_keys(only_comp, "TABLE"), 2
+        )
+        self.assertIsNone(
+            python_crap._table_symbol(only_listcomp, "TABLE")
+        )
+        self.assertEqual(
+            python_crap._scope_keys(only_listcomp, "TABLE"), -1
+        )
+        self.assertIsNone(
+            python_crap._scope_keys(only_listcomp, "flag")
+        )
+        self.assertEqual(
+            python_crap._resolved_keys(only_listcomp, "TABLE"), -1
+        )
+        self.assertTrue(
+            python_crap._global_symbol(
+                python_crap._table_symbol(outer, "TABLE")
+            )
+        )
+        self.assertFalse(
+            python_crap._global_symbol(
+                python_crap._table_symbol(outer, "local")
+            )
+        )
+        self.assertFalse(
+            python_crap._outer_only(
+                python_crap._table_symbol(outer, "local")
+            )
+        )
+        nonlocal_symbol = python_crap._table_symbol(inner, "local")
+        self.assertTrue(python_crap._outer_only(nonlocal_symbol))
+        self.assertEqual(
+            python_crap._scope_keys(inner, "local"), -1
+        )
+        self.assertIsNone(python_crap._table_symbol(outer, "missing"))
+        self.assertTrue(python_crap._global_symbol(None))
 
 
 class FunctionCollectionTests(unittest.TestCase):

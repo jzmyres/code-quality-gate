@@ -546,8 +546,8 @@ module-level definition). The construct rules and the named-table selections are
 | `and`/`or` | One per operand after the first. |
 | `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements, recursively, so an empty one adds none. |
 | subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
-| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name bound in the same module or function to such a table counts the same way, with module tables taken from module-level statements only and a parameter, local or nested binding of the name shadowing the module table. |
-| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, or tuples of one length with a boolean position, when it counts like the display. |
+| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name counts the same way when `symtable` resolves the name to the module's boolean table (global in that scope) or to a boolean table bound in the same scope; parameters, locals, comprehension and lambda variables, nested functions, `global` and `nonlocal` follow Python's own scoping. |
+| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, or tuples of one length with a boolean position, when it counts like the display, with the same name resolution as the subscript row. |
 | `getattr` with three arguments | One, the default is a branch. |
 | `next` with two arguments | One, the default is a branch. |
 | a string literal or tuple/list display multiplied by a non-constant on either side | One, the repetition chooses a length or count. |
@@ -690,11 +690,10 @@ dispatching on it, a function and a table, or two tables, so every vocabulary li
 table read through one path. It has no baseline, threshold or exemption key: every finding is value
 `1` against threshold `0`, its metric version is `variant-dispatch/1` and its evidence is `static`.
 
-Every selected Python file is parsed with `ast` and every selected shell file - a `*.sh` file or a
-script whose shebang names `sh` or `bash` - is read line by line. An owner is a function (qualified
-`FILE:Class.method` or `FILE:function`), a module-level table, a shell function, or a shell file's
-top-level statements (one owner per file). An owner's set is the union of its literal sets, and a
-literal set is the string literals of one of these:
+Every selected Python file is parsed with `ast`. Shell files are not read yet: a line reader
+cannot read bash exactly, and a shell front end needs an exact parser. An owner is a function
+(qualified `FILE:Class.method` or `FILE:function`) or a module-level table. An owner's set is the
+union of its literal sets, and a literal set is the string literals of one of these:
 
 * Python: the literals one function compares with `==`, `!=`, `in` or `not in` against the same
   subject (the same name, attribute chain or subscript, compared by `ast.dump`), when the other
@@ -706,13 +705,6 @@ literal set is the string literals of one of these:
   dict display with all string keys, or a tuple, list, set or `frozenset(...)` display of string
   elements, with at least two literals; its set is its keys or elements, and a nested tuple, list or
   set element contributes its string literals.
-* Shell: a `case SUBJECT in` block's literal pattern alternatives from every arm until its
-  `esac`, however the arms are laid out (a bare word `[A-Za-z0-9_][A-Za-z0-9_.:+-]*` or a quoted
-  word; a quoted word is a literal whatever it holds unless double quotes contain an expansion;
-  a bare pattern with `*`, `?`, `[` or `$` is not a literal); the right-hand words of
-  `[[ $X == word ]]`, `[[ $X != word ]]`, `[[ $X = word ]]` and `[ "$X" = word ]` grouped by the
-  normalised subject (`${X:-}` and `$X` are `X`); a top-level array assignment `NAME=(a b c)` of
-  literal words, at least two, as a declared table.
 
 A literal counts only if it contains a letter, so numbers, exit codes and the empty string never form
 a vocabulary. A literal set with fewer than two literals is not a vocabulary and contributes
@@ -720,7 +712,7 @@ nothing. Two owners are linked when their sets share at least two literals. Each
 of linked owners is one finding, `VSD`, whose subject is the sorted shared literals and whose message
 is exactly:
 
-    VSD variant-dispatch: "a", "b", ... are listed in N places: FILE:LINE NAME (function|table|top level), ...
+    VSD variant-dispatch: "a", "b", ... are listed in N places: FILE:LINE NAME (function|table), ...
     Declare this vocabulary once, in one table, and read every per-variant difference through it.
 
 The owners appear in file and line order. The JSON `measurement` carries `literals` and `owners`,
@@ -731,19 +723,15 @@ one of its owners is a function or table the diff from `base` adds or changes; t
 still read to find the other owners. `base` defaults to `HEAD`. An invalid base is a check error,
 never a pass.
 
-The shell reader is line based: a function is `name() {` at column 0 to the matching `}` at column 0.
-A comment from an unquoted `#` that starts a word, and every here-document body (`<<WORD`,
-`<<-WORD`, `<<'WORD'` or `<<"WORD"` up to its terminator line), are never read. A test split over a
-continuation line is not read. A case block's patterns and an array assignment must each be written
-on the lines the reader sees.
-
 The same adapter reports `TRIAL`, Python only: a function that calls two or more different
 module-level functions of its own module on the same first argument as a fallback chain and returns
 the chain's value, in one of three forms: `return f(x) or g(x)`; `v = f(x)`, then
 `if v is None` or `if not v` whose body assigns `v = g(x)` or returns `g(x)`, and a later
-`return v` with no other assignment to `v` in between; or a `try` whose body returns `f(x)` (or
-assigns `v` returned later) and whose handler returns `g(x)` (or assigns `v`). A discarded chain,
-guard or try is not a finding. It is reported only when the callees have the same return annotation
+`return v`; or a `try` whose body returns `f(x)` or assigns `v = f(x)`, with a handler that
+returns `g(x)` or assigns `v = g(x)`, then `return v` when assigned. The chain's value must
+reach a return of the same block in statement order, with no assignment to the carrying variable
+between them; an assignment in a nested block between them counts. A discarded chain, guard or try
+is not a finding. It is reported only when the callees have the same return annotation
 and their names differ only in tokens that are literals of a declared table of the same module (a
 format-name table). Its message is exactly:
 
