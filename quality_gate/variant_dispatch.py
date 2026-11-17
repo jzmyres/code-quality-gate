@@ -503,20 +503,33 @@ def _same_call(
     return callee is not other and ast.dump(other_argument) == ast.dump(argument)
 
 
+def _matching_calls(
+    first: tuple[ast.AST, ast.AST] | None,
+    second: tuple[ast.AST, ast.AST] | None,
+) -> tuple[ast.AST, ast.AST, ast.AST] | None:
+    if first is None or second is None:
+        return None
+    (callee, argument), (other, other_argument) = first, second
+    if not _same_call(callee, argument, other, other_argument):
+        return None
+    return callee, other, argument
+
+
 def _or_chain(
     node: ast.BoolOp,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    calls = [_module_call(value, functions) for value in node.values]
-    if None in calls:
+    if (
+        not isinstance(node, ast.BoolOp)
+        or not isinstance(node.op, ast.Or)
+        or len(node.values) != 2
+    ):
         return []
-    pairs: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    first, argument = calls[0]
-    for callee, other_argument in calls[1:]:
-        if _same_call(first, argument, callee, other_argument):
-            pairs.append((first, callee, argument))
-        first, argument = callee, other_argument
-    return pairs
+    pair = _matching_calls(
+        _module_call(node.values[0], functions),
+        _module_call(node.values[1], functions),
+    )
+    return [] if pair is None else [pair]
 
 
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -547,19 +560,7 @@ def _blocks(node: ast.AST):
                 yield from _blocks(statement)
 
 
-def _or_statement_chains(
-    statement: ast.AST,
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    if not isinstance(statement, ast.Return):
-        return []
-    value = statement.value
-    if not isinstance(value, ast.BoolOp) or not isinstance(value.op, ast.Or):
-        return []
-    return _or_chain(value, functions)
-
-
-def _assignment_call(
+def _assigned_call(
     statement: ast.AST,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> tuple[str, tuple[ast.AST, ast.AST]] | None:
@@ -574,31 +575,13 @@ def _assignment_call(
     return None
 
 
-def _action(
-    child: ast.AST,
+def _returned_call(
+    statement: ast.AST,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> tuple[ast.AST, ast.AST, str | None] | None:
-    if isinstance(child, ast.Return):
-        call = _module_call(child.value, functions) if child.value else None
-        return (*call, None) if call is not None else None
-    if isinstance(child, ast.Assign):
-        found = _assignment_call(child, functions)
-        if found is not None:
-            name, (callee, argument) = found
-            return callee, argument, name
-    return None
-
-
-def _actions(
-    node: ast.AST,
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> list[tuple[ast.AST, ast.AST, str | None]]:
-    """Returned or assigned module calls in one node's body."""
-    return [
-        action
-        for child in _scope_walk(node.body)
-        if (action := _action(child, functions)) is not None
-    ]
+) -> tuple[ast.AST, ast.AST] | None:
+    if not isinstance(statement, ast.Return) or statement.value is None:
+        return None
+    return _module_call(statement.value, functions)
 
 
 def _guard_name(test: ast.AST) -> str | None:
@@ -614,111 +597,96 @@ def _guard_name(test: ast.AST) -> str | None:
     return None
 
 
-def _assigns(node: ast.AST, name: str) -> bool:
-    return any(
-        isinstance(child, ast.Name)
-        and isinstance(child.ctx, ast.Store)
-        and child.id == name
-        for child in _scope_walk([node])
+def _guard_body(guard: ast.AST) -> ast.stmt | None:
+    if not isinstance(guard, ast.If) or guard.orelse or len(guard.body) != 1:
+        return None
+    return guard.body[0]
+
+
+def _returns_name(statement: ast.AST, name: str) -> bool:
+    return (
+        isinstance(statement, ast.Return)
+        and isinstance(statement.value, ast.Name)
+        and statement.value.id == name
     )
 
 
-def _reaches_return(
-    block: list[ast.stmt], after: int, name: str
-) -> bool | None:
-    """True for a clean later return, False when an assignment blocks it."""
-    for statement in block[after + 1:]:
-        if (
-            isinstance(statement, ast.Return)
-            and isinstance(statement.value, ast.Name)
-            and statement.value.id == name
-        ):
-            return True
-        if _assigns(statement, name):
-            return False
-    return None
-
-
-def _assigns_between(
-    block: list[ast.stmt], start: int, stop: int, name: str
-) -> bool:
-    return any(
-        _assigns(statement, name)
-        for statement in block[start + 1:stop]
-    )
-
-
-def _guard_actions(
+def _guard_assignment(
     block: list[ast.stmt],
-    guard_index: int,
-    name: str,
-    callee: ast.AST,
-    argument: ast.AST,
-    guard: ast.If,
+    index: int,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    reaches = _reaches_return(block, guard_index, name)
-    allowed = {None} if reaches is not False else set()
-    if reaches:
-        allowed.add(name)
-    return [
-        (callee, other, argument)
-        for other, other_argument, assigned in _actions(guard, functions)
-        if _same_call(callee, argument, other, other_argument)
-        and assigned in allowed
-    ]
+) -> tuple[str, tuple[ast.AST, ast.AST]] | None:
+    found = _assigned_call(block[index], functions)
+    if found is None or index + 2 >= len(block):
+        return None
+    return found
+
+
+def _guard_fallback(
+    statement: ast.stmt,
+    name: str,
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> tuple[ast.AST, ast.AST] | None:
+    found = _assigned_call(statement, functions)
+    if found is None or found[0] != name:
+        return None
+    return found[1]
 
 
 def _guard_chain(
     block: list[ast.stmt],
     index: int,
-    found: tuple[str, tuple[ast.AST, ast.AST]],
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    name, (callee, argument) = found
-    for guard_index in range(index + 1, len(block)):
-        guard = block[guard_index]
-        if not isinstance(guard, ast.If) or _guard_name(guard.test) != name:
-            continue
-        if _assigns_between(block, index, guard_index, name):
-            continue
-        return _guard_actions(
-            block, guard_index, name, callee, argument, guard, functions
-        )
-    return []
+    found = _guard_assignment(block, index, functions)
+    if found is None:
+        return []
+    name, first = found
+    guard, final = block[index + 1], block[index + 2]
+    statement = _guard_body(guard)
+    if statement is None or _guard_name(guard.test) != name:
+        return []
+    if not _returns_name(final, name):
+        return []
+    pair = _matching_calls(
+        first, _guard_fallback(statement, name, functions)
+    )
+    return [] if pair is None else [pair]
 
 
-def _try_value_reaches(
-    block: list[ast.stmt],
-    index: int,
-    assigned: str | None,
-    handler_assigned: str | None,
-) -> bool:
-    names = {assigned, handler_assigned} - {None}
-    if not names:
-        return True
-    return len(names) == 1 and _reaches_return(block, index, names.pop())
+def _single_return(
+    body: list[ast.stmt],
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> tuple[ast.AST, ast.AST] | None:
+    if len(body) != 1:
+        return None
+    return _returned_call(body[0], functions)
+
+
+def _single_handler(statement: ast.AST) -> ast.ExceptHandler | None:
+    if not isinstance(statement, (ast.Try, ast.TryStar)):
+        return None
+    if (
+        len(statement.handlers) != 1
+        or statement.orelse
+        or statement.finalbody
+    ):
+        return None
+    return statement.handlers[0]
 
 
 def _try_chain(
-    block: list[ast.stmt],
-    index: int,
-    statement: ast.Try | ast.TryStar,
+    statement: ast.AST,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    actions = _actions(statement, functions)
-    return [
-        (callee, other, argument)
-        for handler in statement.handlers
-        for callee, argument, assigned in actions
-        for other, other_argument, handler_assigned in _actions(
-            handler, functions
-        )
-        if _same_call(callee, argument, other, other_argument)
-        and _try_value_reaches(
-            block, index, assigned, handler_assigned
-        )
-    ]
+    handler = _single_handler(statement)
+    if handler is None:
+        return []
+    pair = _matching_calls(
+        _single_return(statement.body, functions),
+        _single_return(handler.body, functions),
+    )
+    return [] if pair is None else [pair]
 
 
 def _chains(
@@ -727,12 +695,11 @@ def _chains(
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
     chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
     for index, statement in enumerate(block):
-        chains.extend(_or_statement_chains(statement, functions))
-        found = _assignment_call(statement, functions)
-        if found is not None:
-            chains.extend(_guard_chain(block, index, found, functions))
+        if isinstance(statement, ast.Return) and statement.value is not None:
+            chains.extend(_or_chain(statement.value, functions))
+        chains.extend(_guard_chain(block, index, functions))
         if isinstance(statement, (ast.Try, ast.TryStar)):
-            chains.extend(_try_chain(block, index, statement, functions))
+            chains.extend(_try_chain(statement, functions))
     return chains
 
 

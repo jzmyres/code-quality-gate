@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ast
-import symtable
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +47,7 @@ class MeasuredFunction:
         node: ast.FunctionDef | ast.AsyncFunctionDef,
         path: str,
         prefix: str,
-        selection_tables: dict[int, int] | None = None,
+        module_tables: dict[str, int] | None = None,
     ) -> MeasuredFunction:
         identity = _function_identity(node, prefix)
         return cls(
@@ -58,7 +57,7 @@ class MeasuredFunction:
             node=node,
             start_line=_start_line(node),
             end_line=node.end_lineno or node.lineno,
-            cc=_function_complexity(node, selection_tables),
+            cc=_function_complexity(node, module_tables),
         )
 
 
@@ -321,24 +320,20 @@ def _boolean_tables(
     }
 
 
-def _named_receiver(
-    display: ast.AST, tables: dict[int | str, int]
-) -> int:
+def _named_receiver(display: ast.AST, tables: dict[str, int]) -> int:
     if not isinstance(display, ast.Name):
         return -1
-    return tables.get(id(display), tables.get(display.id, -1))
+    return tables.get(display.id, -1)
 
 
-def _named_selection(
-    node: ast.Subscript, tables: dict[int | str, int]
-) -> int:
+def _named_selection(node: ast.Subscript, tables: dict[str, int]) -> int:
     keys = _named_receiver(node.value, tables)
     if keys < 0 or _literal_flags(node.slice)[0]:
         return 0
     return max(0, keys - 1)
 
 
-def _named_get(node: ast.Call, tables: dict[int | str, int]) -> int:
+def _named_get(node: ast.Call, tables: dict[str, int]) -> int:
     if (
         not isinstance(node.func, ast.Attribute)
         or node.func.attr != "get"
@@ -552,245 +547,17 @@ def _start_line(
     return node.lineno
 
 
-def _argument_names(arguments: ast.arguments) -> set[str]:
-    names = {
-        argument.arg
-        for argument in [
-            *arguments.posonlyargs,
-            *arguments.args,
-            *arguments.kwonlyargs,
-        ]
-    }
-    for argument in (arguments.vararg, arguments.kwarg):
-        if argument is not None:
-            names.add(argument.arg)
-    return names
-
-
-def _binding_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id if isinstance(node.ctx, ast.Store) else None
-    if isinstance(
-        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-    ):
-        return node.name
-    return None
-
-
-def _scope_bindings(nodes: list[ast.AST]) -> set[str]:
-    return {
-        name
-        for node in nodes
-        for child in _scope_walk(node)
-        if (name := _binding_name(child)) is not None
-    }
-
-
-@dataclass
-class _Scope:
-    kind: str
-    table: symtable.SymbolTable | None
-    parent: "_Scope | None"
-    tables: dict[str, int]
-    bindings: set[str]
-    comp_targets: set[str]
-
-
-def _target_names(target: ast.AST) -> set[str]:
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, ast.Starred):
-        return _target_names(target.value)
-    return {
-        name
-        for child in ast.iter_child_nodes(target)
-        for name in _target_names(child)
-    }
-
-
-def _comprehension_targets(node: ast.AST) -> set[str]:
-    names: set[str] = set()
-    for generator in node.generators:
-        names.update(_target_names(generator.target))
-    return names
-
-
-def _child_table(
-    table: symtable.SymbolTable | None,
-    node: ast.AST,
-    kind: str,
-    name: str,
-) -> symtable.SymbolTable | None:
-    if table is None:
-        return None
-    for child in table.get_children():
-        if (
-            child.get_type(),
-            child.get_name(),
-            child.get_lineno(),
-        ) == (kind, name, node.lineno):
-            return child
-    return None
-
-
-def _scope_for(
-    node: ast.AST,
-    parent: _Scope,
-    table: symtable.SymbolTable | None,
-) -> _Scope | None:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return _Scope(
-            "function",
-            _child_table(table, node, "function", node.name),
-            parent,
-            _boolean_tables(node.body, scoped=True),
-            _argument_names(node.args) | _scope_bindings(node.body),
-            set(),
-        )
-    if isinstance(node, ast.Lambda):
-        return _Scope(
-            "function",
-            _child_table(table, node, "function", "lambda"),
-            parent,
-            _boolean_tables([node.body], scoped=True),
-            _argument_names(node.args) | _scope_bindings([node.body]),
-            set(),
-        )
-    if isinstance(node, ast.ClassDef):
-        return _Scope(
-            "class",
-            _child_table(table, node, "class", node.name),
-            parent,
-            _boolean_tables(node.body, scoped=True),
-            _scope_bindings(node.body),
-            set(),
-        )
-    if isinstance(
-        node,
-        (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
-    ):
-        targets = _comprehension_targets(node)
-        if not isinstance(node, ast.GeneratorExp):
-            parent.comp_targets.update(targets)
-        return _Scope("comprehension", None, parent, {}, targets, set())
-    return None
-
-
-def _module_keys(scope: _Scope, name: str) -> int:
-    while scope.parent is not None:
-        scope = scope.parent
-    return scope.tables.get(name, -1)
-
-
-def _table_symbol(
-    scope: _Scope, name: str
-) -> symtable.Symbol | None:
-    if scope.table is None:
-        return None
-    try:
-        return scope.table.lookup(name)
-    except KeyError:
-        return None
-
-
-def _comp_only(
-    scope: _Scope, name: str, symbol: symtable.Symbol | None
-) -> bool:
-    return (
-        symbol is not None
-        and symbol.is_local()
-        and name in scope.comp_targets
-        and name not in scope.bindings
-    )
-
-
-def _global_symbol(symbol: symtable.Symbol | None) -> bool:
-    return symbol is None or symbol.is_global()
-
-
-def _outer_only(symbol: symtable.Symbol) -> bool:
-    return symbol.is_nonlocal() or symbol.is_free()
-
-
-def _scope_keys(scope: _Scope, name: str) -> int | None:
-    if scope.kind == "comprehension":
-        return -1 if name in scope.bindings else None
-    symbol = _table_symbol(scope, name)
-    if _comp_only(scope, name, symbol):
-        return None
-    if _global_symbol(symbol):
-        return _module_keys(scope, name)
-    if _outer_only(symbol):
-        return -1
-    return scope.tables.get(name, -1)
-
-
-def _resolved_keys(scope: _Scope, name: str) -> int:
-    while scope.kind != "module":
-        keys = _scope_keys(scope, name)
-        if keys is not None:
-            return keys
-        scope = scope.parent
-    return scope.tables.get(name, -1)
-
-
-def _selection_display(node: ast.AST) -> ast.AST | None:
-    if isinstance(node, ast.Subscript):
-        return node.value
-    if not isinstance(node, ast.Call) or not node.args:
-        return None
-    if getattr(node.func, "attr", None) != "get":
-        return None
-    return node.func.value
-
-
-def _walk_selection_scopes(
-    node: ast.AST,
-    scope: _Scope,
-    table: symtable.SymbolTable | None,
-    selections: dict[int, int],
-) -> None:
-    for child in ast.iter_child_nodes(node):
-        child_scope = _scope_for(child, scope, table)
-        if child_scope is not None:
-            _walk_selection_scopes(
-                child,
-                child_scope,
-                child_scope.table or table,
-                selections,
-            )
-            continue
-        display = _selection_display(child)
-        if isinstance(display, ast.Name):
-            selections[id(display)] = _resolved_keys(scope, display.id)
-        _walk_selection_scopes(child, scope, table, selections)
-
-
-def _selection_tables(
-    tree: ast.Module, source: str, relative: str
-) -> dict[int, int]:
-    table = symtable.symtable(source, relative, "exec")
-    module = _Scope(
-        "module",
-        table,
-        None,
-        _boolean_tables(tree.body, scoped=True),
-        _scope_bindings(tree.body),
-        set(),
-    )
-    selections: dict[int, int] = {}
-    _walk_selection_scopes(tree, module, table, selections)
-    return selections
-
-
 def _function_complexity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
-    selection_tables: dict[int, int] | None = None,
+    module_tables: dict[str, int] | None = None,
 ) -> int:
     # Defaults, decorators and annotations run at definition time and belong
     # to the enclosing owner, so only the executable body counts here.
+    tables = _boolean_tables(node.body)
+    if module_tables:
+        tables = {**module_tables, **tables}
     return cyclomatic_complexity(
-        ast.Module(body=node.body, type_ignores=[]), selection_tables
+        ast.Module(body=node.body, type_ignores=[]), tables
     )
 
 
@@ -801,14 +568,14 @@ def _collect_functions(
     found: list[MeasuredFunction],
     overload_names: set[str],
     typing_modules: set[str],
-    selection_tables: dict[int, int],
+    module_tables: dict[str, int],
 ) -> None:
     for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_overload(node, overload_names, typing_modules):
                 continue
             found.append(MeasuredFunction.from_node(
-                node, path, prefix, selection_tables
+                node, path, prefix, module_tables
             ))
             continue
         if isinstance(node, ast.ClassDef):
@@ -819,7 +586,7 @@ def _collect_functions(
                 found,
                 overload_names,
                 typing_modules,
-                selection_tables,
+                module_tables,
             )
             continue
         for child in ast.iter_child_nodes(node):
@@ -830,7 +597,7 @@ def _collect_functions(
                 found,
                 overload_names,
                 typing_modules,
-                selection_tables,
+                module_tables,
             )
 
 
@@ -920,7 +687,7 @@ def _last_end_line(nodes: list[ast.AST], default: int) -> int:
 
 
 def _module_subject(
-    tree: ast.Module, relative: str, selection_tables: dict[int, int]
+    tree: ast.Module, relative: str, module_tables: dict[str, int]
 ) -> MeasuredFunction | None:
     nodes = _outside_nodes(tree)
     lines = _node_lines(nodes)
@@ -934,7 +701,7 @@ def _module_subject(
         node=tree,
         start_line=lines[0],
         end_line=end,
-        cc=_count_rules(nodes, selection_tables),
+        cc=_count_rules(nodes, module_tables),
         lines=tuple(lines),
     )
 
@@ -950,9 +717,10 @@ def _lambda_lines(node: ast.Lambda) -> tuple[int, ...]:
 
 
 def _lambda_subject(
-    node: ast.Lambda, relative: str, selection_tables: dict[int, int]
+    node: ast.Lambda, relative: str, module_tables: dict[str, int]
 ) -> MeasuredFunction | None:
-    cc = cyclomatic_complexity(node, selection_tables)
+    tables = {**module_tables, **_boolean_tables(node)}
+    cc = cyclomatic_complexity(node, tables)
     if cc == 1:
         return None
     return MeasuredFunction(
@@ -968,13 +736,13 @@ def _lambda_subject(
 
 
 def _lambda_subjects(
-    tree: ast.Module, relative: str, selection_tables: dict[int, int]
+    tree: ast.Module, relative: str, module_tables: dict[str, int]
 ) -> list[MeasuredFunction]:
     found: list[MeasuredFunction] = []
     for node in _outside_nodes(tree):
         if isinstance(node, ast.Lambda):
             subject = _lambda_subject(
-                node, relative, selection_tables
+                node, relative, module_tables
             )
             if subject is not None:
                 found.append(subject)
@@ -986,14 +754,14 @@ def collect_functions(
 ) -> list[MeasuredFunction]:
     tree = ast.parse(source, filename=relative)
     overload_names, typing_modules = _typing_overload(tree)
-    selection_tables = _selection_tables(tree, source, relative)
+    module_tables = _boolean_tables(tree.body, scoped=True)
     found: list[MeasuredFunction] = []
     _collect_functions(
         [tree], "", relative, found, overload_names, typing_modules,
-        selection_tables,
+        module_tables,
     )
-    found.extend(_lambda_subjects(tree, relative, selection_tables))
-    module = _module_subject(tree, relative, selection_tables)
+    found.extend(_lambda_subjects(tree, relative, module_tables))
+    module = _module_subject(tree, relative, module_tables)
     if module is not None:
         found.append(module)
     return sorted(found, key=lambda item: (item.start_line, item.identity))

@@ -287,18 +287,37 @@ def load(value):
     except ValueError:
         return read_csv(value)
 """
-TRIAL_GUARD_RETURN = TRIAL_HEADER + """\
+TRIAL_GUARD_ELSE = TRIAL_HEADER + """\
 def load(value):
     result = read_json(value)
     if result is None:
-        return read_csv(value)
+        result = read_csv(value)
+    else:
+        result = None
     return result
 """
-TRIAL_TRY_ASSIGN = TRIAL_HEADER + """\
+TRIAL_GUARD_TWO = TRIAL_HEADER + """\
+def load(value):
+    result = read_json(value)
+    if result is None:
+        result = read_csv(value)
+        result = None
+    return result
+"""
+TRIAL_OVERWRITTEN_TRY = TRIAL_HEADER + """\
 def load(value):
     try:
-        result = read_json(value)
+        return read_json(value)
     except ValueError:
+        result = read_csv(value)
+        result = None
+    return result
+"""
+TRIAL_NOT_CONSECUTIVE = TRIAL_HEADER + """\
+def load(value):
+    result = read_json(value)
+    value = value
+    if result is None:
         result = read_csv(value)
     return result
 """
@@ -322,53 +341,23 @@ def load(value):
         read_csv(value)
     return "fixed"
 """
-TRIAL_STALE_GUARD = TRIAL_HEADER + """\
-def load(value):
-    result = read_json(value)
-    if result is None:
-        result = read_csv(value)
-    result = None
-    return result
-"""
-TRIAL_TRY_HANDLER_ASSIGN = TRIAL_HEADER + """\
-def load(value):
-    try:
-        return read_json(value)
-    except ValueError:
-        result = read_csv(value)
-    return result
-"""
-TRIAL_GUARD_RETURN_REBOUND = TRIAL_HEADER + """\
-def load(value):
-    result = read_json(value)
-    if result is None:
-        return read_csv(value)
-    result = None; return result
-"""
-TRIAL_GUARD_REBOUND_BEFORE = TRIAL_HEADER + """\
-def load(value):
-    result = read_json(value)
-    result = None
-    if result is None:
-        result = read_csv(value)
-    return result
-"""
-TRIAL_GUARD_NESTED_REBIND = TRIAL_HEADER + """\
-def load(value):
-    result = read_json(value)
-    if result is None:
-        result = read_csv(value)
-    if value:
-        result = None
-    return result
-"""
-TRIAL_TRY_ASSIGN_HANDLER_RETURN = TRIAL_HEADER + """\
-def load(value):
-    try:
-        result = read_json(value)
-    except ValueError:
-        return read_csv(value)
-    return result
+TRIAL_HARNESS = """\
+FORMATS = ("dsh", "codex")
+
+
+def dsh_run_values(records) -> str:
+    return records
+
+
+def codex_run_values(records) -> str:
+    return records
+
+
+def load(records):
+    values = dsh_run_values(records)
+    if values is None:
+        values = codex_run_values(records)
+    return values
 """
 
 
@@ -645,8 +634,54 @@ class SpecTests(VariantCase):
         self.assertTrue(callable(variant_dispatch._run_variant_dispatch))
 
     def test_the_policy_keys_are_parsed_with_their_defaults(self):
+        parsed = variant_dispatch._variant_dispatch_spec(
+            {}, self.repo, self.repo / "quality-gate.toml",
+            "checks.variant-dispatch",
+        )
+        self.assertEqual(
+            parsed.spec, variant_dispatch.VariantSpec("tree", "HEAD")
+        )
+        self.assertEqual(parsed.metric_version, "variant-dispatch/1")
+        self.assertEqual(parsed.evidence, ("static",))
+        self.assertEqual(parsed.threshold, 0)
+        changed = variant_dispatch._variant_dispatch_spec(
+            {"scope": "changed", "base": "main"},
+            self.repo,
+            self.repo / "quality-gate.toml",
+            "checks.variant-dispatch",
+        )
+        self.assertEqual(
+            changed.spec, variant_dispatch.VariantSpec("changed", "main")
+        )
         spec = policy.load_config(self.repo).checks[VARIANT_CHECK].spec
         self.assertEqual((spec.scope, spec.base), ("tree", "HEAD"))
+
+    def test_the_run_hook_reports_a_one_finding_fixture(self):
+        self.add_file("pkg/app.py", PY_COMPARE)
+        config = policy.load_config(self.repo)
+        context = SimpleNamespace(
+            root=self.repo,
+            config=config,
+            check=config.checks[VARIANT_CHECK],
+            files=None,
+            classes=None,
+            base_override=None,
+            prefix="pkg",
+        )
+        with mock.patch(
+            "quality_gate.checks._select_files",
+            return_value=(["pkg/app.py"], []),
+        ):
+            result = variant_dispatch._run_variant_dispatch(context)
+        document = result.to_json()
+        self.assertEqual(document["id"], VARIANT_CHECK)
+        self.assertEqual(document["adapter"], "variant_dispatch")
+        self.assertEqual(document["evidence"], ["static"])
+        self.assertEqual(document["metric_version"], "variant-dispatch/1")
+        self.assertEqual(document["outcome"], "fail")
+        self.assertEqual(document["measurement"], {"owners": 2})
+        self.assertEqual(len(document["findings"]), 1)
+        self.assertIn("VSD variant-dispatch:", document["findings"][0]["subject"])
 
     def test_invalid_scope_is_a_configuration_error(self):
         self.write_config(variant_config(scope="repository"))
@@ -755,6 +790,15 @@ class HelperTests(VariantCase):
             frozenset({"alpha", "beta"}),
         )
 
+    def test_display_words_read_nested_displays_and_strings_only(self):
+        display = ast.parse(
+            "('alpha', ('beta', [1, {'gamma'}]), b'delta')"
+        ).body[0].value
+        self.assertEqual(
+            variant_dispatch._display_words(display),
+            ["alpha", "beta", "gamma"],
+        )
+
     def test_a_display_compared_with_an_expression_is_its_own_set(self):
         subjects: dict[str, set[str]] = {}
         displays: list[frozenset[str]] = []
@@ -837,6 +881,50 @@ class ReaderHelperTests(VariantCase):
             [("TABLE", "table"), ("first", "function")],
         )
 
+    def test_owner_collection_qualifies_functions_through_classes(self):
+        source = (
+            "def top(kind):\n"
+            '    if kind == "alpha":\n'
+            "        return 1\n"
+            '    if kind == "beta":\n'
+            "        return 2\n"
+            "    return 0\n"
+            "class Thing:\n"
+            "    def method(self):\n"
+            "        return 1\n"
+            "    class Inner:\n"
+            "        def deep(self):\n"
+            "            return 2\n"
+        )
+        owners: list[variant_dispatch.Owner] = []
+        variant_dispatch._collect_owners(
+            ast.parse(source).body, "", "pkg/app.py", owners
+        )
+        self.assertEqual(
+            [
+                (
+                    owner.path,
+                    owner.name,
+                    owner.kind,
+                    owner.start_line,
+                    owner.end_line,
+                )
+                for owner in owners
+            ],
+            [
+                ("pkg/app.py", "top", "function", 1, 6),
+                ("pkg/app.py", "Thing.method", "function", 8, 9),
+                (
+                    "pkg/app.py",
+                    "Thing.Inner.deep",
+                    "function",
+                    11,
+                    12,
+                ),
+            ],
+        )
+        self.assertEqual(owners[0].literals, frozenset({"alpha", "beta"}))
+
 
     def test_vocabulary_grouping_and_findings(self):
         def owner(name: str, literals: set[str]) -> Any:
@@ -888,16 +976,13 @@ class ReaderHelperTests(VariantCase):
         )
         load = functions["load"]
         self.assertEqual(
-            len(variant_dispatch._or_statement_chains(
-                load.body[0], functions
-            )),
-            1,
-        )
-        self.assertEqual(
             len(variant_dispatch._or_chain(
                 load.body[0].value, functions
             )),
             1,
+        )
+        self.assertEqual(
+            len(variant_dispatch._chains(load.body, functions)), 1
         )
         self.assertEqual(
             [block[0].lineno for block in variant_dispatch._blocks(load)],
@@ -911,13 +996,10 @@ class ReaderHelperTests(VariantCase):
             variant_dispatch._guard_name(guard.test), "result"
         )
         self.assertEqual(
-            variant_dispatch._assignment_call(
+            variant_dispatch._assigned_call(
                 guard_load.body[0], guard_functions
             )[0],
             "result",
-        )
-        self.assertEqual(
-            len(variant_dispatch._actions(guard, guard_functions)), 1
         )
         self.assertEqual(
             len(variant_dispatch._chains(
@@ -933,34 +1015,6 @@ class ReaderHelperTests(VariantCase):
                 try_load.body, try_functions
             )),
             1,
-        )
-        rebound = ast.parse(
-            "def f():\n"
-            "    value = 1\n"
-            "    if flag:\n"
-            "        value = 2\n"
-            "    return value\n"
-        ).body[0]
-        self.assertTrue(
-            variant_dispatch._assigns(rebound.body[1], "value")
-        )
-        self.assertFalse(
-            variant_dispatch._assigns(rebound.body[2], "value")
-        )
-        self.assertFalse(
-            variant_dispatch._reaches_return(rebound.body, 0, "value")
-        )
-        self.assertIsNone(
-            variant_dispatch._reaches_return(rebound.body, 2, "value")
-        )
-        returned = ast.parse(
-            "def f():\n    value = 1\n    return value\n"
-        ).body[0]
-        self.assertTrue(
-            variant_dispatch._reaches_return(returned.body, 0, "value")
-        )
-        self.assertIsNone(
-            variant_dispatch._reaches_return(returned.body, 1, "value")
         )
         span = variant_dispatch._caller_span("pkg/app.py", load)
         self.assertEqual((span.name, span.start_line), ("load", 12))
@@ -980,7 +1034,6 @@ class ReaderHelperTests(VariantCase):
             variant_dispatch._python_trials("pkg/app.py", PY_COMPARE_ONE),
             [],
         )
-
 
     def test_trial_flow_helpers(self):
         tree = ast.parse(
@@ -1013,42 +1066,20 @@ class ReaderHelperTests(VariantCase):
         guard_tree = ast.parse(TRIAL_GUARD)
         guard_functions = variant_dispatch._module_functions(guard_tree)
         guard_load = guard_functions["load"]
-        found = variant_dispatch._assignment_call(
-            guard_load.body[0], guard_functions
-        )
         self.assertEqual(
             len(variant_dispatch._guard_chain(
-                guard_load.body, 0, found, guard_functions
+                guard_load.body, 0, guard_functions
             )),
             1,
-        )
-        name, (callee, argument) = found
-        guard = guard_load.body[1]
-        self.assertEqual(
-            len(variant_dispatch._guard_actions(
-                guard_load.body, 1, name, callee, argument, guard,
-                guard_functions,
-            )),
-            1,
-        )
-        self.assertFalse(
-            variant_dispatch._assigns_between(
-                guard_load.body, 0, 1, "result"
-            )
         )
         try_tree = ast.parse(TRIAL_TRY)
         try_functions = variant_dispatch._module_functions(try_tree)
         try_load = try_functions["load"]
         self.assertEqual(
             len(variant_dispatch._try_chain(
-                try_load.body, 0, try_load.body[0], try_functions
+                try_load.body[0], try_functions
             )),
             1,
-        )
-        self.assertTrue(
-            variant_dispatch._try_value_reaches(
-                try_load.body, 0, None, None
-            )
         )
         or_tree = ast.parse(TRIAL_OR)
         or_functions = variant_dispatch._module_functions(or_tree)
@@ -1064,28 +1095,68 @@ class ReaderHelperTests(VariantCase):
         self.assertIsNone(variant_dispatch._new_trial(
             seen, span, chain, frozenset({"json", "csv"})
         ))
-        returned = ast.parse("return read_json(x)").body[0]
-        assigned = ast.parse("result = read_json(x)").body[0]
-        self.assertIsNone(variant_dispatch._action(ast.Pass(), or_functions))
-        self.assertIsNone(
-            variant_dispatch._action(ast.parse("return").body[0], or_functions)
+        first, second, argument = chain
+        self.assertTrue(variant_dispatch._same_call(
+            first, argument, second, argument
+        ))
+        self.assertFalse(variant_dispatch._same_call(
+            first, argument, first, argument
+        ))
+        guard_body = variant_dispatch._guard_body(guard_load.body[1])
+        self.assertIs(guard_body, guard_load.body[1].body[0])
+        self.assertIsNone(variant_dispatch._guard_body(
+            ast.parse("if flag:\n    pass\nelse:\n    pass\n").body[0]
+        ))
+        self.assertEqual(
+            variant_dispatch._guard_assignment(
+                guard_load.body, 0, guard_functions
+            ),
+            variant_dispatch._assigned_call(
+                guard_load.body[0], guard_functions
+            ),
         )
-        self.assertIsNone(
-            variant_dispatch._action(
-                ast.parse("return other(x)").body[0], or_functions
-            )
-        )
-        self.assertIsNone(
-            variant_dispatch._action(
-                ast.parse("result = other(x)").body[0], or_functions
-            )
-        )
-        self.assertIsNone(
-            variant_dispatch._action(returned, or_functions)[2]
+        self.assertIsNone(variant_dispatch._guard_assignment(
+            guard_load.body, 1, guard_functions
+        ))
+        fallback = variant_dispatch._guard_fallback(
+            guard_load.body[1].body[0], "result", guard_functions
         )
         self.assertEqual(
-            variant_dispatch._action(assigned, or_functions)[2], "result"
+            fallback,
+            variant_dispatch._assigned_call(
+                guard_load.body[1].body[0], guard_functions
+            )[1],
         )
+        self.assertIsNone(variant_dispatch._guard_fallback(
+            guard_load.body[1].body[0], "other", guard_functions
+        ))
+        self.assertTrue(variant_dispatch._returns_name(
+            guard_load.body[2], "result"
+        ))
+        self.assertFalse(variant_dispatch._returns_name(
+            guard_load.body[2], "other"
+        ))
+        self.assertIsNone(variant_dispatch._single_return([], try_functions))
+        self.assertEqual(
+            variant_dispatch._single_return(
+                try_load.body[0].body, try_functions
+            ),
+            variant_dispatch._module_call(
+                try_load.body[0].body[0].value, try_functions
+            ),
+        )
+        self.assertEqual(
+            variant_dispatch._matching_calls(
+                (first, argument), (second, argument)
+            ),
+            chain,
+        )
+        handler = variant_dispatch._single_handler(try_load.body[0])
+        self.assertIs(handler, try_load.body[0].handlers[0])
+        self.assertIsNone(variant_dispatch._single_handler(
+            ast.parse("if flag:\n    pass\n").body[0]
+        ))
+
 
     def test_the_adapter_measure_step(self):
         self.add_file("pkg/app.py", PY_COMPARE_ONE)
@@ -1108,14 +1179,20 @@ class ReaderHelperTests(VariantCase):
 
 
 class TrialTests(VariantCase):
-    def assert_trial(self, source: str, argument: str = "value") -> None:
+    def assert_trial(
+        self,
+        source: str,
+        argument: str = "value",
+        first: str = "read_json",
+        second: str = "read_csv",
+    ) -> None:
         self.add_file("pkg/app.py", source)
         findings = self.rejected()
         self.assertEqual(len(findings), 1, findings)
         self.assertEqual(
             findings[0]["subject"],
-            "TRIAL variant-dispatch: pkg/app.py:12 load tries read_json then "
-            f"read_csv on {argument}; select the reader from the table that "
+            f"TRIAL variant-dispatch: pkg/app.py:12 load tries {first} then "
+            f"{second} on {argument}; select the reader from the table that "
             "names the formats, by the record's declared format, instead of "
             "trying each.",
         )
@@ -1132,11 +1209,13 @@ class TrialTests(VariantCase):
     def test_try_then_handler_is_a_finding(self):
         self.assert_trial(TRIAL_TRY)
 
-    def test_a_guard_that_returns_the_fallback_is_a_finding(self):
-        self.assert_trial(TRIAL_GUARD_RETURN)
-
-    def test_a_try_that_assigns_the_chain_returned_later_is_a_finding(self):
-        self.assert_trial(TRIAL_TRY_ASSIGN)
+    def test_the_harness_guard_shape_is_a_finding(self):
+        self.assert_trial(
+            TRIAL_HARNESS,
+            argument="records",
+            first="dsh_run_values",
+            second="codex_run_values",
+        )
 
     def test_a_discarded_or_chain_is_not_a_finding(self):
         self.add_file("pkg/app.py", TRIAL_OR_DISCARDED)
@@ -1150,36 +1229,43 @@ class TrialTests(VariantCase):
         self.add_file("pkg/app.py", TRIAL_TRY_DISCARDED)
         self.accepted()
 
-    def test_a_guard_value_rebound_before_the_return_is_not_a_finding(self):
-        self.add_file("pkg/app.py", TRIAL_STALE_GUARD)
+    def test_an_overwritten_guard_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_GUARD_TWO)
         self.accepted()
 
-    def test_try_return_with_a_handler_assignment_and_return_is_a_finding(self):
-        self.assert_trial(TRIAL_TRY_HANDLER_ASSIGN)
-
-    def test_try_assignment_with_a_handler_return_is_a_finding(self):
-        self.assert_trial(TRIAL_TRY_ASSIGN_HANDLER_RETURN)
-
-    def test_a_guard_return_rebound_before_the_return_is_not_a_finding(self):
-        self.add_file("pkg/app.py", TRIAL_GUARD_RETURN_REBOUND)
+    def test_a_guard_body_of_two_statements_is_not_a_finding(self):
+        self.add_file(
+            "pkg/app.py",
+            TRIAL_HEADER
+            + "def load(value):\n"
+            "    result = read_json(value)\n"
+            "    if result is None:\n"
+            "        fallback = read_csv(value)\n"
+            "        result = fallback\n"
+            "    return result\n",
+        )
         self.accepted()
 
-    def test_a_value_rebound_before_the_guard_is_not_a_finding(self):
-        self.add_file("pkg/app.py", TRIAL_GUARD_REBOUND_BEFORE)
+    def test_a_guard_with_an_else_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_GUARD_ELSE)
         self.accepted()
 
-    def test_a_value_rebound_inside_an_if_after_the_guard_is_not_a_finding(self):
-        self.add_file("pkg/app.py", TRIAL_GUARD_NESTED_REBIND)
+    def test_statements_that_are_not_consecutive_are_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_NOT_CONSECUTIVE)
         self.accepted()
 
-    def test_the_same_chain_twice_reports_one_finding(self):
+    def test_an_overwritten_try_handler_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_OVERWRITTEN_TRY)
+        self.accepted()
+
+    def test_an_or_chain_of_three_calls_is_not_a_finding(self):
         self.add_file(
             "pkg/app.py",
             TRIAL_HEADER
             + "def load(value):\n"
             "    return read_json(value) or read_csv(value) or read_json(value)\n",
         )
-        self.assertEqual(len(self.rejected()), 1)
+        self.accepted()
 
     def test_a_table_without_the_name_token_is_not_a_finding(self):
         self.add_file(

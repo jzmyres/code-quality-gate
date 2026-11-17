@@ -546,13 +546,15 @@ module-level definition). The construct rules and the named-table selections are
 | `and`/`or` | One per operand after the first. |
 | `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements, recursively, so an empty one adds none. |
 | subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
-| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name counts the same way when `symtable` resolves the name to the module's boolean table (global in that scope) or to a boolean table bound in the same scope; parameters, locals, comprehension and lambda variables, nested functions, `global` and `nonlocal` follow Python's own scoping. |
-| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, or tuples of one length with a boolean position, when it counts like the display, with the same name resolution as the subscript row. |
+| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name counts the same way when the name is bound at module level to such a table, or is bound in the same function to one. Names are not scope-resolved: a parameter, local, lambda or comprehension variable, nested binding or default that reuses a module table's name is counted as that table. |
+| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, or tuples of one length with a boolean position, when it counts like the display, by the same name rule as the subscript row. |
 | `getattr` with three arguments | One, the default is a branch. |
 | `next` with two arguments | One, the default is a branch. |
 | a string literal or tuple/list display multiplied by a non-constant on either side | One, the repetition chooses a length or count. |
 | `map` | One, a loop as a comprehension's `for`. |
 | `filter`, `itertools.filterfalse`, `itertools.dropwhile`, `itertools.takewhile` | Two, a loop and its condition. |
+
+Shadowing a table's name is itself a defect, and renaming it is the fix; the count never resolves a name to a scope.
 
 A starred element whose length the source does not write counts as one element, and a written
 empty display contributes none. In a dict display, each `**` entry counts as one key whatever it
@@ -723,17 +725,15 @@ one of its owners is a function or table the diff from `base` adds or changes; t
 still read to find the other owners. `base` defaults to `HEAD`. An invalid base is a check error,
 never a pass.
 
-The same adapter reports `TRIAL`, Python only: a function that calls two or more different
-module-level functions of its own module on the same first argument as a fallback chain and returns
-the chain's value, in one of three forms: `return f(x) or g(x)`; `v = f(x)`, then
-`if v is None` or `if not v` whose body assigns `v = g(x)` or returns `g(x)`, and a later
-`return v`; or a `try` whose body returns `f(x)` or assigns `v = f(x)`, with a handler that
-returns `g(x)` or assigns `v = g(x)`, then `return v` when assigned. The chain's value must
-reach a return of the same block in statement order, with no assignment to the carrying variable
-between them; an assignment in a nested block between them counts. A discarded chain, guard or try
-is not a finding. It is reported only when the callees have the same return annotation
-and their names differ only in tokens that are literals of a declared table of the same module (a
-format-name table). Its message is exactly:
+The same adapter reports `TRIAL`, Python only: a function whose body contains one of three exact
+statement shapes, with `f` and `g` different module-level functions of the same module called on
+the same first argument: `return f(x) or g(x)`; three consecutive statements in one block,
+`v = f(x)`, `if v is None:` or `if not v:` whose body is exactly `v = g(x)` and which has no
+`else`, then `return v`; or a `try` whose body is exactly `return f(x)` and whose only
+handler's body is exactly `return g(x)`, with no `else` or `finally`. Nothing else is a
+finding: other fallback chains, guards, handlers and assignments are not read. It is reported only
+when the callees have the same return annotation and their names differ only in tokens that are
+literals of a declared table of the same module (a format-name table). Its message is exactly:
 
     TRIAL variant-dispatch: FILE:LINE FUNCTION tries F then G on ARG; select the reader from the table that names the formats, by the record's declared format, instead of trying each.
 
