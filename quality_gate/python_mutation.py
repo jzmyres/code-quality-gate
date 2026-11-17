@@ -448,36 +448,18 @@ def _ast_mutated(
     return mutated
 
 
-def _enclosing_statement(
-    change: _Change, parents: dict[int, tuple[ast.AST, str]]
-) -> ast.stmt:
-    """The statement that contains the change's target expression."""
-    assert change.replacement_node is not None
-    node = change.target
-    while id(node) in parents:
-        parent, _name = parents[id(node)]
-        if isinstance(parent, ast.stmt):
-            return parent
-        node = parent
-    raise ValueError("the change target is not inside a statement")
-
-
-def _mutated_line(
-    change: _Change, parents: dict[int, tuple[ast.AST, str]], delete_pass: bool
-) -> str:
-    """The original line with the mutated expression, or its deletion marker."""
-    if change.rule == "return None":
-        return "return None"
+def _mutated_line(change: _Change, source: str) -> str:
+    """The original line with the changed expression, or its deletion marker."""
+    target = change.target
+    lines = source.splitlines()
     if change.delete:
-        return "pass" if delete_pass else "(statement deleted)"
-    statement = _enclosing_statement(change, parents)
-    index = next(
-        position for position, node in enumerate(ast.walk(statement))
-        if node is change.target
-    )
-    mutated = copy.deepcopy(statement)
-    _replace_target(mutated, index, change)
-    return ast.unparse(mutated).splitlines()[0].strip()
+        return f"deleted: {lines[target.lineno - 1].strip()}"
+    replacement = ast.unparse(change.replacement_node)
+    start = target.lineno
+    end = target.end_lineno or start
+    before = lines[start - 1][:target.col_offset]
+    after = lines[end - 1][target.end_col_offset:]
+    return (before + replacement + after).strip()
 
 
 def _generated_rule(
@@ -496,7 +478,7 @@ def _generated_rule(
 def _mutation(
     function: ast.FunctionDef | ast.AsyncFunctionDef, change: _Change,
     parents: dict[int, tuple[ast.AST, str]], module: ast.Module,
-    function_index: int, path: str, original: str,
+    function_index: int, path: str, original: str, source: str,
 ) -> Mutation:
     target = change.target
     rule = _suppression(function, change, parents)
@@ -521,7 +503,7 @@ def _mutation(
         change.delete,
         delete_pass,
         rule,
-        _mutated_line(change, parents, delete_pass),
+        _mutated_line(change, source),
         mutated_source,
     )
 
@@ -540,7 +522,7 @@ def _mutations(
     for change in _raw_changes(module_function):
         mutation = _mutation(
             module_function, change, parents, module, function_index,
-            path, original,
+            path, original, source,
         )
         found.append(mutation)
         if mutation.rule is None:
@@ -708,16 +690,31 @@ def _copy_directory(copy_root: Path, name: str) -> Path:
     return path
 
 
-def _environment(copy_root: Path) -> dict[str, str]:
-    """The allowlisted environment, with every writable path inside the copy."""
+def _inherited_path(source_root: Path, copy_root: Path) -> str:
+    """PATH, with each entry inside SOURCE_ROOT moved into COPY_ROOT."""
+    source = Path(os.path.realpath(source_root))
+    entries = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        resolved = Path(os.path.realpath(entry))
+        if resolved.is_relative_to(source):
+            entries.append(str(copy_root / resolved.relative_to(source)))
+        else:
+            entries.append(entry)
+    return os.pathsep.join(entries)
+
+
+def _environment(source_root: Path, copy_root: Path) -> dict[str, str]:
+    """The allowlisted environment, with every path inside the copy."""
     from .python_tests import _test_environment
 
     exported = _test_environment([sys.executable, "-I", "-B"])
     environment = {
         name: os.environ[name]
-        for name in ("PATH", "LANG", "LC_ALL")
+        for name in ("LANG", "LC_ALL")
         if name in os.environ
     }
+    if "PATH" in os.environ:
+        environment["PATH"] = _inherited_path(source_root, copy_root)
     environment.update({
         name: exported[name]
         for name in ("QG_PYTHON", "PYTHONDONTWRITEBYTECODE")
@@ -744,14 +741,14 @@ def _budget_result(argv: list[str]) -> RunResult:
 
 
 def _run_one_test(
-    copy_root: Path, relative: str, deadline: float
+    source_root: Path, copy_root: Path, relative: str, deadline: float
 ) -> RunResult:
     argv = _discover_argv(relative)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return _budget_result(argv)
     return run(
-        argv, cwd=copy_root, env=_environment(copy_root),
+        argv, cwd=copy_root, env=_environment(source_root, copy_root),
         budget_seconds=remaining,
     )
 
@@ -771,13 +768,13 @@ def _result_or_failure(
 
 
 def _run_unittest(
-    copy_root: Path, tests: tuple[str, ...], seconds: float
+    source_root: Path, copy_root: Path, tests: tuple[str, ...], seconds: float
 ) -> RunResult:
     deadline = time.monotonic() + seconds
     result: RunResult | None = None
     failure: RunResult | None = None
     for relative in tests:
-        result = _run_one_test(copy_root, relative, deadline)
+        result = _run_one_test(source_root, copy_root, relative, deadline)
         if not execution_outcome(result.execution).completed:
             return result
         failure = _first_failure(failure, result)
@@ -839,7 +836,7 @@ def _baseline(
     if remaining <= 0:
         return False
     allowance = min(spec.mutant_seconds, remaining)
-    result = _run_unittest(copy_root, tests, allowance)
+    result = _run_unittest(root, copy_root, tests, allowance)
     if not _baseline_passed(
         function, result, allowance, spec.mutant_seconds
     ):
@@ -974,7 +971,7 @@ def _run_mutant(
     if remaining <= 0:
         return "not run (over budget)", True
     allowance = min(spec.mutant_seconds, remaining)
-    result = _run_unittest(copy_root, tests, allowance)
+    result = _run_unittest(root, copy_root, tests, allowance)
     outcome = _outcome(result, function)
     over_budget = (
         outcome == "timed out" and allowance < spec.mutant_seconds
@@ -1024,11 +1021,11 @@ def _run_function(
     generated = _generated_mutations(mutations)
     if _remaining(start, spec) <= 0:
         return records + _not_run_records(function, generated, tests), [], False
-    if not generated:
-        return records, [], True
     if not _baseline(function, tests, root, work, numbers[0], spec, start):
         return records + _not_run_records(function, generated, tests), [], False
     numbers[0] += 1
+    if not generated:
+        return records, [], True
     return _run_generated(
         function, generated, tests, spec, start,
         root, work, numbers, records,

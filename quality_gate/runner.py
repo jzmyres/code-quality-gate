@@ -251,11 +251,16 @@ def _proc_group_member(path: str, group: int) -> bool:
 
 
 def _fields_of(name: str) -> list[str] | None:
-    """One process's /proc fields, or None when it is gone or unreadable."""
+    """One process's /proc fields, or None when its record has disappeared."""
     try:
         return _proc_fields(f"/proc/{name}/stat")
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
+    except OSError as error:
+        raise OSError(
+            f"cannot read the process record for pid {name}: "
+            f"{type(error).__name__}: {error}"
+        ) from error
 
 
 def _child_pid(name: str, pid: int) -> int | None:

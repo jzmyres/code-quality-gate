@@ -166,6 +166,24 @@ class MutationCase(FixtureCase):
             for finding in check["findings"]
         ), check["findings"])
 
+    def assert_unlisted_baseline_error(
+        self, source: str, test_source: str
+    ) -> dict[str, Any]:
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": source,
+            "tests/test_app.py": test_source,
+        })
+        result, document, check = self.run_mutation(env={
+            "QG_FIXTURE_UNLISTED": "1",
+        })
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("test_reads_unlisted_variable", check["reason"])
+        self.assertIn("allowlisted", check["reason"])
+        return check
+
 
 class OperatorTests(MutationCase):
     def test_each_operator_generates_its_mutant(self) -> None:
@@ -1095,6 +1113,30 @@ class UnlistedTests(unittest.TestCase):
 """
 
 
+SUPPRESSED_ONLY = """\
+def documented():
+    "Only a docstring."
+"""
+
+
+SUPPRESSED_ONLY_TEST = """\
+import os
+import pathlib
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import documented
+
+
+class SuppressedTests(unittest.TestCase):
+    def test_reads_unlisted_variable(self):
+        os.environ["QG_FIXTURE_UNLISTED"]
+        documented()
+"""
+
+
 SPIN = """\
 def spin(value):
     while value > 0:
@@ -1132,6 +1174,41 @@ class DetachedTests(unittest.TestCase):
 """
 
 
+SOURCE_PATH_TOOL = """\
+#!/usr/bin/env python3
+import pathlib
+
+(pathlib.Path(__file__).parent / "written").write_text("written")
+"""
+
+
+SOURCE_PATH_TEST = """\
+import pathlib
+import shutil
+import subprocess
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from pkg.app import classify
+
+
+class SourcePathTests(unittest.TestCase):
+    def test_the_source_path_entry_is_the_copy_entry(self):
+        tool = shutil.which("source-tool.py")
+        self.assertIsNotNone(tool)
+        self.assertEqual(pathlib.Path(tool).parent.parent, pathlib.Path.cwd())
+        subprocess.run([tool], check=True)
+        self.assertTrue(
+            (pathlib.Path.cwd() / "source-bin" / "written").exists()
+        )
+        self.assertEqual(classify(1), "positive")
+        self.assertEqual(classify(0), "other")
+        self.assertEqual(classify(-1), "other")
+"""
+
+
 def _process_running(pid: int) -> bool:
     try:
         state = Path(f"/proc/{pid}/stat").read_text(
@@ -1158,20 +1235,29 @@ class IsolationTests(MutationCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(check["outcome"], "pass", output(result))
 
-    def test_an_unlisted_variable_is_an_allowlisted_baseline_error(self) -> None:
+    def test_a_path_entry_inside_the_source_is_the_copy_entry(self) -> None:
+        self.add_file(
+            "source-bin/source-tool.py", SOURCE_PATH_TOOL
+        ).chmod(0o755)
         self.base_commit()
         self.commit({
             "pkg/app.py": CLASSIFY,
-            "tests/test_app.py": UNLISTED_ENVIRONMENT_TEST,
+            "tests/test_app.py": SOURCE_PATH_TEST,
         })
-        result, document, check = self.run_mutation(env={
-            "QG_FIXTURE_UNLISTED": "1",
+        result, _document, check = self.run_mutation(env={
+            "PATH": (
+                f"{self.repo / 'source-bin'}{os.pathsep}{os.environ['PATH']}"
+            ),
         })
-        self.assertEqual(result.returncode, 2, output(result))
-        self.assertEqual(document["decision"], "error")
-        self.assertEqual(check["outcome"], "error")
-        self.assertIn("test_reads_unlisted_variable", check["reason"])
-        self.assertIn("allowlisted", check["reason"])
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass", output(result))
+        self.assertFalse((self.repo / "source-bin/written").exists())
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+
+    def test_an_unlisted_variable_is_an_allowlisted_baseline_error(self) -> None:
+        self.assert_unlisted_baseline_error(
+            CLASSIFY, UNLISTED_ENVIRONMENT_TEST
+        )
 
     def test_a_detached_child_is_gone_after_the_mutant_times_out(self) -> None:
         pids_file = self.base / "detached-pids.txt"
@@ -1258,6 +1344,35 @@ class NonlocalTests(unittest.TestCase):
 """
 
 
+MATCH_PATTERN = """\
+def matched(value):
+    match value:
+        case 1:
+            return "one"
+        case _:
+            return "other"
+"""
+
+
+LONG_CONDITION = """\
+def long_condition(first, second, third):
+    if (
+        first == second
+        and third
+    ):
+        return 1
+    return 2
+"""
+
+
+DELETE_STATEMENT = """\
+def process(value):
+    total = value + 1
+    total = total * 2
+    return total
+"""
+
+
 class GeneratorTests(unittest.TestCase):
     def generated(
         self, source: str, limit: int = 100,
@@ -1290,6 +1405,43 @@ class GeneratorTests(unittest.TestCase):
             record = by_line[line]
             self.assertEqual(record.operator, operator, record)
             self.assertEqual(record.mutated_line, text, record)
+
+    def test_a_changed_match_pattern_shows_the_changed_case(self) -> None:
+        _function, records = self.generated(MATCH_PATTERN)
+        changed = next(
+            record for record in records
+            if record.operator == "n+1" and record.line == 3
+        )
+        self.assertEqual(changed.mutated_line, "case 2:")
+
+    def test_a_comparison_in_a_long_condition_shows_its_expression(
+        self,
+    ) -> None:
+        _function, records = self.generated(LONG_CONDITION)
+        changed = next(
+            record for record in records
+            if record.operator == "!=" and record.line == 3
+        )
+        self.assertEqual(changed.mutated_line, "first != second")
+
+    def test_a_deleted_statement_shows_its_first_line(self) -> None:
+        _function, records = self.generated(DELETE_STATEMENT)
+        deleted = next(
+            record for record in records
+            if record.operator == "delete" and record.line == 3
+        )
+        self.assertEqual(
+            deleted.mutated_line, "deleted: total = total * 2"
+        )
+
+    def test_a_changed_constant_shows_its_original_line(self) -> None:
+        source = "def constant():\n    value = 1\n    return value\n"
+        _function, records = self.generated(source)
+        changed = next(
+            record for record in records
+            if record.operator == "n+1" and record.line == 2
+        )
+        self.assertEqual(changed.mutated_line, "value = 2")
 
     def test_a_signed_integer_literal_is_one_constant(self) -> None:
         source = "def signed():\n    return -1\n"
@@ -1563,22 +1715,12 @@ class ContractTests(unittest.TestCase):
         mutated = python_mutation._ast_mutated(module, index, change)
         self.assertEqual(ast.unparse(mutated), "def only():\n    pass")
 
-    def test_enclosing_statement_finds_the_containing_statement(self) -> None:
-        source = "def work():\n    return 1 + 2\n"
-        function = ast.parse(source).body[0]
-        parents = python_mutation._parents(function)
-        statement = function.body[0]
-        change = python_mutation._Change(
-            "n+1", statement.value, "3", ast.Constant(value=3)
-        )
-        self.assertIs(
-            python_mutation._enclosing_statement(change, parents), statement
-        )
-
     def test_mutated_line_and_generated_rule_use_the_ast(self) -> None:
-        module, _function, index, parents, change = self.work_ast_change()
+        module, _function, index, _parents, change = self.work_ast_change()
         self.assertEqual(
-            python_mutation._mutated_line(change, parents, False),
+            python_mutation._mutated_line(
+                change, "def work():\n    return 1\n"
+            ),
             "return 2",
         )
         mutated = ast.unparse(
@@ -1626,7 +1768,7 @@ class ContractTests(unittest.TestCase):
         module, function, index, parents, change = self.work_ast_change()
         mutation = python_mutation._mutation(
             function, change, parents, module, index,
-            "pkg/app.py", ast.unparse(module),
+            "pkg/app.py", ast.unparse(module), ast.unparse(module),
         )
         self.assertEqual((mutation.operator, mutation.line), ("n+1", 2))
         self.assertIsNone(mutation.rule)
@@ -1661,11 +1803,28 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(path, root / "home")
             self.assertTrue(path.is_dir())
 
+    def test_inherited_path_moves_source_entries_into_the_copy(self) -> None:
+        source_root, copy_root = self.source_tree(
+            "def work():\n    return 1\n"
+        )
+        (source_root / "bin").mkdir()
+        with mock.patch.dict(os.environ, {
+            "PATH": f"{source_root / 'bin'}{os.pathsep}/usr/bin",
+        }, clear=True):
+            path = python_mutation._inherited_path(source_root, copy_root)
+        self.assertEqual(
+            path, f"{copy_root / 'bin'}{os.pathsep}/usr/bin"
+        )
+
     def test_environment_is_the_allowlist_with_paths_inside_the_copy(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as source_directory, (
+            tempfile.TemporaryDirectory()
+        ) as directory:
+            source_root = Path(source_directory)
             copy_root = Path(directory)
+            (source_root / "bin").mkdir()
             with mock.patch.dict(os.environ, {
-                "PATH": "/bin",
+                "PATH": f"{source_root / 'bin'}{os.pathsep}/bin",
                 "LANG": "C",
                 "LC_ALL": "C.UTF-8",
                 "PWD": "/src",
@@ -1673,12 +1832,17 @@ class ContractTests(unittest.TestCase):
                 "OTHER": "/tmp",
                 "QG_PYTHON": "inherited",
             }, clear=True):
-                environment = python_mutation._environment(copy_root)
+                environment = python_mutation._environment(
+                    source_root, copy_root
+                )
             self.assertEqual(set(environment), {
                 "PATH", "LANG", "LC_ALL", "QG_PYTHON",
                 "PYTHONDONTWRITEBYTECODE", "PWD", "HOME", "TMPDIR",
             })
-            self.assertEqual(environment["PATH"], "/bin")
+            self.assertEqual(
+                environment["PATH"],
+                f"{copy_root / 'bin'}{os.pathsep}/bin",
+            )
             self.assertEqual(
                 json.loads(environment["QG_PYTHON"]),
                 [sys.executable, "-I", "-B"],
@@ -1815,7 +1979,7 @@ class ContractTests(unittest.TestCase):
 
     def test_run_one_test_past_its_deadline_is_a_budget_result(self) -> None:
         result = python_mutation._run_one_test(
-            Path("."), "tests/test_app.py", time.monotonic() - 1
+            Path("."), Path("."), "tests/test_app.py", time.monotonic() - 1
         )
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.argv, tuple(
@@ -2014,14 +2178,20 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(records[0]["outcome"], "not run (over budget)")
         self.assertEqual(findings, [])
 
-    def test_run_function_without_generated_mutants_finishes(self) -> None:
+    def test_run_function_without_generated_mutants_runs_the_baseline(
+        self,
+    ) -> None:
         source = "def empty():\n    0\n"
         function = self.function(source)
-        records, findings, finished = python_mutation._run_function(
-            function, ("tests/test_app.py",), source,
-            python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10),
-            time.monotonic(), Path("."), Path("."), [0],
-        )
+        with mock.patch.object(
+            python_mutation, "_baseline", return_value=True
+        ) as baseline:
+            records, findings, finished = python_mutation._run_function(
+                function, ("tests/test_app.py",), source,
+                python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10),
+                time.monotonic(), Path("."), Path("."), [0],
+            )
+        baseline.assert_called_once()
         self.assertTrue(finished)
         self.assertTrue(records)
         self.assertEqual(findings, [])
@@ -2073,6 +2243,8 @@ class ContractTests(unittest.TestCase):
                 python_mutation, "_source_for", return_value=(
                     "def empty():\n    0\n"
                 ),
+            ), mock.patch.object(
+                python_mutation, "_baseline", return_value=True
             ):
                 records, findings, unfinished = python_mutation._measure(
                     context,
@@ -2275,6 +2447,11 @@ class BaselineTests(MutationCase):
         })
         check = self.assert_check_error()
         self.assertIn("original tests do not pass", check["reason"])
+
+    def test_a_suppressed_only_function_still_runs_the_baseline(self) -> None:
+        self.assert_unlisted_baseline_error(
+            SUPPRESSED_ONLY, SUPPRESSED_ONLY_TEST
+        )
 
     def test_a_baseline_cut_by_run_seconds_is_over_budget(self) -> None:
         self.write_config(mutation_config(

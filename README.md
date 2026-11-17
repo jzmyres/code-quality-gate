@@ -799,7 +799,9 @@ The operator label in a finding is the new spelling (`!=`, `>=`, `or`, `return F
 operator's complement and its display text. Each mutant is produced by applying the change to the
 module's syntax tree and printing it with `ast.unparse`, then compiled with
 `compile(source, PATH, "exec")`; a mutant that does not compile is not generated. Messages keep
-the original line numbers and show the original line with the mutated expression. At most
+the original line numbers and show the changed expression (`ast.unparse` of the changed node)
+substituted into the original source line it came from; a deleted statement is shown as
+`deleted: <first line of the statement>`. At most
 `function_mutants` mutants are generated per function: the first that many generated mutants
 ordered by source position (line, then column), not counting a suppressed candidate.
 
@@ -828,17 +830,23 @@ mutant is written to a copy of the repository in a temporary directory; the work
 written. The mutant run, and the baseline run of the unmutated copy, get a fresh allowlisted
 environment: `PATH`, `LANG` and `LC_ALL` from the gate's own environment, the `QG_PYTHON` and
 `PYTHONDONTWRITEBYTECODE` values `_test_environment` adds, and `PWD`, `HOME` and `TMPDIR` set to
-directories inside the copy. No other variable is inherited, so no inherited path or relative
-traversal can reach the source tree. A baseline that fails in this environment is a check error
-naming the failing test and saying the mutation environment is allowlisted, never a pass. The
-selected test files run in that copy with the bounded runner as
+directories inside the copy. Each `PATH` entry is resolved with `os.path.realpath`; an entry
+inside the source repository is replaced by the same relative path inside the copy, and every
+other entry is kept. No other allowlisted value is a path the gate does not set itself, and no
+other variable is inherited, so no inherited path or relative traversal can reach the source
+tree. The baseline runs once for every changed function that has tests, whether or not any
+mutant is generated. A baseline that fails in this environment is a check error naming the
+failing test and saying the mutation environment is allowlisted, never a pass. The selected test
+files run in that copy with the bounded runner as
 `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
 
 Each run makes the check process a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)` on Linux). After
 the mutant's process group is stopped, every remaining descendant the check adopted is stopped and
-reaped, including a child a test started with `start_new_session=True`. Where the subreaper is
-unavailable, or the process table cannot be enumerated to confirm the adopted descendants stopped,
-the check is an error naming why, never a pass or a completed run.
+reaped, including a child a test started with `start_new_session=True`. A process record counts as
+gone only when reading it raises `FileNotFoundError` or `ProcessLookupError`; any other failure to
+read a record is a check error naming the pid and the failure. Where the subreaper is unavailable,
+or the process table cannot be enumerated to confirm the adopted descendants stopped, the check is
+an error naming why, never a pass or a completed run.
 
 `mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
 mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering
@@ -853,7 +861,10 @@ never a pass.
 
 A surviving mutant is one finding, value `1` against threshold `0`, with the exact message:
 
-    python-mutation: FILE:LINE FUNCTION survives OPERATOR (MUTATED LINE); tests run: FILES. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.
+    python-mutation: FILE:LINE FUNCTION survives OPERATOR (CHANGED EXPRESSION IN ITS ORIGINAL LINE); tests run: FILES. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.
+
+The parenthetical is the changed expression itself, substituted into the original source line,
+or `deleted: <first line of the statement>`; `FILE:LINE` is that line's original number.
 
 For example, a weak test that only asserts the result is one of the possible strings:
 
