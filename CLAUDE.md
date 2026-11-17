@@ -4,8 +4,8 @@ A reusable, offline code-quality gate any repository can run, built to keep AI-w
 quality and maintainable. Consuming repositories pin it as a git submodule and declare their own
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
 implementation is the `quality_gate/` package (`policy`, `adapters`, `command`, `files`, `tools`, `runner`,
-`ratchet`, `clones`, `source_chars`, `removal_symmetry`, `output_patterns`,
-`python_tests`, `python_crap`, `python_shape`, `elisp_tests`, `elisp_crap`, `elisp_lint`, `elisp/qg-elisp-child.el`,
+`ratchet`, `clones`, `source_chars`, `output_patterns`,
+`python_tests`, `python_crap`, `python_shape`, `variant_dispatch`, `elisp_tests`, `elisp_crap`, `elisp_lint`, `elisp/qg-elisp-child.el`,
 `elisp/qg-elisp-complexity.el`, `elisp/qg-elisp-lint.el`, `verification`, `covrun`,
 `coverage_tool`, `checks`, `gate_result`,
 `trust`, `cli`);
@@ -18,8 +18,8 @@ allowed to import adapters.
 absolute trusted directory; `docs/TRUST.md` is the contract.
 
 Policy declares `schema = 2`, code classes with their `checks`, and one `[checks.ID]` table per check
-(`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `python_shape`, `elisp_crap`,
-`elisp_compile`, `elisp_checkdoc` or `verification`). Adapters declare evidence
+(`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `python_shape`,
+`variant_dispatch`, `elisp_crap`, `elisp_compile`, `elisp_checkdoc` or `verification`). Adapters declare evidence
 (`tests`, `crap`, `duplication`, `static`) and the result reports one obligation per code class and
 required tier.
 Adapters measure subjects; the core in `ratchet.py` decides raw outcome, policy satisfaction, expiry,

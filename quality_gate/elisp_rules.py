@@ -7,6 +7,10 @@ from typing import Any
 from .policy import _check_keys, _config_error, _optional_table, _string_list
 
 
+# The two families whose forms may repeat a form from another family; one
+# table, read by the default rules and by their validation.
+REPEATED_FAMILIES = ("loop_clauses", "catch_all")
+
 DEFAULT_RULES = {
     "branch": ("if", "when", "unless", "while", "dolist", "dotimes", "cl-dolist", "cl-dotimes",
                "cl-do", "cl-do*", "dolist-with-progress-reporter", "ignore-errors", "bound-and-true-p"),
@@ -16,9 +20,11 @@ DEFAULT_RULES = {
     "handlers": ("condition-case", "condition-case-unless-debug"),
     "case": ("pcase", "pcase-exhaustive", "cl-case", "cl-ecase", "cl-typecase"),
     "loop": ("cl-loop",),
-    "loop_clauses": ("when", "if", "unless", "while", "until", "always", "never", "thereis"),
-    "catch_all": ("t", "_", "otherwise"),
 }
+DEFAULT_RULES[REPEATED_FAMILIES[0]] = (
+    "when", "if", "unless", "while", "until", "always", "never", "thereis",
+)
+DEFAULT_RULES[REPEATED_FAMILIES[1]] = ("t", "_", "otherwise")
 
 
 def _valid_symbol(value: str) -> bool:
@@ -42,7 +48,7 @@ def _symbols(raw: dict[str, Any], family: str, path: Path, key: str) -> tuple[st
 def _validate_families(rules: dict[str, tuple[str, ...]], path: Path, key: str) -> None:
     seen: dict[str, str] = {}
     for family, values in rules.items():
-        if family in ("loop_clauses", "catch_all"):
+        if family in REPEATED_FAMILIES:
             continue
         for index, value in enumerate(values):
             if value in seen:

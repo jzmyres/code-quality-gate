@@ -27,7 +27,7 @@ from .policy import (
     _config_from_data,
 )
 from .ratchet import BaselineEntry, FindingResult, RatchetResult
-from .runner import RunResult, run
+from .runner import RunResult, execution_outcome, run
 
 
 GIT_BUDGET_SECONDS = 60.0
@@ -497,9 +497,10 @@ def _git(root: Path, *args: str) -> RunResult:
 
 
 def _failure(result: RunResult) -> str:
-    if result.execution == "error":
+    outcome = execution_outcome(result.execution)
+    if outcome.error:
         return str(result.error)
-    if result.execution != "completed":
+    if not outcome.completed:
         return f"git {result.execution}"
     return result.stderr_text.strip() or f"git exited {result.returncode}"
 

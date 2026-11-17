@@ -89,13 +89,13 @@ the configuration, `adapters.py` declares every adapter once in its descriptor a
 supported-adapter registry, `files.py` resolves the repository and runs inventory and hygiene,
 `tools.py` owns the pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning,
 `clones.py` measures jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage,
-`python_crap.py` joins coverage with `ast` complexity, `elisp_tests.py` and
+`python_crap.py` joins coverage with `ast` complexity, `variant_dispatch.py` refuses a
+vocabulary listed in two places and a format guessed by trial, `elisp_tests.py` and
 `elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `elisp_crap.py` and
 `elisp/qg-elisp-complexity.el` join that coverage with the Emacs Lisp default or policy decision rules,
 `elisp_lint.py` and `elisp/qg-elisp-lint.el` run byte compilation and checkdoc,
 `verification.py` measures test counts and source exclusions,
 `source_chars.py` rejects invisible control characters in selected source,
-`removal_symmetry.py` reports removed definitions and strings that tests or docs still retain,
 `coverage_tool.py` loads and combines the pinned wheel's data,
 `runner.py` is the one bounded subprocess runner, `checks.py` runs every adapter and assembles the
 result, `gate_result.py` computes identity, obligations and the decision, `trust.py` owns
@@ -306,64 +306,6 @@ A file that does not decode as UTF-8 is a finding, never a pass. It uses the sub
 `PATH:decode`, reports the first invalid byte offset and its line and column, and can be baselined
 like any other subject. Do not baseline a bare CR that changes line-ending behaviour: replace it
 with an explicit escape or remove it.
-
-### Removed-token checks
-
-    [checks.removal-symmetry]
-    adapter = "removal_symmetry"
-    tier = 1
-    enforcement = "advisory"
-    scope = "changed"                   # all | changed
-    base = "HEAD^"                      # used when scope = "changed"
-    search_untracked = true
-    min_token_chars = 16
-    token_kinds = ["definition", "string"]
-    scan_classes = ["python", "test", "config", "build", "doc"]
-    exclude_paths = ["VERIFICATION.md", "plans/**", "archive/**", "CHANGELOG*"]
-    baseline = "quality-gate-removal-symmetry.toml"  # optional; must name an existing file
-
-`removal-symmetry` reads the files of every class that lists it, takes the tokens the diff from
-`base` removed, and searches the current tree for each one. A removing path is classified from the
-diff's old path by the same rules, so a file the commit deleted still contributes its removals even
-though it is absent from the search tree. Tokens the same diff adds anywhere are not removed tokens
-and produce no finding. A definition is Elisp `defun`, `defsubst`, `defmacro`, `cl-defun`,
-`defvar`, `defconst` or `defcustom`, or Python `def`, `async def`, `class` or a module-level
-assignment; its name is matched on identifier boundaries. A string token is a single-line literal of
-at least `min_token_chars` characters, with its quote delimiters removed and escaped quotes
-unescaped; other escape sequences are not normalized. `token_kinds` may restate `definition` and
-`string` but cannot change that pair. Multi-line strings are not extracted.
-
-`scan_classes` is the search domain, so tests and docs can be searched even when they do not list the
-check themselves; when omitted, every class is searched. `exclude_paths` are `fnmatch` globs
-applied to both the parsed removals and the search tree; history notes, plans and changelogs belong
-there or in the baseline. The baseline file itself is never searched. With `scope = "changed"` only
-removals from files of classes that list the check are parsed; `scope = "all"` parses the whole
-diff. Both search the same `scan_classes` domain. `search_untracked = false` removes untracked
-files from that domain. The diff runs with fixed `a/` and `b/` prefixes and `core.quotePath=false`,
-so `diff.mnemonicPrefix` and non-ASCII paths do not change the result; a path Git still quotes is a
-configuration error naming it. An invalid base and a missing scanned file are configuration errors,
-never passes. A scanned file that does not decode as UTF-8 is reported as `PATH:not-measured` and the
-check still completes.
-
-Each finding has a `subject` of `TOKEN@PATH`, a `value` equal to the number of remaining
-occurrences, a `location` of `PATH:LINE` for the first occurrence, and a `measurement` containing
-the token, its kind, the removing files and every occurrence. The threshold is `0`, so a justified
-remaining copy needs a baseline entry with a reason:
-
-    check = "removal-symmetry"
-    metric_version = "removal-symmetry/1"
-
-    [[entry]]
-    subject = "allow this window with@tests/test_agent_usage.py"
-    bound = 1
-    reason = "fixture intentionally exercises the old prompt; removing it would lose the negative case"
-
-With `enforcement = "advisory"` (the shipped setting) it reports its findings with
-`outcome = "fail"`, but the gate decision is `accepted_with_exceptions` and the exit status stays
-`0`. With `enforcement = "enforced"` an uncovered finding rejects the gate. It may be promoted to
-`enforced` only after replaying a commit range measures its false-positive rate and the designer
-decides that rate is acceptable. Record the measured rate and that decision with the promotion; do
-not pick an enforcement setting from one commit.
 
 ### Python tests
 
@@ -591,7 +533,8 @@ capture name, `_`, or an or-pattern with an irrefutable alternative, so `case re
 `case 1 | _` add nothing, like `case _`. Nested function and lambda bodies add to the enclosing
 function. A function's own CC counts only its executable body: defaults, decorators and annotations
 count once, in the owner where they execute (the enclosing function, or the module subject for a
-module-level definition). The rules are one data table in `quality_gate/python_crap.py`.
+module-level definition). The construct rules and the named-table selections are data tables in
+`quality_gate/python_crap.py`.
 
 | Construct | Decisions added |
 |---|---|
@@ -603,8 +546,8 @@ module-level definition). The rules are one data table in `quality_gate/python_c
 | `and`/`or` | One per operand after the first. |
 | `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements, recursively, so an empty one adds none. |
 | subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
-| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. |
-| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing. |
+| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. The same subscript of a name bound in the same module or function to a dict display whose keys are all booleans or tuples of booleans counts the same way. |
+| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, when it counts like the display. |
 | `getattr` with three arguments | One, the default is a branch. |
 | `next` with two arguments | One, the default is a branch. |
 | a string literal or tuple/list display multiplied by a non-constant on either side | One, the repetition chooses a length or count. |
@@ -732,6 +675,88 @@ gives the main commit it lands on, and CI gives the pushed commits. A gate run r
 that moves during the run cannot make checks judge different changes. The variable must name a
 commit: an existing tree or blob is a configuration error that names the variable and its value,
 never a fallback to the policy `base`.
+
+### Variant dispatch
+
+    [checks.variant-dispatch]
+    adapter = "variant_dispatch"
+    tier = 1
+    enforcement = "enforced"
+    scope = "tree"                        # tree or changed
+    base = "HEAD"                         # optional; the diff base, used with changed
+
+`variant-dispatch` refuses the same vocabulary of names written in two places: two functions
+dispatching on it, a function and a table, or two tables, so every vocabulary lives in one declared
+table read through one path. It has no baseline, threshold or exemption key: every finding is value
+`1` against threshold `0`, its metric version is `variant-dispatch/1` and its evidence is `static`.
+
+Every selected Python file is parsed with `ast` and every selected shell file - a `*.sh` file or a
+script whose shebang names `sh` or `bash` - is read line by line. An owner is a function (qualified
+`FILE:Class.method` or `FILE:function`), a module-level table, a shell function, or a shell file's
+top-level statements (one owner per file). An owner's set is the union of its literal sets, and a
+literal set is the string literals of one of these:
+
+* Python: the literals one function compares with `==`, `!=`, `in` or `not in` against the same
+  subject (the same name, attribute chain or subscript, compared by `ast.dump`); a literal tuple,
+  list or set display used with `in` or `not in` against a non-constant; a `match` statement's
+  literal case patterns; a dict display whose keys are all string literals, at least two of them,
+  that is subscripted, or read with `.get`, by a non-constant.
+* A declared table: a module-level assignment (or annotated assignment) to a name whose value is a
+  dict display with all string keys, or a tuple, list, set or `frozenset(...)` display of string
+  elements, with at least two literals; its set is its keys or elements, and a nested tuple, list or
+  set element contributes its string literals.
+* Shell: a `case SUBJECT in` block's literal pattern alternatives (a bare word
+  `[A-Za-z0-9_][A-Za-z0-9_.:+-]*` or a quoted word; patterns with `*`, `?`, `[` or `$` are not
+  literals); the right-hand words of `[[ $X == word ]]`, `[[ $X != word ]]`, `[[ $X = word ]]` and
+  `[ "$X" = word ]` grouped by the normalised subject (`${X:-}` and `$X` are `X`); a top-level
+  array assignment `NAME=(a b c)` of literal words, at least two, as a declared table.
+
+A literal counts only if it contains a letter, so numbers, exit codes and the empty string never form
+a vocabulary. A literal set with fewer than two literals is not a vocabulary and contributes
+nothing. Two owners are linked when their sets share at least two literals. Each connected group
+of linked owners is one finding, `VSD`, whose subject is the sorted shared literals and whose message
+is exactly:
+
+    VSD variant-dispatch: "a", "b", ... are listed in N places: FILE:LINE NAME (function|table|top level), ...
+    Declare this vocabulary once, in one table, and read every per-variant difference through it.
+
+The owners appear in file and line order. The JSON `measurement` carries `literals` and `owners`,
+each owner with its `path`, `line`, qualified `name`, `kind` and own sorted `literals`.
+
+`scope = "tree"` (the default) reports every finding. `scope = "changed"` reports a finding only when
+one of its owners is a function or table the diff from `base` adds or changes; the whole tree is
+still read to find the other owners. `base` defaults to `HEAD`. An invalid base is a check error,
+never a pass.
+
+The shell reader is line based: a function is `name() {` at column 0 to the matching `}` at column 0.
+Here-documents are not read, and a test split over a continuation line is not read. A case block's
+patterns and an array assignment must each be written on the lines the reader sees.
+
+The same adapter reports `TRIAL`, Python only: a function that calls two or more different
+module-level functions of its own module on the same first argument as a fallback chain and returns
+the first non-empty result, in one of three forms: `f(x) or g(x)`; `v = f(x)` then
+`if v is None` or `if not v` and then `g(x)`; or a `try` around `f(x)` whose handler calls
+`g(x)`. It is reported only when the callees have the same return annotation and their names differ
+only in tokens that are literals of a declared table of the same module (a format-name table). Its
+message is exactly:
+
+    TRIAL variant-dispatch: FILE:LINE FUNCTION tries F then G on ARG; select the reader from the table that names the formats, by the record's declared format, instead of trying each.
+
+Two functions that compare a kind with `"alpha"` and `"beta"` are one finding whose remedy is one
+table:
+
+    def first(kind):
+        if kind == "alpha":
+            return 1
+        if kind == "beta":
+            return 2
+
+    def second(kind):
+        return {"alpha": 1, "beta": 2}[kind]
+
+    VSD variant-dispatch: "alpha", "beta" are listed in 2 places: pkg/app.py:1 first (function), pkg/app.py:7 second (function)
+    Declare this vocabulary once, in one table, and read every per-variant difference through it.
+
 
 ### Emacs Lisp CRAP
 
@@ -1018,8 +1043,9 @@ with a traceback.
 
 ### Locations
 
-The `python_crap`, `elisp_crap` and `clones` adapters provide complete locations: respectively the entire
-function range (including Python decorators) and both ranges of every clone in a fingerprint group.
+The `python_crap`, `variant_dispatch`, `elisp_crap` and `clones` adapters provide complete locations:
+respectively the entire function range (including Python decorators), every owner range of a
+vocabulary and a trial reader's caller, and both ranges of every clone in a fingerprint group.
 CRAP's module subject uses the span from its first to last outside-function node; that conservative
 span can include intervening functions. Verification supplies every inline and file-wide suppression
 line, one location per directive, but its test-count metrics have no source location. Command checks,
@@ -1176,19 +1202,6 @@ and the allowed keys. The complete shape is:
     # deny = ["nul", "bare-cr", "esc", "del", "c1", "bidi"]
     baseline = "quality-gate-source-chars.toml"  # optional; must name an existing file
 
-    [checks.removal-symmetry]
-    adapter = "removal_symmetry"
-    tier = 1
-    enforcement = "advisory"
-    scope = "changed"                     # optional; all or changed
-    base = "HEAD^"                        # optional; used with changed
-    search_untracked = true               # optional
-    min_token_chars = 16                  # optional
-    token_kinds = ["definition", "string"]  # optional; this is the fixed pair
-    scan_classes = ["python", "test", "config", "build", "doc"]
-    exclude_paths = ["VERIFICATION.md", "plans/**", "archive/**", "CHANGELOG*"]
-    baseline = "quality-gate-removal-symmetry.toml"  # optional; must name an existing file
-
     [checks.tests]
     adapter = "python_tests"
     tier = 1
@@ -1216,6 +1229,13 @@ and the allowed keys. The complete shape is:
     max_chain = 6                         # optional; this is the default
     clone_min_tokens = 30                 # optional; 20-49; this is the default
     clone_similarity = 0.95               # optional; 0.5-1.0; this is the default
+
+    [checks.variant-dispatch]
+    adapter = "variant_dispatch"
+    tier = 1
+    enforcement = "enforced"
+    scope = "tree"                        # optional; tree or changed
+    base = "HEAD"                         # optional; used with changed
 
     [checks.verification]
     adapter = "verification"
@@ -1277,18 +1297,6 @@ Notes:
   `include_untracked = false`. A file that is not valid UTF-8 reports `PATH:decode`. For a
   `changed` scope, `QG_DIFF_BASE` replaces `base`, and the check's measurement names the commit
   it judged and whether `QG_DIFF_BASE` or the policy key named it.
-* A `removal_symmetry` check may name a `baseline` path, which must exist; without one it accepts
-  no baseline entries. Its files come from the classes that list it and supply the diff scope; a
-  removing path is classified by rule from the diff's old path, so a
-  deleted file still contributes its removals. `scan_classes` is the search domain (all classes
-  when omitted), and `exclude_paths` are globs. `scope` defaults to `changed`; `base` defaults
-  to `HEAD^`; `min_token_chars` defaults to 16; `search_untracked = false` removes untracked
-  files from the search domain. `token_kinds` is the fixed pair `definition` and `string`. Tokens
-  the same diff adds anywhere are not reported. `QG_DIFF_BASE` replaces `base`, and the check's
-  measurement names the commit it judged and whether `QG_DIFF_BASE` or the policy key named it.
-  The check ships advisory: with
-  `enforcement = "advisory"` its findings are reported but never fail the gate; with `enforced`
-  an uncovered finding rejects the gate.
 * A `python_tests` check needs `run` and a one-group `tests_pattern`; `skipped_pattern` is optional
   with one group. Its `{python}` token and `QG_PYTHON` export are described above.
 * A `python_crap` check needs `requires`, naming one `python_tests` check declared earlier in the
@@ -1309,6 +1317,8 @@ Notes:
   `threshold` of the `python_crap` check `crap_check` names. `QG_DIFF_BASE` replaces `base` in
   both scopes, and the check's measurement names the commit it judged and whether `QG_DIFF_BASE`
   or the policy key named it.
+* A `variant_dispatch` check takes no `baseline` key: every finding is enforced. `scope` is
+  `tree` (the default) or `changed`; `base` defaults to `HEAD` and is used with `changed`.
 * A `verification` check may name a `baseline` path, which must exist; without one it accepts no
   baseline entries. Its optional `requires` names an earlier check with `tests` evidence:
   `python_tests`, `elisp_tests`, or a `command` with `tests_pattern`.

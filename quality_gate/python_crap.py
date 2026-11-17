@@ -47,6 +47,7 @@ class MeasuredFunction:
         node: ast.FunctionDef | ast.AsyncFunctionDef,
         path: str,
         prefix: str,
+        module_tables: dict[str, int] | None = None,
     ) -> MeasuredFunction:
         identity = _function_identity(node, prefix)
         return cls(
@@ -56,7 +57,7 @@ class MeasuredFunction:
             node=node,
             start_line=_start_line(node),
             end_line=node.end_lineno or node.lineno,
-            cc=_function_complexity(node),
+            cc=_function_complexity(node, module_tables),
         )
 
 
@@ -147,6 +148,126 @@ def _dict_get(node: ast.Call) -> int:
     return keys + int(len(node.args) >= 2)
 
 
+def _boolean_key(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, bool)
+    if isinstance(node, ast.Tuple) and node.elts:
+        return all(
+            isinstance(element, ast.Constant)
+            and isinstance(element.value, bool)
+            for element in node.elts
+        )
+    return False
+
+
+def _boolean_keys(node: ast.AST) -> int | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    for key in node.keys:
+        if key is None or not _boolean_key(key):
+            return None
+    return len(node.keys)
+
+
+def _assignment_targets(statement: ast.AST) -> list[ast.Name]:
+    if isinstance(statement, ast.Assign):
+        return [
+            target for target in statement.targets
+            if isinstance(target, ast.Name)
+        ]
+    if (
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+    ):
+        return [statement.target]
+    return []
+
+
+def _record_boolean_table(
+    statement: ast.AST,
+    tables: dict[str, int],
+    valid: set[int],
+    invalid: set[str],
+) -> None:
+    keys = (
+        _boolean_keys(statement.value)
+        if statement.value is not None else None
+    )
+    for target in _assignment_targets(statement):
+        if keys is None:
+            invalid.add(target.id)
+        else:
+            valid.add(id(target))
+            tables[target.id] = keys
+
+
+def _collect_boolean_tables(
+    node: ast.AST,
+    tables: dict[str, int],
+    valid: set[int],
+    invalid: set[str],
+) -> None:
+    for child in ast.walk(node):
+        if isinstance(child, (ast.Assign, ast.AnnAssign)):
+            _record_boolean_table(child, tables, valid, invalid)
+
+
+def _record_rebindings(
+    node: ast.AST, valid: set[int], invalid: set[str]
+) -> None:
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Name)
+            and isinstance(child.ctx, ast.Store)
+            and id(child) not in valid
+        ):
+            invalid.add(child.id)
+
+
+def _boolean_tables(source: ast.AST | list[ast.AST]) -> dict[str, int]:
+    """The names bound in one scope to a dict display keyed by booleans."""
+    roots = [source] if isinstance(source, ast.AST) else source
+    tables: dict[str, int] = {}
+    valid: set[int] = set()
+    invalid: set[str] = set()
+    for root in roots:
+        _collect_boolean_tables(root, tables, valid, invalid)
+        _record_rebindings(root, valid, invalid)
+    return {
+        name: count
+        for name, count in tables.items()
+        if name not in invalid
+    }
+
+
+def _named_receiver(
+    display: ast.AST, tables: dict[str, int]
+) -> int:
+    if isinstance(display, ast.Name) and display.id in tables:
+        return tables[display.id]
+    return -1
+
+
+def _named_selection(node: ast.Subscript, tables: dict[str, int]) -> int:
+    keys = _named_receiver(node.value, tables)
+    if keys < 0 or _literal_flags(node.slice)[0]:
+        return 0
+    return max(0, keys - 1)
+
+
+def _named_get(node: ast.Call, tables: dict[str, int]) -> int:
+    if (
+        not isinstance(node.func, ast.Attribute)
+        or node.func.attr != "get"
+        or not node.args
+    ):
+        return 0
+    keys = _named_receiver(node.func.value, tables)
+    if keys < 0 or _literal_flags(node.args[0])[0]:
+        return 0
+    return max(0, keys - 1) + int(len(node.args) >= 2)
+
+
 _LOOP_CALL_COUNTS = {
     "map": 1,
     "filter": 2,
@@ -214,14 +335,34 @@ CC_RULES: tuple[
     (ast.BinOp, _repetition),
 )
 
+# Selections of a named table read the scope's boolean-keyed tables, so their
+# counters take that table beside the node.
+_BOUND_RULES: tuple[
+    tuple[type[ast.AST], Callable[[Any, dict[str, int]], int]], ...
+] = (
+    (ast.Subscript, _named_selection),
+    (ast.Call, _named_get),
+)
 
-def cyclomatic_complexity(node: ast.AST) -> int:
+
+def _count_rules(nodes: Any, tables: dict[str, int]) -> int:
     total = 1
-    for child in ast.walk(node):
+    for child in nodes:
         for kind, counter in CC_RULES:
             if isinstance(child, kind):
                 total += counter(child)
+        for kind, counter in _BOUND_RULES:
+            if isinstance(child, kind):
+                total += counter(child, tables)
     return total
+
+
+def cyclomatic_complexity(
+    node: ast.AST, tables: dict[str, int] | None = None
+) -> int:
+    if tables is None:
+        tables = _boolean_tables(node)
+    return _count_rules(ast.walk(node), tables)
 
 
 def _decorator_name(node: ast.AST) -> str | None:
@@ -330,11 +471,15 @@ def _start_line(
 
 def _function_complexity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_tables: dict[str, int] | None = None,
 ) -> int:
     # Defaults, decorators and annotations run at definition time and belong
     # to the enclosing owner, so only the executable body counts here.
+    tables = _boolean_tables(node.body)
+    if module_tables:
+        tables = {**module_tables, **tables}
     return cyclomatic_complexity(
-        ast.Module(body=node.body, type_ignores=[])
+        ast.Module(body=node.body, type_ignores=[]), tables
     )
 
 
@@ -345,12 +490,15 @@ def _collect_functions(
     found: list[MeasuredFunction],
     overload_names: set[str],
     typing_modules: set[str],
+    module_tables: dict[str, int],
 ) -> None:
     for node in nodes:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_overload(node, overload_names, typing_modules):
                 continue
-            found.append(MeasuredFunction.from_node(node, path, prefix))
+            found.append(MeasuredFunction.from_node(
+                node, path, prefix, module_tables
+            ))
             continue
         if isinstance(node, ast.ClassDef):
             _collect_functions(
@@ -360,6 +508,7 @@ def _collect_functions(
                 found,
                 overload_names,
                 typing_modules,
+                module_tables,
             )
             continue
         for child in ast.iter_child_nodes(node):
@@ -370,6 +519,7 @@ def _collect_functions(
                 found,
                 overload_names,
                 typing_modules,
+                module_tables,
             )
 
 
@@ -439,12 +589,7 @@ def _outside_nodes(tree: ast.Module) -> list[ast.AST]:
 
 
 def _outside_complexity(nodes: list[ast.AST]) -> int:
-    total = 1
-    for node in nodes:
-        for kind, counter in CC_RULES:
-            if isinstance(node, kind):
-                total += counter(node)
-    return total
+    return _count_rules(nodes, _boolean_tables(nodes))
 
 
 def _node_lines(nodes: list[ast.AST]) -> list[int]:
@@ -498,9 +643,10 @@ def _lambda_lines(node: ast.Lambda) -> tuple[int, ...]:
 
 
 def _lambda_subject(
-    node: ast.Lambda, relative: str
+    node: ast.Lambda, relative: str, module_tables: dict[str, int]
 ) -> MeasuredFunction | None:
-    cc = cyclomatic_complexity(node)
+    tables = {**module_tables, **_boolean_tables(node)}
+    cc = cyclomatic_complexity(node, tables)
     if cc == 1:
         return None
     return MeasuredFunction(
@@ -516,12 +662,12 @@ def _lambda_subject(
 
 
 def _lambda_subjects(
-    tree: ast.Module, relative: str
+    tree: ast.Module, relative: str, module_tables: dict[str, int]
 ) -> list[MeasuredFunction]:
     found: list[MeasuredFunction] = []
     for node in _outside_nodes(tree):
         if isinstance(node, ast.Lambda):
-            subject = _lambda_subject(node, relative)
+            subject = _lambda_subject(node, relative, module_tables)
             if subject is not None:
                 found.append(subject)
     return found
@@ -532,11 +678,13 @@ def collect_functions(
 ) -> list[MeasuredFunction]:
     tree = ast.parse(source, filename=relative)
     overload_names, typing_modules = _typing_overload(tree)
+    module_tables = _boolean_tables(_outside_nodes(tree))
     found: list[MeasuredFunction] = []
     _collect_functions(
-        [tree], "", relative, found, overload_names, typing_modules
+        [tree], "", relative, found, overload_names, typing_modules,
+        module_tables,
     )
-    found.extend(_lambda_subjects(tree, relative))
+    found.extend(_lambda_subjects(tree, relative, module_tables))
     module = _module_subject(tree, relative)
     if module is not None:
         found.append(module)

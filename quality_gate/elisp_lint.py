@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
 from .json_input import load_json
-from .runner import mark_step, run
+from .runner import execution_outcome, mark_step, run
 
 
 if TYPE_CHECKING:
@@ -129,13 +129,14 @@ def _failure(context: Any, start: float, reason: str, *, version: str | None = N
 
 
 def _execution_failure(context: Any, start: float, child: Any, version: str | None) -> Any:
-    if child.execution == "budget":
-        return _failure(context, start, "Emacs exceeded its budget", version=version, execution="budget",
-                        diagnostics=child.diagnostics())
-    if child.execution == "error":
+    outcome = execution_outcome(child.execution)
+    if outcome.budget:
+        return _failure(context, start, "Emacs exceeded its budget", version=version,
+                        execution=outcome.name, diagnostics=child.diagnostics())
+    if outcome.error:
         reason = f"expected Emacs command {context.check.spec.emacs!r}, got {child.error}"
-        return _failure(context, start, reason, version=version, outcome="unsupported", execution="error",
-                        diagnostics=child.diagnostics())
+        return _failure(context, start, reason, version=version, outcome="unsupported",
+                        execution=outcome.name, diagnostics=child.diagnostics())
     return None
 
 

@@ -19,7 +19,7 @@ from .policy import (
     _optional_string_list,
     _string,
 )
-from .runner import mark_step, run
+from .runner import execution_outcome, mark_step, run
 
 
 if TYPE_CHECKING:
@@ -324,15 +324,16 @@ def _execution_failure(context: Any, start: float, run_result: Any) -> Any:
     from .checks import _tests_result
 
     check, prefix, spec = context.check, context.prefix, context.check.spec
-    if run_result.execution == "budget":
+    outcome = execution_outcome(run_result.execution)
+    if outcome.budget:
         return _tests_result(
             check, spec, start, prefix, "Emacs exceeded its budget",
-            execution="budget", diagnostics=run_result.diagnostics(), report=False,
+            execution=outcome.name, diagnostics=run_result.diagnostics(), report=False,
         )
-    if run_result.execution == "error":
+    if outcome.error:
         reason = f"expected Emacs command {spec.emacs!r}, got {run_result.error}"
-        return _tests_result(check, spec, start, prefix, reason, outcome="unsupported", execution="error",
-                             diagnostics=run_result.diagnostics(), report=False)
+        return _tests_result(check, spec, start, prefix, reason, outcome="unsupported",
+                             execution=outcome.name, diagnostics=run_result.diagnostics(), report=False)
     return None
 
 

@@ -27,7 +27,7 @@ from .policy import (
     _config_error,
     _integer,
 )
-from .runner import Diagnostics, RunResult, mark_step, run
+from .runner import Diagnostics, RunResult, execution_outcome, mark_step, run
 from .tools import installed_tool
 
 
@@ -346,7 +346,8 @@ def _tests_execution_failure(
 ) -> Any | None:
     from .checks import _tests_result
 
-    if run_result.execution == "error":
+    outcome = execution_outcome(run_result.execution)
+    if outcome.error:
         reason = run_result.error or "cannot run command"
         return _tests_result(
             check,
@@ -355,29 +356,29 @@ def _tests_execution_failure(
             prefix,
             reason,
             outcome="error",
-            execution="error",
+            execution=outcome.name,
             diagnostics=diagnostics,
             report=False,
         )
-    if run_result.execution == "budget":
+    if outcome.budget:
         return _tests_result(
             check,
             spec,
             start,
             prefix,
             f"command exceeded its {spec.budget_seconds} second budget",
-            execution="budget",
+            execution=outcome.name,
             diagnostics=diagnostics,
             report=False,
         )
-    if run_result.execution == "signal":
+    if outcome.signal:
         return _tests_result(
             check,
             spec,
             start,
             prefix,
             f"command terminated by signal {-run_result.returncode}",
-            execution="signal",
+            execution=outcome.name,
             diagnostics=diagnostics,
             report=False,
         )

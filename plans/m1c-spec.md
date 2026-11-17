@@ -75,7 +75,7 @@ the number of tests that ran), `budget_seconds` (default 900).
 - The baseline lists each current function above 6, measured by this commit, with reason "above 6 at adoption
   (M1c, 2026-10-24); worklist". Nothing else enters it.
 - `make check` becomes `python3 -I qg.py check` plus nothing that duplicates a policy check: remove the
-  Makefile's separate lint and test recipes if the policy now runs them (removal symmetry). Keep `make check`
+  Makefile's separate lint and test recipes if the policy now runs them, together with their replacement. Keep `make check`
   as the one entry point.
 - `CLAUDE.md`'s "standard-library Python only" rule becomes: the core is standard library; the Python adapters
   load the pinned coverage wheel from the tools cache.

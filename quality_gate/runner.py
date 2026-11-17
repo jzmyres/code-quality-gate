@@ -118,6 +118,35 @@ class Diagnostics:
         return document
 
 
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    """One value of RunResult.execution and what it means to a caller."""
+
+    name: str
+    completed: bool = False
+    error: bool = False
+    budget: bool = False
+    signal: bool = False
+
+
+# The one termination-outcome table: every adapter reads a run's execution
+# through it instead of comparing the names itself.
+EXECUTION_OUTCOMES = {
+    "completed": ExecutionOutcome("completed", completed=True),
+    "error": ExecutionOutcome("error", error=True),
+    "budget": ExecutionOutcome("budget", budget=True),
+    "signal": ExecutionOutcome("signal", signal=True),
+}
+
+
+def execution_outcome(execution: str) -> ExecutionOutcome:
+    """The table's record for EXECUTION, or an unknown one with no flags."""
+    outcome = EXECUTION_OUTCOMES.get(execution)
+    if outcome is None:
+        return ExecutionOutcome(execution)
+    return outcome
+
+
 @dataclass
 class RunResult:
     """The outcome of one bounded run."""

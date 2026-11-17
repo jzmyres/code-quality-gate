@@ -17,6 +17,7 @@ from typing import Any
 from . import gate_result
 from .adapters import AdapterContext, adapter_for
 from .files import (
+    BUILTIN_RESULT_KINDS,
     DiffBaseOverride,
     git_argv,
     hygiene_result,
@@ -975,7 +976,7 @@ def _builtin_failures(results: list[CheckResult]) -> list[str]:
     return [
         result.id
         for result in results
-        if result.kind in ("inventory", "hygiene")
+        if result.kind in BUILTIN_RESULT_KINDS
         and not result.is_satisfied()
     ]
 
@@ -1140,6 +1141,15 @@ def _hygiene_check(root: Path, config: Config) -> CheckResult:
         ),
     )
 
+# The accepted decisions and what the human report calls each one.  Both the
+# printed message and the exit status read this one table.
+DECISION_MESSAGES = {
+    "accepted": "check: passed",
+    "accepted_with_exceptions": "check: passed with exceptions",
+    "partial": "check: partial run passed",
+}
+
+
 def _print_decision(
     decision: str, configuration_error: str | None,
     results: list[CheckResult], obligations: list[dict[str, Any]],
@@ -1152,22 +1162,16 @@ def _print_decision(
             sep="\n",
             file=sys.stderr,
         )
-    elif decision == "accepted_with_exceptions":
-        print(
-            f"check: passed with exceptions ({len(results)} checks)",
-            flush=True,
-        )
-    elif decision == "partial":
-        print(f"check: partial run passed ({len(results)} checks)", flush=True)
     else:
-        print(f"check: passed ({len(results)} checks)", flush=True)
+        message = DECISION_MESSAGES.get(decision, "check: passed")
+        print(f"{message} ({len(results)} checks)", flush=True)
 
 
 
 def _decision_exit_code(decision: str, prune_ids: list[str], prune: dict[str, Any]) -> int:
     if decision == "error":
         return 2
-    if decision not in ("accepted", "accepted_with_exceptions", "partial"):
+    if decision not in DECISION_MESSAGES:
         return 1
     return 1 if prune_ids and not prune["performed"] else 0
 

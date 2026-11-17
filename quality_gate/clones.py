@@ -20,7 +20,7 @@ from .policy import (
     _integer,
 )
 from .ratchet import Domain, Finding, Location, RatchetResult
-from .runner import Diagnostics, mark_step, run
+from .runner import Diagnostics, execution_outcome, mark_step, run
 from .tools import tool_binary
 
 
@@ -464,23 +464,26 @@ def _jscpd_command(
 def _raise_jscpd_termination(
     result: Any, diagnostics: Diagnostics
 ) -> None:
-    if result.execution == "error":
+    outcome = execution_outcome(result.execution)
+    if outcome.completed:
+        return
+    if outcome.error:
         raise CloneEvidenceError(
             f"cannot run jscpd: {result.error}",
             diagnostics=diagnostics,
-            execution="error",
+            execution=outcome.name,
         )
-    if result.execution == "budget":
+    if outcome.budget:
         raise CloneEvidenceError(
             "jscpd exceeded its 600 second budget",
             diagnostics=diagnostics,
-            execution="budget",
+            execution=outcome.name,
         )
-    if result.execution == "signal":
+    if outcome.signal:
         raise CloneEvidenceError(
             f"jscpd terminated by signal {-result.returncode}",
             diagnostics=diagnostics,
-            execution="signal",
+            execution=outcome.name,
         )
 
 
@@ -689,7 +692,8 @@ def _jscpd_binary() -> Path:
 
 
 def _clone_outcome(measurement: Any) -> str:
-    if measurement.execution in ("budget", "signal"):
+    outcome = execution_outcome(measurement.execution)
+    if outcome.budget or outcome.signal:
         return "fail"
     return "unsupported" if measurement.unsupported else "error"
 

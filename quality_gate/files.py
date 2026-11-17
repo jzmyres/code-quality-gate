@@ -11,11 +11,14 @@ from itertools import product
 from pathlib import Path, PurePosixPath
 
 from .policy import Config, ConfigError, GateError, Rule, UsageError
-from .runner import run
+from .runner import execution_outcome, run
 
 
 SHEBANG_LIMIT = 4096
 DIFF_BASE_ENV = "QG_DIFF_BASE"
+# The built-in results every check run reports; one table, read by the check
+# runner, the decision rule and the command dispatch.
+BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
 _SHEBANG_ENV = "env"
 _TYPE_NAMES = {
     stat.S_IFIFO: "FIFO",
@@ -64,9 +67,10 @@ def _git_toplevel(root: Path) -> str:
         budget_seconds=600,
         capture_limit=None,
     )
-    if result.execution == "error":
+    outcome = execution_outcome(result.execution)
+    if outcome.error:
         raise UsageError(f"{root}: cannot run git: {result.error}")
-    if result.execution != "completed":
+    if not outcome.completed:
         raise UsageError(
             f"{root}: expected the top level of a git work tree, got "
             f"git {result.execution}"
@@ -107,9 +111,10 @@ def _git(root: Path, args: list[str], what: str) -> bytes:
     result = run(
         git_argv(root, *args), budget_seconds=600, capture_limit=None
     )
-    if result.execution == "error":
+    outcome = execution_outcome(result.execution)
+    if outcome.error:
         raise GateError(f"{what} failed: {result.error}")
-    if result.execution != "completed":
+    if not outcome.completed:
         raise GateError(f"{what} failed: git {result.execution}")
     if result.returncode != 0:
         detail = result.stderr_text.strip()
@@ -543,23 +548,7 @@ class _InventoryOutcome:
     status: int
     stream: str
     templates: tuple[str, ...]
-
-
-_INVENTORY_KINDS = {
-    (True, False, False): "unknown_class",
-    (True, True, False): "unknown_class",
-    (True, False, True): "unknown_class",
-    (True, True, True): "unknown_class",
-    (False, True, False): "violations",
-    (False, True, True): "violations",
-    (False, False, True): "listing",
-    (False, False, False): "summary",
-}
-
-_INVENTORY_LINE_KEYS = {
-    "violations": "violations_lines",
-    "listing": "listing_lines",
-}
+    lines_key: str = ""
 
 
 _INVENTORY_OUTCOMES = {
@@ -574,8 +563,10 @@ _INVENTORY_OUTCOMES = {
     "error": _InventoryOutcome(
         1, "stderr", ("inventory: {value}",)
     ),
-    "violations": _InventoryOutcome(1, "stderr", ()),
-    "listing": _InventoryOutcome(0, "stdout", ()),
+    "violations": _InventoryOutcome(
+        1, "stderr", (), "violations_lines"
+    ),
+    "listing": _InventoryOutcome(0, "stdout", (), "listing_lines"),
     "summary": _InventoryOutcome(
         0,
         "stdout",
@@ -588,12 +579,24 @@ def _inventory_lines(
     kind: str, values: dict[str, object]
 ) -> tuple[int, str, tuple[str, ...]]:
     outcome = _INVENTORY_OUTCOMES[kind]
-    lines = values.get(_INVENTORY_LINE_KEYS.get(kind, ""))
+    lines = values.get(outcome.lines_key)
     if not lines:
         lines = tuple(
             template.format(**values) for template in outcome.templates
         )
     return outcome.status, outcome.stream, tuple(lines)
+
+
+def _inventory_kind(
+    unknown: bool, violations: list[str], listing: bool
+) -> str:
+    if unknown:
+        return "unknown_class"
+    if violations:
+        return "violations"
+    if listing:
+        return "listing"
+    return "summary"
 
 
 def _inventory_outcome(
@@ -612,9 +615,9 @@ def _inventory_outcome(
         for relative in sorted(classes)
         if classes[relative] == list_class
     ]
-    kind = _INVENTORY_KINDS[
-        (unknown, bool(violations), list_class is not None)
-    ]
+    kind = _inventory_kind(
+        unknown, violations, list_class is not None
+    )
     return _inventory_lines(
         kind,
         {

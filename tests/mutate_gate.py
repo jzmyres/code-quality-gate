@@ -173,7 +173,7 @@ DECISIONS = (
         "quality_gate/gate_result.py",
         "_builtins_pass",
         "comparison",
-        'result.kind in ("inventory", "hygiene")',
+        "result.kind in BUILTIN_RESULT_KINDS",
         "Inventory and hygiene failures reject the gate.",
     ),
     Decision(

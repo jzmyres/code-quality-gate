@@ -5,7 +5,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Iterable
 
-from .files import git_argv
+from .files import BUILTIN_RESULT_KINDS, git_argv
 from .runner import RunResult, run
 
 
@@ -237,7 +237,7 @@ def _builtins_pass(results: list[Any]) -> bool:
     return all(
         result.is_satisfied()
         for result in results
-        if result.kind in ("inventory", "hygiene")
+        if result.kind in BUILTIN_RESULT_KINDS
     )
 
 

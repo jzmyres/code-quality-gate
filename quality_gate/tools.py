@@ -24,6 +24,9 @@ from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
 TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+# The one archive-format table: the lock validates against it and extraction
+# dispatches through it.
+ARCHIVE_FORMATS = ("tar", "wheel", "deb")
 LOCK_KEYS = (
     "version",
     "url",
@@ -136,11 +139,11 @@ def _lock_binary(lock: Path, name: str, raw: dict[str, Any]) -> str:
 
 def _lock_format(lock: Path, name: str, raw: dict[str, Any]) -> str:
     archive_format = raw.get("format", "tar")
-    if archive_format not in ("tar", "wheel", "deb"):
+    if archive_format not in ARCHIVE_FORMATS:
         raise _tool_error(
             lock,
             f"{name}.format",
-            "one of tar, wheel, deb",
+            "one of " + ", ".join(ARCHIVE_FORMATS),
             _describe(archive_format),
         )
     return archive_format
@@ -323,29 +326,31 @@ _MEMBER_RULES = {
 _ROOT_PATHS = (PurePosixPath("."), PurePosixPath("./"))
 
 _TAR_MEMBER_KINDS = (
-    (lambda member: member.issym(), "link"),
-    (lambda member: member.islnk(), "link"),
-    (lambda member: member.isdir(), "directory"),
-    (lambda member: member.isreg(), "regular"),
+    (lambda member: member.issym(), _MEMBER_RULES["link"]),
+    (lambda member: member.islnk(), _MEMBER_RULES["link"]),
+    (lambda member: member.isdir(), _MEMBER_RULES["directory"]),
+    (lambda member: member.isreg(), _MEMBER_RULES["regular"]),
 )
 
 _WHEEL_MEMBER_KINDS = (
-    (lambda member: stat.S_ISLNK(member.external_attr >> 16), "link"),
+    (
+        lambda member: stat.S_ISLNK(member.external_attr >> 16),
+        _MEMBER_RULES["link"],
+    ),
     (
         lambda member: member.is_dir()
         or stat.S_ISDIR(member.external_attr >> 16),
-        "directory",
+        _MEMBER_RULES["directory"],
     ),
     (
         lambda member: stat.S_IFMT(member.external_attr >> 16)
         in (0, stat.S_IFREG),
-        "regular",
+        _MEMBER_RULES["regular"],
     ),
 )
 
 
-def _member_rule(kind: str, name: str, tool: Tool) -> _MemberRule:
-    rule = _MEMBER_RULES[kind]
+def _member_rule(rule: _MemberRule, name: str, tool: Tool) -> _MemberRule:
     if rule.message:
         raise GateError(
             f"tools: {tool.name} {tool.version}: "
@@ -355,10 +360,11 @@ def _member_rule(kind: str, name: str, tool: Tool) -> _MemberRule:
 
 
 def _member_kind(
-    member: Any, kinds: tuple[tuple[Any, str], ...]
-) -> str:
+    member: Any, kinds: tuple[tuple[Any, _MemberRule], ...]
+) -> _MemberRule:
     return next(
-        (kind for matches, kind in kinds if matches(member)), "other"
+        (rule for matches, rule in kinds if matches(member)),
+        _MEMBER_RULES["other"],
     )
 
 
@@ -369,7 +375,7 @@ def _member_path(
     if root and path in _ROOT_PATHS:
         return PurePosixPath()
     if path.is_absolute() or ".." in path.parts or not path.parts:
-        _member_rule("unsafe", name, tool)
+        _member_rule(_MEMBER_RULES["unsafe"], name, tool)
     return path
 
 
@@ -547,13 +553,15 @@ def _extract_deb(archive_path: Path, destination: Path, tool: Tool) -> None:
         path.unlink(missing_ok=True)
 
 
+_ARCHIVE_EXTRACTORS = dict(zip(
+    ARCHIVE_FORMATS, (_extract_tar, _extract_wheel, _extract_deb),
+    strict=True,
+))
+
+
 def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
-    if tool.format == "wheel":
-        _extract_wheel(archive_path, destination, tool)
-    elif tool.format == "deb":
-        _extract_deb(archive_path, destination, tool)
-    else:
-        _extract_tar(archive_path, destination, tool)
+    extractor = _ARCHIVE_EXTRACTORS.get(tool.format, _extract_tar)
+    extractor(archive_path, destination, tool)
 
 
 def _install_target(tool: Tool, tools_root: Path) -> Path:

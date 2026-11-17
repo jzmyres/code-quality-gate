@@ -11,7 +11,7 @@ from . import output_patterns, policy
 from .policy import (
     DEFAULT_BUDGET_SECONDS, CheckDef, UnsupportedError, UsageError, _config_error, _integer, _string,
 )
-from .runner import Diagnostics, RunResult, mark_step, run
+from .runner import Diagnostics, RunResult, execution_outcome, mark_step, run
 from .tools import tool_binary
 
 
@@ -179,7 +179,8 @@ def _termination_failure(
     diagnostics: Diagnostics,
 ) -> Any | None:
     combined = result.combined_text
-    if result.execution == "error":
+    outcome = execution_outcome(result.execution)
+    if outcome.error:
         return _command_failure(
             check,
             spec,
@@ -187,28 +188,28 @@ def _termination_failure(
             prefix,
             result.error or "cannot run command",
             outcome="error",
-            execution="error",
+            execution=outcome.name,
             diagnostics=diagnostics,
         )
-    if result.execution == "budget":
+    if outcome.budget:
         return _command_failure(
             check,
             spec,
             start,
             prefix,
             f"command exceeded its {spec.budget_seconds} second budget",
-            execution="budget",
+            execution=outcome.name,
             diagnostics=diagnostics,
             combined=combined,
         )
-    if result.execution == "signal":
+    if outcome.signal:
         return _command_failure(
             check,
             spec,
             start,
             prefix,
             f"command terminated by signal {-result.returncode}",
-            execution="signal",
+            execution=outcome.name,
             diagnostics=diagnostics,
             combined=combined,
         )

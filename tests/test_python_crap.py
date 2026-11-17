@@ -1614,6 +1614,134 @@ class CyclomaticComplexityTests(unittest.TestCase):
                 self.assertEqual(self.complexity(source), expected)
 
 
+class BooleanTableTests(unittest.TestCase):
+    """A named table keyed by booleans is a decision, exactly like a display."""
+
+    def complexity(self, source: str, name: str) -> int:
+        found = {
+            item.name: item.cc
+            for item in python_crap.collect_functions(
+                "pkg/example.py", source
+            )
+        }
+        return found[name]
+
+    def test_a_module_table_keyed_by_booleans_counts_each_key_after_the_first(self):
+        cases = {
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose(flag):\n"
+            "    return TABLE[flag]\n": 2,
+            "TABLE = {True: 1, False: 2, (True, False): 3, (False, False): 4}\n"
+            "def choose(flag):\n"
+            "    return TABLE[flag]\n": 4,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source, "choose"), expected)
+
+    def test_a_function_local_table_keyed_by_booleans_counts_the_same(self):
+        cases = {
+            "def choose(flag):\n"
+            "    table = {True: 1, False: 2}\n"
+            "    return table[flag]\n": 2,
+            "def choose(flag):\n"
+            "    table = {True: 1, False: 2, (True, True): 3, (False, True): 4}\n"
+            "    return table[flag]\n": 4,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source, "choose"), expected)
+
+    def test_a_named_table_read_with_get_counts_its_keys_and_a_default(self):
+        source = "TABLE = {True: 1, False: 2}\n"
+        cases = {
+            "def choose(flag):\n    return TABLE.get(flag)\n": 2,
+            "def choose(flag):\n    return TABLE.get(flag, 0)\n": 3,
+        }
+        for body, expected in cases.items():
+            with self.subTest(body=body):
+                self.assertEqual(self.complexity(source + body, "choose"), expected)
+
+    def test_a_constant_key_adds_nothing(self):
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose():\n"
+            "    return TABLE[True]\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 1)
+
+    def test_a_string_keyed_named_table_adds_nothing(self):
+        source = (
+            'NAMES = {"alpha": 1, "beta": 2}\n'
+            "def choose(name):\n"
+            "    return NAMES[name]\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 1)
+
+    def test_assignment_targets_cover_each_binding_form(self):
+        tree = ast.parse("a = 1\nb: int = 2\nc: int\nd += 1\n")
+        self.assertEqual(
+            [name.id for name in python_crap._assignment_targets(tree.body[0])],
+            ["a"],
+        )
+        self.assertEqual(
+            [name.id for name in python_crap._assignment_targets(tree.body[1])],
+            ["b"],
+        )
+        self.assertEqual(
+            python_crap._assignment_targets(tree.body[2]), [tree.body[2].target]
+        )
+        self.assertEqual(python_crap._assignment_targets(tree.body[3]), [])
+
+    def test_boolean_keys_accept_booleans_and_tuples_of_them_only(self):
+        for source in ("True", "False", "(True, False)", "(False, False, True)"):
+            with self.subTest(source=source):
+                self.assertTrue(
+                    python_crap._boolean_key(ast.parse(source).body[0].value)
+                )
+        for source in ("1", '"True"', "()", "(True, 1)", "[]"):
+            with self.subTest(source=source):
+                self.assertFalse(
+                    python_crap._boolean_key(ast.parse(source).body[0].value)
+                )
+
+    def test_an_annotation_without_a_value_is_not_a_boolean_table(self):
+        source = (
+            "TABLE: dict\n"
+            "def choose(flag):\n"
+            "    return TABLE[flag]\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 1)
+
+    def test_the_named_selection_counters_read_the_scope_table(self):
+        tables = {"table": 3}
+        selection = ast.parse("table[key]").body[0].value
+        call = ast.parse("table.get(key, 0)").body[0].value
+        self.assertEqual(
+            python_crap._named_selection(selection, tables), 2
+        )
+        self.assertEqual(python_crap._named_get(call, tables), 3)
+
+    def test_a_name_rebound_to_something_else_is_not_counted(self):
+        cases = {
+            "TABLE = {True: 1, False: 2}\n"
+            "TABLE = {}\n"
+            "def choose(flag):\n"
+            "    return TABLE[flag]\n": 1,
+            "TABLE = {True: 1, False: 2}\n"
+            "TABLE = load()\n"
+            "def choose(flag):\n"
+            "    return TABLE[flag]\n": 1,
+            "def choose(flag):\n"
+            "    table = {True: 1, False: 2}\n"
+            "    table = {}\n"
+            "    return table[flag]\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source, "choose"), expected)
+
+
 class FunctionCollectionTests(unittest.TestCase):
     def test_measured_function_builds_itself_from_a_node(self) -> None:
         node = ast.parse(

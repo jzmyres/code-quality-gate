@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from . import (
     clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_shape,
-    python_tests, ratchet, removal_symmetry, source_chars, verification,
+    python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import DiffBaseOverride
 from .policy import (
@@ -195,18 +195,6 @@ register_adapter(AdapterDescriptor(
     failure_wording="occurrences",
 ))
 register_adapter(AdapterDescriptor(
-    "removal_symmetry",
-    (
-        "scope", "base", "search_untracked", "min_token_chars", "token_kinds",
-        "scan_classes", "exclude_paths", "baseline",
-    ),
-    removal_symmetry._removal_symmetry_spec,
-    removal_symmetry._run_removal_symmetry,
-    location_coverage="complete",
-    subject_noun="removed token",
-    failure_wording="occurrences",
-))
-register_adapter(AdapterDescriptor(
     "python_tests",
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     python_tests._python_tests_spec,
@@ -254,6 +242,13 @@ register_adapter(AdapterDescriptor(
     ),
     python_shape._python_shape_spec,
     python_shape._run_python_shape,
+    location_coverage="complete",
+))
+register_adapter(AdapterDescriptor(
+    "variant_dispatch",
+    ("scope", "base"),
+    variant_dispatch._variant_dispatch_spec,
+    variant_dispatch._run_variant_dispatch,
     location_coverage="complete",
 ))
 register_adapter(AdapterDescriptor(

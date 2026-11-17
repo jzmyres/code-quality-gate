@@ -17,7 +17,6 @@ from quality_gate import files
 
 
 SOURCE_BASELINE = "quality-gate-source-chars.toml"
-REMOVAL_BASELINE = "quality-gate-removal-symmetry.toml"
 
 SOURCE_CHECK = (
     "\n[checks.source-chars]\n"
@@ -27,16 +26,6 @@ SOURCE_CHECK = (
     'scope = "changed"\n'
     'base = "HEAD"\n'
     f'baseline = "{SOURCE_BASELINE}"\n'
-)
-
-REMOVAL_CHECK = (
-    "\n[checks.removal-symmetry]\n"
-    'adapter = "removal_symmetry"\n'
-    "tier = 1\n"
-    'enforcement = "enforced"\n'
-    'scope = "changed"\n'
-    'base = "HEAD"\n'
-    f'baseline = "{REMOVAL_BASELINE}"\n'
 )
 
 SHAPE_CHECKS = (
@@ -69,9 +58,9 @@ BASE_FILES = {
 
 def combined_config() -> str:
     text = BASE_CONFIG
-    for identifier in ("source-chars", "removal-symmetry", "shape"):
+    for identifier in ("source-chars", "shape"):
         text = _add_check_to_class(text, "python", identifier)
-    return text + SOURCE_CHECK + REMOVAL_CHECK + SHAPE_CHECKS
+    return text + SOURCE_CHECK + SHAPE_CHECKS
 
 
 class OneResolutionTests(FixtureCase):
@@ -82,14 +71,6 @@ class OneResolutionTests(FixtureCase):
             SOURCE_BASELINE,
             baseline_text(
                 [], check="source-chars", metric_version="source-chars/1"
-            ),
-        )
-        self.add_file(
-            REMOVAL_BASELINE,
-            baseline_text(
-                [],
-                check="removal-symmetry",
-                metric_version="removal-symmetry/1",
             ),
         )
         for relative, content in BASE_FILES.items():
@@ -103,17 +84,16 @@ class OneResolutionTests(FixtureCase):
 
     def run_all(self, env: dict[str, str] | None = None) -> Any:
         return self.run_json(
-            "--only", "source-chars", "removal-symmetry", "shape",
-            env=env,
+            "--only", "source-chars", "shape", env=env
         )
 
     def measurements(self, document: dict[str, Any]) -> list[dict[str, str]]:
         return [
             self.check_by_id(document, identifier)["measurement"]["base"]
-            for identifier in ("source-chars", "removal-symmetry", "shape")
+            for identifier in ("source-chars", "shape")
         ]
 
-    def test_a_run_with_all_three_adapters_resolves_the_variable_once(self) -> None:
+    def test_a_run_with_both_diffing_adapters_resolves_the_variable_once(self) -> None:
         original = files._verified_commit
         with mock.patch.object(
             files, "_verified_commit", wraps=original
@@ -163,7 +143,7 @@ class OneResolutionTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         self.assertEqual(
             self.measurements(document),
-            [{"commit": self.base_commit, "source": "QG_DIFF_BASE"}] * 3,
+            [{"commit": self.base_commit, "source": "QG_DIFF_BASE"}] * 2,
         )
 
 

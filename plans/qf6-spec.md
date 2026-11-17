@@ -21,7 +21,7 @@ tree (HA2, 2026-10-25) and passed on the runner's retry.
 1. **Register the dataset up front.** `covrun.py` writes one registration record per invocation before the run,
    naming the dataset file it will use and the program it runs (the script path, or `-m MODULE`; not the remaining
    arguments, which may carry values a consumer would not want in gate output). The record is written atomically
-   (temporary file, then rename). The separate completion record goes away (removal symmetry: code, docs, tests);
+   (temporary file, then rename). The separate completion record goes away with its replacement (code, docs, tests);
    nothing runs in `covrun.py` after `coverage_main`, so the wrapped program's exit status, signal death and
    traceback stay exactly as they are today.
 2. **Complete means saved.** At combination, every registered invocation's named dataset must exist and load. A
