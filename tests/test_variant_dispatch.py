@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import ast
 import unittest
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from support import (
     BASE_CONFIG,
@@ -139,6 +141,42 @@ def first(kind):
     return {"alpha": 1, "beta": 2}[kind]
 """
 
+PY_MIXED_DICT = """\
+def first(kind):
+    return {"alpha": 1, "beta": 2, 0: 3}[kind]
+
+
+def second(kind):
+    return {"alpha": 3, "beta": 4, 0: 5}.get(kind)
+"""
+
+PY_MIXED_DICT_ONE = """\
+def first(kind):
+    return {"alpha": 1, 0: 2}[kind]
+
+
+def second(kind):
+    return {"alpha": 3, 0: 4}[kind]
+"""
+
+PY_CONSTANT_IN_DISPLAY = """\
+def first():
+    return "alpha" in ("alpha", "beta")
+
+
+def second():
+    return "alpha" in ("alpha", "beta")
+"""
+
+PY_CONSTANT_COMPARE = """\
+def first():
+    return "alpha" == "alpha"
+
+
+def second():
+    return "beta" == "beta"
+"""
+
 TABLE_DICT = 'TABLE = {"alpha": 1, "beta": 2}\nOTHER = {"alpha": 3, "beta": 4}\n'
 TABLE_TUPLE = 'TABLE = ("alpha", "beta")\nOTHER = ("alpha", "beta")\n'
 TABLE_LIST = "TABLE = ['alpha', 'beta']\nOTHER = ['alpha', 'beta']\n"
@@ -267,6 +305,83 @@ first() {
 }
 """
 
+SHELL_CASE_SEPARATE_ARMS = """\
+#!/bin/sh
+first() {
+    case "$1" in
+        alpha) echo one ;;
+        beta) echo two ;;
+    esac
+}
+"""
+
+SHELL_CASE_SEVERAL = """\
+#!/bin/sh
+first() {
+    case "$1" in
+        alpha|beta|gamma) echo one ;;
+        *) echo other ;;
+    esac
+}
+"""
+
+SHELL_CASE_QUOTED = """\
+#!/bin/sh
+first() {
+    case "$1" in
+        "alpha type"|'beta type') echo one ;;
+        *) echo other ;;
+    esac
+}
+"""
+
+SHELL_COMMENTS = """\
+#!/bin/sh
+reader() {
+    case "$1" in
+        # alpha|beta) echo commented ;;
+        *) echo other ;;
+    esac
+    # if [[ $FORMAT == alpha ]]; then echo one; fi
+    # if [[ $FORMAT == beta ]]; then echo two; fi
+}
+"""
+
+SHELL_HEREDOC = """\
+#!/bin/sh
+reader() {
+    cat <<EOF
+case "$1" in
+alpha) echo one ;;
+beta) echo two ;;
+esac
+if [[ $FORMAT == alpha ]]; then echo one; fi
+if [[ $FORMAT == beta ]]; then echo two; fi
+EOF
+    cat <<-END
+alpha) echo one ;;
+beta) echo two ;;
+END
+    cat <<'SQ'
+alpha) echo one ;;
+beta) echo two ;;
+SQ
+    cat <<"DQ"
+alpha) echo one ;;
+beta) echo two ;;
+DQ
+}
+"""
+
+PY_QUOTED = """\
+def first(kind):
+    if kind == "alpha type":
+        return 1
+    if kind == "beta type":
+        return 2
+    return 0
+"""
+
 SHELL_ARRAY = "#!/bin/sh\nFORMATS=(alpha beta)\nOTHER=(alpha beta)\n"
 SHELL_ARRAY_ONE = "#!/bin/sh\nFORMATS=(alpha beta)\n"
 
@@ -343,6 +458,49 @@ def load(value):
         return read_json(value)
     except ValueError:
         return read_csv(value)
+"""
+TRIAL_GUARD_RETURN = TRIAL_HEADER + """\
+def load(value):
+    result = read_json(value)
+    if result is None:
+        return read_csv(value)
+    return result
+"""
+TRIAL_TRY_ASSIGN = TRIAL_HEADER + """\
+def load(value):
+    try:
+        result = read_json(value)
+    except ValueError:
+        result = read_csv(value)
+    return result
+"""
+TRIAL_OR_DISCARDED = TRIAL_HEADER + """\
+def load(value):
+    read_json(value) or read_csv(value)
+    return "fixed"
+"""
+TRIAL_GUARD_DISCARDED = TRIAL_HEADER + """\
+def load(value):
+    result = read_json(value)
+    if result is None:
+        result = read_csv(value)
+    return "fixed"
+"""
+TRIAL_TRY_DISCARDED = TRIAL_HEADER + """\
+def load(value):
+    try:
+        read_json(value)
+    except ValueError:
+        read_csv(value)
+    return "fixed"
+"""
+TRIAL_STALE_GUARD = TRIAL_HEADER + """\
+def load(value):
+    result = read_json(value)
+    if result is None:
+        result = read_csv(value)
+    result = None
+    return result
 """
 
 
@@ -465,6 +623,27 @@ class InlineDictTests(VariantCase):
         self.add_file("pkg/app.py", PY_DICT_ONE)
         self.accepted()
 
+    def test_a_mixed_key_dict_contributes_its_two_string_keys(self):
+        self.add_file("pkg/app.py", PY_MIXED_DICT)
+        finding = self.rejected()[0]
+        self.assertEqual(
+            finding["measurement"]["literals"], ["alpha", "beta"]
+        )
+
+    def test_a_mixed_key_dict_with_one_string_key_contributes_nothing(self):
+        self.add_file("pkg/app.py", PY_MIXED_DICT_ONE)
+        self.accepted()
+
+
+class ConstantSubjectTests(VariantCase):
+    def test_a_constant_is_not_a_subject_of_a_membership_display(self):
+        self.add_file("pkg/app.py", PY_CONSTANT_IN_DISPLAY)
+        self.accepted()
+
+    def test_a_constant_against_a_constant_is_not_a_subject(self):
+        self.add_file("pkg/app.py", PY_CONSTANT_COMPARE)
+        self.accepted()
+
 
 class DeclaredTableTests(VariantCase):
     def test_two_dict_tables_are_a_finding(self):
@@ -514,6 +693,41 @@ class ShellTests(VariantCase):
 
     def test_one_shell_function_is_not_a_finding(self):
         self.add_file("run.sh", SHELL_CASE_ONE)
+        self.accepted()
+
+    def test_separate_case_arms_contribute_each_pattern(self):
+        self.add_file("pkg/app.py", PY_AND_SHELL)
+        self.add_file("run.sh", SHELL_CASE_SEPARATE_ARMS)
+        finding = self.rejected()[0]
+        self.assertEqual(
+            finding["measurement"]["literals"], ["alpha", "beta"]
+        )
+
+    def test_an_arm_with_several_patterns_contributes_all_of_them(self):
+        self.add_file("pkg/app.py", PY_AND_SHELL)
+        self.add_file("run.sh", SHELL_CASE_SEVERAL)
+        finding = self.rejected()[0]
+        self.assertEqual(
+            finding["measurement"]["literals"], ["alpha", "beta"]
+        )
+
+    def test_quoted_case_words_with_spaces_are_literals(self):
+        self.add_file("pkg/app.py", PY_QUOTED)
+        self.add_file("run.sh", SHELL_CASE_QUOTED)
+        finding = self.rejected()[0]
+        self.assertEqual(
+            finding["measurement"]["literals"],
+            ["alpha type", "beta type"],
+        )
+
+    def test_comments_are_never_read(self):
+        self.add_file("pkg/app.py", PY_AND_SHELL)
+        self.add_file("run.sh", SHELL_COMMENTS)
+        self.accepted()
+
+    def test_here_document_bodies_are_never_read(self):
+        self.add_file("pkg/app.py", PY_AND_SHELL)
+        self.add_file("run.sh", SHELL_HEREDOC)
         self.accepted()
 
     def test_shell_tests_group_by_the_normalised_subject(self):
@@ -689,7 +903,7 @@ class HelperTests(VariantCase):
     def test_a_display_compared_with_an_expression_is_its_own_set(self):
         subjects: dict[str, set[str]] = {}
         displays: list[frozenset[str]] = []
-        compare = ast.parse('"alpha" in ("alpha", "beta")').body[0].value
+        compare = ast.parse('load() in ("alpha", "beta")').body[0].value
         variant_dispatch._compare_literals(compare, subjects, displays)
         self.assertEqual(subjects, {})
         self.assertEqual(displays, [frozenset({"alpha", "beta"})])
@@ -729,6 +943,236 @@ class HelperTests(VariantCase):
         )
 
 
+class ReaderHelperTests(VariantCase):
+    def test_python_reader_pieces(self):
+        source = (
+            'TABLE = ("alpha", "beta")\n'
+            "\n"
+            "\n"
+            "def first(kind):\n"
+            '    if kind == "alpha":\n'
+            "        return 1\n"
+            '    if kind == "beta":\n'
+            "        return 2\n"
+            "    return 0\n"
+        )
+        tree = ast.parse(source)
+        first = tree.body[1]
+        self.assertEqual(
+            variant_dispatch._function_literals(first),
+            frozenset({"alpha", "beta"}),
+        )
+        selection = ast.parse('{"alpha": 1, "beta": 2}[kind]').body[0].value
+        display, key = variant_dispatch._selection_parts(selection)
+        self.assertEqual(ast.unparse(display), '{\'alpha\': 1, \'beta\': 2}')
+        self.assertEqual(ast.unparse(key), "kind")
+        call = ast.parse('{"alpha": 1}.get(kind)').body[0].value
+        display, key = variant_dispatch._selection_parts(call)
+        self.assertEqual(ast.unparse(display), "{'alpha': 1}")
+        self.assertEqual(ast.unparse(key), "kind")
+        self.assertEqual(variant_dispatch._selection_parts(ast.Name(id="x")),
+                         (None, None))
+        compare = ast.parse('kind in ("alpha", "beta")').body[0].value
+        subjects: dict[str, set[str]] = {}
+        displays: list[frozenset[str]] = []
+        self.assertTrue(variant_dispatch._display_sets(
+            compare.left, compare.comparators[0], subjects, displays
+        ))
+        self.assertEqual(subjects[ast.dump(compare.left)], {"alpha", "beta"})
+        pattern = ast.parse(
+            'match kind:\n    case "alpha" | "beta":\n        pass\n'
+        ).body[0].cases[0].pattern
+        self.assertEqual(
+            variant_dispatch._or_pattern_literals(pattern),
+            {"alpha", "beta"},
+        )
+        owners = variant_dispatch._python_owners("pkg/app.py", source)
+        self.assertEqual(
+            [(owner.name, owner.kind) for owner in owners],
+            [("TABLE", "table"), ("first", "function")],
+        )
+
+    def test_shell_reader_pieces(self):
+        self.assertEqual(
+            variant_dispatch._shell_code('echo "a # b" # alpha').strip(),
+            'echo "a # b"',
+        )
+        self.assertEqual(
+            variant_dispatch._readable_lines([
+                "cat <<EOF",
+                "alpha",
+                "EOF",
+                "echo x # beta",
+            ]),
+            ["cat <<EOF", "", "", "echo x "],
+        )
+        self.assertEqual(
+            variant_dispatch._case_pattern_literals([
+                'case "$1" in',
+                "    alpha) echo one ;;",
+                "    beta) echo two ;;",
+                "esac",
+            ]),
+            {"alpha", "beta"},
+        )
+        lines = ["reader() {", "    case \"$1\" in", "}", "x=1"]
+        blocks = variant_dispatch._shell_blocks(lines)
+        self.assertEqual(
+            [(block.name, block.first, block.last) for block in blocks],
+            [("reader", 0, 2)],
+        )
+        self.assertEqual(
+            variant_dispatch._top_level_indexes(blocks, len(lines)), [3]
+        )
+        arrays = variant_dispatch._array_owners(
+            "run.sh", ["FORMATS=(alpha beta)"], [0]
+        )
+        self.assertEqual(
+            [(owner.name, owner.literals) for owner in arrays],
+            [("FORMATS", frozenset({"alpha", "beta"}))],
+        )
+        owners = variant_dispatch._shell_owners(
+            "run.sh", SHELL_CASE_ONE
+        )
+        self.assertEqual(
+            [(owner.name, owner.kind) for owner in owners],
+            [("first", "function"), ("<module>", "top level")],
+        )
+
+    def test_vocabulary_grouping_and_findings(self):
+        def owner(name: str, literals: set[str]) -> Any:
+            return variant_dispatch.Owner(
+                "pkg/app.py", name, "function", 1, 2, frozenset(literals)
+            )
+
+        owners = [
+            owner("first", {"alpha", "beta"}),
+            owner("second", {"alpha", "beta"}),
+            owner("third", {"gamma", "delta"}),
+        ]
+        pairs = variant_dispatch._linked_pairs(owners)
+        self.assertEqual(pairs, [(0, 1)])
+        groups = variant_dispatch._groups(owners)
+        self.assertEqual(
+            [[item.name for item in group] for group in groups],
+            [["first", "second"]],
+        )
+        self.assertEqual(
+            variant_dispatch._shared_literals(groups[0]),
+            ["alpha", "beta"],
+        )
+        finding = variant_dispatch._vsd_finding(groups[0])
+        self.assertIn('VSD variant-dispatch: "alpha", "beta"', finding.subject)
+        candidates = variant_dispatch._candidate_findings(owners, [])
+        self.assertEqual(len(candidates), 1)
+        spec = variant_dispatch.VariantSpec("changed", "HEAD")
+        with mock.patch.object(variant_dispatch, "_touched", return_value=True):
+            self.assertEqual(
+                len(variant_dispatch._changed_candidates(
+                    spec, object(), candidates
+                )),
+                1,
+            )
+
+    def test_trial_reader_pieces(self):
+        tree = ast.parse(TRIAL_OR)
+        functions = variant_dispatch._module_functions(tree)
+        self.assertEqual(
+            set(functions), {"read_json", "read_csv", "load"}
+        )
+        self.assertEqual(
+            {node.name for node in variant_dispatch._all_functions(tree)},
+            {"read_json", "read_csv", "load"},
+        )
+        self.assertEqual(
+            variant_dispatch._format_literals(tree), {"json", "csv"}
+        )
+        load = functions["load"]
+        self.assertEqual(len(variant_dispatch._or_chains(load, functions)), 1)
+        self.assertEqual(
+            len(variant_dispatch._or_chain(
+                load.body[0].value, functions
+            )),
+            1,
+        )
+        guard_tree = ast.parse(TRIAL_GUARD)
+        guard_functions = variant_dispatch._module_functions(guard_tree)
+        guard_load = guard_functions["load"]
+        self.assertEqual(
+            [name for _guard, name in variant_dispatch._guards(guard_load)],
+            ["result"],
+        )
+        guard = variant_dispatch._guards(guard_load)[0][0]
+        _line, _name, (callee, argument) = variant_dispatch._assign_calls(
+            guard_load, guard_functions
+        )[0]
+        self.assertEqual(
+            len(variant_dispatch._matching_actions(
+                variant_dispatch._call_actions(guard, guard_functions),
+                callee,
+                argument,
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(variant_dispatch._guard_chains(guard_load, guard_functions)),
+            1,
+        )
+        try_tree = ast.parse(TRIAL_TRY)
+        try_functions = variant_dispatch._module_functions(try_tree)
+        try_load = try_functions["load"]
+        self.assertEqual(
+            len(variant_dispatch._try_chains(try_load, try_functions)), 1
+        )
+        rebound = ast.parse(
+            "def f():\n    value = 1\n    value = 2\n    return value\n"
+        ).body[0]
+        self.assertTrue(
+            variant_dispatch._rebound_between(rebound, "value", 2, 4)
+        )
+        self.assertFalse(
+            variant_dispatch._rebound_between(rebound, "value", 3, 4)
+        )
+        returned = ast.parse(
+            "def f():\n    value = 1\n    return value\n"
+        ).body[0]
+        self.assertTrue(variant_dispatch._later_return(returned, "value", 2))
+        self.assertFalse(variant_dispatch._later_return(returned, "value", 3))
+        span = variant_dispatch._caller_span("pkg/app.py", load)
+        self.assertEqual((span.name, span.start_line), ("load", 12))
+        first = functions["read_json"]
+        second = functions["read_csv"]
+        argument = ast.parse("read_json(value)").body[0].value.args[0]
+        self.assertIsNotNone(variant_dispatch._trial_finding(
+            span, first, second, argument, frozenset({"json", "csv"})
+        ))
+        self.assertIsNone(variant_dispatch._trial_finding(
+            span, first, second, argument, frozenset({"alpha", "beta"})
+        ))
+        self.assertEqual(
+            len(variant_dispatch._python_trials("pkg/app.py", TRIAL_OR)), 1
+        )
+
+    def test_the_adapter_measure_step(self):
+        self.add_file("pkg/app.py", PY_COMPARE_ONE)
+        context = SimpleNamespace(
+            root=self.repo,
+            check=SimpleNamespace(
+                spec=variant_dispatch.VariantSpec("tree", "HEAD")
+            ),
+            config=None,
+            files=None,
+            classes=None,
+            base_override=None,
+        )
+        with mock.patch(
+            "quality_gate.checks._select_files",
+            return_value=(["pkg/app.py"], []),
+        ):
+            candidates, count, base = variant_dispatch._measure(context)
+        self.assertEqual((candidates, count, base), ([], 1, None))
+
+
 class TrialTests(VariantCase):
     def assert_trial(self, source: str, argument: str = "value") -> None:
         self.add_file("pkg/app.py", source)
@@ -753,6 +1197,28 @@ class TrialTests(VariantCase):
 
     def test_try_then_handler_is_a_finding(self):
         self.assert_trial(TRIAL_TRY)
+
+    def test_a_guard_that_returns_the_fallback_is_a_finding(self):
+        self.assert_trial(TRIAL_GUARD_RETURN)
+
+    def test_a_try_that_assigns_the_chain_returned_later_is_a_finding(self):
+        self.assert_trial(TRIAL_TRY_ASSIGN)
+
+    def test_a_discarded_or_chain_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_OR_DISCARDED)
+        self.accepted()
+
+    def test_a_discarded_guard_chain_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_GUARD_DISCARDED)
+        self.accepted()
+
+    def test_a_discarded_try_chain_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_TRY_DISCARDED)
+        self.accepted()
+
+    def test_a_guard_value_rebound_before_the_return_is_not_a_finding(self):
+        self.add_file("pkg/app.py", TRIAL_STALE_GUARD)
+        self.accepted()
 
     def test_the_same_chain_twice_reports_one_finding(self):
         self.add_file(

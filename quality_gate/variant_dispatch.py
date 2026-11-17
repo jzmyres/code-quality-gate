@@ -45,16 +45,10 @@ KIND_TABLE = "table"
 KIND_TOP_LEVEL = "top level"
 TOP_LEVEL_NAME = "<module>"
 _SHELL_INTERPRETERS = frozenset({"sh", "bash"})
-_FORBIDDEN = frozenset("*?[$")
-_LITERAL_WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:+-]*")
 _SHELL_FUNCTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{\s*$")
-_CASE = re.compile(r"^\s*case\b.*\bin\s*$")
 _ARRAY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=\((.*)\)\s*$")
 _SUBJECT = (
-    r'"\$\{([A-Za-z_][A-Za-z0-9_]*):-\}"'
-    r'|"\$([A-Za-z_][A-Za-z0-9_]*)"'
-    r"|\$\{([A-Za-z_][A-Za-z0-9_]*):-\}"
-    r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+    r'"?\$\{?([A-Za-z_][A-Za-z0-9_]*)(?::-)?\}?"?'
 )
 _WORD = r'("[^"]*"|\'[^\']*\'|\S+)'
 _BRACKET_TEST = re.compile(
@@ -115,6 +109,10 @@ def _has_letter(value: str) -> bool:
     return any(char.isalpha() for char in value)
 
 
+def _letter_literals(words: list[str]) -> frozenset[str]:
+    return frozenset(word for word in words if _has_letter(word))
+
+
 def _text_literal(node: ast.AST) -> str | None:
     if (
         isinstance(node, ast.Constant)
@@ -131,20 +129,18 @@ def _subject(node: ast.AST) -> str | None:
     return None
 
 
-def _string_keys(display: ast.Dict) -> list[str] | None:
+def _dict_key_literals(
+    display: ast.Dict, *, all_strings: bool, minimum: int
+) -> frozenset[str] | None:
     keys: list[str] = []
     for key in display.keys:
-        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.append(key.value)
+        elif all_strings:
             return None
-        keys.append(key.value)
-    return keys
-
-
-def _key_literals(display: ast.Dict, minimum: int) -> frozenset[str] | None:
-    keys = _string_keys(display)
-    if keys is None or len(keys) < minimum:
+    if len(keys) < minimum:
         return None
-    return frozenset(key for key in keys if _has_letter(key))
+    return _letter_literals(keys)
 
 
 def _display_words(node: ast.AST) -> list[str]:
@@ -166,12 +162,12 @@ def _word_display(node: ast.AST, minimum: int) -> frozenset[str] | None:
     words = _display_words(node)
     if len(words) < minimum:
         return None
-    return frozenset(word for word in words if _has_letter(word))
+    return _letter_literals(words)
 
 
 def _declared_literals(node: ast.AST) -> frozenset[str] | None:
     if isinstance(node, ast.Dict):
-        return _key_literals(node, 2)
+        return _dict_key_literals(node, all_strings=True, minimum=2)
     if (
         isinstance(node, ast.Call)
         and _called_name(node) == "frozenset"
@@ -182,18 +178,17 @@ def _declared_literals(node: ast.AST) -> frozenset[str] | None:
     return _word_display(node, 2)
 
 
-def _assigned_names(targets: list[ast.AST]) -> list[str]:
+def _table_names(statement: ast.AST) -> list[str]:
+    targets = (
+        statement.targets
+        if isinstance(statement, ast.Assign)
+        else [statement.target]
+        if isinstance(statement, ast.AnnAssign)
+        else []
+    )
     return [
         target.id for target in targets if isinstance(target, ast.Name)
     ]
-
-
-def _table_names(statement: ast.AST) -> list[str]:
-    if isinstance(statement, ast.Assign):
-        return _assigned_names(statement.targets)
-    if isinstance(statement, ast.AnnAssign):
-        return _assigned_names([statement.target])
-    return []
 
 
 def _declared_tables(
@@ -227,21 +222,6 @@ def _selection_parts(
     return None, None
 
 
-def _display_key_literals(
-    display: ast.AST, key: ast.AST
-) -> frozenset[str]:
-    if not isinstance(display, ast.Dict) or _literal_flags(key)[0]:
-        return frozenset()
-    return _key_literals(display, 2) or frozenset()
-
-
-def _selection_literals(node: ast.AST) -> frozenset[str]:
-    display, key = _selection_parts(node)
-    if display is None or key is None:
-        return frozenset()
-    return _display_key_literals(display, key)
-
-
 def _add_literal(
     subjects: dict[str, set[str]],
     literal_node: ast.AST,
@@ -266,26 +246,10 @@ def _display_sets(
         subject = _subject(other)
         if subject is not None:
             subjects.setdefault(subject, set()).update(literals)
-        else:
+        elif not _literal_flags(other)[0]:
             displays.append(literals)
         return True
     return False
-
-
-def _pair_sets(
-    left: ast.AST,
-    operation: ast.AST,
-    right: ast.AST,
-    subjects: dict[str, set[str]],
-    displays: list[frozenset[str]],
-) -> None:
-    if isinstance(operation, (ast.In, ast.NotIn)) and _display_sets(
-        left, right, subjects, displays
-    ):
-        return
-    if isinstance(operation, (ast.Eq, ast.NotEq, ast.In, ast.NotIn)):
-        _add_literal(subjects, right, left)
-        _add_literal(subjects, left, right)
 
 
 def _compare_literals(
@@ -295,10 +259,14 @@ def _compare_literals(
 ) -> None:
     operands = [node.left, *node.comparators]
     for index, operation in enumerate(node.ops):
-        _pair_sets(
-            operands[index], operation, operands[index + 1],
-            subjects, displays,
-        )
+        left, right = operands[index], operands[index + 1]
+        if isinstance(operation, (ast.In, ast.NotIn)) and _display_sets(
+            left, right, subjects, displays
+        ):
+            continue
+        if isinstance(operation, (ast.Eq, ast.NotEq, ast.In, ast.NotIn)):
+            _add_literal(subjects, right, left)
+            _add_literal(subjects, left, right)
 
 
 def _or_pattern_literals(pattern: ast.AST) -> set[str]:
@@ -321,19 +289,15 @@ def _pattern_literals(pattern: ast.AST) -> set[str]:
     return _or_pattern_literals(pattern)
 
 
-def _match_literals(node: ast.Match) -> frozenset[str]:
-    literals: set[str] = set()
-    for case in node.cases:
-        literals.update(_pattern_literals(case.pattern))
-    return frozenset(literals)
-
-
 def _match_into(
     node: ast.Match,
     _subjects: dict[str, set[str]],
     displays: list[frozenset[str]],
 ) -> None:
-    displays.append(_match_literals(node))
+    literals: set[str] = set()
+    for case in node.cases:
+        literals.update(_pattern_literals(case.pattern))
+    displays.append(frozenset(literals))
 
 
 def _selection_into(
@@ -341,7 +305,15 @@ def _selection_into(
     _subjects: dict[str, set[str]],
     displays: list[frozenset[str]],
 ) -> None:
-    displays.append(_selection_literals(node))
+    display, key = _selection_parts(node)
+    if display is None or key is None:
+        return
+    literals = (
+        _dict_key_literals(display, all_strings=False, minimum=2)
+        if isinstance(display, ast.Dict) and not _literal_flags(key)[0]
+        else frozenset()
+    )
+    displays.append(literals or frozenset())
 
 
 # The one dispatch table from a node kind to its literal-set reader.
@@ -364,13 +336,18 @@ def _scope_walk(nodes: list[ast.AST]):
         yield from _scope_walk(list(ast.iter_child_nodes(node)))
 
 
-def _vocabulary_literals(
-    subjects: dict[str, set[str]], displays: list[frozenset[str]]
-) -> frozenset[str]:
+def _subject_literals(subjects: dict[str, set[str]]) -> set[str]:
     literals: set[str] = set()
     for values in subjects.values():
         if len(values) >= 2:
             literals.update(values)
+    return literals
+
+
+def _vocabulary_literals(
+    subjects: dict[str, set[str]], displays: list[frozenset[str]]
+) -> frozenset[str]:
+    literals = _subject_literals(subjects)
     for values in displays:
         if len(values) >= 2:
             literals.update(values)
@@ -432,87 +409,87 @@ def _python_owners(relative: str, source: str) -> list[Owner]:
     return owners
 
 
-def _unquote_shell(word: str) -> str:
-    if len(word) >= 2 and word[0] == word[-1] and word[0] in "'\"":
-        return word[1:-1]
-    return word
+_SHELL_LITERAL = re.compile(
+    r"(?:'([^']*)'|\"([^\"$\`]*)\"|([A-Za-z0-9_][A-Za-z0-9_.:+-]*))\Z"
+)
+_QUOTED_CHUNK = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+_COMMENT = re.compile(r"(?:^|\s)#")
+_HEREDOC = re.compile(
+    r"<<(-?)(?!<)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2"
+)
+_CASE_BLOCK = re.compile(
+    r"^\s*case\b.*\bin\s*$([\s\S]*?)^\s*esac\b[^\n]*$",
+    re.MULTILINE,
+)
+_CASE_ARM = re.compile(
+    r"(?:^|;;|;&|;;&)\s*\(?((?:[^)\"']|'[^']*'|\"[^\"]*\")*)\)",
+    re.MULTILINE,
+)
+_ALTERNATIVE = re.compile(r"(?:'[^']*'|\"[^\"]*\"|[^|])+")
 
 
 def _shell_word(raw: str) -> str | None:
-    text = _unquote_shell(raw.strip())
-    if not text or not _FORBIDDEN.isdisjoint(text) or not _has_letter(text):
+    match = _SHELL_LITERAL.fullmatch(raw.strip())
+    if match is None:
         return None
-    if _LITERAL_WORD.fullmatch(text) is None:
-        return None
-    return text
+    text = next((group for group in match.groups() if group is not None), "")
+    return text if _has_letter(text) else None
 
 
-def _shell_matches(line: str):
-    return itertools.chain(
-        _BRACKET_TEST.finditer(line), _SINGLE_TEST.finditer(line)
+def _shell_code(line: str) -> str:
+    """The line up to an unquoted # that starts a word."""
+    masked = _QUOTED_CHUNK.sub(
+        lambda match: " " * len(match.group()), line
     )
+    match = _COMMENT.search(masked)
+    return line[:match.end() - 1] if match is not None else line
 
 
-def _test_subject(match: Any) -> str | None:
-    return next(
-        (group for group in match.groups()[:4] if group is not None),
-        None,
-    )
-
-
-def _shell_test(line: str, found: dict[str, set[str]]) -> None:
-    for match in _shell_matches(line):
-        subject = _test_subject(match)
-        word = _shell_word(match.group(5))
-        if subject is not None and word is not None:
-            found.setdefault(subject, set()).add(word)
-
-
-def _case_patterns(line: str) -> set[str]:
-    text = line.strip()
-    close = text.find(")")
-    if close < 0:
-        return set()
-    part = text[:close]
-    if part.startswith("("):
-        part = part[1:]
-    found: set[str] = set()
-    for alternative in part.split("|"):
-        word = _shell_word(alternative)
-        if word is not None:
-            found.add(word)
-    return found
+def _readable_lines(lines: list[str]) -> list[str]:
+    """Lines with comments and here-document bodies blanked, preserving lines."""
+    readable: list[str] = []
+    delimiter: str | None = None
+    strip_tabs = False
+    for line in lines:
+        if delimiter is not None:
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate == delimiter:
+                delimiter = None
+            readable.append("")
+            continue
+        code = _shell_code(line)
+        readable.append(code)
+        match = _HEREDOC.search(code)
+        if match is not None:
+            delimiter = match.group(3)
+            strip_tabs = match.group(1) == "-"
+    return readable
 
 
 def _case_pattern_literals(lines: list[str]) -> set[str]:
     literals: set[str] = set()
-    in_case = False
-    for line in lines:
-        if not in_case:
-            in_case = _CASE.match(line) is not None
-            continue
-        in_case = line.strip() != "esac"
-        if in_case:
-            patterns = _case_patterns(line)
-            if len(patterns) >= 2:
-                literals.update(patterns)
-    return literals
-
-
-def _test_line_literals(lines: list[str]) -> set[str]:
-    subjects: dict[str, set[str]] = {}
-    for line in lines:
-        _shell_test(line, subjects)
-    literals: set[str] = set()
-    for words in subjects.values():
-        if len(words) >= 2:
-            literals.update(words)
-    return literals
+    text = "\n".join(lines)
+    for block in _CASE_BLOCK.finditer(text):
+        for match in _CASE_ARM.finditer(block.group(1)):
+            literals.update(
+                word
+                for alternative in _ALTERNATIVE.findall(match.group(1))
+                if (word := _shell_word(alternative)) is not None
+            )
+    return literals if len(literals) >= 2 else set()
 
 
 def _shell_lines_literals(lines: list[str]) -> frozenset[str]:
+    subjects: dict[str, set[str]] = {}
+    for line in lines:
+        for match in itertools.chain(
+            _BRACKET_TEST.finditer(line), _SINGLE_TEST.finditer(line)
+        ):
+            word = _shell_word(match.group(2))
+            if match.group(1) is not None and word is not None:
+                subjects.setdefault(match.group(1), set()).add(word)
     return frozenset(
-        _case_pattern_literals(lines) | _test_line_literals(lines)
+        _case_pattern_literals(lines) | _subject_literals(subjects)
     )
 
 
@@ -552,15 +529,6 @@ def _top_level_indexes(
     return [index for index in range(total) if index not in covered]
 
 
-def _array_literals(text: str) -> set[str]:
-    found: set[str] = set()
-    for raw in text.split():
-        word = _shell_word(raw)
-        if word is not None:
-            found.add(word)
-    return found
-
-
 def _array_owners(
     relative: str, lines: list[str], indexes: list[int]
 ) -> list[Owner]:
@@ -569,7 +537,11 @@ def _array_owners(
         match = _ARRAY.match(lines[index])
         if match is None:
             continue
-        literals = _array_literals(match.group(2))
+        literals = {
+            word
+            for raw in match.group(2).split()
+            if (word := _shell_word(raw)) is not None
+        }
         if len(literals) >= 2:
             line = index + 1
             owners.append(Owner(
@@ -584,7 +556,7 @@ def _array_owners(
 
 
 def _shell_owners(relative: str, source: str) -> list[Owner]:
-    lines = source.splitlines()
+    lines = _readable_lines(source.splitlines())
     blocks = _shell_blocks(lines)
     owners = [
         Owner(
@@ -620,15 +592,11 @@ def _is_shell_program(root: Path, relative: str) -> bool:
     return interpreter in _SHELL_INTERPRETERS
 
 
-def _owner_index(owners: list[Owner]) -> dict[str, list[int]]:
+def _linked_pairs(owners: list[Owner]) -> list[tuple[int, int]]:
     index: dict[str, list[int]] = {}
     for position, owner in enumerate(owners):
         for literal in owner.literals:
             index.setdefault(literal, []).append(position)
-    return index
-
-
-def _linked_pairs(index: dict[str, list[int]]) -> list[tuple[int, int]]:
     pairs: Counter[tuple[int, int]] = Counter()
     for positions in index.values():
         pairs.update(itertools.combinations(positions, 2))
@@ -642,16 +610,12 @@ def _root(parent: list[int], item: int) -> int:
     return item
 
 
-def _union(parent: list[int], first: int, second: int) -> None:
-    first_root, second_root = _root(parent, first), _root(parent, second)
-    if first_root != second_root:
-        parent[second_root] = first_root
-
-
 def _groups(owners: list[Owner]) -> list[list[Owner]]:
     parent = list(range(len(owners)))
-    for first, second in _linked_pairs(_owner_index(owners)):
-        _union(parent, first, second)
+    for first, second in _linked_pairs(owners):
+        first_root, second_root = _root(parent, first), _root(parent, second)
+        if first_root != second_root:
+            parent[second_root] = first_root
     grouped: dict[int, list[Owner]] = {}
     for position, owner in enumerate(owners):
         grouped.setdefault(_root(parent, position), []).append(owner)
@@ -667,20 +631,6 @@ def _shared_literals(group: list[Owner]) -> list[str]:
     )
 
 
-def _owner_text(owner: Owner) -> str:
-    return f"{owner.path}:{owner.start_line} {owner.name} ({owner.kind})"
-
-
-def _owner_json(owner: Owner) -> dict[str, Any]:
-    return {
-        "path": owner.path,
-        "line": owner.start_line,
-        "name": owner.name,
-        "kind": owner.kind,
-        "literals": sorted(owner.literals),
-    }
-
-
 def _vsd_finding(group: list[Owner]) -> Finding:
     shared = _shared_literals(group)
     ordered = sorted(
@@ -689,7 +639,10 @@ def _vsd_finding(group: list[Owner]) -> Finding:
     subject = _VSD_HEADER.format(
         literals=", ".join(json.dumps(value) for value in shared),
         count=len(ordered),
-        places=", ".join(_owner_text(owner) for owner in ordered),
+        places=", ".join(
+            f"{owner.path}:{owner.start_line} {owner.name} ({owner.kind})"
+            for owner in ordered
+        ),
     )
     first = ordered[0]
     return Finding(
@@ -697,7 +650,14 @@ def _vsd_finding(group: list[Owner]) -> Finding:
         1,
         f"{first.path}:{first.start_line}",
         {"literals": shared, "owners": [
-            _owner_json(owner) for owner in ordered
+            {
+                "path": owner.path,
+                "line": owner.start_line,
+                "name": owner.name,
+                "kind": owner.kind,
+                "literals": sorted(owner.literals),
+            }
+            for owner in ordered
         ]},
         tuple(
             Location(owner.path, owner.start_line, owner.end_line)
@@ -742,16 +702,10 @@ def _module_call(
     return callee, node.args[0]
 
 
-def _pair_calls(
-    calls: list[tuple[ast.AST, ast.AST]]
-) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    pairs: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    first, argument = calls[0]
-    for callee, other_argument in calls[1:]:
-        if callee is not first and ast.dump(other_argument) == ast.dump(argument):
-            pairs.append((first, callee, argument))
-        first, argument = callee, other_argument
-    return pairs
+def _same_call(
+    callee: ast.AST, argument: ast.AST, other: ast.AST, other_argument: ast.AST
+) -> bool:
+    return callee is not other and ast.dump(other_argument) == ast.dump(argument)
 
 
 def _or_chain(
@@ -759,9 +713,15 @@ def _or_chain(
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
     calls = [_module_call(value, functions) for value in node.values]
-    if any(call is None for call in calls):
+    if None in calls:
         return []
-    return _pair_calls(calls)
+    pairs: list[tuple[ast.AST, ast.AST, ast.AST]] = []
+    first, argument = calls[0]
+    for callee, other_argument in calls[1:]:
+        if _same_call(first, argument, callee, other_argument):
+            pairs.append((first, callee, argument))
+        first, argument = callee, other_argument
+    return pairs
 
 
 def _scope_nodes(node: ast.AST, kinds: Any) -> list[Any]:
@@ -777,9 +737,10 @@ def _or_chains(
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
     return [
         chain
-        for child in _scope_nodes(node, ast.BoolOp)
-        if isinstance(child.op, ast.Or)
-        for chain in _or_chain(child, functions)
+        for child in _scope_nodes(node, ast.Return)
+        if isinstance(child.value, ast.BoolOp)
+        if isinstance(child.value.op, ast.Or)
+        for chain in _or_chain(child.value, functions)
     ]
 
 
@@ -817,83 +778,92 @@ def _guards(node: ast.AST) -> list[tuple[ast.If, str]]:
     return found
 
 
-def _is_other_call(
-    callee: ast.AST,
-    argument: ast.AST,
-    other: ast.AST,
-    other_argument: ast.AST,
+def _call_actions(
+    node: ast.AST,
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> list[tuple[ast.AST, ast.AST, int, str | None]]:
+    """Returned or assigned module calls, with the assigned name if any."""
+    actions: list[tuple[ast.AST, ast.AST, int, str | None]] = []
+    for child in _scope_nodes(node, ast.Return):
+        call = _module_call(child.value, functions) if child.value else None
+        if call is not None:
+            actions.append((*call, child.lineno, None))
+    for line, name, call in _assign_calls(node, functions):
+        actions.append((*call, line, name))
+    return actions
+
+
+def _rebound_between(
+    node: ast.AST, name: str, after: int, before: int
 ) -> bool:
-    return (
-        callee is not other
-        and ast.dump(other_argument) == ast.dump(argument)
+    return any(
+        isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Store)
+        and child.id == name
+        and after < child.lineno < before
+        for child in _scope_walk(node.body)
     )
 
 
-def _handler_calls(
-    nodes: list[ast.AST],
+def _later_return(node: ast.AST, name: str, after: int) -> bool:
+    return any(
+        isinstance(child.value, ast.Name)
+        and child.value.id == name
+        and child.lineno > after
+        and not _rebound_between(node, name, after, child.lineno)
+        for child in _scope_nodes(node, ast.Return)
+    )
+
+
+def _matching_actions(
+    actions: list[tuple[ast.AST, ast.AST, int, str | None]],
     callee: ast.AST,
     argument: ast.AST,
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> list[tuple[ast.AST, int, str | None]]:
+    return [
+        (other, line, assigned)
+        for other, other_argument, line, assigned in actions
+        if _same_call(callee, argument, other, other_argument)
+    ]
+
+
+def _handler_chains(
+    owner: ast.AST,
+    actions: list[tuple[ast.AST, ast.AST, int, str | None]],
+    callee: ast.AST,
+    argument: ast.AST,
+    expected: str | None,
+    after: int,
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    found: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    for other, other_argument in _body_calls(nodes, functions):
-        if _is_other_call(callee, argument, other, other_argument):
-            found.append((callee, other, argument))
-    return found
+    chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
+    allowed = {None, expected}
+    for other, line, assigned in _matching_actions(
+        actions, callee, argument
+    ):
+        if assigned not in allowed:
+            continue
+        names = {expected, assigned} - {None}
+        if all(
+            _later_return(owner, name, max(after, line)) for name in names
+        ):
+            chains.append((callee, other, argument))
+    return chains
 
 
 def _guard_chains(
     node: ast.AST,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    assignments = _assign_calls(node, functions)
+    chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
     guards = _guards(node)
-    chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    for line, name, (callee, argument) in assignments:
+    for line, name, (callee, argument) in _assign_calls(node, functions):
         for guard, guard_name in guards:
-            if guard_name == name and guard.lineno > line:
-                chains.extend(_handler_calls(
-                    guard.body, callee, argument, functions
-                ))
-    return chains
-
-
-def _body_calls(
-    nodes: list[ast.AST],
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> list[tuple[ast.AST, ast.AST]]:
-    found: list[tuple[ast.AST, ast.AST]] = []
-    for child in _scope_walk(nodes):
-        if not isinstance(child, ast.Call):
-            continue
-        call = _module_call(child, functions)
-        if call is not None:
-            found.append(call)
-    return found
-
-
-def _handler_pairs(
-    body: list[tuple[ast.AST, ast.AST]],
-    handled: list[tuple[ast.AST, ast.AST]],
-) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    for callee, argument in body:
-        for other, other_argument in handled:
-            if _is_other_call(callee, argument, other, other_argument):
-                chains.append((callee, other, argument))
-    return chains
-
-
-def _try_chain(
-    node: ast.AST,
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    body = _body_calls(node.body, functions)
-    chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    for handler in node.handlers:
-        chains.extend(_handler_pairs(
-            body, _body_calls(handler.body, functions)
-        ))
+            if guard_name != name or guard.lineno <= line:
+                continue
+            chains.extend(_handler_chains(
+                node, _call_actions(guard, functions),
+                callee, argument, name, guard.lineno,
+            ))
     return chains
 
 
@@ -901,22 +871,17 @@ def _try_chains(
     node: ast.AST,
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> list[tuple[ast.AST, ast.AST, ast.AST]]:
-    chains: list[tuple[ast.AST, ast.AST, ast.AST]] = []
-    for child in _scope_nodes(node, (ast.Try, ast.TryStar)):
-        chains.extend(_try_chain(child, functions))
-    return chains
-
-
-def _same_annotation(first: ast.AST, second: ast.AST) -> bool:
-    return (
-        first.returns is not None
-        and second.returns is not None
-        and ast.dump(first.returns) == ast.dump(second.returns)
-    )
-
-
-def _name_token(first: str, second: str, formats: frozenset[str]) -> bool:
-    return bool((set(first.split("_")) ^ set(second.split("_"))) & formats)
+    return list(itertools.chain.from_iterable(
+        _handler_chains(
+            node, _call_actions(handler, functions),
+            callee, argument, body_name, body_line,
+        )
+        for child in _scope_nodes(node, (ast.Try, ast.TryStar))
+        for handler in child.handlers
+        for callee, argument, body_line, body_name in _call_actions(
+            child, functions
+        )
+    ))
 
 
 def _caller_span(relative: str, node: ast.AST) -> Owner:
@@ -937,8 +902,14 @@ def _trial_finding(
     argument: ast.AST,
     formats: frozenset[str],
 ) -> Finding | None:
-    if not _same_annotation(first, second) or not _name_token(
-        first.name, second.name, formats
+    if (
+        first.returns is None
+        or second.returns is None
+        or ast.dump(first.returns) != ast.dump(second.returns)
+        or not (
+            (set(first.name.split("_")) ^ set(second.name.split("_")))
+            & formats
+        )
     ):
         return None
     argument_text = ast.unparse(argument)
@@ -995,24 +966,6 @@ def _python_trials(
     return trials
 
 
-def _selected(context: Any) -> list[str]:
-    from .checks import _select_files
-
-    selected, _names = _select_files(
-        context.config, context.check, context.files, context.classes
-    )
-    return selected
-
-
-def _changed(
-    spec: VariantSpec, diff: Any, candidate: Candidate
-) -> bool:
-    return any(
-        owner.kind != KIND_TOP_LEVEL and _touched(spec, diff, owner)
-        for owner in candidate.owners
-    )
-
-
 def _candidate_findings(
     owners: list[Owner], trials: list[tuple[Finding, Owner]]
 ) -> list[Candidate]:
@@ -1031,7 +984,10 @@ def _changed_candidates(
 ) -> list[Candidate]:
     return [
         candidate for candidate in candidates
-        if _changed(spec, diff, candidate)
+        if any(
+            owner.kind != KIND_TOP_LEVEL and _touched(spec, diff, owner)
+            for owner in candidate.owners
+        )
     ]
 
 
@@ -1046,9 +1002,14 @@ def _measure(
             context.root, spec.base, resolved=context.base_override
         )
         diff = _diff_lines(context.root, base.commit)
+    from .checks import _select_files
+
+    selected, _names = _select_files(
+        context.config, context.check, context.files, context.classes
+    )
     owners: list[Owner] = []
     trials: list[tuple[Finding, Owner]] = []
-    for relative in _selected(context):
+    for relative in selected:
         if _is_python_program(context.root, relative):
             source = _read_source(context.root, relative)
             owners.extend(_python_owners(relative, source))
@@ -1064,55 +1025,40 @@ def _measure(
     return candidates, len(owners), base
 
 
-def _measurement(count: int, base: DiffBase | None) -> dict[str, Any]:
+def _finish(
+    context: Any, check: Any, start: float, measured: tuple[Any, int, Any]
+) -> Any:
+    from .checks import _evaluate_ratchet, _ratchet_result
+
+    candidates, count, base = measured
+    findings: list[Finding] = []
+    subjects: list[str] = []
+    for candidate in candidates:
+        finding = candidate.finding
+        findings.append(finding)
+        subjects.append(finding.subject)
+    findings.sort(key=lambda finding: finding.subject)
+    domain = Domain.of_subjects(
+        subjects, "the measured owners and vocabularies",
+    )
+    ratchet, failure = _evaluate_ratchet(
+        findings, [], check, context.prefix, domain
+    )
     measurement: dict[str, Any] = {"owners": count}
     if base is not None:
         measurement["base"] = base.measurement()
-    return measurement
-
-
-def _ratchet_outcome(
-    prefix: str,
-    check: Any,
-    start: float,
-    ratchet: Any,
-    failure: str | None,
-    measurement: dict[str, Any],
-) -> Any:
-    from .checks import _ratchet_result
-
     if ratchet is None:
         return _ratchet_result(
             check, start, failure, reason=failure, measurement=measurement
         )
     if ratchet.satisfied:
         print(
-            f"{prefix}: {measurement['owners']} owners measured", flush=True
+            f"{context.prefix}: {measurement['owners']} owners measured",
+            flush=True,
         )
     return _ratchet_result(
         check, start, ratchet.outcome, ratchet=ratchet,
         measurement=measurement,
-    )
-
-
-def _finish(
-    context: Any, check: Any, start: float, measured: tuple[Any, int, Any]
-) -> Any:
-    from .checks import _evaluate_ratchet
-
-    candidates, count, base = measured
-    findings = [candidate.finding for candidate in candidates]
-    findings.sort(key=lambda finding: finding.subject)
-    domain = Domain.of_subjects(
-        [finding.subject for finding in findings],
-        "the measured owners and vocabularies",
-    )
-    ratchet, failure = _evaluate_ratchet(
-        findings, [], check, context.prefix, domain
-    )
-    return _ratchet_outcome(
-        context.prefix, check, start, ratchet, failure,
-        _measurement(count, base),
     )
 
 

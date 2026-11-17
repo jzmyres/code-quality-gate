@@ -129,6 +129,9 @@ def _display_selection(node: ast.Subscript) -> int:
     if constant:
         return 0
     if isinstance(node.value, ast.Dict):
+        positions = _tuple_boolean_positions(node.value)
+        if positions is not None:
+            return positions
         return max(0, len(node.value.keys) - 1)
     return _display_elements(node.value)
 
@@ -144,7 +147,12 @@ def _dict_get(node: ast.Call) -> int:
     display = getattr(node.func, "value", None)
     if not isinstance(display, ast.Dict) or _called_name(node) != "get":
         return 0
-    keys = max(0, len(display.keys) - 1)
+    positions = _tuple_boolean_positions(display)
+    keys = (
+        positions
+        if positions is not None
+        else max(0, len(display.keys) - 1)
+    )
     return keys + int(len(node.args) >= 2)
 
 
@@ -169,6 +177,53 @@ def _boolean_keys(node: ast.AST) -> int | None:
     return len(node.keys)
 
 
+def _tuple_width(keys: list[ast.AST | None]) -> int | None:
+    width: int | None = None
+    for key in keys:
+        elts = key.elts if isinstance(key, ast.Tuple) else None
+        if not elts:
+            return None
+        if width not in (None, len(elts)):
+            return None
+        width = len(elts)
+    return width
+
+
+def _boolean_positions(
+    keys: list[ast.AST | None], width: int
+) -> int:
+    count = 0
+    for index in range(width):
+        if all(
+            isinstance(key.elts[index], ast.Constant)
+            and isinstance(key.elts[index].value, bool)
+            for key in keys
+            if isinstance(key, ast.Tuple)
+        ):
+            count += 1
+    return count
+
+
+def _tuple_boolean_positions(node: ast.Dict) -> int | None:
+    """Boolean positions in tuple keys of one length, or None if not tuples."""
+    keys = node.keys
+    width = _tuple_width(keys)
+    if width is None or all(_boolean_key(key) for key in keys):
+        return None
+    return _boolean_positions(keys, width)
+
+
+def _table_selection_count(node: ast.AST) -> int | None:
+    """The selection count that keeps the existing keys-minus-one arithmetic."""
+    keys = _boolean_keys(node)
+    if keys is not None:
+        return keys
+    if not isinstance(node, ast.Dict):
+        return None
+    positions = _tuple_boolean_positions(node)
+    return None if positions in (None, 0) else positions + 1
+
+
 def _assignment_targets(statement: ast.AST) -> list[ast.Name]:
     if isinstance(statement, ast.Assign):
         return [
@@ -190,7 +245,7 @@ def _record_boolean_table(
     invalid: set[str],
 ) -> None:
     keys = (
-        _boolean_keys(statement.value)
+        _table_selection_count(statement.value)
         if statement.value is not None else None
     )
     for target in _assignment_targets(statement):
@@ -201,21 +256,34 @@ def _record_boolean_table(
             tables[target.id] = keys
 
 
+def _scope_walk(node: ast.AST):
+    """A node and its own scope, without a nested function or class body."""
+    yield node
+    if isinstance(
+        node,
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+    ):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _scope_walk(child)
+
+
 def _collect_boolean_tables(
     node: ast.AST,
     tables: dict[str, int],
     valid: set[int],
     invalid: set[str],
+    walk: Any,
 ) -> None:
-    for child in ast.walk(node):
+    for child in walk(node):
         if isinstance(child, (ast.Assign, ast.AnnAssign)):
             _record_boolean_table(child, tables, valid, invalid)
 
 
 def _record_rebindings(
-    node: ast.AST, valid: set[int], invalid: set[str]
+    node: ast.AST, valid: set[int], invalid: set[str], walk: Any
 ) -> None:
-    for child in ast.walk(node):
+    for child in walk(node):
         if (
             isinstance(child, ast.Name)
             and isinstance(child.ctx, ast.Store)
@@ -224,15 +292,18 @@ def _record_rebindings(
             invalid.add(child.id)
 
 
-def _boolean_tables(source: ast.AST | list[ast.AST]) -> dict[str, int]:
+def _boolean_tables(
+    source: ast.AST | list[ast.AST], *, scoped: bool = False
+) -> dict[str, int]:
     """The names bound in one scope to a dict display keyed by booleans."""
     roots = [source] if isinstance(source, ast.AST) else source
+    walk = _scope_walk if scoped else ast.walk
     tables: dict[str, int] = {}
     valid: set[int] = set()
     invalid: set[str] = set()
     for root in roots:
-        _collect_boolean_tables(root, tables, valid, invalid)
-        _record_rebindings(root, valid, invalid)
+        _collect_boolean_tables(root, tables, valid, invalid, walk)
+        _record_rebindings(root, valid, invalid, walk)
     return {
         name: count
         for name, count in tables.items()
@@ -469,6 +540,38 @@ def _start_line(
     return node.lineno
 
 
+def _argument_names(arguments: ast.arguments) -> set[str]:
+    names = {
+        argument.arg
+        for argument in [
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        ]
+    }
+    for argument in (arguments.vararg, arguments.kwarg):
+        if argument is not None:
+            names.add(argument.arg)
+    return names
+
+
+def _scope_bindings(nodes: list[ast.AST]) -> set[str]:
+    names: set[str] = set()
+    for node in nodes:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Name)
+                and isinstance(child.ctx, ast.Store)
+            ):
+                names.add(child.id)
+            elif isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                names.add(child.name)
+    return names
+
+
 def _function_complexity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_tables: dict[str, int] | None = None,
@@ -477,7 +580,15 @@ def _function_complexity(
     # to the enclosing owner, so only the executable body counts here.
     tables = _boolean_tables(node.body)
     if module_tables:
-        tables = {**module_tables, **tables}
+        shadowed = _scope_bindings(node.body) | _argument_names(node.args)
+        tables = {
+            **{
+                name: keys
+                for name, keys in module_tables.items()
+                if name not in shadowed
+            },
+            **tables,
+        }
     return cyclomatic_complexity(
         ast.Module(body=node.body, type_ignores=[]), tables
     )
@@ -589,7 +700,7 @@ def _outside_nodes(tree: ast.Module) -> list[ast.AST]:
 
 
 def _outside_complexity(nodes: list[ast.AST]) -> int:
-    return _count_rules(nodes, _boolean_tables(nodes))
+    return _count_rules(nodes, _boolean_tables(nodes, scoped=True))
 
 
 def _node_lines(nodes: list[ast.AST]) -> list[int]:
@@ -678,7 +789,7 @@ def collect_functions(
 ) -> list[MeasuredFunction]:
     tree = ast.parse(source, filename=relative)
     overload_names, typing_modules = _typing_overload(tree)
-    module_tables = _boolean_tables(_outside_nodes(tree))
+    module_tables = _boolean_tables(tree.body, scoped=True)
     found: list[MeasuredFunction] = []
     _collect_functions(
         [tree], "", relative, found, overload_names, typing_modules,

@@ -1652,6 +1652,55 @@ class BooleanTableTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.complexity(source, "choose"), expected)
 
+    def test_mixed_tuple_keys_count_their_boolean_positions(self):
+        cases = {
+            "TABLE = {(True, 'a'): 1, (False, 'b'): 2}\n"
+            "def choose(key):\n"
+            "    return TABLE[key]\n": 2,
+            "TABLE = {(True, True, 'a'): 1, (False, False, 'b'): 2}\n"
+            "def choose(key):\n"
+            "    return TABLE[key]\n": 3,
+            "TABLE = {('a', 'b'): 1, ('c', 'd'): 2}\n"
+            "def choose(key):\n"
+            "    return TABLE[key]\n": 1,
+            "TABLE = {(True, 'a'): 1, (False, 'b', 'c'): 2}\n"
+            "def choose(key):\n"
+            "    return TABLE[key]\n": 1,
+            "def choose(key):\n"
+            "    return {(True, 'a'): 1, (False, 'b'): 2}[key]\n": 2,
+            "def choose(key):\n"
+            "    return {(True, True, 'a'): 1, (False, False, 'b'): 2}[key]\n": 3,
+            "def choose(key):\n"
+            "    return {('a', 'b'): 1, ('c', 'd'): 2}[key]\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source, "choose"), expected)
+
+    def test_mixed_tuple_keys_count_with_get_and_a_default(self):
+        cases = {
+            "TABLE = {(True, 'a'): 1, (False, 'b'): 2}\n"
+            "def choose(key):\n"
+            "    return TABLE.get(key)\n": 2,
+            "TABLE = {(True, 'a'): 1, (False, 'b'): 2}\n"
+            "def choose(key, fallback):\n"
+            "    return TABLE.get(key, fallback)\n": 3,
+            "def choose(key):\n"
+            "    return {(True, True, 'a'): 1, (False, False, 'b'): 2}"
+            ".get(key)\n": 3,
+            "def choose(key, fallback):\n"
+            "    return {(True, True, 'a'): 1, (False, False, 'b'): 2}"
+            ".get(key, fallback)\n": 4,
+            "def choose(key):\n"
+            "    return {('a', 'b'): 1, ('c', 'd'): 2}.get(key)\n": 1,
+            "def choose(key, fallback):\n"
+            "    return {('a', 'b'): 1, ('c', 'd'): 2}"
+            ".get(key, fallback)\n": 2,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source, "choose"), expected)
+
     def test_a_named_table_read_with_get_counts_its_keys_and_a_default(self):
         source = "TABLE = {True: 1, False: 2}\n"
         cases = {
@@ -1721,6 +1770,44 @@ class BooleanTableTests(unittest.TestCase):
             python_crap._named_selection(selection, tables), 2
         )
         self.assertEqual(python_crap._named_get(call, tables), 3)
+
+    def test_a_local_in_another_function_does_not_hide_the_module_table(self):
+        selections = ", ".join(["TABLE[flag]"] * 6)
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def unrelated():\n"
+            "    TABLE = {}\n"
+            "    return TABLE\n"
+            "def choose(flag):\n"
+            f"    return ({selections})\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 7)
+
+    def test_a_parameter_shadows_the_module_table(self):
+        selections = ", ".join(["TABLE[flag]"] * 6)
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def choose(TABLE, flag):\n"
+            f"    return ({selections})\n"
+        )
+        self.assertEqual(self.complexity(source, "choose"), 1)
+
+    def test_a_nested_function_binding_counts_in_its_enclosing_function(self):
+        source = (
+            "TABLE = {True: 1, False: 2}\n"
+            "def outer(flag):\n"
+            "    def inner():\n"
+            "        TABLE = {True: 3, False: 4, (True, False): 5}\n"
+            "        return TABLE[flag]\n"
+            "    return TABLE[flag]\n"
+            "def shadowed(flag):\n"
+            "    def hidden():\n"
+            "        TABLE = {}\n"
+            "        return TABLE[flag]\n"
+            "    return TABLE[flag]\n"
+        )
+        self.assertEqual(self.complexity(source, "outer"), 5)
+        self.assertEqual(self.complexity(source, "shadowed"), 1)
 
     def test_a_name_rebound_to_something_else_is_not_counted(self):
         cases = {

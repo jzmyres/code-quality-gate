@@ -546,8 +546,8 @@ module-level definition). The construct rules and the named-table selections are
 | `and`/`or` | One per operand after the first. |
 | `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`; a starred element that is itself a tuple or list display expands to its elements, recursively, so an empty one adds none. |
 | subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. A signed numeric constant such as `-1` or `+2` is a constant. |
-| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. The same subscript of a name bound in the same module or function to a dict display whose keys are all booleans or tuples of booleans counts the same way. |
-| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, when it counts like the display. |
+| subscript of a dict display whose key is not a constant | One per key after the first, a selection among them. Tuple keys of one length that mix booleans with other constants add one per position that holds a boolean constant in every key; string and number positions add nothing. The same subscript of a name bound in the same module or function to such a table counts the same way, with module tables taken from module-level statements only and a parameter, local or nested binding of the name shadowing the module table. |
+| `.get` on a dict display | One per key after the first, a selection among them, plus one for a default argument, which is a branch. A dict bound to a name is data and adds nothing, unless its keys are all booleans or tuples of booleans, or tuples of one length with a boolean position, when it counts like the display. |
 | `getattr` with three arguments | One, the default is a branch. |
 | `next` with two arguments | One, the default is a branch. |
 | a string literal or tuple/list display multiplied by a non-constant on either side | One, the repetition chooses a length or count. |
@@ -697,19 +697,22 @@ top-level statements (one owner per file). An owner's set is the union of its li
 literal set is the string literals of one of these:
 
 * Python: the literals one function compares with `==`, `!=`, `in` or `not in` against the same
-  subject (the same name, attribute chain or subscript, compared by `ast.dump`); a literal tuple,
-  list or set display used with `in` or `not in` against a non-constant; a `match` statement's
-  literal case patterns; a dict display whose keys are all string literals, at least two of them,
-  that is subscripted, or read with `.get`, by a non-constant.
+  subject (the same name, attribute chain or subscript, compared by `ast.dump`), when the other
+  operand is not a constant; a literal tuple, list or set display used with `in` or `not in`
+  against a non-constant; a `match` statement's literal case patterns; a dict display with at
+  least two string-literal keys, other keys ignored, that is subscripted, or read with `.get`,
+  by a non-constant.
 * A declared table: a module-level assignment (or annotated assignment) to a name whose value is a
   dict display with all string keys, or a tuple, list, set or `frozenset(...)` display of string
   elements, with at least two literals; its set is its keys or elements, and a nested tuple, list or
   set element contributes its string literals.
-* Shell: a `case SUBJECT in` block's literal pattern alternatives (a bare word
-  `[A-Za-z0-9_][A-Za-z0-9_.:+-]*` or a quoted word; patterns with `*`, `?`, `[` or `$` are not
-  literals); the right-hand words of `[[ $X == word ]]`, `[[ $X != word ]]`, `[[ $X = word ]]` and
-  `[ "$X" = word ]` grouped by the normalised subject (`${X:-}` and `$X` are `X`); a top-level
-  array assignment `NAME=(a b c)` of literal words, at least two, as a declared table.
+* Shell: a `case SUBJECT in` block's literal pattern alternatives from every arm until its
+  `esac`, however the arms are laid out (a bare word `[A-Za-z0-9_][A-Za-z0-9_.:+-]*` or a quoted
+  word; a quoted word is a literal whatever it holds unless double quotes contain an expansion;
+  a bare pattern with `*`, `?`, `[` or `$` is not a literal); the right-hand words of
+  `[[ $X == word ]]`, `[[ $X != word ]]`, `[[ $X = word ]]` and `[ "$X" = word ]` grouped by the
+  normalised subject (`${X:-}` and `$X` are `X`); a top-level array assignment `NAME=(a b c)` of
+  literal words, at least two, as a declared table.
 
 A literal counts only if it contains a letter, so numbers, exit codes and the empty string never form
 a vocabulary. A literal set with fewer than two literals is not a vocabulary and contributes
@@ -729,16 +732,20 @@ still read to find the other owners. `base` defaults to `HEAD`. An invalid base 
 never a pass.
 
 The shell reader is line based: a function is `name() {` at column 0 to the matching `}` at column 0.
-Here-documents are not read, and a test split over a continuation line is not read. A case block's
-patterns and an array assignment must each be written on the lines the reader sees.
+A comment from an unquoted `#` that starts a word, and every here-document body (`<<WORD`,
+`<<-WORD`, `<<'WORD'` or `<<"WORD"` up to its terminator line), are never read. A test split over a
+continuation line is not read. A case block's patterns and an array assignment must each be written
+on the lines the reader sees.
 
 The same adapter reports `TRIAL`, Python only: a function that calls two or more different
 module-level functions of its own module on the same first argument as a fallback chain and returns
-the first non-empty result, in one of three forms: `f(x) or g(x)`; `v = f(x)` then
-`if v is None` or `if not v` and then `g(x)`; or a `try` around `f(x)` whose handler calls
-`g(x)`. It is reported only when the callees have the same return annotation and their names differ
-only in tokens that are literals of a declared table of the same module (a format-name table). Its
-message is exactly:
+the chain's value, in one of three forms: `return f(x) or g(x)`; `v = f(x)`, then
+`if v is None` or `if not v` whose body assigns `v = g(x)` or returns `g(x)`, and a later
+`return v` with no other assignment to `v` in between; or a `try` whose body returns `f(x)` (or
+assigns `v` returned later) and whose handler returns `g(x)` (or assigns `v`). A discarded chain,
+guard or try is not a finding. It is reported only when the callees have the same return annotation
+and their names differ only in tokens that are literals of a declared table of the same module (a
+format-name table). Its message is exactly:
 
     TRIAL variant-dispatch: FILE:LINE FUNCTION tries F then G on ARG; select the reader from the table that names the formats, by the record's declared format, instead of trying each.
 
