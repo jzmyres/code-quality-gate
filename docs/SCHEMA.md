@@ -147,6 +147,9 @@ Rules:
   `executed = ran - skipped`, and zero executed tests fail.
 * `python_crap.requires` names an earlier `python_tests` check. Anything else
   is a configuration error.
+* `python_mutation` requires `base` and has no `baseline` key. `scope`, when present, is
+  `changed`; `mutant_seconds` (default 10), `function_mutants` (default 20) and
+  `run_seconds` (default 300) are positive integers.
 * `python_shape` requires `base` and `crap_check`, and has no `baseline` key. `scope`
   is `changed` or `tree`; `crap_check` names a `python_crap` check whose `threshold`
   is CPF's limit; `max_chain` is an integer of at least 1; `clone_min_tokens` is 20-49;
@@ -220,6 +223,7 @@ The same `tests` evidence identifies producers for verification and its
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
 | `python_shape` | `duplication` |
+| `python_mutation` | `static` |
 | `elisp_crap` | `crap` |
 | `verification` | none |
 

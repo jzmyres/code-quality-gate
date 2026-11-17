@@ -67,7 +67,7 @@ in how each one invokes the gate.
 
 | Consumer | Language | `[code]` | Classes, then checks | How it runs the gate |
 | --- | --- | --- | --- | --- |
-| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
+| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `variant-dispatch` (`variant_dispatch`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
 | A shell and Python agent harness | Shell and Python | `*.py`, `*.sh`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `shell-tested`, `shell-sourced`, `shell-probe`, `config`, `build`, `doc`, `gate`; `ruff`, `shellcheck`, `json` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification` | A runner gates each candidate with `--policy-from` the last landed commit |
 | An Emacs Lisp editor configuration | Emacs Lisp, with shell helpers | Emacs Lisp sources and their shell helpers | `modules`, `tools`, `suites`, `startup`, `shell`, `config`, `data`, `docs`, `fixture`, `gate`; `emacs-tests`, `tooling-tests` (`elisp_tests`), `emacs-crap`, `tooling-crap` (`elisp_crap`), `elisp-compile`, `elisp-checkdoc`, `shellcheck` (`command`) | Ran beside its own older gate, recording parity first |
 
@@ -89,7 +89,8 @@ the configuration, `adapters.py` declares every adapter once in its descriptor a
 supported-adapter registry, `files.py` resolves the repository and runs inventory and hygiene,
 `tools.py` owns the pinned tool lock and extraction, `ratchet.py` owns baseline decisions and pruning,
 `clones.py` measures jscpd clones, `python_tests.py` and `covrun.py` run tests under coverage,
-`python_crap.py` joins coverage with `ast` complexity, `variant_dispatch.py` refuses a
+`python_crap.py` joins coverage with `ast` complexity, `python_mutation.py` mutates changed
+functions and refuses a change whose tests survive, `variant_dispatch.py` refuses a
 vocabulary listed in two places and a format guessed by trial, `elisp_tests.py` and
 `elisp/qg-elisp-child.el` run an ERT suite with Edebug coverage, `elisp_crap.py` and
 `elisp/qg-elisp-complexity.el` join that coverage with the Emacs Lisp default or policy decision rules,
@@ -725,6 +726,10 @@ one of its owners is a function or table the diff from `base` adds or changes; t
 still read to find the other owners. `base` defaults to `HEAD`. An invalid base is a check error,
 never a pass.
 
+This repository's own `quality-gate.toml` enables `variant_dispatch` in the `python` class with
+`scope = "tree"`; the gate's own code has no VSD or TRIAL finding. The check landed before the policy
+that judges this repository enabled it, which is why the enabling change is separate.
+
 The same adapter reports `TRIAL`, Python only: a function whose body contains one of three exact
 statement shapes, with `f` and `g` different module-level functions of the same module called on
 the same first argument: `return f(x) or g(x)`; three consecutive statements in one block,
@@ -752,6 +757,94 @@ table:
     VSD variant-dispatch: "alpha", "beta" are listed in 2 places: pkg/app.py:1 first (function), pkg/app.py:7 second (function)
     Declare this vocabulary once, in one table, and read every per-variant difference through it.
 
+
+### Python mutation
+
+    [checks.mutation]
+    adapter = "python_mutation"
+    tier = 1
+    enforcement = "enforced"
+    scope = "changed"                     # only changed
+    base = "HEAD"                         # required; the diff base
+    mutant_seconds = 10                   # optional; one mutant's test run
+    function_mutants = 20                 # optional; mutants per function
+    run_seconds = 300                     # optional; the whole check
+
+`python_mutation` refuses a change whose tests survive a mutation of a function the diff adds or
+changes. It selects the production functions exactly as `python_shape` does with `scope = "changed"`
+and `base`: the selected files the diff touches, and in them each function or method an added line
+falls inside, or every function of a new file. Test files are never mutated. A function with no
+mutants is not reported merely for that; a function no test names is a finding (see below).
+
+For each selected function, in source order, the adapter generates these mutants from a fixed
+operator set:
+
+* a comparison operator flipped: `==`/`!=`, `<`/`>=`, `>`/`<=`, `in`/`not in`, `is`/`is not`;
+* `and` and `or` swapped;
+* a condition negated: an `if`, `while`, ternary or comprehension `if` test;
+* a `return` value replaced by `None`, or `True` and `False` swapped for a boolean constant;
+* one statement deleted, replaced by `pass` when deleting it would leave an empty block;
+* an integer constant `n` changed to `n + 1`, and a string constant changed to the empty string.
+
+The operator label in a finding is the new spelling (`!=`, `>=`, `or`, `return False`, `n+1`,
+`empty string`, ...), except that negation is `not` and deletion is `delete`. At most
+`function_mutants` mutants are generated per function: the first that many generated mutants in
+source order, not counting a suppressed candidate.
+
+An equivalent mutant is not generated, and the JSON records it with outcome `not generated` and the
+rule that suppressed it:
+
+* `unparsed source unchanged`: `ast.unparse` of the mutated function equals the original's;
+* `self-comparison`: the mutation compares a value with itself, as in `x == x`;
+* `only statement`: deleting it would remove the only non-docstring statement of a function body;
+* `docstring`: the mutation would change a docstring;
+* `return None`: the return is already `return None` or a bare `return`.
+
+There is no suppression list and no baseline: a surviving mutant is answered with a test or by
+fixing a generation rule here.
+
+The test files for a function are the Python files under the test directory a `python_tests`
+check discovers whose source names the function or imports its module's dotted path; when the policy
+configures no `python_tests` check, every selected test-shaped Python file is considered. A function
+no such file names is a finding with `no test names it`: it has no tests, and mutation testing cannot
+show its tests can fail. Each mutant is applied to a copy of the repository in a temporary directory;
+the working tree is never written. The selected test files run in that copy with the bounded runner
+as `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
+
+`mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
+mutants per function (default 20), and `run_seconds` bounds the whole check (default 300). A mutant
+that exceeds its run is `timed out` and counts as killed only when the original tests passed within
+`mutant_seconds`; if the original tests fail or exceed their own time, the check is an error, never
+a pass. A check that reaches `run_seconds` stops and reports every function it did not finish as an
+`over budget` finding. An invalid `base` is a check error, never a pass.
+
+A surviving mutant is one finding, value `1` against threshold `0`, with the exact message:
+
+    python-mutation: FILE:LINE FUNCTION survives OPERATOR (MUTATED LINE); tests run: FILES. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.
+
+For example, a weak test that only asserts the result is one of the possible strings:
+
+    def classify(value):
+        if value > 0:
+            return "positive"
+        return "other"
+
+    class ClassifyTests(unittest.TestCase):
+        def test_classify(self):
+            self.assertIn(classify(1), ("positive", "other"))
+
+reports the boundary flip that takes the same branch for `1`:
+
+    check: mutation: python-mutation: pkg/app.py:2 classify survives >= (if value >= 0:); tests run: tests/test_app.py. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.: value 1 exceeds threshold 0 at pkg/app.py:1-3
+
+The finding's `measurement` carries `subject` (`FILE:FUNCTION`), `file`, `function`, `operator`,
+`line`, `mutated`, `outcome` and `tests`. The check's JSON `measurement` carries every mutant in
+`mutants`, each with those fields plus `rule` (the suppressed rule, otherwise null), and the
+`functions` count, the `test_files` considered and the `base` commit. Outcomes are `killed`,
+`survived`, `timed out` and `not generated`. The metric version is `python-mutation/1`.
+
+This repository does not enable `python_mutation` in this commit: the trusted gate that judges the
+change predates the adapter. A later item enables it.
 
 ### Emacs Lisp CRAP
 
@@ -1038,9 +1131,10 @@ with a traceback.
 
 ### Locations
 
-The `python_crap`, `variant_dispatch`, `elisp_crap` and `clones` adapters provide complete locations:
-respectively the entire function range (including Python decorators), every owner range of a
-vocabulary and a trial reader's caller, and both ranges of every clone in a fingerprint group.
+The `python_crap`, `python_mutation`, `variant_dispatch`, `elisp_crap` and `clones` adapters provide
+complete locations: respectively the entire function range (including Python decorators), the mutated
+function's range, every owner range of a vocabulary and a trial reader's caller, and both ranges of
+every clone in a fingerprint group.
 CRAP's module subject uses the span from its first to last outside-function node; that conservative
 span can include intervening functions. Verification supplies every inline and file-wide suppression
 line, one location per directive, but its test-count metrics have no source location. Command checks,
@@ -1225,6 +1319,16 @@ and the allowed keys. The complete shape is:
     clone_min_tokens = 30                 # optional; 20-49; this is the default
     clone_similarity = 0.95               # optional; 0.5-1.0; this is the default
 
+    [checks.mutation]
+    adapter = "python_mutation"
+    tier = 1
+    enforcement = "enforced"
+    scope = "changed"                     # only changed
+    base = "HEAD"                         # required; the diff base
+    mutant_seconds = 10                   # optional; this is the default
+    function_mutants = 20                 # optional; this is the default
+    run_seconds = 300                     # optional; this is the default
+
     [checks.variant-dispatch]
     adapter = "variant_dispatch"
     tier = 1
@@ -1312,6 +1416,10 @@ Notes:
   `threshold` of the `python_crap` check `crap_check` names. `QG_DIFF_BASE` replaces `base` in
   both scopes, and the check's measurement names the commit it judged and whether `QG_DIFF_BASE`
   or the policy key named it.
+* A `python_mutation` check takes no `baseline` key: every finding is enforced. `scope` is
+  `changed`; `base` is required. `mutant_seconds` (default 10), `function_mutants` (default 20)
+  and `run_seconds` (default 300) are positive integers. Its files come from the classes that list
+  it, minus test files; its test files are what the policy's `python_tests` checks select.
 * A `variant_dispatch` check takes no `baseline` key: every finding is enforced. `scope` is
   `tree` (the default) or `changed`; `base` defaults to `HEAD` and is used with `changed`.
 * A `verification` check may name a `baseline` path, which must exist; without one it accepts no

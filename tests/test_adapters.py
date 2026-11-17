@@ -202,8 +202,8 @@ class AdapterRegistrationTests(unittest.TestCase):
         names = (
             "command", "clones", "source_chars", "python_tests",
             "elisp_tests", "elisp_compile", "elisp_checkdoc",
-            "python_crap", "python_shape", "variant_dispatch", "elisp_crap",
-            "verification",
+            "python_crap", "python_shape", "python_mutation", "variant_dispatch",
+            "elisp_crap", "verification",
         )
         descriptors = [adapters.adapter_for(name) for name in names]
         with mock.patch.dict(adapters.ADAPTERS, clear=True):

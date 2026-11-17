@@ -5,7 +5,7 @@ quality and maintainable. Consuming repositories pin it as a git submodule and d
 configuration (`quality-gate.toml`); this repository gates itself with the same tool. The
 implementation is the `quality_gate/` package (`policy`, `adapters`, `command`, `files`, `tools`, `runner`,
 `ratchet`, `clones`, `source_chars`, `output_patterns`,
-`python_tests`, `python_crap`, `python_shape`, `variant_dispatch`, `elisp_tests`, `elisp_crap`, `elisp_lint`, `elisp/qg-elisp-child.el`,
+`python_tests`, `python_crap`, `python_shape`, `python_mutation`, `variant_dispatch`, `elisp_tests`, `elisp_crap`, `elisp_lint`, `elisp/qg-elisp-child.el`,
 `elisp/qg-elisp-complexity.el`, `elisp/qg-elisp-lint.el`, `verification`, `covrun`,
 `coverage_tool`, `checks`, `gate_result`,
 `trust`, `cli`);
@@ -15,11 +15,13 @@ specification helpers; `policy` holds shared value readers and policy validation
 Core package modules and `qg.py` import only core package modules, with `adapters.py` the sole registry
 allowed to import adapters.
 `check --policy-from DIR` takes its policy, baselines, tool lock and protected paths from an
-absolute trusted directory; `docs/TRUST.md` is the contract.
+absolute trusted directory; `docs/TRUST.md` is the contract. This repository's own
+`quality-gate.toml` enables `variant_dispatch` in the `python` class with `scope = "tree"`;
+`python_mutation` is not enabled in this commit.
 
 Policy declares `schema = 2`, code classes with their `checks`, and one `[checks.ID]` table per check
 (`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `python_shape`,
-`variant_dispatch`, `elisp_crap`, `elisp_compile`, `elisp_checkdoc` or `verification`). Adapters declare evidence
+`python_mutation`, `variant_dispatch`, `elisp_crap`, `elisp_compile`, `elisp_checkdoc` or `verification`). Adapters declare evidence
 (`tests`, `crap`, `duplication`, `static`) and the result reports one obligation per code class and
 required tier.
 Adapters measure subjects; the core in `ratchet.py` decides raw outcome, policy satisfaction, expiry,

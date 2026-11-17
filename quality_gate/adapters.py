@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (
-    clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_shape,
-    python_tests, ratchet, source_chars, variant_dispatch, verification,
+    clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_mutation,
+    python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import DiffBaseOverride
 from .policy import (
@@ -243,6 +243,14 @@ register_adapter(AdapterDescriptor(
     python_shape._python_shape_spec,
     python_shape._run_python_shape,
     location_coverage="complete",
+))
+register_adapter(AdapterDescriptor(
+    "python_mutation",
+    ("scope", "base", "mutant_seconds", "function_mutants", "run_seconds"),
+    python_mutation._python_mutation_spec,
+    python_mutation._run_python_mutation,
+    location_coverage="complete",
+    budget=python_mutation._budget,
 ))
 register_adapter(AdapterDescriptor(
     "variant_dispatch",
