@@ -224,6 +224,12 @@ def _run_trusted_inventory(root: Path, args: Any) -> int:
         trust.close()
 
 
+_TRUSTED_COMMANDS = {
+    "check": _run_trusted_check,
+    "inventory": _run_trusted_inventory,
+}
+
+
 def _reject_partial_options(args: Any) -> None:
     if not getattr(args, "only", None):
         return
@@ -234,10 +240,9 @@ def _reject_partial_options(args: Any) -> None:
 
 
 def _run_gate(root: Path, args: Any) -> int:
-    if args.command in ("check", "inventory") and args.policy_from is not None:
-        if args.command == "check":
-            return _run_trusted_check(root, args)
-        return _run_trusted_inventory(root, args)
+    trusted = _TRUSTED_COMMANDS.get(args.command)
+    if trusted is not None and args.policy_from is not None:
+        return trusted(root, args)
     if getattr(args, "allow_protected", None):
         raise UsageError(
             "qg.py: --allow-protected: expected --policy-from"

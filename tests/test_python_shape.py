@@ -1332,12 +1332,14 @@ class HelperTests(unittest.TestCase):
             return ast.parse(source).body[0].value.args
 
         self.assertEqual(
-            _forwarded(values("f(data, flag, 2)"), ["data", "flag"]),
+            _forwarded(values("f(data, flag, 2)"), ["data", "flag"], 1),
             ["data", "flag"],
         )
-        self.assertIsNone(_forwarded(values("f(data)"), ["data", "flag"]))
-        self.assertIsNone(_forwarded(values("f(data, data)"), ["data"]))
-        self.assertIsNone(_forwarded(values("f(data, flag)"), ["data"]))
+        self.assertIsNone(
+            _forwarded(values("f(data)"), ["data", "flag"], 0)
+        )
+        self.assertIsNone(_forwarded(values("f(data, data)"), ["data"], 0))
+        self.assertIsNone(_forwarded(values("f(data, flag)"), ["data"], 0))
 
     def test_a_test_class_keeps_a_walk_inside_a_test(self) -> None:
         suite = ast.parse("class SpecialTests:\n    pass\n").body[0]
@@ -1774,8 +1776,8 @@ MUTATIONS = {
         "forwarding = False",
     ),
     "PTW-SU zero parameters": (
-        "if not all((named, not forwarding, not plain)):",
-        "if not all((True, not forwarding, not plain)):",
+        "if not named or forwarding or plain:",
+        "if forwarding or plain:",
     ),
     "PTW-SU callee is a parameter": (
         "if values is None or callee is None or callee in own:",

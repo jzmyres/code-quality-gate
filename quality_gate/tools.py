@@ -373,7 +373,11 @@ def _member_path(
     return path
 
 
-def _write_member(target: Path, source: Any, mode: int) -> None:
+def _write_member(
+    target: Path, source: Any, mode: int, missing: str
+) -> None:
+    if source is None:
+        raise GateError(missing)
     with source, target.open("wb") as stream:
         shutil.copyfileobj(source, stream)
     if mode:
@@ -395,18 +399,18 @@ def _extract_tar(archive_path: Path, destination: Path, tool: Tool) -> None:
                     tool,
                 )
                 records.append((member, path, rule))
-            for member, relative, _rule in filter(
-                lambda record: record[2].writes, records
-            ):
+            for member, relative, rule in records:
+                if not rule.writes:
+                    continue
                 target = destination.joinpath(*relative.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                source = archive.extractfile(member)
-                if source is None:
-                    raise GateError(
-                        f"tools: {tool.name} {tool.version}: cannot read archive "
-                        f"member {member.name!r}"
-                    )
-                _write_member(target, source, member.mode & 0o777)
+                _write_member(
+                    target,
+                    archive.extractfile(member),
+                    member.mode & 0o777,
+                    f"tools: {tool.name} {tool.version}: cannot read archive "
+                    f"member {member.name!r}",
+                )
     except (tarfile.TarError, OSError) as error:
         raise GateError(
             f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"
@@ -436,15 +440,17 @@ def _extract_wheel(archive_path: Path, destination: Path, tool: Tool) -> None:
                 (member, *_wheel_member_record(member, tool))
                 for member in archive.infolist()
             ]
-            for member, path, _rule in filter(
-                lambda record: record[2].writes, records
-            ):
+            for member, path, rule in records:
+                if not rule.writes:
+                    continue
                 target = destination.joinpath(*path.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _write_member(
                     target,
                     archive.open(member),
                     (member.external_attr >> 16) & 0o777,
+                    f"tools: {tool.name} {tool.version}: cannot read archive "
+                    f"member {member.filename!r}",
                 )
     except (zipfile.BadZipFile, OSError, EOFError) as error:
         raise GateError(

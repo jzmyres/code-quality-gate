@@ -7,7 +7,7 @@ import stat
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
-from itertools import dropwhile, product
+from itertools import product
 from pathlib import Path, PurePosixPath
 
 from .policy import Config, ConfigError, GateError, Rule, UsageError
@@ -16,6 +16,8 @@ from .runner import run
 
 SHEBANG_LIMIT = 4096
 DIFF_BASE_ENV = "QG_DIFF_BASE"
+_SHEBANG_ENV = "env"
+_ENV_INTERPRETER_DEFAULT = {_SHEBANG_ENV: None}
 
 
 @dataclass(frozen=True)
@@ -281,26 +283,18 @@ def enumerate_files(root: Path) -> list[str]:
 
 
 def _shebang_interpreter(first_line: str) -> str | None:
-    if not first_line.startswith("#!"):
-        return None
-    words = first_line[2:].strip().split()
-    if not words:
-        return None
-    name = PurePosixPath(words[0]).name
-    if name != "env":
-        return name
-    interpreter = next(
-        dropwhile(
-            lambda word: any(
-                (word.startswith("-"), "=" in word)
-            ),
-            words[1:],
-        ),
-        None,
+    words = first_line[2:].strip().split() if first_line.startswith("#!") else []
+    name = next(
+        (PurePosixPath(word).name for word in words[:1]), None
     )
-    if interpreter is None:
-        return None
-    return PurePosixPath(interpreter).name
+    candidates = {
+        _SHEBANG_ENV: (
+            PurePosixPath(word).name
+            for word in words[1:]
+            if not word.startswith("-") and "=" not in word
+        ),
+    }.get(name, iter(()))
+    return next(candidates, _ENV_INTERPRETER_DEFAULT.get(name, name))
 
 
 def _type_name(mode: int) -> str | None:
@@ -388,6 +382,12 @@ _FILE_CLASS_MESSAGES = {
         "{relative}: code file classified as {class_name} "
         "(rule {pattern})"
     ),
+}
+
+_FILE_HIT_MESSAGES = {
+    0: "{relative}: unclassified (no rule matches)",
+    1: None,
+    2: "{relative}: matches {count} rules ({patterns})",
 }
 
 _RULE_CHECKS = (
@@ -478,17 +478,17 @@ class _InventoryValidator:
                 if fnmatch.fnmatchcase(relative, rule.pattern):
                     hits.append((index, rule))
                     self.matched[index] += 1
-            if not hits:
+            patterns = ", ".join(
+                repr(rule.pattern) for _index, rule in hits
+            )
+            message = _FILE_HIT_MESSAGES[min(len(hits), 2)]
+            if message is not None:
                 self.violations.append(
-                    f"{relative}: unclassified (no rule matches)"
-                )
-                continue
-            if len(hits) > 1:
-                patterns = ", ".join(
-                    map(lambda hit: repr(hit[1].pattern), hits)
-                )
-                self.violations.append(
-                    f"{relative}: matches {len(hits)} rules ({patterns})"
+                    message.format(
+                        relative=relative,
+                        count=len(hits),
+                        patterns=patterns,
+                    )
                 )
                 continue
             self._classify(entry, hits[0][1])
@@ -543,6 +543,18 @@ class _InventoryOutcome:
     templates: tuple[str, ...]
 
 
+_INVENTORY_KINDS = {
+    (True, False, False): "unknown_class",
+    (True, True, False): "unknown_class",
+    (True, False, True): "unknown_class",
+    (True, True, True): "unknown_class",
+    (False, True, False): "violations",
+    (False, True, True): "violations",
+    (False, False, True): "listing",
+    (False, False, False): "summary",
+}
+
+
 _INVENTORY_OUTCOMES = {
     "unknown_class": _InventoryOutcome(
         2,
@@ -569,9 +581,11 @@ def _inventory_lines(
     kind: str, values: dict[str, object]
 ) -> tuple[int, str, tuple[str, ...]]:
     outcome = _INVENTORY_OUTCOMES[kind]
-    lines = values.get("lines") or tuple(
-        map(lambda template: template.format(**values), outcome.templates)
-    )
+    lines = values.get("lines")
+    if not lines:
+        lines = tuple(
+            template.format(**values) for template in outcome.templates
+        )
     return outcome.status, outcome.stream, tuple(lines)
 
 
@@ -582,41 +596,30 @@ def _inventory_outcome(
     config: Config,
     list_class: str | None,
 ) -> tuple[int, str, tuple[str, ...]]:
-    if list_class is not None and list_class not in config.classes:
-        return _inventory_lines(
-            "unknown_class",
-            {
-                "value": repr(list_class),
-                "known": _known_names(sorted(config.classes)),
-            },
-        )
-    if violations:
-        return _inventory_lines(
-            "violations",
-            {
-                "lines": list(
-                    map(
-                        lambda violation: f"inventory: {violation}",
-                        violations,
-                    )
-                )
-            },
-        )
-    if list_class is not None:
-        return _inventory_lines(
-            "listing",
-            {
-                "lines": tuple(
-                    filter(
-                        lambda relative: classes[relative] == list_class,
-                        sorted(classes),
-                    )
-                )
-            },
-        )
+    unknown = list_class not in (None, *config.classes)
+    violations_lines = [
+        f"inventory: {violation}" for violation in violations
+    ]
+    listing_lines = [
+        relative
+        for relative in sorted(classes)
+        if classes[relative] == list_class
+    ]
+    kind = _INVENTORY_KINDS[
+        (unknown, bool(violations), list_class is not None)
+    ]
     return _inventory_lines(
-        "summary",
-        {"files": len(files), "rules": len(config.rules)},
+        kind,
+        {
+            "files": len(files),
+            "rules": len(config.rules),
+            "value": repr(list_class),
+            "known": _known_names(sorted(config.classes)),
+            "lines": {
+                "violations": violations_lines,
+                "listing": listing_lines,
+            }.get(kind, ()),
+        },
     )
 
 

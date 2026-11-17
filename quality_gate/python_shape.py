@@ -17,7 +17,6 @@ import time
 import tokenize
 from collections.abc import Callable
 from dataclasses import dataclass
-from operator import attrgetter
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -570,13 +569,14 @@ def _arguments(call: ast.Call) -> list[ast.AST] | None:
     return [*call.args, *(keyword.value for keyword in call.keywords)]
 
 
-def _forwarded(values: list[ast.AST], own: list[str]) -> list[str] | None:
+def _forwarded(
+    values: list[ast.AST], own: list[str], constants: int
+) -> list[str] | None:
     """The own names the values forward, each once, with every other a constant."""
     named = [value.id for value in values if isinstance(value, ast.Name)]
-    constants = sum(isinstance(value, ast.Constant) for value in values)
     forwarding = sorted(named) != sorted(own)
     plain = len(named) + constants != len(values)
-    if not all((named, not forwarding, not plain)):
+    if not named or forwarding or plain:
         return None
     return named
 
@@ -587,13 +587,11 @@ def _wrapper_call(call: ast.Call, own: list[str]) -> Wrapper | None:
     values = _arguments(call)
     if values is None or callee is None or callee in own:
         return None
-    forwarded = _forwarded(values, own)
+    constants = sum(isinstance(value, ast.Constant) for value in values)
+    forwarded = _forwarded(values, own, constants)
     if forwarded is None:
         return None
-    return Wrapper(
-        callee, tuple(forwarded),
-        sum(isinstance(value, ast.Constant) for value in values),
-    )
+    return Wrapper(callee, tuple(forwarded), constants)
 
 
 def _body_value(
@@ -963,7 +961,7 @@ def _run_python_shape(context: Any) -> Any:
         limit = _crap_limit(context.config, check.spec)
         base = diff_base(
             context.root, check.spec.base,
-            resolved=getattr(context, "base_override", None),
+            resolved=context.base_override,
         )
         mark_step("python-shape analysis")
         data = _shape_input(context, check.spec, limit, base)
@@ -975,14 +973,14 @@ def _run_python_shape(context: Any) -> Any:
         return result
     mark_step("python-shape rules")
     measured = Domain.of_files(
-        sorted(set(map(attrgetter("path"), data.functions))),
+        sorted({function.path for function in data.functions}),
         "the measured production files",
     )
     ratchet, failure = _evaluate_ratchet(
         _findings(data), [], check, context.prefix, measured
     )
     if ratchet is None:
-        return _ratchet_result(check, start, failure or "error", reason=failure)
+        return _ratchet_result(check, start, failure, reason=failure)
     if ratchet.satisfied:
         print(
             f"{context.prefix}: {len(data.functions)} functions measured",

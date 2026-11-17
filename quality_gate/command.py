@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import output_patterns, policy
+from .files import _known_names
 from .policy import (
     DEFAULT_BUDGET_SECONDS, CheckDef, UnsupportedError, UsageError, _config_error, _integer, _string,
 )
@@ -107,7 +108,8 @@ def _expand_run(
 ) -> tuple[list[str], str | None]:
     spec = check.spec
     state = _RunExpansion(
-        list(map(_file_argument, files)), functools.cache(current_tools)
+        [_file_argument(name) for name in files],
+        functools.cache(current_tools),
     )
     expanded: list[str] = []
     for argument in spec.run:
@@ -117,7 +119,7 @@ def _expand_run(
             name = match.group("name")
             tools = state.tools()[1]
             if name not in tools:
-                known = ", ".join(sorted(tools)) or "none"
+                known = _known_names(sorted(tools))
                 return (
                     [],
                     f"unknown tool {name!r} (pinned tools: {known}); "

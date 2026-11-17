@@ -345,15 +345,12 @@ def _has_magic(pattern: str) -> bool:
 
 
 def _expand_protect(
-    patterns: tuple[str, ...], root: Path, source: _TrustedTree
+    literals: set[str],
+    globs: tuple[str, ...],
+    root: Path,
+    source: _TrustedTree,
 ) -> set[str]:
-    protected: set[str] = set()
-    globs: list[str] = []
-    for pattern in patterns:
-        if _has_magic(pattern):
-            globs.append(pattern)
-        else:
-            protected.add(_normalise(pattern))
+    protected = {_normalise(pattern) for pattern in literals}
     if not globs:
         return protected
     names = set(source.files()) | set(_candidate_files(root))
@@ -382,7 +379,13 @@ def _protected_scope(
     root: Path, source: _TrustedTree, config: Config
 ) -> set[str]:
     paths = {POLICY_NAME, LOCK_NAME} | _baseline_names(config)
-    return paths | _expand_protect(config.protect_paths, root, source)
+    literals = {
+        pattern for pattern in config.protect_paths if not _has_magic(pattern)
+    }
+    globs = tuple(
+        pattern for pattern in config.protect_paths if _has_magic(pattern)
+    )
+    return paths | _expand_protect(literals, globs, root, source)
 
 
 def _input_kind(path: str, baselines: set[str]) -> str:

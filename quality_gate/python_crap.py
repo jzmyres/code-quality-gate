@@ -74,6 +74,55 @@ def _comprehension(node: ast.comprehension) -> int:
     return 1 + len(node.ifs)
 
 
+_CALLED_NAME_FIELDS = {ast.Name: "id", ast.Attribute: "attr"}
+
+
+def _called_name(node: ast.Call) -> str | None:
+    field = _CALLED_NAME_FIELDS.get(type(node.func))
+    return getattr(node.func, field) if field is not None else None
+
+
+def _display_elements(node: ast.AST) -> int:
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return max(0, len(node.elts) - 1)
+    return 0
+
+
+def _any_all_operands(node: ast.Call) -> int:
+    if (
+        _called_name(node) in ("any", "all")
+        and (len(node.args), len(node.keywords)) == (1, 0)
+    ):
+        return _display_elements(node.args[0])
+    return 0
+
+
+def _display_selection(node: ast.Subscript) -> int:
+    if isinstance(node.slice, ast.Constant):
+        return 0
+    return _display_elements(node.value)
+
+
+def _getattr_default(node: ast.Call) -> int:
+    return int(
+        _called_name(node) == "getattr"
+        and len(node.args) == 3
+    )
+
+
+_LOOP_CALL_COUNTS = {
+    "map": 1,
+    "filter": 2,
+    "filterfalse": 2,
+    "dropwhile": 2,
+    "takewhile": 2,
+}
+
+
+def _loop_call(node: ast.Call) -> int:
+    return _LOOP_CALL_COUNTS.get(_called_name(node) or "", 0)
+
+
 def _irrefutable(pattern: ast.AST) -> bool:
     if isinstance(pattern, ast.MatchAs):
         return pattern.pattern is None or _irrefutable(pattern.pattern)
@@ -103,6 +152,10 @@ CC_RULES: tuple[
     (ast.ExceptHandler, lambda node: 1),
     (ast.match_case, _match_case),
     (ast.BoolOp, _bool_operands),
+    (ast.Call, _any_all_operands),
+    (ast.Call, _getattr_default),
+    (ast.Call, _loop_call),
+    (ast.Subscript, _display_selection),
 )
 
 
@@ -286,33 +339,23 @@ def _argument_annotations(arguments: ast.arguments) -> list[ast.AST]:
     return annotations
 
 
-def _function_outside_children(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> list[ast.AST]:
-    children = [*node.decorator_list]
-    children.extend(_argument_defaults(node.args))
-    children.extend(_argument_annotations(node.args))
-    if node.returns is not None:
-        children.append(node.returns)
-    return children
-
-
-def _class_outside_children(node: ast.ClassDef) -> list[ast.AST]:
-    return [
-        *node.decorator_list,
-        *node.bases,
-        *node.keywords,
-        *node.body,
-    ]
-
-
 def _outside_children(node: ast.AST) -> list[ast.AST]:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return _function_outside_children(node)
+        children = [*node.decorator_list]
+        children.extend(_argument_defaults(node.args))
+        children.extend(_argument_annotations(node.args))
+        if node.returns is not None:
+            children.append(node.returns)
+        return children
     if isinstance(node, ast.Lambda):
         return _argument_defaults(node.args)
     if isinstance(node, ast.ClassDef):
-        return _class_outside_children(node)
+        return [
+            *node.decorator_list,
+            *node.bases,
+            *node.keywords,
+            *node.body,
+        ]
     return list(ast.iter_child_nodes(node))
 
 

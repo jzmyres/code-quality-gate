@@ -87,6 +87,28 @@ class AdapterDescriptor:
             return self.entry_direction(subject, configured)
         return self.default_direction or configured
 
+    def required_checks(
+        self, requires: str | None, earlier: list[Any]
+    ) -> tuple[str, ...]:
+        """The earlier check ids a check of this adapter depends on."""
+        if not self.requires_tests:
+            return () if requires is None else (requires,)
+        return (
+            *self._test_dependencies(requires, earlier),
+            *(check.id for check in earlier if check.adapter == "python_crap"),
+        )
+
+    @staticmethod
+    def _test_dependencies(
+        requires: str | None, earlier: list[Any]
+    ) -> tuple[str, ...]:
+        """The configured test check, or every earlier check producing tests."""
+        if requires is not None:
+            return (requires,)
+        return tuple(
+            check.id for check in earlier if "tests" in check.evidence
+        )
+
 
 def _baseline(
     raw: dict[str, Any], root: Path, path: Path, full_key: str

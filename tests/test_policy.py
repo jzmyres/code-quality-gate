@@ -481,6 +481,10 @@ class PolicyTests(FixtureCase):
             table,
         )
 
+    def test_the_default_converter_returns_its_value(self) -> None:
+        value = object()
+        self.assertIs(policy._identity(value), value)
+
     def test_elisp_decision_rules_refuse_invalid_entries(self) -> None:
         prefix = (BASE_CONFIG + '\n[checks.crap]\nadapter = "elisp_crap"\n'
                   'tier = 1\nenforcement = "enforced"\nrequires = "smoke"\n'

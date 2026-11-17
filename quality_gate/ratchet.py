@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime
 import functools
-import itertools
 import json
 import math
 import os
@@ -387,9 +386,18 @@ def _number(value: float | int) -> str:
     return repr(value)
 
 
+def _toml_list(value: list[Any]) -> str:
+    if not all(isinstance(item, str) for item in value):
+        raise GateError(
+            f"cannot write baseline value of type {type(value).__name__}"
+        )
+    return json.dumps(value, ensure_ascii=False)
+
+
 _TOML_FORMATS: tuple[
     tuple[type | tuple[type, ...], Callable[[Any], str]], ...
 ] = (
+    (list, _toml_list),
     (bool, json.dumps),
     (
         (int, float),
@@ -407,12 +415,6 @@ _TOML_FORMATS: tuple[
 
 
 def _toml_value(value: object) -> str:
-    if isinstance(value, list):
-        if not all(map(isinstance, value, itertools.repeat(str))):
-            raise GateError(
-                f"cannot write baseline value of type {type(value).__name__}"
-            )
-        return json.dumps(value, ensure_ascii=False)
     for types, formatter in _TOML_FORMATS:
         if isinstance(value, types):
             return formatter(value)

@@ -1356,6 +1356,115 @@ class CrapRunTests(unittest.TestCase):
         self.assertEqual(failure.reason, "first\nsecond")
 
 
+class CyclomaticComplexityTests(unittest.TestCase):
+    def complexity(self, source: str) -> int:
+        return python_crap.cyclomatic_complexity(ast.parse(source))
+
+    def test_any_and_all_displays_count_each_element_after_the_first(self) -> None:
+        cases = {
+            "def f(a, b):\n    return any((a, b))\n": 2,
+            "def f(a, b, c):\n    return all((a, b, c))\n": 3,
+            "def f(a, b):\n    return any([a, b])\n": 2,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_any_and_all_without_a_display_count_nothing_extra(self) -> None:
+        cases = {
+            "def f(items):\n    return all(items)\n": 1,
+            "def f(items):\n    return any(item for item in items)\n": 2,
+            "def f(a, b):\n    return any((a, b), key=None)\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_display_subscripts_count_each_selection_after_the_first(self) -> None:
+        cases = {
+            "def f(count):\n"
+            "    return ('plural', 'singular')[count == 1]\n": 2,
+            "def f(a, b, c, index):\n    return [a, b, c][index]\n": 3,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_constant_and_plain_subscripts_count_nothing(self) -> None:
+        cases = {
+            "def f():\n    return ('plural', 'singular')[0]\n": 1,
+            "def f(values, index):\n    return values[index]\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_three_argument_getattr_counts_a_branch(self) -> None:
+        cases = {
+            "def f(value):\n    return getattr(value, 'name', None)\n": 2,
+            "def f(value):\n    return getattr(value, 'name')\n": 1,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_map_and_filter_family_calls_count_loops_and_conditions(self) -> None:
+        cases = {
+            "def f(items):\n    return map(str, items)\n": 2,
+            "def f(items):\n    return filter(None, items)\n": 3,
+            "def f(items):\n    return itertools.filterfalse(None, items)\n": 3,
+            "def f(items):\n    return itertools.dropwhile(bool, items)\n": 3,
+            "def f(items):\n    return items.takewhile(bool)\n": 3,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+    def test_calls_are_recognised_by_name_even_for_a_user_function(self) -> None:
+        source = (
+            "def choose(pred, items):\n"
+            "    def filter(pred, items):\n"
+            "        return items\n"
+            "    return filter(pred, items)\n"
+        )
+        tree = ast.parse(source)
+        self.assertEqual(python_crap.cyclomatic_complexity(tree.body[0]), 3)
+
+    def test_call_counters_recognise_their_nodes(self) -> None:
+        def call(source: str) -> ast.Call:
+            return ast.parse(source).body[0].value
+
+        self.assertEqual(
+            python_crap._any_all_operands(call("any((a, b))")), 1
+        )
+        self.assertEqual(
+            python_crap._display_selection(
+                ast.parse("('a', 'b')[index]").body[0].value
+            ),
+            1,
+        )
+        self.assertEqual(
+            python_crap._getattr_default(
+                call("getattr(value, 'name', None)")
+            ),
+            1,
+        )
+        self.assertEqual(
+            python_crap._loop_call(call("map(str, values)")), 1
+        )
+
+    def test_nested_lambdas_add_to_their_enclosing_function(self) -> None:
+        cases = {
+            "def f(items):\n"
+            "    return map(lambda item: any((item.left, item.right)), items)\n": 3,
+            "def f(items):\n"
+            "    return filter(lambda item: item if item else 0, items)\n": 4,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(self.complexity(source), expected)
+
+
 class FunctionCollectionTests(unittest.TestCase):
     def test_measured_function_builds_itself_from_a_node(self) -> None:
         node = ast.parse(

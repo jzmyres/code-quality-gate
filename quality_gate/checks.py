@@ -59,7 +59,15 @@ class RunCleanupError(UsageError):
     """The run directory could not be removed after the checks ran."""
 
 
-def _budget_detail(reason: str, start: float, budget: float) -> str:
+def _budget_detail(
+    reason: str,
+    start: float,
+    budget: float,
+    *,
+    already_detailed: bool = False,
+) -> str:
+    if already_detailed and "deadline:" in reason:
+        return reason
     elapsed = time.monotonic() - start
     return f"{reason} (timeout; deadline: {budget:g} seconds; elapsed: {elapsed:.3f} seconds)"
 
@@ -270,19 +278,18 @@ def _ratchet_reason(
     execution: str,
     start: float,
 ) -> str | None:
-    if all(
-        (
-            execution == "budget",
-            reason is not None,
-            "deadline:" not in (reason or ""),
+    if reason is None:
+        outcome = ratchet.outcome if ratchet is not None else None
+        if outcome not in (None, "pass"):
+            return "ratchet findings did not satisfy the threshold or baseline"
+        return reason
+    if execution == "budget":
+        return _budget_detail(
+            reason,
+            start,
+            RATCHET_BUDGET_SECONDS,
+            already_detailed=True,
         )
-    ):
-        reason = _budget_detail(reason, start, RATCHET_BUDGET_SECONDS)
-    if reason is None and getattr(ratchet, "outcome", None) not in (
-        None,
-        "pass",
-    ):
-        return "ratchet findings did not satisfy the threshold or baseline"
     return reason
 
 
@@ -360,7 +367,7 @@ def _finish_crap_ratchet(
         entries = _baseline_entries(check)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
-    noun = nouns[len(findings) == 1]
+    noun = nouns[1] if len(findings) == 1 else nouns[0]
     return _finish_ratchet(
         check,
         findings,
@@ -461,23 +468,7 @@ def _require_distinct(command: str, identifiers: list[str]) -> None:
 
 
 def _required(config: Config, check: CheckDef) -> list[str]:
-    descriptor = adapter_for(check.adapter)
-    assert descriptor is not None
-    if descriptor.requires_tests:
-        ordered = list(config.checks.values())
-        earlier = ordered[: list(config.checks).index(check.id)]
-        return [
-            *_test_check_dependencies(
-                check, {candidate.id: candidate for candidate in earlier}
-            ),
-            *(
-                candidate.id
-                for candidate in earlier
-                if candidate.adapter == "python_crap"
-            ),
-        ]
-    required = getattr(check.spec, "requires", None)
-    return [required] if required is not None else []
+    return list(check.required)
 
 
 def _needed_order(config: Config, selected: list[CheckDef]) -> list[str]:

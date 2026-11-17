@@ -375,6 +375,11 @@ class BaselineFileTests(unittest.TestCase):
         )
         self.assertEqual(ratchet._toml_value(["a", "b"]), '["a", "b"]')
 
+    def test_toml_list_formatter_accepts_only_strings(self) -> None:
+        self.assertEqual(ratchet._toml_list(["a", "b"]), '["a", "b"]')
+        with self.assertRaises(policy.GateError):
+            ratchet._toml_list(["a", 1])
+
     def test_toml_value_rejects_non_finite_and_unknown_values(self) -> None:
         for value in (float("inf"), float("-inf"), float("nan")):
             with self.subTest(value=value):

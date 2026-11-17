@@ -80,6 +80,7 @@ class CheckDef:
     baseline: Path | None
     direction: str = "max"
     effective_baseline: tuple[BaselineEntry, ...] | None = None
+    required: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,10 @@ def _check_keys(
         )
 
 
+def _identity(value: Any) -> Any:
+    return value
+
+
 @dataclass(frozen=True)
 class _ValueRule:
     expected: str
@@ -150,7 +155,7 @@ class _ValueRule:
     maximum: int | float | None = None
     item: "_ValueRule | None" = None
     exclude: tuple[type, ...] = ()
-    convert: Any = None
+    convert: Any = _identity
 
 
 _STRING_ITEM = _ValueRule(
@@ -245,7 +250,7 @@ def _read_scalar(
                 raise _config_error(
                     path, full_key, expected.format(bound=bound), str(value)
                 )
-    return rule.convert(value) if rule.convert is not None else value
+    return rule.convert(value)
 
 
 def _read_value(
@@ -509,8 +514,10 @@ def _validate_requires(
         expected = "the id of an earlier check that produces tests"
         if required is not None:
             required_descriptor = adapter_for(required.adapter)
-            detail = getattr(required_descriptor, "no_tests_hint", "")
-            actual += f" that produces no tests{detail}"
+            actual += (
+                " that produces no tests"
+                f"{required_descriptor.no_tests_hint}"
+            )
     raise _config_error(
         path,
         f"checks.{name}.requires",
@@ -568,6 +575,7 @@ def _parse_check(
     parse_root: Path | None = candidate if descriptor.parse_candidate_inputs else root
     parts = descriptor.parse(raw, parse_root, path, full_key)
     direction = _parse_direction(raw, path, full_key)
+    required = descriptor.required_checks(parts.requires, list(checks.values()))
     check = CheckDef(
         id=name,
         adapter=descriptor.name,
@@ -579,6 +587,7 @@ def _parse_check(
         threshold=parts.threshold,
         baseline=parts.baseline,
         direction=direction,
+        required=required,
     )
     _validate_requires(checks, name, parts.requires, path, descriptor)
     return check

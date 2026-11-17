@@ -586,15 +586,29 @@ Executable code outside every function - module and class bodies - is one subjec
 `PATH:<module>`. Its CC is the complexity of those statements and its coverage is their combined
 coverage, so top-level control flow goes through the same ratchet as a function.
 
-Cyclomatic complexity is 1 plus one for each `if` (an `elif` is a nested `if`), conditional expression,
-`for`, `async for`, `while`, comprehension `for` clause and comprehension `if`, `except` handler
-(including `except*`), `match` case that is not an unguarded irrefutable pattern, and each operand of
-`and`/`or` after the first. An irrefutable pattern is a capture name, `_`, or an or-pattern with an
-irrefutable alternative, so `case remaining` and `case 1 | _` add nothing, like `case _`. Nested
-function and lambda bodies add to the enclosing function. A function's own CC counts only its
-executable body: defaults, decorators and annotations count once, in the owner where they execute (the
-enclosing function, or the module subject for a module-level definition). The rules are one data table
-in `quality_gate/python_crap.py`.
+Cyclomatic complexity is 1 plus the decisions in the table below. An irrefutable pattern is a
+capture name, `_`, or an or-pattern with an irrefutable alternative, so `case remaining` and
+`case 1 | _` add nothing, like `case _`. Nested function and lambda bodies add to the enclosing
+function. A function's own CC counts only its executable body: defaults, decorators and annotations
+count once, in the owner where they execute (the enclosing function, or the module subject for a
+module-level definition). The rules are one data table in `quality_gate/python_crap.py`.
+
+| Construct | Decisions added |
+|---|---|
+| `if` (an `elif` is a nested `if`), conditional expression | One per form. |
+| `for`, `async for`, `while` | One per loop. |
+| comprehension `for` clause, comprehension `if` | One per clause. |
+| `except` handler (including `except*`) | One per handler. |
+| `match` case | One, except an unguarded irrefutable pattern. |
+| `and`/`or` | One per operand after the first. |
+| `any`/`all` whose single argument is a tuple or list display | One per element after the first, as for `and`/`or`. |
+| subscript whose value is a tuple or list display and whose index is not a constant | One per element after the first, a selection among them. |
+| `getattr` with three arguments | One, the default is a branch. |
+| `map` | One, a loop as a comprehension's `for`. |
+| `filter`, `itertools.filterfalse`, `itertools.dropwhile`, `itertools.takewhile` | Two, a loop and its condition. |
+
+Calls are recognised by the called name, so a user function with one of these names counts too; this
+is the same name-based limit the `shape` check's rules share.
 
 Coverage comes from coverage's own analysis of the combined data (`Coverage.analysis2`) under the same
 gate-owned configuration as collection and combination, which also reports files the tests never imported
