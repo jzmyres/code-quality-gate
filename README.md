@@ -67,7 +67,7 @@ in how each one invokes the gate.
 
 | Consumer | Language | `[code]` | Classes, then checks | How it runs the gate |
 | --- | --- | --- | --- | --- |
-| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `variant-dispatch` (`variant_dispatch`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
+| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `variant-dispatch` (`variant_dispatch`), `mutation` (`python_mutation`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
 | A shell and Python agent harness | Shell and Python | `*.py`, `*.sh`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `shell-tested`, `shell-sourced`, `shell-probe`, `config`, `build`, `doc`, `gate`; `ruff`, `shellcheck`, `json` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification` | A runner gates each candidate with `--policy-from` the last landed commit |
 | An Emacs Lisp editor configuration | Emacs Lisp, with shell helpers | Emacs Lisp sources and their shell helpers | `modules`, `tools`, `suites`, `startup`, `shell`, `config`, `data`, `docs`, `fixture`, `gate`; `emacs-tests`, `tooling-tests` (`elisp_tests`), `emacs-crap`, `tooling-crap` (`elisp_crap`), `elisp-compile`, `elisp-checkdoc`, `shellcheck` (`command`) | Ran beside its own older gate, recording parity first |
 
@@ -315,6 +315,7 @@ with an explicit escape or remove it.
     tier = 1
     enforcement = "enforced"
     run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
+    workers = 4                           # optional; 1 is the default
     tests_pattern = "^Ran (\\d+) tests? in"
     skipped_pattern = "skipped=(\\d+)"  # optional; one capture group
     budget_seconds = 900                  # optional; this is the default
@@ -347,6 +348,14 @@ runner with a measured script that reports every `quality_gate` module in its `s
 one parses `covrun.py` for a `quality_gate` import. With `--policy-from`, the version and payload
 digest are the authorized effective lock's, so the parent and the coverage runner agree on an
 authorized coverage upgrade.
+
+`workers = N` above 1 requires `run` to begin with `{python} -m unittest discover`; any other
+command shape is a policy error naming the check. The adapter discovers every test id once, deals
+the ids in id order round-robin to N worker processes, and starts each as `{python} -m unittest`
+over a file of its ids, never over the command line. Every worker writes into the same coverage data
+directory. The check reports one summed `Ran` count, every failing test's name and condition, and an
+error naming the id when a discovered test did not run exactly once or a worker exited without a test
+summary. `workers` absent or 1 keeps the single run exactly.
 
 Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
 directly in the caller's temporary directory with a short `qg-t-` prefix, so the caller's `TMPDIR`
@@ -800,8 +809,11 @@ operator's complement and its display text. Each mutant is produced by applying 
 module's syntax tree and printing it with `ast.unparse`, then compiled with
 `compile(source, PATH, "exec")`; a mutant that does not compile is not generated. Messages keep
 the original line numbers and show the changed expression (`ast.unparse` of the changed node)
-substituted into the original source line it came from; a deleted statement is shown as
-`deleted: <first line of the statement>`. At most
+substituted into the original source line it came from. Lines are split only on `
+`, and the
+target's span uses its UTF-8 byte offsets, so non-ASCII text, a form feed, or a Unicode line
+separator inside a string before the target cannot shift the shown line. A deleted statement is
+shown as `deleted: <first line of the statement's own source segment>`. At most
 `function_mutants` mutants are generated per function: the first that many generated mutants
 ordered by source position (line, then column), not counting a suppressed candidate.
 
@@ -830,9 +842,10 @@ mutant is written to a copy of the repository in a temporary directory; the work
 written. The mutant run, and the baseline run of the unmutated copy, get a fresh allowlisted
 environment: `PATH`, `LANG` and `LC_ALL` from the gate's own environment, the `QG_PYTHON` and
 `PYTHONDONTWRITEBYTECODE` values `_test_environment` adds, and `PWD`, `HOME` and `TMPDIR` set to
-directories inside the copy. Each `PATH` entry is resolved with `os.path.realpath`; an entry
-inside the source repository is replaced by the same relative path inside the copy, and every
-other entry is kept. No other allowlisted value is a path the gate does not set itself, and no
+directories inside the copy. Every `PATH` entry is resolved with `os.path.realpath` and written as
+its absolute path, with an empty entry resolved as the gate's current directory; an entry inside
+the source repository is replaced by the same relative path inside the copy. No other allowlisted
+value is a path the gate does not set itself, and no
 other variable is inherited, so no inherited path or relative traversal can reach the source
 tree. The baseline runs once for every changed function that has tests, whether or not any
 mutant is generated. A baseline that fails in this environment is a check error naming the
@@ -887,9 +900,6 @@ The finding's `measurement` carries `subject` (`FILE:FUNCTION`), `file`, `functi
 `functions` count, the `test_files` considered and the `base` commit. Outcomes are `killed`,
 `survived`, `timed out`, `not generated` and `not run (over budget)`. The metric version is
 `python-mutation/1`.
-
-This repository does not enable `python_mutation` in this commit: the trusted gate that judges the
-change predates the adapter. A later item enables it.
 
 ### Emacs Lisp CRAP
 

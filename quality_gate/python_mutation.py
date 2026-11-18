@@ -451,15 +451,17 @@ def _ast_mutated(
 def _mutated_line(change: _Change, source: str) -> str:
     """The original line with the changed expression, or its deletion marker."""
     target = change.target
-    lines = source.splitlines()
+    lines = source.split("\n")
     if change.delete:
-        return f"deleted: {lines[target.lineno - 1].strip()}"
-    replacement = ast.unparse(change.replacement_node)
+        statement = lines[target.lineno - 1].encode("utf-8")
+        first = statement[target.col_offset:].decode("utf-8")
+        return f"deleted: {first.strip()}"
+    replacement = ast.unparse(change.replacement_node).encode("utf-8")
     start = target.lineno
     end = target.end_lineno or start
-    before = lines[start - 1][:target.col_offset]
-    after = lines[end - 1][target.end_col_offset:]
-    return (before + replacement + after).strip()
+    before = lines[start - 1].encode("utf-8")[:target.col_offset]
+    after = lines[end - 1].encode("utf-8")[target.end_col_offset:]
+    return (before + replacement + after).decode("utf-8").strip()
 
 
 def _generated_rule(
@@ -691,15 +693,16 @@ def _copy_directory(copy_root: Path, name: str) -> Path:
 
 
 def _inherited_path(source_root: Path, copy_root: Path) -> str:
-    """PATH, with each entry inside SOURCE_ROOT moved into COPY_ROOT."""
+    """PATH, absolute, with each entry inside SOURCE_ROOT moved into COPY_ROOT."""
     source = Path(os.path.realpath(source_root))
+    copy = Path(os.path.realpath(copy_root))
     entries = []
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         resolved = Path(os.path.realpath(entry))
         if resolved.is_relative_to(source):
-            entries.append(str(copy_root / resolved.relative_to(source)))
+            entries.append(str(copy / resolved.relative_to(source)))
         else:
-            entries.append(entry)
+            entries.append(str(resolved))
     return os.pathsep.join(entries)
 
 

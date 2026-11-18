@@ -16,8 +16,8 @@ Core package modules and `qg.py` import only core package modules, with `adapter
 allowed to import adapters.
 `check --policy-from DIR` takes its policy, baselines, tool lock and protected paths from an
 absolute trusted directory; `docs/TRUST.md` is the contract. This repository's own
-`quality-gate.toml` enables `variant_dispatch` in the `python` class with `scope = "tree"`;
-`python_mutation` is not enabled in this commit.
+`quality-gate.toml` enables `variant_dispatch` in the `python` class with `scope = "tree"`, and
+`python_mutation` in the `python` class with `scope = "changed"`.
 
 Policy declares `schema = 2`, code classes with their `checks`, and one `[checks.ID]` table per check
 (`command`, `clones`, `python_tests`, `elisp_tests`, `python_crap`, `python_shape`,

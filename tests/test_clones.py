@@ -20,7 +20,6 @@ from support import (
 sys.path.insert(0, str(GATE))
 clones = importlib.import_module("quality_gate.clones")
 policy = importlib.import_module("quality_gate.policy")
-runner = importlib.import_module("quality_gate.runner")
 
 ELISP_SOURCE = """\
 ;;; sample.el --- file summary -*- lexical-binding: t; -*-
@@ -877,7 +876,7 @@ class CloneOutcomeTests(unittest.TestCase):
         self, *, execution: str, unsupported: bool
     ) -> object:
         return clones.CloneMeasurement(
-            [], runner.Diagnostics(), execution, "detail", unsupported
+            [], clones.Diagnostics(), execution, "detail", unsupported
         )
 
     def test_budget_and_signal_are_raw_failures(self) -> None:

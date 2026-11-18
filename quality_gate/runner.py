@@ -232,10 +232,11 @@ def _signal_group(pid: int, number: int) -> None:
 def _proc_fields(path: str) -> list[str] | None:
     """The fields after a process's name in /proc/PID/stat, or None if gone."""
     try:
-        with open(path, encoding="utf-8") as stream:
-            return stream.read().rpartition(")")[2].split()
-    except FileNotFoundError:
+        with open(path, "rb") as stream:
+            record = stream.read()
+    except (FileNotFoundError, ProcessLookupError):
         return None
+    return record.rpartition(b")")[2].decode("utf-8", "surrogateescape").split()
 
 
 def _proc_group_member(path: str, group: int) -> bool:
@@ -254,8 +255,6 @@ def _fields_of(name: str) -> list[str] | None:
     """One process's /proc fields, or None when its record has disappeared."""
     try:
         return _proc_fields(f"/proc/{name}/stat")
-    except (FileNotFoundError, ProcessLookupError):
-        return None
     except OSError as error:
         raise OSError(
             f"cannot read the process record for pid {name}: "

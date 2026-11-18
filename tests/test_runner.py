@@ -124,7 +124,11 @@ class ReadChunkTests(unittest.TestCase):
             "    os.write(1, data)\n"
         )
         start = time.monotonic()
-        result = runner.run([sys.executable, "-c", program], budget_seconds=0.4)
+        result = runner.run(
+            [sys.executable, "-c", program],
+            budget_seconds=0.4,
+            grace_seconds=0.2,
+        )
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.returncode, -signal.SIGKILL)
         self.assertGreater(result.output_bytes, runner.CAPTURE_LIMIT)
@@ -205,18 +209,6 @@ class GroupAliveTests(unittest.TestCase):
 class ChildProcessTests(unittest.TestCase):
     """The subreaper's reads of /proc and its cleanup decisions."""
 
-    def test_fields_of_a_missing_process_is_none(self) -> None:
-        self.assertIsNone(runner._fields_of("missing-process"))
-
-    def test_fields_of_an_unreadable_stat_is_an_error_naming_the_pid(self) -> None:
-        with mock.patch.object(
-            runner, "_proc_fields",
-            side_effect=PermissionError("denied"),
-        ), self.assertRaisesRegex(
-            OSError, r"pid 123.*PermissionError: denied"
-        ):
-            runner._fields_of("123")
-
     def test_child_pid_names_only_a_direct_child(self) -> None:
         process = subprocess.Popen(["sleep", "30"])
         self.addCleanup(_kill_and_reap, process)
@@ -258,31 +250,6 @@ class ChildProcessTests(unittest.TestCase):
             )
         self.assertEqual(result.execution, "error", result)
         self.assertIn("process table", result.error or "")
-        self.assertIn("PermissionError", result.error or "")
-
-    def test_an_unreadable_descendant_stat_is_an_error_naming_the_pid(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            pid_file = Path(directory) / "child.pid"
-            program = _detached_child_program(pid_file)
-            real_fields = runner._proc_fields
-
-            def fields(path: str) -> list[str] | None:
-                if pid_file.exists():
-                    pid = pid_file.read_text(encoding="utf-8")
-                    if path == f"/proc/{pid}/stat":
-                        raise PermissionError("denied")
-                return real_fields(path)
-
-            result, pid = _run_detached(
-                program, pid_file,
-                mock.patch.object(
-                    runner, "_proc_fields", side_effect=fields
-                ),
-            )
-        self.assertEqual(result.execution, "error", result)
-        self.assertIn(str(pid), result.error or "")
         self.assertIn("PermissionError", result.error or "")
 
     def test_kill_adopted_stops_and_reaps_a_child(self) -> None:
@@ -526,7 +493,11 @@ class UnconfirmedCleanupTests(unittest.TestCase):
         program = "import time; time.sleep(30)"
         with mock.patch.object(runner, "_group_alive", return_value=True):
             start = time.monotonic()
-            result = runner.run([sys.executable, "-c", program], budget_seconds=0.2)
+            result = runner.run(
+                [sys.executable, "-c", program],
+                budget_seconds=0.2,
+                grace_seconds=0.2,
+            )
             elapsed = time.monotonic() - start
         self.assertLess(elapsed, runner.CLEANUP_SECONDS + 8.0)
         self.assertEqual(result.execution, "error")

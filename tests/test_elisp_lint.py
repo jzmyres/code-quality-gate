@@ -215,6 +215,35 @@ class ElispLintTests(FixtureCase):
                     self.assertIn("got", check["reason"])
                     self.assertIn(binary if binary.startswith("no-") else "JSON lint report", result.stderr)
 
+    def report_wrapper(
+        self, report: str, *, exit_code: int = 0, real: bool = False
+    ) -> str:
+        wrapper = self.base / ("real-report-emacs" if real else "fake-report-emacs")
+        if real:
+            encoded = json.dumps(report)
+            form = f"(progn (require 'json) (defun json-encode (_value) {encoded}))"
+            content = (
+                '#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
+                f'exec {shlex.quote(self.emacs)} -Q --batch '
+                f'--eval {shlex.quote(form)} "$@"\nexit {exit_code}\n'
+            )
+        else:
+            report_file = self.base / "fake-report.json"
+            report_file.write_text(report, encoding="utf-8")
+            content = (
+                '#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
+                '  printf "30.1"\n  exit 0\nfi\n'
+                "for last; do :; done\n"
+                "report=$(printf '%s' \"$last\" | sed -n "
+                "'s/.*\"\\([^\"]*\\.json\\)\".*/\\1/p')\n"
+                f'cat {shlex.quote(str(report_file))} > "$report"\n'
+                f'exit {exit_code}\n'
+            )
+        wrapper.write_text(content, encoding="utf-8")
+        wrapper.chmod(0o755)
+        return f'emacs = {json.dumps(str(wrapper))}'
+
     def test_invalid_reports_and_nonzero_exit_are_unsupported(self) -> None:
         valid = {"emacs_version": "30.1", "files": ["src/core.el"], "failed": [], "issues": []}
         cases = [None, {}, {**valid, "emacs_version": ""}, {**valid, "files": ["other.el"]},
@@ -225,25 +254,20 @@ class ElispLintTests(FixtureCase):
                  {**valid, "issues": [{"file": "src/core.el", "line": True, "message": "bad"}]},
                  {**valid, "issues": [{"file": "src/core.el", "line": 1, "message": ""}]},
                  {**valid, "issues": [{"file": "src/core.el"}]}]
-        wrapper = self.base / "malformed-report"
         for adapter in ("elisp_compile", "elisp_checkdoc"):
-            for document in cases:
+            for position, document in enumerate(cases):
                 with self.subTest(adapter=adapter, document=document):
-                    encoded = json.dumps(json.dumps(document))
-                    form = f"(progn (require 'json) (defun json-encode (_value) {encoded}))"
-                    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(self.emacs)} -Q --batch '
-                                       f'--eval {shlex.quote(form)} "$@"\n')
-                    wrapper.chmod(0o755)
-                    self.write_config(config((adapter,), {adapter: f'emacs = {json.dumps(str(wrapper))}'}))
+                    option = self.report_wrapper(
+                        json.dumps(document), real=position == 0
+                    )
+                    self.write_config(config((adapter,), {adapter: option}))
                     result, returned = self.run_checks(1)
                     check = self.assert_check(returned, adapter, "unsupported")
                     self.assertIn("expected", check["reason"])
                     self.assertIn("got", check["reason"])
                     self.assertIn("src/core.el", result.stderr)
-            wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
-                               f'  exec {shlex.quote(self.emacs)} "$@"\nfi\n'
-                               f'{shlex.quote(self.emacs)} "$@"\nexit 7\n')
-            wrapper.chmod(0o755)
+            option = self.report_wrapper(json.dumps(valid), exit_code=7)
+            self.write_config(config((adapter,), {adapter: option}))
             result, returned = self.run_checks(1)
             self.assert_check(returned, adapter, "unsupported")
             self.assertIn("expected child exit 0", result.stderr)
@@ -268,20 +292,16 @@ class ElispLintTests(FixtureCase):
         self.assertIn("expected Emacs version 31.1 from preflight, got '31.2'", result.stderr)
         self.assertEqual(check["tool"], {"name": "Emacs", "version": "31.1"})
 
-    def lint_report_version(self, version: object, *, exit_code: int = 0) -> None:
+    def lint_report_version(
+        self, version: object, *, exit_code: int = 0, real: bool = False
+    ) -> None:
         document = {"emacs_version": version, "files": ["src/core.el"], "failed": [], "issues": []}
-        self.lint_report(json.dumps(document), exit_code=exit_code)
+        self.lint_report(json.dumps(document), exit_code=exit_code, real=real)
 
-    def lint_report(self, report: str, *, exit_code: int = 0) -> None:
-        encoded = json.dumps(report)
-        form = f"(progn (require 'json) (defun json-encode (_value) {encoded}))"
-        wrapper = self.base / "report-emacs"
-        wrapper.write_text('#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
-                           '  printf "30.1"\n  exit 0\nfi\n'
-                           f'{shlex.quote(self.emacs)} -Q --batch --eval {shlex.quote(form)} "$@"\n'
-                           f'exit {exit_code}\n', encoding="utf-8")
-        wrapper.chmod(0o755)
-        option = f'emacs = {json.dumps(str(wrapper))}'
+    def lint_report(
+        self, report: str, *, exit_code: int = 0, real: bool = False
+    ) -> None:
+        option = self.report_wrapper(report, exit_code=exit_code, real=real)
         self.write_config(config(options={name: option for name in ("elisp_compile", "elisp_checkdoc")}))
 
     def test_duplicate_failed_is_unsupported(self) -> None:
@@ -297,7 +317,12 @@ class ElispLintTests(FixtureCase):
         for version in REPORT_VERSION_MISMATCHES:
             for exit_code in (0, 7):
                 with self.subTest(version=str(version)[:32], exit_code=exit_code):
-                    self.lint_report_version(version, exit_code=exit_code)
+                    self.lint_report_version(
+                        version,
+                        exit_code=exit_code,
+                        real=version == REPORT_VERSION_MISMATCHES[0]
+                        and exit_code == 0,
+                    )
                     result, document = self.run_checks(1)
                     for adapter in ("elisp_compile", "elisp_checkdoc"):
                         check = self.assert_check(document, adapter, "unsupported")

@@ -16,7 +16,7 @@ paths = ["ruff.toml"]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "tests", "crap", "shape", "variant-dispatch", "verification", "source-chars"]
+checks = ["ruff", "clones", "tests", "crap", "shape", "variant-dispatch", "verification", "source-chars", "mutation"]
 
 [classes.test]
 code = true
@@ -148,6 +148,16 @@ adapter = "variant_dispatch"
 tier = 1
 enforcement = "enforced"
 scope = "tree"
+
+[checks.mutation]
+adapter = "python_mutation"
+tier = 1
+enforcement = "enforced"
+scope = "changed"
+base = "HEAD"
+mutant_seconds = 120
+function_mutants = 3
+run_seconds = 1800
 
 [checks.verification]
 adapter = "verification"

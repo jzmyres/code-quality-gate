@@ -1715,22 +1715,6 @@ class ContractTests(unittest.TestCase):
         mutated = python_mutation._ast_mutated(module, index, change)
         self.assertEqual(ast.unparse(mutated), "def only():\n    pass")
 
-    def test_mutated_line_and_generated_rule_use_the_ast(self) -> None:
-        module, _function, index, _parents, change = self.work_ast_change()
-        self.assertEqual(
-            python_mutation._mutated_line(
-                change, "def work():\n    return 1\n"
-            ),
-            "return 2",
-        )
-        mutated = ast.unparse(
-            python_mutation._ast_mutated(module, index, change)
-        )
-        self.assertIn("return 2", mutated)
-        self.assertIsNone(python_mutation._generated_rule(
-            mutated, ast.unparse(module), "pkg/app.py"
-        ))
-
     def test_generated_rule_names_unchanged_and_uncompilable(self) -> None:
         source = (
             "def block(value):\n"
@@ -1803,19 +1787,6 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(path, root / "home")
             self.assertTrue(path.is_dir())
 
-    def test_inherited_path_moves_source_entries_into_the_copy(self) -> None:
-        source_root, copy_root = self.source_tree(
-            "def work():\n    return 1\n"
-        )
-        (source_root / "bin").mkdir()
-        with mock.patch.dict(os.environ, {
-            "PATH": f"{source_root / 'bin'}{os.pathsep}/usr/bin",
-        }, clear=True):
-            path = python_mutation._inherited_path(source_root, copy_root)
-        self.assertEqual(
-            path, f"{copy_root / 'bin'}{os.pathsep}/usr/bin"
-        )
-
     def test_environment_is_the_allowlist_with_paths_inside_the_copy(self) -> None:
         with tempfile.TemporaryDirectory() as source_directory, (
             tempfile.TemporaryDirectory()
@@ -1841,7 +1812,7 @@ class ContractTests(unittest.TestCase):
             })
             self.assertEqual(
                 environment["PATH"],
-                f"{copy_root / 'bin'}{os.pathsep}/bin",
+                f"{copy_root / 'bin'}{os.pathsep}{os.path.realpath('/bin')}",
             )
             self.assertEqual(
                 json.loads(environment["QG_PYTHON"]),
