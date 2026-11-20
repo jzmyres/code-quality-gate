@@ -54,12 +54,48 @@ class MessageTests(unittest.TestCase):
         )
         self.assertEqual(deleted.mutated_line, "deleted: b = 2")
 
+    def test_deletions_exclude_the_next_statement_and_trailing_comment(self) -> None:
+        source = "def pair():\n    a = 10; b = 20  # comment\n    return a + b\n"
+        deleted = [
+            record.mutated_line for record in self.generated(source)
+            if record.operator == "delete" and record.line == 2
+        ]
+        self.assertEqual(deleted, ["deleted: a = 10", "deleted: b = 20"])
+
+    def test_deletion_after_non_ascii_text_uses_byte_offsets(self) -> None:
+        source = 'def pair():\n    text = "éé"; b = 20  # comment\n    return text, b\n'
+        deleted = next(
+            record for record in self.generated(source)
+            if record.operator == "delete" and record.line == 2
+            and record.column == 19
+        )
+        self.assertEqual(deleted.mutated_line, "deleted: b = 20")
+
+    def test_multiline_deletion_keeps_the_whole_first_line(self) -> None:
+        source = "def work():\n    value = (  \n        10\n    )\n    return value\n"
+        deleted = next(
+            record for record in self.generated(source)
+            if record.operator == "delete" and record.line == 2
+        )
+        self.assertEqual(deleted.mutated_line, "deleted: value = (  ")
+
+    def test_multiline_replacement_keeps_the_first_prefix_and_last_suffix(self) -> None:
+        source = "def choose(x):\n    return (x\n        == 1)  # comment\n"
+        changed = next(
+            record for record in self.generated(source)
+            if record.operator == "!=" and record.line == 2
+        )
+        self.assertEqual(changed.mutated_line, "return (x != 1)  # comment")
+
     def test_every_message_contains_its_replacement_once_on_its_line(self) -> None:
         source = (
             'def choose(x):\n'
             '    text = "é\x85\u2028"\n'
             "\f\n"
-            "    a = 10; b = 20\n"
+            "    a = 10; b = 20  # comment\n"
+            "    value = (  \n"
+            "        a + b\n"
+            "    )\n"
             '    return "éé" if x == 1 else text\n'
         )
         function = ast.parse(source).body[0]
@@ -70,8 +106,9 @@ class MessageTests(unittest.TestCase):
             with self.subTest(operator=record.operator, line=record.line):
                 self.assertEqual(record.line, change.target.lineno)
                 if change.delete:
-                    self.assertTrue(
-                        record.mutated_line.startswith("deleted: ")
+                    segment = ast.get_source_segment(source, change.target)
+                    self.assertEqual(
+                        record.mutated_line, "deleted: " + segment.split("\n", 1)[0]
                     )
                     continue
                 replacement = ast.unparse(change.replacement_node)

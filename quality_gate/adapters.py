@@ -196,7 +196,7 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "python_tests",
-    ("run", "tests_pattern", "skipped_pattern", "budget_seconds", "workers"),
+    ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     python_tests._python_tests_spec,
     python_tests._run_python_tests,
     budget=_spec_budget,

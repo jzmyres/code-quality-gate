@@ -61,6 +61,15 @@ class ProcRecordTests(unittest.TestCase):
                 runner._proc_fields("/proc/123/stat")
             )
 
+    def test_an_unreadable_process_record_propagates_the_read_error(self) -> None:
+        error = PermissionError("denied")
+        with (
+            mock.patch("builtins.open", side_effect=error),
+            self.assertRaises(PermissionError) as raised,
+        ):
+            runner._proc_fields("/proc/123/stat")
+        self.assertIs(raised.exception, error)
+
     def test_proc_fields_returns_the_fields_after_any_name_bytes(self) -> None:
         cases = [
             (b"10 (simple) S 1 2 3", ["S", "1", "2", "3"]),

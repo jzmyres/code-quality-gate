@@ -315,12 +315,11 @@ with an explicit escape or remove it.
     tier = 1
     enforcement = "enforced"
     run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
-    workers = 4                           # optional; 1 is the default
     tests_pattern = "^Ran (\\d+) tests? in"
     skipped_pattern = "skipped=(\\d+)"  # optional; one capture group
     budget_seconds = 900                  # optional; this is the default
 
-`python_tests` runs the consumer's own test command from the repository root. The token `{python}`
+`python_tests` runs the consumer's own test command once from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
 `covrun.py`, a fresh data directory, the source root, the pinned coverage install, that install's
 version and payload digest from the effective tool lock, the gate-owned coverage configuration path,
@@ -348,14 +347,6 @@ runner with a measured script that reports every `quality_gate` module in its `s
 one parses `covrun.py` for a `quality_gate` import. With `--policy-from`, the version and payload
 digest are the authorized effective lock's, so the parent and the coverage runner agree on an
 authorized coverage upgrade.
-
-`workers = N` above 1 requires `run` to begin with `{python} -m unittest discover`; any other
-command shape is a policy error naming the check. The adapter discovers every test id once, deals
-the ids in id order round-robin to N worker processes, and starts each as `{python} -m unittest`
-over a file of its ids, never over the command line. Every worker writes into the same coverage data
-directory. The check reports one summed `Ran` count, every failing test's name and condition, and an
-error naming the id when a discovered test did not run exactly once or a worker exited without a test
-summary. `workers` absent or 1 keeps the single run exactly.
 
 Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
 directly in the caller's temporary directory with a short `qg-t-` prefix, so the caller's `TMPDIR`
@@ -779,7 +770,7 @@ table:
     scope = "changed"                     # only changed
     base = "HEAD"                         # required; the diff base
     mutant_seconds = 10                   # optional; one mutant's test run
-    function_mutants = 20                 # optional; mutants per function
+    function_mutants = 3                  # this repository's policy
     run_seconds = 300                     # optional; the whole check
 
 `python_mutation` refuses a change whose tests survive a mutation of a function the diff adds or
@@ -860,6 +851,9 @@ gone only when reading it raises `FileNotFoundError` or `ProcessLookupError`; an
 read a record is a check error naming the pid and the failure. Where the subreaper is unavailable,
 or the process table cannot be enumerated to confirm the adopted descendants stopped, the check is
 an error naming why, never a pass or a completed run.
+Runner tests check that a noisy timeout ends with SIGKILL and no cleanup error, that a group whose
+absence cannot be confirmed reports a cleanup error after SIGKILL, and that a permission failure
+reading a process record propagates from the reader.
 
 `mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
 mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering
@@ -876,8 +870,11 @@ A surviving mutant is one finding, value `1` against threshold `0`, with the exa
 
     python-mutation: FILE:LINE FUNCTION survives OPERATOR (CHANGED EXPRESSION IN ITS ORIGINAL LINE); tests run: FILES. Add a test that fails on this change, or fix the generation rule if the mutant cannot change behaviour.
 
-The parenthetical is the changed expression itself, substituted into the original source line,
-or `deleted: <first line of the statement>`; `FILE:LINE` is that line's original number.
+The parenthetical substitutes the changed expression between the prefix of its first source line
+and the suffix of its last. A deletion shows `deleted: ` followed by the statement's exact source
+on its first line. For a single-line statement this ends at the statement boundary, excluding
+any following statement or trailing comment. For a multi-line statement it extends to the end of
+the first line. `FILE:LINE` is the original number of the first line.
 
 For example, a weak test that only asserts the result is one of the possible strings:
 

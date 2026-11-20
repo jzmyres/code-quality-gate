@@ -270,6 +270,18 @@ class PolicyTests(FixtureCase):
             "a string",
         )
 
+    def test_python_tests_rejects_workers_as_an_unknown_key(self) -> None:
+        self.config_error(
+            BASE_CONFIG
+            + '\n[checks.tests]\nadapter = "python_tests"\ntier = 1\n'
+            'enforcement = "enforced"\n'
+            'run = ["{python}", "-m", "unittest", "discover"]\n'
+            "tests_pattern = 'Ran (\\d+) tests'\n"
+            "workers = 2\n",
+            "checks.tests.workers",
+            "allowed keys",
+        )
+
     def test_python_tests_needs_a_tests_pattern(self) -> None:
         self.config_error(
             BASE_CONFIG

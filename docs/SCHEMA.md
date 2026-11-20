@@ -58,7 +58,6 @@ adapter = "python_tests"
 tier = 1
 enforcement = "enforced"
 run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
-workers = 4                   # optional; 1 is the default
 tests_pattern = "^Ran (\\d+) tests? in"   # required; one capture group
 skipped_pattern = "skipped=(\\d+)"        # optional; one capture group
 budget_seconds = 900          # optional
@@ -138,10 +137,7 @@ Rules:
   path begins with `-`. `{tool:NAME}` expands to a pinned tool binary.
 * `python_tests` requires a one-group `tests_pattern`; `skipped_pattern` is
   optional, has one group, and is only valid with `tests_pattern`. Both are
-  searched with `re.MULTILINE` over combined stdout and stderr. `workers`
-  above 1 requires a `{python} -m unittest discover` run; the adapter
-  discovers the ids once, runs them in that many workers, and requires each id
-  to run exactly once.
+  searched with `re.MULTILINE` over combined stdout and stderr.
 * The `{python}` token expands to the gate's `covrun.py` under the current
   interpreter with a fresh data directory, the source root, the pinned coverage
   install, the gate-owned coverage configuration path and the registry

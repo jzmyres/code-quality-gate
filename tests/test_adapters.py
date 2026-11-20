@@ -13,7 +13,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from support import GATE, baseline_text, stub_check_result, with_clones
+from support import GATE, FixtureCase, baseline_text, stub_check_result, with_clones
+from test_python_tests import tests_config
+
+from quality_gate.python_tests import _parse_python_tests
 
 sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
@@ -262,6 +265,25 @@ class CheckDependencyTests(unittest.TestCase):
             descriptor.required_checks("tests", self.earlier()), ("tests",)
         )
         self.assertEqual(descriptor.required_checks(None, self.earlier()), ())
+
+
+class PythonTestsAdapterTests(FixtureCase):
+    def test_invalid_run_argument_names_the_full_policy_key(self) -> None:
+        with self.assertRaisesRegex(policy.ConfigError, r"checks\.tests\.run\[0\].*embedded NUL"):
+            _parse_python_tests({"run": ["\0"]}, self.config_path, "checks.tests")
+
+    def test_unavailable_evidence_directory_fails_the_check(self) -> None:
+        self.write_config(tests_config())
+        config = policy.load_config(self.repo)
+        evidence_dir = self.base / "missing"
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = checks.run_check(
+                self.repo, config, config.checks["tests"], [], {},
+                prefix="check: tests", evidence_dir=evidence_dir,
+            )
+        self.assertEqual((result.outcome, result.execution), ("error", "error"))
+        self.assertIn("cannot create coverage data directory", result.reason)
+        self.assertIn(str(evidence_dir / "data"), result.reason)
 
 
 class StubAdapterTests(unittest.TestCase):

@@ -454,8 +454,9 @@ def _mutated_line(change: _Change, source: str) -> str:
     lines = source.split("\n")
     if change.delete:
         statement = lines[target.lineno - 1].encode("utf-8")
-        first = statement[target.col_offset:].decode("utf-8")
-        return f"deleted: {first.strip()}"
+        end_column = target.end_col_offset if target.end_lineno == target.lineno else None
+        first = statement[target.col_offset:end_column].decode("utf-8")
+        return f"deleted: {first}"
     replacement = ast.unparse(change.replacement_node).encode("utf-8")
     start = target.lineno
     end = target.end_lineno or start

@@ -131,6 +131,7 @@ class ReadChunkTests(unittest.TestCase):
         )
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.returncode, -signal.SIGKILL)
+        self.assertIsNone(result.error)
         self.assertGreater(result.output_bytes, runner.CAPTURE_LIMIT)
         self.assertTrue(result.output_truncated)
         self.assertLess(time.monotonic() - start, 8.0)
@@ -491,7 +492,11 @@ class UnconfirmedCleanupTests(unittest.TestCase):
 
     def test_a_group_that_survives_sigkill_reports_unconfirmed_cleanup(self) -> None:
         program = "import time; time.sleep(30)"
-        with mock.patch.object(runner, "_group_alive", return_value=True):
+        with (
+            mock.patch.object(runner, "_group_alive", return_value=True),
+            mock.patch.object(runner, "_signal_group", wraps=runner._signal_group)
+            as signal_group,
+        ):
             start = time.monotonic()
             result = runner.run(
                 [sys.executable, "-c", program],
@@ -503,6 +508,7 @@ class UnconfirmedCleanupTests(unittest.TestCase):
         self.assertEqual(result.execution, "error")
         self.assertTrue(result.timed_out)
         self.assertEqual(result.error, runner.CLEANUP_ERROR)
+        signal_group.assert_any_call(mock.ANY, signal.SIGKILL)
 
 
 if __name__ == "__main__":
