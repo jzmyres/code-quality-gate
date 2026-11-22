@@ -78,6 +78,7 @@ class AdapterDescriptor:
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
     no_tests_hint: str = ""
+    runs_suite: bool = False
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
@@ -200,6 +201,7 @@ register_adapter(AdapterDescriptor(
     python_tests._python_tests_spec,
     python_tests._run_python_tests,
     budget=_spec_budget,
+    runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
     "elisp_tests",
@@ -208,6 +210,7 @@ register_adapter(AdapterDescriptor(
     elisp_tests.run_tests,
     budget=_spec_budget,
     parse_candidate_inputs=True,
+    runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
     "elisp_compile",
@@ -233,6 +236,7 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",
+    runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
     "python_shape",
@@ -251,6 +255,7 @@ register_adapter(AdapterDescriptor(
     python_mutation._run_python_mutation,
     location_coverage="complete",
     budget=python_mutation._budget,
+    runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
     "variant_dispatch",
@@ -267,6 +272,7 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="elisp_tests",
+    runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
     "verification",

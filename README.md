@@ -105,7 +105,8 @@ argument parser and dispatch. `qg.py` is only the entry point.
 
 An adapter is a descriptor, not a branch in the core. It declares its name, configuration keys and
 parser, run function, location coverage, number display, subject noun, failure wording,
-direction rule, extra baseline keys ("extra trusted inputs"), baseline handling and budget. The parser declares each
+direction rule, extra baseline keys ("extra trusted inputs"), baseline handling, budget and whether it
+runs a test suite (`runs_suite`, described with `check` below). The parser declares each
 configured check's evidence; a check produces tests exactly when that evidence includes `tests`.
 The registry is the only list of supported adapters. A test adapter reports how many tests ran and
 were skipped, and its outcome. A metric adapter returns findings. Verification's
@@ -1034,6 +1035,7 @@ The default tools directory is shared by every repository using the gate on this
     python3 -I qg.py check --prune all
     python3 -I qg.py check --policy-from DIR
     python3 -I qg.py check --policy-from DIR --allow-protected ruff.toml
+    QG_AGENT=1 python3 -I qg.py check --only ruff
 
 `check` runs inventory and hygiene (built in, always), then every configured check in policy order. It
 prints progress on stdout and failures on stderr. When inventory fails, configured checks are reported
@@ -1059,6 +1061,17 @@ they require, in policy order. Nothing else runs. An unknown or repeated check i
 directory: `--only` with `--prune` or with `--policy-from` is a usage error (exit 2) naming both
 options, before any check runs. A partial run is never a verdict on the tree; use the full `check` for
 that.
+
+`QG_AGENT=1` marks an agent sandbox. `check` selects the whole policy by default, or the
+`--only` check IDs and their requirements. If any selected adapter declares `runs_suite`,
+the command exits 2 before running any checks and prints one message to stderr.
+For example, `--only crap` can produce this message:
+
+    qg.py: check: refused inside an agent sandbox (QG_AGENT=1): selected checks run a test suite: tests (python_tests), crap (python_crap). the runner's gate runs the test suites once per candidate and returns its log; run focused tests directly, or a static check with --only NAME; allowed here: ruff
+
+The message names each refused check and its adapter. The `allowed here` list contains
+the policy's static check IDs. Select a static check with `--only` to run it inside the
+sandbox. Leave `QG_AGENT` unset or set it to another value for normal check behavior.
 
 `check --json` writes exactly one JSON result to stdout and sends all human-readable lines to stderr.
 The result schema is `3`; a `--policy-from` result is schema `4` and adds `trust` (see below). Its
@@ -1280,8 +1293,9 @@ commit is a candidate input until its submodule path is handled by the caller. S
   invalid command line, a repository that is not the top level of a
   git work tree, an unknown inventory class or check id for pruning, a malformed tool lock, a missing
   `--policy-from` trusted directory, a trusted directory inside the candidate, a gate program inside
-  the candidate, a protected input, tool payload or gate file that changed during the run, or a run or
-  test temporary directory that cannot be removed.
+  the candidate, a protected input, tool payload or gate file that changed during the run, a run or
+  test temporary directory that cannot be removed, or a `check` refused under `QG_AGENT=1` because a
+  selected check runs a test suite.
 
 ## Configuration
 
