@@ -507,6 +507,12 @@ class EquivalenceAndSelectionTests(MutationCase):
 
 
 class SelectionTests(MutationCase):
+    def assert_discovered_test_file(self, expected: str) -> None:
+        result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(check["outcome"], "pass")
+        self.assertEqual(check["measurement"]["test_files"], [expected])
+
     def test_a_weak_test_reports_a_survivor(self) -> None:
         self.base_commit()
         self.commit({
@@ -549,6 +555,32 @@ class SelectionTests(MutationCase):
             record["outcome"] == "killed"
             for record in self.mutants(check)
         ))
+
+    def test_default_discovery_selects_the_test_and_skips_the_helper(self) -> None:
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY,
+            "tests/support.py": (
+                "import pathlib\n"
+                "import sys\n"
+                "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))\n"
+                "from pkg import app\n"
+            ),
+            "tests/test_mod.py": STRONG_CLASSIFY,
+        })
+        self.assert_discovered_test_file("tests/test_mod.py")
+
+    def test_custom_discovery_selects_only_the_configured_pattern(self) -> None:
+        self.write_config(mutation_config().replace(
+            '"-s", "tests"]', '"-s", "tests", "-p", "check_*.py"]',
+        ))
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY,
+            "tests/check_mod.py": STRONG_CLASSIFY,
+            "tests/test_mod.py": STRONG_CLASSIFY,
+        })
+        self.assert_discovered_test_file("tests/check_mod.py")
 
     def test_a_function_no_test_names_it_reports_that_finding(self) -> None:
         self.base_commit()
@@ -634,10 +666,13 @@ class SelectionTests(MutationCase):
         self.base_commit()
         self.commit({
             "pkg/app.py": CLASSIFY,
+            "tests/support.py": "from pkg import app\n",
             "tests/test_app.py": WEAK_CLASSIFY,
         })
         result, _document, check = self.run_mutation()
+        self.assertIn("measurement", check, output(result))
         self.assert_function_was_mutated(result, check)
+        self.assertEqual(check["measurement"]["test_files"], ["tests/test_app.py"])
 
 
 DELETION_BASE = """\
@@ -1866,24 +1901,34 @@ class ContractTests(unittest.TestCase):
                 ["tests/test_app.py"],
             )
 
-    def test_test_directories_reads_the_discover_directory(self) -> None:
+    def test_test_discovery_pairs_the_directory_and_pattern(self) -> None:
         check = SimpleNamespace(
             adapter="python_tests",
             spec=SimpleNamespace(run=(
                 "python", "-m", "unittest", "discover", "-s", "tests",
+                "-p", "check_*.py",
             )),
         )
         context = SimpleNamespace(
-            config=SimpleNamespace(checks={"tests": check})
+            config=SimpleNamespace(checks={
+                "other": SimpleNamespace(adapter="command"),
+                "tests": check,
+            })
         )
-        self.assertEqual(python_mutation._test_directories(context), ["tests"])
+        self.assertEqual(
+            python_mutation._test_discovery(context), [("tests", "check_*.py")]
+        )
 
-    def test_in_any_directory_checks_each_directory(self) -> None:
-        self.assertTrue(python_mutation._in_any_directory(
-            "tests/test_app.py", ["tests"]
+    def test_discovery_matches_each_directory_with_its_own_pattern(self) -> None:
+        discovery = [("tests", "test*.py"), ("checks", "check*.py")]
+        self.assertTrue(python_mutation._matches_discovery(
+            "checks/nested/check_app.py", discovery
         ))
-        self.assertFalse(python_mutation._in_any_directory(
-            "pkg/app.py", ["tests"]
+        self.assertFalse(python_mutation._matches_discovery(
+            "checks/test_app.py", discovery
+        ))
+        self.assertFalse(python_mutation._matches_discovery(
+            "tests/Test_app.py", discovery
         ))
 
     def test_fallback_test_paths_keeps_test_shaped_files(self) -> None:
@@ -1899,34 +1944,37 @@ class ContractTests(unittest.TestCase):
                 ["tests/test_app.py"],
             )
 
-    def test_selected_test_paths_uses_the_directory_or_the_fallback(self) -> None:
+    def test_fallback_uses_the_configured_pattern_without_a_directory(self) -> None:
+        check = SimpleNamespace(
+            adapter="python_tests",
+            spec=SimpleNamespace(run=(
+                "python", "-m", "unittest", "discover", "-p", "check_*.py",
+            )),
+        )
         context = SimpleNamespace(
-            files=["pkg/app.py", "tests/test_app.py", "other/test_other.py"]
+            config=SimpleNamespace(checks={"tests": check}),
+            files=["pkg/check_app.py", "tests/test_app.py", "tests/check_app.py"],
         )
         with mock.patch.object(
-            python_mutation, "_fallback_test_paths",
-            return_value=["fallback"],
+            python_mutation, "_selected_test_files", return_value=[],
         ):
             self.assertEqual(
-                python_mutation._selected_test_paths(context, []), ["fallback"]
+                python_mutation._test_file_paths(context), ["tests/check_app.py"]
             )
-        self.assertEqual(
-            python_mutation._selected_test_paths(context, ["tests"]),
-            ["tests/test_app.py"],
-        )
 
     def test_test_file_paths_keeps_python_files_sorted(self) -> None:
-        context = SimpleNamespace(
-            files=[], config=SimpleNamespace(checks={})
+        check = SimpleNamespace(
+            adapter="python_tests",
+            spec=SimpleNamespace(run=("-s", "checks", "-p", "check*")),
         )
-        with mock.patch.object(
-            python_mutation, "_selected_test_paths",
-            return_value=["tests/test_b.py", "tests/helper.txt", "tests/test_a.py"],
-        ):
-            self.assertEqual(
-                python_mutation._test_file_paths(context),
-                ["tests/test_a.py", "tests/test_b.py"],
-            )
+        context = SimpleNamespace(
+            files=["checks/check_b.py", "checks/check_helper.txt", "checks/check_a.py"],
+            config=SimpleNamespace(checks={"tests": check}),
+        )
+        self.assertEqual(
+            python_mutation._test_file_paths(context),
+            ["checks/check_a.py", "checks/check_b.py"],
+        )
 
     def test_module_name_is_the_dotted_path(self) -> None:
         self.assertEqual(

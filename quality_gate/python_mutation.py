@@ -14,7 +14,9 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +43,7 @@ DEFAULT_MUTANT_SECONDS = 10
 DEFAULT_FUNCTION_MUTANTS = 20
 DEFAULT_RUN_SECONDS = 300
 SCOPES = ("changed",)
+_DEFAULT_TEST_PATTERN = "test*.py"
 
 
 @dataclass(frozen=True)
@@ -575,15 +578,21 @@ def _discover_directory(run: tuple[str, ...]) -> str:
     return ""
 
 
-def _test_directories(context: Any) -> list[str]:
-    directories = []
+def _discover_pattern(run: tuple[str, ...]) -> str:
+    for index, argument in enumerate(run[:-1]):
+        if argument == "-p":
+            return run[index + 1]
+    return _DEFAULT_TEST_PATTERN
+
+
+def _test_discovery(context: Any) -> list[tuple[str, str]]:
+    discovery = []
     for check in context.config.checks.values():
         if check.adapter != "python_tests":
             continue
-        directory = _discover_directory(getattr(check.spec, "run", ()))
-        if directory:
-            directories.append(directory)
-    return directories
+        run = getattr(check.spec, "run", ())
+        discovery.append((_discover_directory(run), _discover_pattern(run)))
+    return discovery
 
 
 def _in_test_directory(relative: str, directory: str) -> bool:
@@ -592,10 +601,12 @@ def _in_test_directory(relative: str, directory: str) -> bool:
     return relative == directory or relative.startswith(directory + "/")
 
 
-def _in_any_directory(relative: str, directories: list[str]) -> bool:
+def _matches_discovery(relative: str, discovery: list[tuple[str, str]]) -> bool:
+    name = PurePosixPath(relative).name
     return any(
-        _in_test_directory(relative, directory)
-        for directory in directories
+        fnmatchcase(name, pattern)
+        and (not directory or _in_test_directory(relative, directory))
+        for directory, pattern in discovery
     )
 
 
@@ -607,21 +618,24 @@ def _fallback_test_paths(context: Any) -> list[str]:
     ]
 
 
-def _selected_test_paths(
-    context: Any, directories: list[str]
+def _matching_test_paths(
+    paths: Iterable[str], discovery: list[tuple[str, str]],
 ) -> list[str]:
-    if not directories:
-        return _fallback_test_paths(context)
-    return [
-        relative for relative in context.files
-        if _in_any_directory(relative, directories)
-    ]
+    return sorted(
+        relative for relative in paths
+        if relative.endswith(".py") and _matches_discovery(relative, discovery)
+    )
 
 
 def _test_file_paths(context: Any) -> list[str]:
-    selected = _selected_test_paths(context, _test_directories(context))
-    return sorted(
-        relative for relative in selected if relative.endswith(".py")
+    discovery = _test_discovery(context)
+    directory_rules = [
+        (directory, pattern) for directory, pattern in discovery if directory
+    ]
+    if directory_rules:
+        return _matching_test_paths(context.files, directory_rules)
+    return _matching_test_paths(
+        _fallback_test_paths(context), discovery or [("", _DEFAULT_TEST_PATTERN)],
     )
 
 
