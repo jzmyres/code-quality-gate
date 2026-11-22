@@ -1255,6 +1255,46 @@ def _process_running(pid: int) -> bool:
 
 
 class IsolationTests(MutationCase):
+    def assert_mutation_loads_pinned_coverage(
+        self, tools_dir: Path, env: dict[str, str] | None = None,
+    ) -> None:
+        gate = self.fixture_gate()
+        installation = tools_dir / "coverage-1.0"
+        module = installation / "coverage" / "__init__.py"
+        module.parent.mkdir(parents=True)
+        module.write_text("VERSION = 'fixture'\n", encoding="utf-8")
+        self.set_lock_field("coverage", "version", "1.0")
+        self.set_lock_field(
+            "coverage", "payload_sha256", self.payload_digest(installation)
+        )
+
+        self.base_commit()
+        self.commit({
+            "pkg/app.py": CLASSIFY,
+            "tests/test_app.py": STRONG_CLASSIFY + f"""
+    def test_mutation_tools_dir_loads_coverage(self):
+        sys.path.insert(0, {str(gate)!r})
+        from quality_gate.coverage_tool import import_coverage
+        from quality_gate.tools import lock_override
+
+        with lock_override(pathlib.Path({str(gate / "tools.lock.toml")!r})):
+            self.assertEqual(import_coverage().__file__, {str(module)!r})
+""",
+        })
+        result, document = self.run_json("--only", "mutation", env=env)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.check_by_id(document, "mutation")["outcome"], "pass")
+
+    def test_mutation_tools_dir_defaults_to_the_gate_home(self) -> None:
+        self.assert_mutation_loads_pinned_coverage(
+            self.home / ".local/share/code-quality-gate/tools"
+        )
+
+    def test_mutation_tools_dir_resolves_a_custom_directory(self) -> None:
+        self.assert_mutation_loads_pinned_coverage(
+            self.base / "custom-tools", {"QG_TOOLS_DIR": "../custom-tools"}
+        )
+
     def test_the_mutant_and_baseline_environment_is_allowlisted(self) -> None:
         self.base_commit()
         self.commit({
@@ -1822,7 +1862,7 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(path, root / "home")
             self.assertTrue(path.is_dir())
 
-    def test_environment_is_the_allowlist_with_paths_inside_the_copy(self) -> None:
+    def test_mutation_tools_dir_preserves_the_isolated_environment(self) -> None:
         with tempfile.TemporaryDirectory() as source_directory, (
             tempfile.TemporaryDirectory()
         ) as directory:
@@ -1839,11 +1879,12 @@ class ContractTests(unittest.TestCase):
                 "QG_PYTHON": "inherited",
             }, clear=True):
                 environment = python_mutation._environment(
-                    source_root, copy_root
+                    source_root, copy_root, source_root / "tools"
                 )
             self.assertEqual(set(environment), {
                 "PATH", "LANG", "LC_ALL", "QG_PYTHON",
                 "PYTHONDONTWRITEBYTECODE", "PWD", "HOME", "TMPDIR",
+                "QG_TOOLS_DIR",
             })
             self.assertEqual(
                 environment["PATH"],
@@ -1855,6 +1896,7 @@ class ContractTests(unittest.TestCase):
             )
             self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(environment["PWD"], str(copy_root))
+            self.assertEqual(environment["QG_TOOLS_DIR"], str(source_root / "tools"))
             for name in ("HOME", "TMPDIR"):
                 path = Path(environment[name])
                 self.assertTrue(path.is_dir(), path)
@@ -1996,14 +2038,23 @@ class ContractTests(unittest.TestCase):
         self.assertIsNone(result.returncode)
         self.assertEqual(result.argv, ("python",))
 
-    def test_run_one_test_past_its_deadline_is_a_budget_result(self) -> None:
-        result = python_mutation._run_one_test(
-            Path("."), Path("."), "tests/test_app.py", time.monotonic() - 1
-        )
+    def test_mutation_tools_dir_skips_the_runner_after_the_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            python_mutation, "run"
+        ) as run_test:
+            root = Path(directory)
+            result = python_mutation._run_one_test(
+                root, root, "tests/test_app.py", time.monotonic() - 1, Path("/tools")
+            )
+        run_test.assert_not_called()
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.argv, tuple(
             python_mutation._discover_argv("tests/test_app.py")
         ))
+
+    def test_mutation_tools_dir_rejects_an_empty_test_selection(self) -> None:
+        with self.assertRaises(AssertionError):
+            python_mutation._run_unittest(Path("."), Path("."), (), 10, Path("/tools"))
 
     def test_first_failure_keeps_the_earliest_failure(self) -> None:
         passed = RunResult((), execution="completed", returncode=0)
@@ -2014,7 +2065,7 @@ class ContractTests(unittest.TestCase):
         )
         self.assertIs(python_mutation._first_failure(None, failed), failed)
 
-    def test_baseline_copies_the_tree_and_reports_its_budget_cut(self) -> None:
+    def test_mutation_tools_dir_baseline_skips_copy_after_budget_cut(self) -> None:
         source = "def work():\n    return 1\n"
         function = self.function(source)
         spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
@@ -2027,13 +2078,14 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertTrue(python_mutation._baseline(
                 function, ("tests/test_app.py",), root, work,
-                0, spec, time.monotonic(),
+                0, spec, time.monotonic(), Path("/tools"),
             ))
         self.assertTrue((work / "copy-0000/pkg/app.py").exists())
         self.assertFalse(python_mutation._baseline(
             function, ("tests/test_app.py",), root, work,
-            1, spec, time.monotonic() - 11,
+            1, spec, time.monotonic() - 11, Path("/tools"),
         ))
+        self.assertFalse((work / "copy-0001").exists())
 
     def test_a_slow_baseline_copy_leaves_no_time_for_its_run(self) -> None:
         source = "def work():\n    return 1\n"
@@ -2057,7 +2109,7 @@ class ContractTests(unittest.TestCase):
         ) as run_tests:
             self.assertFalse(python_mutation._baseline(
                 function, ("tests/test_app.py",), root, work,
-                0, spec, time.monotonic(),
+                0, spec, time.monotonic(), Path("/tools"),
             ))
         run_tests.assert_not_called()
 
@@ -2168,12 +2220,23 @@ class ContractTests(unittest.TestCase):
         ):
             outcome, over_budget = python_mutation._run_mutant(
                 function, mutation, ("tests/test_app.py",),
-                spec, time.monotonic(), root, work, numbers,
+                spec, time.monotonic(), root, work, numbers, Path("/tools"),
             )
         self.assertEqual((outcome, over_budget), ("killed", False))
         self.assertEqual(numbers, [1])
 
-    def test_run_generated_records_a_survivor_and_a_cutoff(self) -> None:
+    def test_mutation_tools_dir_mutant_skips_copy_after_budget_cut(self) -> None:
+        source, function, mutation = self.work_mutation()
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        root, work = self.source_tree(source)
+        result = python_mutation._run_mutant(
+            function, mutation, ("tests/test_app.py",),
+            spec, time.monotonic() - 11, root, work, [0], Path("/tools"),
+        )
+        self.assertEqual(result, ("not run (over budget)", True))
+        self.assertFalse((work / "copy-0000").exists())
+
+    def test_mutation_tools_dir_generated_mutants_stop_at_the_cutoff(self) -> None:
         source, function, mutation = self.work_mutation()
         spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
         records: list[Any] = []
@@ -2183,19 +2246,32 @@ class ContractTests(unittest.TestCase):
         ):
             records, findings, finished = python_mutation._run_generated(
                 function, [mutation], ("tests/test_app.py",), spec,
-                time.monotonic(), Path("."), Path("."), [0], records,
+                time.monotonic(), Path("."), Path("."), [0], records, Path("/tools"),
             )
         self.assertTrue(finished)
         self.assertEqual(records[0]["outcome"], "survived")
         self.assertEqual(len(findings), 1)
         cut = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 1)
-        records, findings, finished = python_mutation._run_generated(
-            function, [mutation], ("tests/test_app.py",), cut,
-            time.monotonic() - 2, Path("."), Path("."), [0], [],
-        )
+        with mock.patch.object(python_mutation, "_run_mutant") as run_mutant:
+            records, findings, finished = python_mutation._run_generated(
+                function, [mutation], ("tests/test_app.py",), cut,
+                time.monotonic() - 2, Path("."), Path("."), [0], [], Path("/tools"),
+            )
+        run_mutant.assert_not_called()
         self.assertFalse(finished)
         self.assertEqual(records[0]["outcome"], "not run (over budget)")
         self.assertEqual(findings, [])
+
+    def test_mutation_tools_dir_skips_generation_after_budget_cut(self) -> None:
+        source, function, _mutation = self.work_mutation()
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
+        with mock.patch.object(python_mutation, "_mutations") as generate:
+            result = python_mutation._run_function(
+                function, ("tests/test_app.py",), source, spec,
+                time.monotonic() - 11, Path("."), Path("."), [0], Path("/tools"),
+            )
+        generate.assert_not_called()
+        self.assertEqual(result, ([], [], False))
 
     def test_run_function_without_generated_mutants_runs_the_baseline(
         self,
@@ -2208,7 +2284,7 @@ class ContractTests(unittest.TestCase):
             records, findings, finished = python_mutation._run_function(
                 function, ("tests/test_app.py",), source,
                 python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10),
-                time.monotonic(), Path("."), Path("."), [0],
+                time.monotonic(), Path("."), Path("."), [0], Path("/tools"),
             )
         baseline.assert_called_once()
         self.assertTrue(finished)

@@ -31,6 +31,7 @@ from .policy import (
 )
 from .ratchet import Domain, Finding, Location
 from .runner import RunResult, execution_outcome, mark_step, run
+from .tools import _tools_dir
 
 
 if TYPE_CHECKING:
@@ -721,8 +722,10 @@ def _inherited_path(source_root: Path, copy_root: Path) -> str:
     return os.pathsep.join(entries)
 
 
-def _environment(source_root: Path, copy_root: Path) -> dict[str, str]:
-    """The allowlisted environment, with every path inside the copy."""
+def _environment(
+    source_root: Path, copy_root: Path, tools_dir: Path
+) -> dict[str, str]:
+    """The allowlisted environment for a test running inside the copy."""
     from .python_tests import _test_environment
 
     exported = _test_environment([sys.executable, "-I", "-B"])
@@ -740,6 +743,7 @@ def _environment(source_root: Path, copy_root: Path) -> dict[str, str]:
     environment["PWD"] = str(copy_root)
     environment["HOME"] = str(_copy_directory(copy_root, "home"))
     environment["TMPDIR"] = str(_copy_directory(copy_root, "tmp"))
+    environment["QG_TOOLS_DIR"] = str(tools_dir)
     return environment
 
 
@@ -759,14 +763,15 @@ def _budget_result(argv: list[str]) -> RunResult:
 
 
 def _run_one_test(
-    source_root: Path, copy_root: Path, relative: str, deadline: float
+    source_root: Path, copy_root: Path, relative: str, deadline: float,
+    tools_dir: Path,
 ) -> RunResult:
     argv = _discover_argv(relative)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return _budget_result(argv)
     return run(
-        argv, cwd=copy_root, env=_environment(source_root, copy_root),
+        argv, cwd=copy_root, env=_environment(source_root, copy_root, tools_dir),
         budget_seconds=remaining,
     )
 
@@ -786,17 +791,17 @@ def _result_or_failure(
 
 
 def _run_unittest(
-    source_root: Path, copy_root: Path, tests: tuple[str, ...], seconds: float
+    source_root: Path, copy_root: Path, tests: tuple[str, ...], seconds: float,
+    tools_dir: Path,
 ) -> RunResult:
+    assert tests
     deadline = time.monotonic() + seconds
-    result: RunResult | None = None
     failure: RunResult | None = None
     for relative in tests:
-        result = _run_one_test(source_root, copy_root, relative, deadline)
+        result = _run_one_test(source_root, copy_root, relative, deadline, tools_dir)
         if not execution_outcome(result.execution).completed:
             return result
         failure = _first_failure(failure, result)
-    assert result is not None
     return _result_or_failure(result, failure)
 
 
@@ -845,6 +850,7 @@ def _baseline_passed(
 def _baseline(
     function: python_shape.ShapeFunction, tests: tuple[str, ...],
     root: Path, work: Path, number: int, spec: MutationSpec, start: float,
+    tools_dir: Path,
 ) -> bool:
     remaining = _remaining(start, spec)
     if remaining <= 0:
@@ -854,7 +860,7 @@ def _baseline(
     if remaining <= 0:
         return False
     allowance = min(spec.mutant_seconds, remaining)
-    result = _run_unittest(root, copy_root, tests, allowance)
+    result = _run_unittest(root, copy_root, tests, allowance, tools_dir)
     if not _baseline_passed(
         function, result, allowance, spec.mutant_seconds
     ):
@@ -976,7 +982,7 @@ def _not_run_records(
 def _run_mutant(
     function: python_shape.ShapeFunction, mutation: Mutation,
     tests: tuple[str, ...], spec: MutationSpec,
-    start: float, root: Path, work: Path, numbers: list[int],
+    start: float, root: Path, work: Path, numbers: list[int], tools_dir: Path,
 ) -> tuple[str, bool]:
     if _remaining(start, spec) <= 0:
         return "not run (over budget)", True
@@ -989,7 +995,7 @@ def _run_mutant(
     if remaining <= 0:
         return "not run (over budget)", True
     allowance = min(spec.mutant_seconds, remaining)
-    result = _run_unittest(root, copy_root, tests, allowance)
+    result = _run_unittest(root, copy_root, tests, allowance, tools_dir)
     outcome = _outcome(result, function)
     over_budget = (
         outcome == "timed out" and allowance < spec.mutant_seconds
@@ -1001,7 +1007,7 @@ def _run_generated(
     function: python_shape.ShapeFunction, mutations: list[Mutation],
     tests: tuple[str, ...], spec: MutationSpec,
     start: float, root: Path, work: Path, numbers: list[int],
-    records: list[dict[str, Any]],
+    records: list[dict[str, Any]], tools_dir: Path,
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     findings: list[Finding] = []
     for position, mutation in enumerate(mutations):
@@ -1012,7 +1018,7 @@ def _run_generated(
             return records, findings, False
         outcome, over_budget = _run_mutant(
             function, mutation, tests, spec, start,
-            root, work, numbers,
+            root, work, numbers, tools_dir,
         )
         records.append(_record(function, mutation, tests, outcome))
         if over_budget:
@@ -1028,7 +1034,7 @@ def _run_generated(
 def _run_function(
     function: python_shape.ShapeFunction, tests: tuple[str, ...],
     source: str, spec: MutationSpec, start: float,
-    root: Path, work: Path, numbers: list[int],
+    root: Path, work: Path, numbers: list[int], tools_dir: Path,
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     if _remaining(start, spec) <= 0:
         return [], [], False
@@ -1039,14 +1045,14 @@ def _run_function(
     generated = _generated_mutations(mutations)
     if _remaining(start, spec) <= 0:
         return records + _not_run_records(function, generated, tests), [], False
-    if not _baseline(function, tests, root, work, numbers[0], spec, start):
+    if not _baseline(function, tests, root, work, numbers[0], spec, start, tools_dir):
         return records + _not_run_records(function, generated, tests), [], False
     numbers[0] += 1
     if not generated:
         return records, [], True
     return _run_generated(
         function, generated, tests, spec, start,
-        root, work, numbers, records,
+        root, work, numbers, records, tools_dir,
     )
 
 
@@ -1083,6 +1089,7 @@ def _measure(
     findings: list[Finding] = []
     unfinished: list[python_shape.ShapeFunction] = []
     sources: dict[str, str] = {}
+    tools_dir = _tools_dir().resolve()
     with tempfile.TemporaryDirectory(prefix="qg-mutation-") as temporary:
         work = Path(temporary)
         numbers = [0]
@@ -1097,7 +1104,7 @@ def _measure(
             source = _source_for(context.root, function.path, sources)
             related, survived, finished = _run_function(
                 function, function_tests, source, spec, start,
-                context.root, work, numbers,
+                context.root, work, numbers, tools_dir,
             )
             records.extend(related)
             findings.extend(survived)
