@@ -315,10 +315,24 @@ with an explicit escape or remove it.
     adapter = "python_tests"
     tier = 1
     enforcement = "enforced"
-    run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
+    run = ["{python}", "code-quality-gate/quality_gate/test_shards.py", "-s", "tests"]
     tests_pattern = "^Ran (\\d+) tests? in"
     skipped_pattern = "skipped=(\\d+)"  # optional; one capture group
     budget_seconds = 900                  # optional; this is the default
+
+The `run` value above uses the shared unittest runner from a gate submodule at
+`code-quality-gate/`. Pass `-s DIR` (`--start-directory DIR`) to select the discovery directory
+and optionally `-p GLOB` (`--pattern GLOB`) to change unittest's default `test*.py` pattern.
+`-j N` (`--workers N`) sets the maximum number of workers and defaults to the host CPU count
+(or one when the count is unavailable). Use `-j 1` to run in-process. The gate's own policy sets
+four workers.
+
+The runner uses standard unittest discovery in every worker. It keeps discovered instances from
+`load_tests` and assigns whole classes to workers, keeping tests that share module fixtures
+together. Within each worker it runs the assigned tests in discovery order. Tests running in
+different workers need to be independent. The runner reports failures and errors with tracebacks
+and prints the usual unittest counts. It suppresses test output so the adapter sees one summary,
+and runs every worker under the gate's coverage prefix.
 
 `python_tests` runs the consumer's own test command once from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's

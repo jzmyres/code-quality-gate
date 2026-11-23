@@ -1,0 +1,76 @@
+"test_broken.py" = '''
+raise ImportError("shard fixture cannot import its dependency")
+'''
+
+"test_output.py" = '''
+import os
+import sys
+import unittest
+
+
+class OutputCase(unittest.TestCase):
+    def test_noisy(self):
+        print("Ran 999 tests in 0.000s")
+        print("OK (skipped=999)", file=sys.stderr)
+        os.write(1, b"Ran 999 tests in 0.000s\n")
+        os.write(2, b"OK (skipped=999)\n")
+
+    def test_failure(self):
+        self.assertEqual("actual", "expected")
+'''
+
+"test_parameters.py" = '''
+import unittest
+
+
+def setUpModule():
+    global ready
+    ready = []
+
+
+def tearDownModule():
+    assert ready == [4, 9, 16]
+
+
+class ParameterCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.initialized = True
+
+    def id(self):
+        return f"{super().id()}.{self.value}"
+
+    def test_square(self):
+        self.assertTrue(self.initialized)
+        ready.append(self.value ** 2)
+        self.assertGreater(self.value, 0)
+        self.value = 0
+
+
+class FixtureCase(unittest.TestCase):
+    def test_module_state(self):
+        self.assertEqual(ready, [4, 9, 16])
+
+
+def load_tests(loader, standard_tests, pattern):
+    suite = unittest.TestSuite()
+    for value in (2, 3, 4):
+        test = ParameterCase("test_square")
+        test.value = value
+        suite.addTest(test)
+    suite.addTests(loader.loadTestsFromTestCase(FixtureCase))
+    return suite
+'''
+
+"test_skips.py" = '''
+import unittest
+
+
+class SkipCase(unittest.TestCase):
+    @unittest.skip("fixture skip")
+    def test_skip(self):
+        self.fail("skipped test ran")
+
+    def test_runtime_skip(self):
+        self.skipTest("runtime skip")
+'''
