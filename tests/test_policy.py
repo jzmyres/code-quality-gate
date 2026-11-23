@@ -613,6 +613,15 @@ class PolicyTests(FixtureCase):
             with self.subTest(check=identifier):
                 self.assertIsNone(config.checks[identifier].baseline)
 
+    def test_this_repository_policy_uses_default_shard_workers(self) -> None:
+        config = policy.load_config(GATE)
+        for identifier, check in config.checks.items():
+            run = getattr(check.spec, "run", ())
+            if any(Path(arg).parts[-2:] == ("quality_gate", "test_shards.py") for arg in run):
+                with self.subTest(check=identifier):
+                    self.assertNotIn("-j", run)
+                    self.assertNotIn("--workers", run)
+
     def test_check_direction_defaults_to_max_and_accepts_min(self) -> None:
         self.write_config(BASE_CONFIG)
         result = self.run_qg("inventory")

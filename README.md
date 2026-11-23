@@ -401,8 +401,8 @@ The `run` value above uses the shared unittest runner from a gate submodule at
 `code-quality-gate/`. Pass `-s DIR` (`--start-directory DIR`) to select the discovery directory
 and optionally `-p GLOB` (`--pattern GLOB`) to change unittest's default `test*.py` pattern.
 `-j N` (`--workers N`) sets the maximum number of workers and defaults to the host CPU count
-(or one when the count is unavailable). Use `-j 1` to run in-process. The gate's own policy sets
-four workers.
+(or one when the count is unavailable). Use `-j 1` to run in-process. The gate's own policy uses
+the default.
 
 The runner uses standard unittest discovery in every worker. It keeps discovered instances from
 `load_tests` and assigns whole classes to workers, keeping tests that share module fixtures

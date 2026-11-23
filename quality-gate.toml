@@ -124,7 +124,7 @@ enforcement = "enforced"
 adapter = "python_tests"
 tier = 1
 enforcement = "enforced"
-run = ["{python}", "quality_gate/test_shards.py", "-s", "tests", "-j", "4"]
+run = ["{python}", "quality_gate/test_shards.py", "-s", "tests"]
 tests_pattern = "^Ran (\\d+) tests? in"
 skipped_pattern = "skipped=(\\d+)"
 
