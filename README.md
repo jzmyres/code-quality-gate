@@ -294,6 +294,28 @@ python3 -I qg.py check --only env_surface --json
 The `measurement.findings` array includes allowed accesses. See the
 [policy schema](docs/SCHEMA.md#environment-access-policy) for the full table.
 
+### Source comments
+
+Use the `comments` check to reject comments in all files of the classes that
+list it. Python's tokenizer reads `.py` files and Python shebang scripts. Batch
+Emacs reads `.el` files. A parser error or a selected file without a driver fails
+the check and names the file.
+
+The check matches each exception against the whole physical line. `NAME.el`
+must be the file's own base name, and `SUMMARY` is the library summary.
+
+| Language | Position | Exact form | Authority |
+| --- | --- | --- | --- |
+| Python | Line 1 | `#!` followed by an interpreter path and optional arguments | Kernel shebang |
+| Emacs Lisp | Line 1, or line 2 after a `#!` line | `;;; NAME.el --- SUMMARY  -*- lexical-binding: t; -*-` | Emacs library header and file-local cookie |
+| Emacs Lisp | Header block | `;;; Commentary:` | `lm-commentary-start` |
+| Emacs Lisp | After Commentary | `;;; Code:` | `lm-code-start` and checkdoc |
+| Emacs Lisp | Last non-blank line | `;;; NAME.el ends here` | `checkdoc-file-comments-engine` |
+
+Use a docstring for usage and the README or commit message for rationale and
+history. See the [policy schema](docs/SCHEMA.md#source-comments-policy) for the
+check configuration and result.
+
 ### Python module graph
 
 The `module_graph` adapter reads Python files in the named inventory classes. It reports one

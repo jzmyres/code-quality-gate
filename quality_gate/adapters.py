@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (
-    clones, command, elisp_crap, elisp_lint, elisp_tests, env_surface,
+    clones, command, comments, elisp_crap, elisp_lint, elisp_tests, env_surface,
     module_graph, python_crap, python_mutation,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
@@ -281,6 +281,25 @@ def _run_env_surface(context: AdapterContext) -> Any:
     )
 
 
+def _comments_spec(_raw: dict[str, Any], _root: Path, _path: Path, _key: str) -> ParsedSpec:
+    return ParsedSpec(None, "comments/1", ("static",))
+
+
+def _run_comments(context: AdapterContext) -> Any:
+    from .checks import _adapter_selection, _check_result
+
+    _spec, start, selected, _classes = _adapter_selection(context)
+    findings, errors = comments.measure(context.root, selected)
+    problems = [*errors, *(f"{row.path}:{row.line}: {row.text}" for row in findings)]
+    for problem in problems:
+        print(f"{context.prefix}: {problem}", file=sys.stderr)
+    return _check_result(
+        context.check, start, "fail" if problems else "pass",
+        reason="\n".join(problems) or None,
+        measurement={"findings": [asdict(row) for row in findings]},
+    )
+
+
 def _spec_budget(spec: Any) -> int:
     return spec.budget_seconds
 
@@ -445,5 +464,12 @@ register_adapter(AdapterDescriptor(
     ("allow",),
     _env_surface_spec,
     _run_env_surface,
+    runs_suite=False,
+))
+register_adapter(AdapterDescriptor(
+    "comments",
+    (),
+    _comments_spec,
+    _run_comments,
     runs_suite=False,
 ))

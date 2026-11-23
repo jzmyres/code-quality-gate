@@ -250,6 +250,24 @@ write per binding in `with-environment-variables`. It reports writes to
 literal `NAME=value` supplies the name. A reference to `initial-environment`
 produces a computed read of the entire environment.
 
+### Source comments policy
+
+The `comments` adapter reads every file in the classes that list its check.
+It accepts the common check keys and uses a fixed table of
+[tool-required lines](../README.md#source-comments).
+
+```toml
+[checks.comments]
+adapter = "comments"
+tier = 1
+enforcement = "enforced"
+```
+
+The check reads `.py`, Python shebang scripts, and `.el` files. Any forbidden
+comment, parser error, or selected file without a driver produces an outcome
+of `fail`. The reason includes each finding and the path of each unread file.
+A complete scan with zero findings passes.
+
 ### Evidence and obligations
 
 Each adapter's parser declares the evidence for the configured check.
@@ -269,6 +287,7 @@ The same `tests` evidence identifies producers for verification and its
 | `python_shape` | `duplication` |
 | `module_graph` | `static` |
 | `env_surface` | `static` |
+| `comments` | `static` |
 | `python_mutation` | `static` |
 | `elisp_crap` | `crap` |
 | `verification` | none |
@@ -650,6 +669,12 @@ has a null `name` because the source provides no literal name. The check fails
 on any computed row, any name outside the allowlist, or any file the drivers
 cannot read. The inventory includes allowed rows and retains rows from files
 that were read successfully when other files fail.
+
+A `comments` check reports `measurement.findings` sorted by repository-relative
+`path` and one-based `line`. Each row has `path`, `line`, and `text`. The text
+contains the first 60 characters of the forbidden comment. A block comment
+produces one row at its opening line. Findings from successfully parsed files
+remain in the result when another file fails to parse.
 
 Python CRAP findings carry `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
 Emacs Lisp CRAP findings carry `measurement` with `cc` (cyclomatic complexity), `points` (Edebug
