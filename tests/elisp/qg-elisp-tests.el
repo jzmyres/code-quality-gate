@@ -13,6 +13,7 @@
 (require 'qg-elisp-child)
 (require 'qg-elisp-complexity)
 (require 'qg-elisp-lint)
+(require 'qg-env-surface)
 
 (defconst qg-elisp-tests--rules
   '((branch if when unless while dolist dotimes cl-dolist cl-dotimes cl-do cl-do*
@@ -411,6 +412,32 @@
             (should (stringp (alist-get 'message issue)))
             (should (string-match-p "documentation"
                                     (downcase (alist-get 'message issue))))))
+      (qg-elisp-tests--delete directory))))
+
+(ert-deftest qg-env-surface-reports-reader-results ()
+  "Exercise nested forms, computed names, and reader errors."
+  (let ((directory (make-temp-file "qg-env-surface-" t)))
+    (unwind-protect
+        (let* ((default-directory (file-name-as-directory directory))
+               (report (expand-file-name "result.json" directory)))
+          (with-temp-file "valid.el"
+            (insert "(progn\n  ;; Ignore (getenv \"COMMENT\")\n"
+                    "  (getenv \"READ\")\n  (setenv key \"value\")\n"
+                    "  (push \"PUSH=value\" process-environment)\n"
+                    "  (copy-sequence process-environment)\n"
+                    "  (with-environment-variables ((\"WITH\" \"v\") (key \"v\")) nil)\n"
+                    "  #'(lambda () (getenv \"LAMBDA\"))\n"
+                    "  process-environment\n  '(setenv \"QUOTED\" nil))\n"))
+          (with-temp-file "broken.el" (insert "(getenv"))
+          (qg-env-surface-run '("valid.el" "broken.el") report)
+          (let* ((result (qg-elisp-tests--read report))
+                 (rows (alist-get 'findings result))
+                 (errors (alist-get 'errors result)))
+            (should (equal (mapcar (lambda (row) (alist-get 'name row)) rows)
+                           '("READ" nil "PUSH" nil "WITH" nil "LAMBDA" nil)))
+            (should (equal (mapcar (lambda (row) (alist-get 'line row)) rows)
+                           '(3 4 5 6 7 7 8 9)))
+            (should (string-match-p "broken.el" (aref errors 0)))))
       (qg-elisp-tests--delete directory))))
 
 (provide 'qg-elisp-tests)

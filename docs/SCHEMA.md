@@ -218,6 +218,28 @@ file's directory. Relative imports resolve from the importing file's package. A
 `from P import N` edge points to `P.N` when that module is in scope and otherwise
 points to `P` when it is in scope. Only edges between measured files are recorded.
 
+### Environment access policy
+
+The `env_surface` adapter reads all files in the classes that list the check.
+Its optional `allow` array defaults to empty. Each entry specifies exactly one
+nonempty `name` or `prefix` and a nonempty `owner`. Names and prefixes match
+case-sensitively. This policy allows `HOME` and names beginning with `XDG_`.
+
+```toml
+[checks.env_surface]
+adapter = "env_surface"
+tier = 1
+enforcement = "enforced"
+allow = [
+  { name = "HOME", owner = "POSIX" },
+  { prefix = "XDG_", owner = "XDG Base Directory" },
+]
+```
+
+The Python AST driver reads `.py` files and Python shebang scripts. The Emacs
+reader handles `.el` files in batch mode. A selected file without a driver or
+with a reader error fails the check and appears in its reason.
+
 ### Evidence and obligations
 
 Each adapter's parser declares the evidence for the configured check.
@@ -236,6 +258,7 @@ The same `tests` evidence identifies producers for verification and its
 | `python_crap` | `crap` |
 | `python_shape` | `duplication` |
 | `module_graph` | `static` |
+| `env_surface` | `static` |
 | `python_mutation` | `static` |
 | `elisp_crap` | `crap` |
 | `verification` | none |
@@ -609,6 +632,14 @@ Cycle findings include their sorted `component` and a shortest witness `cycle`
 as an ordered array of edges. When several shortest cycles exist, the adapter
 chooses the lexicographically first edge sequence. Suite findings include the
 offending `edge`. Both findings use the import lines as their locations.
+
+An `env_surface` check reports `measurement.findings`, an array sorted by
+repository-relative `path` and one-based `line`. Each row has `name`, `path`,
+`line`, and `access`. Access is `read`, `write`, or `computed`. A computed row
+has a null `name` because the source provides no literal name. The check fails
+on any computed row, any name outside the allowlist, or any file the drivers
+cannot read. The inventory includes allowed rows and retains rows from files
+that were read successfully when other files fail.
 
 Python CRAP findings carry `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
 Emacs Lisp CRAP findings carry `measurement` with `cc` (cyclomatic complexity), `points` (Edebug

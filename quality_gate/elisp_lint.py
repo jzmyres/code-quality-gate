@@ -34,13 +34,18 @@ def parse_spec(raw: dict[str, Any], root: Path | None, path: Path, key: str) -> 
     return ElispLintSpec(*_common_spec(raw, root, path, key))
 
 
+def batch_command(emacs: str, helper: Path, form: str, load_path: tuple[str, ...] = ()) -> list[str]:
+    """Invoke a trusted Lisp helper in a clean batch Emacs."""
+    directories = [item for directory in load_path for item in ("-L", directory)]
+    return [emacs, "-Q", "--batch", *directories, "-l", str(helper), "--eval", form]
+
+
 def _command(spec: ElispLintSpec, mode: str, files: list[str], output: Path, report: Path) -> list[str]:
-    directories = [item for directory in spec.load_path for item in ("-L", directory)]
     names = " ".join(_lisp_string(name) for name in files)
     extra = _lisp_string(str(output)) + " " if mode == "elisp_compile" else ""
     form = f"(qg-elisp-lint-{mode.removeprefix('elisp_')} '({names}) {extra}{_lisp_string(str(report))})"
     helper = Path(__file__).with_name("elisp") / "qg-elisp-lint.el"
-    return [spec.emacs, "-Q", "--batch", *directories, "-l", str(helper), "--eval", form]
+    return batch_command(spec.emacs, helper, form, spec.load_path)
 
 
 def _issue_location(issue: dict[str, Any], files: list[str]) -> bool:

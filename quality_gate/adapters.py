@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (
-    clones, command, elisp_crap, elisp_lint, elisp_tests, module_graph, python_crap, python_mutation,
+    clones, command, elisp_crap, elisp_lint, elisp_tests, env_surface,
+    module_graph, python_crap, python_mutation,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import DiffBaseOverride
@@ -366,5 +367,12 @@ register_adapter(AdapterDescriptor(
     _run_module_graph,
     location_coverage="complete",
     default_direction="max",
+    runs_suite=False,
+))
+register_adapter(AdapterDescriptor(
+    "env_surface",
+    ("allow",),
+    env_surface.parse_spec,
+    env_surface.run_check,
     runs_suite=False,
 ))

@@ -265,6 +265,25 @@ check fails. Add a new exception by hand, with a reason. A baseline whose entrie
 its header and no entries, and prune prints that the baseline is now empty, so the check's `baseline`
 key and file can then be deleted by hand.
 
+### Environment access
+
+Use `env_surface` to enforce a policy for environment reads and writes. Give
+each allowed name or prefix an owner, such as
+`allow = [{ name = "HOME", owner = "POSIX" }]`, and list the check in the
+classes it should scan. A computed access has no literal name and always fails.
+The Python AST and Emacs Lisp reader handle `.py`, Python shebang scripts, and
+`.el` files. Any selected file without a driver, including a shell script,
+fails with its path in the report.
+
+This command prints the inventory for a policy that declares the check.
+
+```sh
+python3 -I qg.py check --only env_surface --json
+```
+
+The `measurement.findings` array includes allowed accesses. See the
+[policy schema](docs/SCHEMA.md#environment-access-policy) for the full table.
+
 ### Python module graph
 
 The `module_graph` adapter reads Python files in the named inventory classes. It reports one
