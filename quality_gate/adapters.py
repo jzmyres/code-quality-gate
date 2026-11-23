@@ -7,8 +7,9 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
+import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,9 @@ from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
     GateError,
+    _check_keys,
     _config_error,
+    _describe,
     _number,
     _optional_string_list,
     _string,
@@ -210,6 +213,74 @@ def _run_module_graph(context: AdapterContext) -> Any:
     )
 
 
+@dataclass(frozen=True)
+class AllowEntry:
+    owner: str
+    name: str | None = None
+    prefix: str | None = None
+
+    def matches(self, name: str) -> bool:
+        if self.prefix is not None:
+            return name.startswith(self.prefix)
+        return name == self.name
+
+
+def _env_allow_entry(raw: Any, path: Path, key: str) -> AllowEntry:
+    if not isinstance(raw, dict):
+        raise _config_error(path, key, "an allowlist table", _describe(raw))
+    _check_keys(raw, ("name", "prefix", "owner"), path, key)
+    selectors = raw.keys() & {"name", "prefix"}
+    if len(selectors) != 1:
+        raise _config_error(path, key, "exactly one of name or prefix", repr(raw))
+    selector, = selectors
+    return AllowEntry(
+        _string(raw, "owner", path, f"{key}.owner"),
+        **{selector: _string(raw, selector, path, f"{key}.{selector}")},
+    )
+
+
+def _env_surface_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -> ParsedSpec:
+    """Parse an allowlist, defaulting to no allowed names."""
+    entries = raw.get("allow", [])
+    if not isinstance(entries, list):
+        raise _config_error(path, f"{key}.allow", "an array of tables", _describe(entries))
+    allowed = tuple(
+        _env_allow_entry(entry, path, f"{key}.allow[{index}]")
+        for index, entry in enumerate(entries)
+    )
+    return ParsedSpec(allowed, "env-surface/1", ("static",))
+
+
+def _env_problems(findings: list[env_surface.Finding], allow: tuple[AllowEntry, ...]) -> list[str]:
+    return [
+        f"{row.path}:{row.line}: {row.access} {row.name!r}"
+        for row in findings if row.name is None or not any(entry.matches(row.name) for entry in allow)
+    ]
+
+
+def _env_failure_reason(errors: list[str], violations: int) -> str | None:
+    messages = list(errors)
+    if violations:
+        messages.append(f"{violations} environment accesses are outside the allowlist or computed")
+    return "\n".join(messages) or None
+
+
+def _run_env_surface(context: AdapterContext) -> Any:
+    """Report the complete inventory and fail on unapproved access or unread files."""
+    from .checks import _adapter_selection, _check_result
+
+    allow, start, selected, _classes = _adapter_selection(context)
+    findings, errors = env_surface.measure(context.root, selected)
+    violations = _env_problems(findings, allow)
+    for problem in [*errors, *violations]:
+        print(f"{context.prefix}: {problem}", file=sys.stderr)
+    reason = _env_failure_reason(errors, len(violations))
+    return _check_result(
+        context.check, start, "fail" if reason else "pass", reason=reason,
+        measurement={"findings": [asdict(row) for row in findings]},
+    )
+
+
 def _spec_budget(spec: Any) -> int:
     return spec.budget_seconds
 
@@ -372,7 +443,7 @@ register_adapter(AdapterDescriptor(
 register_adapter(AdapterDescriptor(
     "env_surface",
     ("allow",),
-    env_surface.parse_spec,
-    env_surface.run_check,
+    _env_surface_spec,
+    _run_env_surface,
     runs_suite=False,
 ))

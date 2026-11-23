@@ -187,8 +187,7 @@ reason = "package measured by the graph"
         ]
         measurement, cycles, suite_edges = module_graph.measure(GATE, modules, spec)
         (component, _), = cycles
-        self.assertEqual(len(component), 24)
-        self.assertIn("quality_gate/env_surface.py", component)
+        self.assertEqual(len(component), 23)
         self.assertTrue(all(path.startswith("quality_gate/") for path in component))
         self.assertEqual(len(suite_edges), 16)
         self.assertIn(

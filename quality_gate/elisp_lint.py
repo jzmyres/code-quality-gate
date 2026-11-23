@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .elisp_batch import batch_command
 from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
 from .json_input import load_json
 from .runner import execution_outcome, mark_step, run
@@ -32,12 +33,6 @@ def _elisp_lint_spec(
 def parse_spec(raw: dict[str, Any], root: Path | None, path: Path, key: str) -> ElispLintSpec:
     """Parse and validate the shared compile and checkdoc configuration."""
     return ElispLintSpec(*_common_spec(raw, root, path, key))
-
-
-def batch_command(emacs: str, helper: Path, form: str, load_path: tuple[str, ...] = ()) -> list[str]:
-    """Invoke a trusted Lisp helper in a clean batch Emacs."""
-    directories = [item for directory in load_path for item in ("-L", directory)]
-    return [emacs, "-Q", "--batch", *directories, "-l", str(helper), "--eval", form]
 
 
 def _command(spec: ElispLintSpec, mode: str, files: list[str], output: Path, report: Path) -> list[str]:

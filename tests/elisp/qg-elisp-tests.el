@@ -440,6 +440,33 @@
             (should (string-match-p "broken.el" (aref errors 0)))))
       (qg-elisp-tests--delete directory))))
 
+(ert-deftest qg-env-surface-reports-mutations-once ()
+  "Inventory distinct read and write sites in the same forms."
+  (with-temp-buffer
+    (set-syntax-table emacs-lisp-mode-syntax-table)
+    (insert "(progn\n"
+            "  (add-to-list 'process-environment \"ADD=1\")\n"
+            "  (add-to-list 'other \"IGNORED=1\")\n"
+            "  (push source process-environment)\n"
+            "  (setq unrelated 0 process-environment (cons \"SET=1\" process-environment))\n"
+            "  (let ((process-environment '(\"LET=1\")))\n"
+            "    (member \"READ=1\" process-environment))\n"
+            "  (copy-sequence initial-environment)\n"
+            "  (setq process-environment (append '(\"KNOWN=1\") unknown))\n"
+            "  (push (member \"NESTED=1\" process-environment) process-environment))")
+    (goto-char (point-min))
+    (let ((rows (qg-env-surface--read "fixture.el" nil nil)))
+      (should
+       (equal (mapcar (lambda (row)
+                        (list (alist-get 'name row)
+                              (alist-get 'line row)
+                              (alist-get 'access row)))
+                      rows)
+              '(("ADD" 2 "write") (nil 4 "computed") ("SET" 5 "write")
+                ("LET" 6 "write") ("READ" 7 "read") (nil 8 "computed")
+                ("KNOWN" 9 "write") (nil 9 "computed")
+                (nil 10 "computed") ("NESTED" 10 "read")))))))
+
 (provide 'qg-elisp-tests)
 (ert-run-tests-batch-and-exit t)
 ;;; qg-elisp-tests.el ends here

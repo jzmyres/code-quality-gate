@@ -1,7 +1,6 @@
 ;;; qg-env-surface.el --- Inventory environment accesses -*- lexical-binding: t -*-
 
 ;;; Commentary:
-;; Read source forms and report environment accesses without evaluating source.
 
 ;;; Code:
 
@@ -44,13 +43,62 @@
   (list (qg-env-surface--row (and (stringp name) name) path position
                             (if (eq head 'getenv) "read" "write"))))
 
-(defun qg-env-surface--reference (form path position)
-  "Report environment names in the referencing FORM at POSITION in PATH."
-  (mapcar (lambda (key) (qg-env-surface--row key path position "write"))
+(defun qg-env-surface--reference (form path position access)
+  "Report names in referencing FORM at POSITION in PATH with ACCESS."
+  (mapcar (lambda (key) (qg-env-surface--row key path position access))
           (or (qg-env-surface--assignments form) '(nil))))
 
+(defun qg-env-surface--setq-values (args)
+  "Return values assigned to the environment in alternating ARGS."
+  (let (values)
+    (while (consp args)
+      (let ((target (pop args))
+            (value (pop args)))
+        (when (eq target 'process-environment)
+          (push value values))))
+    (nreverse values)))
+
+(defun qg-env-surface--list-mutation (form)
+  "Return the value written by a list mutation in FORM."
+  (pcase (car form)
+    ('add-to-list
+     (when (equal (nth 1 form) '(quote process-environment))
+       (list (nth 2 form))))
+    ('push
+     (when (eq (nth 2 form) 'process-environment)
+       (list (nth 1 form))))))
+
+(defun qg-env-surface--mutation (form context)
+  "Return the values FORM writes to the environment in CONTEXT."
+  (pcase (car-safe form)
+    ((or 'add-to-list 'push) (qg-env-surface--list-mutation form))
+    ('setq (qg-env-surface--setq-values (cdr form)))
+    ('process-environment
+     (when (eq context 'binding)
+       (list (nth 1 form))))))
+
+(defun qg-env-surface--value-names (value)
+  "Return literal names and unknown parts of an environment VALUE."
+  (pcase (car-safe value)
+    ('quote (qg-env-surface--assignments (nth 1 value)))
+    ((or 'cons 'list 'append) (apply #'append (mapcar #'qg-env-surface--value-names (cdr value))))
+    (_ (qg-env-surface--unexpanded-names value))))
+
+(defun qg-env-surface--unexpanded-names (value)
+  "Return names for a VALUE outside a recognized list constructor."
+  (unless (memq value '(nil process-environment))
+    (or (and (stringp value) (qg-env-surface--assignments value)) '(nil))))
+
+(defun qg-env-surface--writes (values path position)
+  "Report each assignment in VALUES in PATH at POSITION."
+  (let (rows)
+    (dolist (value values)
+      (dolist (key (or (qg-env-surface--value-names value) '(nil)))
+        (push (qg-env-surface--row key path position "write") rows)))
+    (nreverse rows)))
+
 (defun qg-env-surface--direct (form path position)
-  "Report environment accesses belonging to FORM in PATH at POSITION."
+  "Report read and named access rows for FORM in PATH at POSITION."
   (let ((head (car-safe form))
         (name (car-safe (cdr-safe form))))
     (cond
@@ -59,45 +107,89 @@
      ((eq head 'with-environment-variables)
       (qg-env-surface--bindings name path position))
      ((qg-env-surface--reference-p form)
-      (qg-env-surface--reference form path position))
-     ((eq form 'process-environment)
+      (qg-env-surface--reference form path position "read"))
+     ((memq form '(process-environment initial-environment))
       (list (qg-env-surface--row nil path position "read"))))))
 
-(defun qg-env-surface--children (path end reference)
-  "Read children in PATH until END, suppressing symbols covered by REFERENCE."
-  (let (rows)
+(defun qg-env-surface--child-context (context head index)
+  "Return the role of child INDEX of HEAD in CONTEXT."
+  (cond
+   ((eq context 'bindings) 'binding)
+   ((and (= index 1) (memq head '(let let*))) 'bindings)))
+
+(defun qg-env-surface--covered-child (child values suppress)
+  "Return whether CHILD is already covered by VALUES or SUPPRESS."
+  (or (eq suppress 'covered)
+      (and values (or (eq child 'process-environment) (memq child values)))))
+
+(defun qg-env-surface--children (form path end context values suppress)
+  "Read children of FORM in PATH until END in CONTEXT.
+Use VALUES and SUPPRESS to avoid recounting operands."
+  (let ((head (car-safe form)) (index 0) rows)
     (forward-comment (point-max))
     (while (< (point) (1- end))
       (if (looking-at-p "\\.[[:space:];]")
           (forward-char)
-        (setq rows (nconc rows (qg-env-surface--read path reference))))
+        (let ((child (car-safe form)))
+          (setq rows
+                (nconc rows
+                       (qg-env-surface--read
+                        path
+                        (qg-env-surface--child-context context head index)
+                        (if (qg-env-surface--covered-child child values suppress)
+                            'covered
+                          suppress)))))
+        (setq form (cdr-safe form) index (1+ index)))
       (forward-comment (point-max)))
     rows))
 
-(defun qg-env-surface--nested (form path end)
-  "Read nested expressions in FORM in PATH, ending at END."
+(defun qg-env-surface--nested (form path end context values suppress)
+  "Read children of FORM in PATH up to END, using CONTEXT, VALUES and SUPPRESS."
   (cond
    ((looking-at-p "#'")
     (forward-char 2)
     (forward-comment (point-max))
     (when (eq (char-after) ?\()
-      (qg-env-surface--read path nil)))
+      (qg-env-surface--read path nil suppress)))
    ((eq (char-after) ?\()
     (forward-char)
-    (qg-env-surface--children path end (qg-env-surface--reference-p form)))))
+    (qg-env-surface--children form path end context values suppress))))
 
-(defun qg-env-surface--read (path reference)
-  "Read one form in PATH and return its rows.
-When REFERENCE is non-nil, the containing form accounts for direct references."
+(defun qg-env-surface--covered-p (form suppress)
+  "Return whether FORM's process environment access was counted by SUPPRESS."
+  (pcase suppress
+    ('covered
+     (or (eq form 'process-environment)
+         (and (memq (car-safe form) '(cons list append))
+              (qg-env-surface--reference-p form))))
+    ('operand (eq form 'process-environment))))
+
+(defun qg-env-surface--coverage (form suppress)
+  "Return the coverage to pass to children of FORM given SUPPRESS."
+  (if (eq suppress 'covered)
+      suppress
+    (when (qg-env-surface--reference-p form)
+      'operand)))
+
+(defun qg-env-surface--rows (form path position values suppress)
+  "Report FORM at POSITION in PATH using write VALUES and inherited SUPPRESS."
+  (cond
+   (values (qg-env-surface--writes values path position))
+   ((not (qg-env-surface--covered-p form suppress))
+    (qg-env-surface--direct form path position))))
+
+(defun qg-env-surface--read (path context suppress)
+  "Read one form in PATH with CONTEXT and inherited SUPPRESS."
   (let* ((position (point))
          (form (read (current-buffer)))
-         (end (point)))
+         (end (point))
+         (values (qg-env-surface--mutation form context)))
     (prog1
-        (unless (or (eq (car-safe form) 'quote)
-                    (and reference (eq form 'process-environment)))
+        (unless (eq (car-safe form) 'quote)
           (goto-char position)
-          (nconc (qg-env-surface--direct form path position)
-                 (qg-env-surface--nested form path end)))
+          (nconc (qg-env-surface--rows form path position values suppress)
+                 (qg-env-surface--nested form path end context values
+                                         (qg-env-surface--coverage form suppress))))
       (goto-char end))))
 
 (defun qg-env-surface--file (path)
@@ -109,7 +201,7 @@ When REFERENCE is non-nil, the containing form accounts for direct references."
     (forward-comment (point-max))
     (let ((read-circle nil) rows)
       (while (not (eobp))
-        (setq rows (nconc rows (qg-env-surface--read path nil)))
+        (setq rows (nconc rows (qg-env-surface--read path nil nil)))
         (forward-comment (point-max)))
       rows)))
 

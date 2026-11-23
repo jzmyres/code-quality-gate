@@ -275,6 +275,16 @@ The Python AST and Emacs Lisp reader handle `.py`, Python shebang scripts, and
 `.el` files. Any selected file without a driver, including a shell script,
 fails with its path in the report.
 
+The Python reader follows direct local aliases such as `env = os.environ`.
+A wildcard import from `os` produces a computed finding at the import line.
+
+The Emacs Lisp reader reports `getenv` reads, `setenv` writes, and one
+write per binding in `with-environment-variables`. It reports writes to
+`process-environment` through `add-to-list`, `push`, `setq`, and `let` or
+`let*` bindings. Other references to `process-environment` are reads. A
+literal `NAME=value` supplies the name. A reference to `initial-environment`
+produces a computed read of the entire environment.
+
 This command prints the inventory for a policy that declares the check.
 
 ```sh

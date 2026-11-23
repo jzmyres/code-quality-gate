@@ -8,7 +8,7 @@ from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase, output
 
-from quality_gate import env_surface, policy
+from quality_gate import adapters, env_surface, policy
 
 
 FIXTURES = GATE / "tests" / "fixtures" / "env_surface"
@@ -168,11 +168,79 @@ class Example:
             (7, "TWO", "write"),
             (8, "ONE", "read"),
             (9, None, "computed"),
+            (11, "ADDED", "write"),
+            (12, None, "computed"),
+            (13, None, "computed"),
+            (14, "C", "write"),
+            (15, "LOCAL", "write"),
+            (15, "LOCAL", "read"),
+            (16, None, "computed"),
+            (16, "A", "read"),
+            (17, "A", "read"),
+            (18, None, "computed"),
+            (19, "KNOWN", "write"),
+            (19, None, "computed"),
         ])
+
+    def test_env_surface_star_os_import_fails_at_import(self):
+        self.configure('[{name = "X", owner = "fixture"}]')
+        self.add_file("a.py", '\nfrom os import *\ngetenv("X")\n')
+        check = self.inventory(1)
+        self.assertEqual(check["measurement"]["findings"], [
+            {"name": None, "path": "a.py", "line": 2, "access": "computed"},
+        ])
+
+    def test_env_surface_local_mapping_alias_preserves_literal_names(self):
+        tree = ast.parse(
+            'import os as platform\n'
+            'def local():\n'
+            '    env = platform.environ\n'
+            '    alias: dict = env\n'
+            '    alias["READ"]\n'
+            '    env["WRITE"] = "value"\n'
+        )
+        reader = env_surface.PythonReader(tree, "a.py")
+        local, alias = tree.body[1].body[:2]
+        reader.visit_Assign(local)
+        reader.visit_AnnAssign(alias)
+        self.assertEqual(reader.findings, [])
+        for statement in tree.body[1].body[2:]:
+            reader.visit(statement)
+        self.assertEqual(reader.findings, [
+            env_surface.Finding("READ", "a.py", 5, "read"),
+            env_surface.Finding("WRITE", "a.py", 6, "write"),
+        ])
+
+    def test_env_surface_star_import_visitor_ignores_non_os_imports(self):
+        tree = ast.parse("from pathlib import *\nfrom .os import *\nfrom os import *")
+        reader = env_surface.PythonReader(tree, "a.py")
+        for node in tree.body:
+            reader.visit_ImportFrom(node)
+        self.assertEqual(reader.findings, [env_surface.Finding(None, "a.py", 3, "computed")])
 
     def test_env_surface_python_shebang(self):
         self.assert_rows("script", '#!/usr/bin/env -S python3 -I\nimport os\nos.getenv("HOME")\n', [
             (3, "HOME", "read"),
+        ])
+
+    def test_env_surface_adapter_applies_parsed_policy_to_selected_classes(self):
+        self.configure('[{name = "HOME", owner = "POSIX"}]')
+        self.add_file("a.py", 'import os\nos.getenv("HOME")\n')
+        config = policy.load_config(self.repo)
+        check = config.checks["env_surface"]
+        parsed = adapters._env_surface_spec(
+            {"allow": [{"name": "HOME", "owner": "POSIX"}]},
+            self.repo, self.config_path, "checks.env_surface",
+        )
+        self.assertEqual(parsed.spec, check.spec)
+        context = adapters.AdapterContext(
+            self.repo, config, check, ["a.py", "README.md"],
+            {"a.py": "python", "README.md": "doc"}, "check: env_surface", {}, self.base,
+        )
+        result = adapters._run_env_surface(context)
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.measurement["findings"], [
+            {"name": "HOME", "path": "a.py", "line": 2, "access": "read"},
         ])
 
     def test_env_surface_allowed_names_remain_in_report(self):

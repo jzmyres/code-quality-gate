@@ -2,32 +2,15 @@
 from __future__ import annotations
 
 import ast
-import sys
-from dataclasses import asdict, dataclass
+import json
+import re
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from tempfile import TemporaryDirectory
+from typing import Any
 
-from .elisp_lint import batch_command
-from .elisp_tests import _lisp_string, _temporary
-from .json_input import load_json
-from .policy import GateError, _check_keys, _config_error, _describe, _string
-from .runner import run
-from .verification import _is_python_program
-
-if TYPE_CHECKING:
-    from .adapters import AdapterContext, ParsedSpec
-
-
-@dataclass(frozen=True)
-class AllowEntry:
-    owner: str
-    name: str | None = None
-    prefix: str | None = None
-
-    def matches(self, name: str) -> bool:
-        if self.prefix is not None:
-            return name.startswith(self.prefix)
-        return name == self.name
+from .elisp_batch import batch_command
 
 
 @dataclass(frozen=True)
@@ -37,36 +20,6 @@ class Finding:
     line: int
     access: str
 
-    def allowed(self, entries: tuple[AllowEntry, ...]) -> bool:
-        return self.name is not None and any(entry.matches(self.name) for entry in entries)
-
-
-def _allow_entry(raw: Any, path: Path, key: str) -> AllowEntry:
-    if not isinstance(raw, dict):
-        raise _config_error(path, key, "an allowlist table", _describe(raw))
-    _check_keys(raw, ("name", "prefix", "owner"), path, key)
-    selectors = raw.keys() & {"name", "prefix"}
-    if len(selectors) != 1:
-        raise _config_error(path, key, "exactly one of name or prefix", repr(raw))
-    selector, = selectors
-    return AllowEntry(
-        _string(raw, "owner", path, f"{key}.owner"),
-        **{selector: _string(raw, selector, path, f"{key}.{selector}")},
-    )
-
-
-def parse_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -> ParsedSpec:
-    """Parse an allowlist, defaulting to no allowed names."""
-    from .adapters import ParsedSpec
-
-    entries = raw.get("allow", [])
-    if not isinstance(entries, list):
-        raise _config_error(path, f"{key}.allow", "an array of tables", _describe(entries))
-    allowed = tuple(
-        _allow_entry(entry, path, f"{key}.allow[{index}]")
-        for index, entry in enumerate(entries)
-    )
-    return ParsedSpec(allowed, "env-surface/1", ("static",))
 
 
 class PythonImports(ast.NodeVisitor):
@@ -104,7 +57,6 @@ def _argument(call: ast.Call, position: int, keyword: str) -> ast.expr | None:
     return None
 
 
-# The environment argument has a fixed position in these os APIs.
 _OS_ENV_ARGUMENTS = {
     "execle": 2, "execlpe": 2,
     "execve": 2, "execvpe": 2,
@@ -193,6 +145,21 @@ class PythonReader(ast.NodeVisitor):
             self.record(node, None, "read")
         return super().visit(node)
 
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if not node.level and node.module == "os" and node.names[0].name == "*":
+            self.record(node, None, "read")
+
+    def visit_Assign(self, node: ast.Assign | ast.AnnAssign) -> None:
+        if self.environ(node.value):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    self.names[target.id] = self.qualified(node.value)
+                    self.consumed.update((target, node.value))
+        self.generic_visit(node)
+
+    visit_AnnAssign = visit_Assign
+
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if self.environ(node.value):
             self.consumed.add(node.value)
@@ -279,76 +246,55 @@ class PythonReader(ast.NodeVisitor):
 
 
 def _python_findings(root: Path, path: str) -> list[Finding]:
-    try:
-        tree = ast.parse((root / path).read_bytes(), filename=path)
-    except (OSError, SyntaxError, ValueError) as error:
-        raise GateError(f"cannot read {path}: {error}") from error
+    tree = ast.parse((root / path).read_bytes(), filename=path)
     reader = PythonReader(tree, path)
     reader.visit(tree)
     return reader.findings
 
 
-def _elisp_findings(root: Path, files: list[str], budget: int) -> tuple[list[Finding], list[str]]:
+def _elisp_findings(root: Path, files: list[str], emacs: str, budget: int) -> tuple[list[Finding], list[str]]:
     helper = Path(__file__).with_name("elisp") / "qg-env-surface.el"
-    names = " ".join(map(_lisp_string, files))
+    names = " ".join(json.dumps(path, ensure_ascii=False) for path in files)
     try:
-        with _temporary() as temporary:
+        with TemporaryDirectory(prefix="qg-env-surface-") as temporary:
             report = Path(temporary) / "result.json"
-            form = f"(qg-env-surface-run '({names}) {_lisp_string(str(report))})"
-            child = run(batch_command("emacs", helper, form), cwd=root, budget_seconds=budget)
-            if child.returncode != 0:
-                raise ValueError(child.error or child.combined_text.strip())
-            document = load_json(report.read_text(encoding="utf-8"))
+            form = f"(qg-env-surface-run '({names}) {json.dumps(str(report), ensure_ascii=False)})"
+            command = batch_command(emacs, helper, form)
+            subprocess.run(command, cwd=root, timeout=budget, capture_output=True, check=True)
+            document = json.loads(report.read_text(encoding="utf-8"))
         return [Finding(**row) for row in document["findings"]], document["errors"]
-    except (OSError, TypeError, ValueError, KeyError) as error:
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError, KeyError) as error:
         return [], [f"cannot read Emacs Lisp files {', '.join(files)}: {error}"]
 
 
-def measure(root: Path, files: list[str], budget: int = 30) -> tuple[list[Finding], list[str]]:
+def _python_source(path: Path) -> bool:
+    if path.suffix == ".py":
+        return True
+    if not path.is_file() or path.is_symlink():
+        return False
+    with path.open("rb") as source:
+        line = source.readline(4096)
+    return re.match(rb"#![ \t]*(?:/[^ \t]*/)?(?:env[ \t]+(?:[-][^ \t]+[ \t]+|[^ \t=]+=[^ \t]*[ \t]+)*)?"
+                    rb"python(?:3(?:\.[0-9]+)?)?(?:[ \t\r\n]|$)", line) is not None
+
+
+def measure(
+    root: Path, files: list[str], emacs: str = "emacs", budget: int = 30,
+) -> tuple[list[Finding], list[str]]:
     """Read each selected file and return inventory rows and driver errors."""
     findings, errors, elisp = [], [], []
     for path in sorted(set(files)):
         try:
             if path.endswith(".el"):
                 elisp.append(path)
-            elif _is_python_program(root, path):
+            elif _python_source(root / path):
                 findings.extend(_python_findings(root, path))
             else:
                 errors.append(f"{path}: no env_surface driver")
-        except GateError as error:
-            errors.append(str(error))
+        except (OSError, SyntaxError, ValueError) as error:
+            errors.append(f"cannot read {path}: {error}")
     if elisp:
-        rows, failures = _elisp_findings(root, elisp, budget)
+        rows, failures = _elisp_findings(root, elisp, emacs, budget)
         findings.extend(rows)
         errors.extend(failures)
     return sorted(findings, key=lambda row: (row.path, row.line)), errors
-
-
-def _problems(findings: list[Finding], allow: tuple[AllowEntry, ...]) -> list[str]:
-    return [
-        f"{row.path}:{row.line}: {row.access} {row.name!r}"
-        for row in findings if not row.allowed(allow)
-    ]
-
-
-def _failure_reason(errors: list[str], violations: int) -> str | None:
-    messages = list(errors)
-    if violations:
-        messages.append(f"{violations} environment accesses are outside the allowlist or computed")
-    return "\n".join(messages) or None
-
-
-def run_check(context: AdapterContext) -> Any:
-    """Report the complete inventory and fail on unapproved access or unread files."""
-    from .checks import _adapter_selection, _check_result
-
-    allow, start, selected, _classes = _adapter_selection(context)
-    findings, errors = measure(context.root, selected)
-    violations = _problems(findings, allow)
-    for problem in [*errors, *violations]:
-        print(f"{context.prefix}: {problem}", file=sys.stderr)
-    reason = _failure_reason(errors, len(violations))
-    return _check_result(
-        context.check, start, "fail" if reason else "pass", reason=reason,
-        measurement={"findings": [asdict(row) for row in findings]},
-    )
