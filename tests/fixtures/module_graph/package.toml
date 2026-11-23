@@ -1,0 +1,4 @@
+[files]
+"pkg/__init__.py" = "value = 42\n"
+"pkg/a.py" = "def load():\n    from . import b\n"
+"pkg/b.py" = "import pkg.a\n"

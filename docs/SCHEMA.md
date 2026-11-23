@@ -206,6 +206,18 @@ Rules:
   `check --policy-from DIR`; without that option it is parsed and ignored. The
   list used by a trust run always comes from `DIR`.
 
+### Python module graph policy
+
+The `module_graph` adapter requires `classes`, a nonempty array of inventory class
+names. It reads the Python files in those classes. The optional `suites` array
+contains case-sensitive `fnmatch` patterns for repository-relative paths. It defaults
+to an empty array. The adapter uses a fixed maximum threshold of zero findings.
+
+For each import, the adapter searches the repository root followed by the importing
+file's directory. Relative imports resolve from the importing file's package. A
+`from P import N` edge points to `P.N` when that module is in scope and otherwise
+points to `P` when it is in scope. Only edges between measured files are recorded.
+
 ### Evidence and obligations
 
 Each adapter's parser declares the evidence for the configured check.
@@ -223,6 +235,7 @@ The same `tests` evidence identifies producers for verification and its
 | `clones` | `duplication` |
 | `python_crap` | `crap` |
 | `python_shape` | `duplication` |
+| `module_graph` | `static` |
 | `python_mutation` | `static` |
 | `elisp_crap` | `crap` |
 | `verification` | none |
@@ -585,6 +598,18 @@ A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `locations` and `expired`. `locations` is an array of objects with `path`,
 `start_line` and `end_line`, or null when the source locations are incomplete.
 Baseline errors carry `error`.
+
+A completed `module_graph` check reports `measurement.modules` as sorted
+repository-relative paths and `measurement.edges` as objects with `source`, `target`
+and one-based `line`, sorted by those fields. Each distinct source, target and
+line is included. The `fan_in` and `fan_out` objects map each module path to its
+number of distinct importing or imported modules, respectively. The `value`
+is the total number of findings and `threshold` is zero. The adapter has no baseline.
+Cycle findings include their sorted `component` and a shortest witness `cycle`
+as an ordered array of edges. When several shortest cycles exist, the adapter
+chooses the lexicographically first edge sequence. Suite findings include the
+offending `edge`. Both findings use the import lines as their locations.
+
 Python CRAP findings carry `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
 Emacs Lisp CRAP findings carry `measurement` with `cc` (cyclomatic complexity), `points` (Edebug
 stop points) and `hits` (reached stop points); their metric version is `elisp-edebug/1`.

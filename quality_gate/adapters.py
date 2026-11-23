@@ -7,21 +7,25 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from . import (
-    clones, command, elisp_crap, elisp_lint, elisp_tests, python_crap, python_mutation,
+    clones, command, elisp_crap, elisp_lint, elisp_tests, module_graph, python_crap, python_mutation,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import DiffBaseOverride
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
+    GateError,
     _config_error,
     _number,
+    _optional_string_list,
     _string,
+    _string_list,
 )
 
 
@@ -139,6 +143,69 @@ def _crap_spec(
         threshold=threshold,
         baseline=baseline,
         requires=requires,
+    )
+
+
+def _module_graph_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -> ParsedSpec:
+    classes = _string_list(raw, "classes", path, f"{key}.classes")
+    if not classes:
+        raise _config_error(path, f"{key}.classes", "at least one inventory class", "an empty list")
+    suites = _optional_string_list(raw, "suites", path, f"{key}.suites")
+    return ParsedSpec(module_graph.GraphSpec(classes, suites), "module-graph/1", ("static",), threshold=0)
+
+
+def _graph_finding(subject: str, edges: tuple[module_graph.Edge, ...], **measurement: Any) -> ratchet.Finding:
+    locations = tuple(ratchet.Location(edge.source, edge.line, edge.line) for edge in edges)
+    return ratchet.Finding(subject, 1, ", ".join(map(str, locations)), measurement, locations)
+
+
+def _graph_findings(
+    cycles: list[module_graph.Cycle], suite_edges: list[module_graph.Edge]
+) -> list[ratchet.Finding]:
+    findings = []
+    for component, cycle in cycles:
+        route = " -> ".join([*(edge.source for edge in cycle), cycle[0].source])
+        findings.append(_graph_finding(
+            f"Cyclic import ({route}), component [{', '.join(component)}]", cycle,
+            component=component, cycle=[edge.to_json() for edge in cycle],
+        ))
+    findings.extend(
+        _graph_finding(
+            f"Suite import ({edge.source} -> {edge.target}) at line {edge.line}",
+            (edge,), edge=edge.to_json(),
+        )
+        for edge in suite_edges
+    )
+    return findings
+
+
+def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> list[str]:
+    unknown = sorted(set(spec.classes) - context.config.classes.keys())
+    if unknown:
+        key = f"checks.{context.check.id}.classes"
+        known = ", ".join(sorted(context.config.classes))
+        raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
+    return sorted(
+        path for path in context.files
+        if context.classes.get(path) in spec.classes
+        and verification._is_python_program(context.root, path)
+    )
+
+
+def _run_module_graph(context: AdapterContext) -> Any:
+    from .checks import _finish_ratchet, _ratchet_error
+
+    start = time.monotonic()
+    check = context.check
+    try:
+        modules = _graph_modules(context, check.spec)
+        measurement, cycles, suite_edges = module_graph.measure(context.root, modules, check.spec)
+    except (GateError, ValueError) as error:
+        return _ratchet_error(check, start, context.prefix, error)
+    findings = _graph_findings(cycles, suite_edges)
+    return _finish_ratchet(
+        check, findings, [], context.prefix, start, ratchet.Domain.all(),
+        f"{len(modules)} Python modules measured", measurement=measurement,
     )
 
 
@@ -290,5 +357,14 @@ register_adapter(AdapterDescriptor(
     default_direction="max",
     requires_tests=True,
     entry_direction=verification._verification_entry_direction,
+    runs_suite=False,
+))
+register_adapter(AdapterDescriptor(
+    "module_graph",
+    ("classes", "suites"),
+    _module_graph_spec,
+    _run_module_graph,
+    location_coverage="complete",
+    default_direction="max",
     runs_suite=False,
 ))

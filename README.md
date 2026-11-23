@@ -265,6 +265,30 @@ check fails. Add a new exception by hand, with a reason. A baseline whose entrie
 its header and no entries, and prune prints that the baseline is now empty, so the check's `baseline`
 key and file can then be deleted by hand.
 
+### Python module graph
+
+The `module_graph` adapter reads Python files in the named inventory classes. It reports one
+finding per strongly connected component with at least two modules and shows a shortest cycle
+with its import lines. It also reports each import from one test suite into another. Suite
+patterns match repository-relative paths, so suites can share support modules outside those
+patterns. Imports anywhere in a file count, including function bodies and `TYPE_CHECKING`
+blocks. A syntax error produces a check error with the file and parser diagnostic.
+
+For a repository with `python` and `test` inventory classes, add this check and list
+`module-graph` in both classes' `checks` arrays.
+
+```toml
+[checks.module-graph]
+adapter = "module_graph"
+tier = 1
+enforcement = "enforced"
+classes = ["python", "test"]
+suites = ["tests/test_*.py"]
+```
+
+The check allows zero findings, so any finding fails the gate under this policy.
+The JSON result includes the sorted modules and import edges, plus fan-in and fan-out for each module.
+
 ### Source-character checks
 
     [checks.source-chars]
