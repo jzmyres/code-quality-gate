@@ -26,6 +26,7 @@ from quality_gate.tools import (
     Tool,
     _extract_tar,
     _extract_wheel,
+    _pinned_tool,
     _wheel_member_path,
     lock_override,
     verify_tool_directory,
@@ -57,6 +58,21 @@ def child_permissions(base: Path) -> dict[str, object]:
 
 
 class ToolsTests(FixtureCase):
+    def test_repository_lock_pins_shfmt_deb(self) -> None:
+        with lock_override(GATE / "tools.lock.toml"):
+            _, tool = _pinned_tool("shfmt")
+
+        self.assertEqual(tool.version, "3.8.0-1+b8")
+        self.assertEqual(tool.format, "deb")
+        self.assertEqual(tool.binary, "usr/bin/shfmt")
+        self.assertEqual(
+            tool.sha256, "7f5ba49c0bb38584cb8d2b6571306189ddbfd56e3371e5b877001f3e5b02501f"
+        )
+        self.assertEqual(
+            tool.payload_sha256,
+            "d36a64424d379a28ef1d47be26f7ff081bfbc4a9e25a3262db5883e97d3055ad",
+        )
+
     def make_tarball(
         self,
         name: str = "tool.tar.gz",

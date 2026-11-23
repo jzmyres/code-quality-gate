@@ -1067,6 +1067,9 @@ owner, and a later run as another user cannot read the altered tree. With the wr
 process cannot add files, and any install that still matches its pinned payload keeps working. Replacing a
 read-only install first restores the owner's write bit on the tree's directories and then removes it.
 
+The lock pins Ruff, jscpd, coverage, and shfmt. It sources shfmt from Debian 13's
+`3.8.0-1+b8` package for use as the Bash parser for shell checks.
+
 Every later use of a tool recomputes the install's payload digest before the tool runs or is imported:
 Ruff and jscpd binaries, and the coverage package for collection and analysis. The coverage adapter
 passes the effective lock's coverage version and payload digest to `covrun.py`, which verifies the
