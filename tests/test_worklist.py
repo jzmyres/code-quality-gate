@@ -231,7 +231,8 @@ def _no_threshold_run(_context):
 
 
 NO_THRESHOLD = adapters.AdapterDescriptor(
-    "no-threshold", ("baseline",), _no_threshold_parse, _no_threshold_run
+    "no-threshold", ("baseline",), _no_threshold_parse, _no_threshold_run,
+    runs_suite=False,
 )
 
 
@@ -699,6 +700,7 @@ class WorklistMinimumTests(FixtureCase):
     def test_a_selected_producer_also_runs_its_own_prerequisite(self) -> None:
         descriptor = adapters.AdapterDescriptor(
             "bridge", ("requires",), _bridge_parse, _bridge_run,
+            runs_suite=False,
             requires_adapter="python_tests",
         )
         bridge = ('[checks.bridge]\nadapter = "bridge"\ntier = 1\n'

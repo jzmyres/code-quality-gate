@@ -13,10 +13,7 @@ from support import PYTHON_TEST_HEADER, FixtureCase, output
 from test_python_crap import crap_config
 
 from quality_gate import adapters, checks, cli, policy
-
-SUITE_ADAPTERS = {
-    "python_tests", "elisp_tests", "python_crap", "python_mutation", "elisp_crap",
-}
+from quality_gate.trust import Trust
 
 AGENT = {"QG_AGENT": "1"}
 
@@ -107,6 +104,14 @@ class AgentRefusalTests(FixtureCase):
         self.assertNotIn("crap", allowed)
         self.assertNotIn("tests", allowed)
 
+    def test_agent_refusal_none_allowed(self) -> None:
+        self.write_config(crap_config())
+        result = self.run_qg("check", env=AGENT)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertTrue(
+            result.stderr.rstrip().endswith("allowed here: none"), output(result)
+        )
+
     def test_a_static_check_runs_alone_under_the_agent_variable(self) -> None:
         result = self.run_qg("check", "--only", "lint", env=AGENT)
         text = output(result)
@@ -140,7 +145,7 @@ class AgentRefusalTests(FixtureCase):
         self.commit_all()
         trusted = self.trusted_directory("HEAD")
         with mock.patch.object(
-            cli.Trust, "close", autospec=True, side_effect=cli.Trust.close,
+            Trust, "close", autospec=True, side_effect=Trust.close,
         ) as close:
             result = self.run_qg("check", "--policy-from", str(trusted), env=AGENT)
         self.assertEqual(result.returncode, 2, output(result))
@@ -208,10 +213,6 @@ class AgentHelperTests(unittest.TestCase):
         selected = cli._agent_selected_checks(self.config, ["lint"])
         self.assertIsNone(cli._agent_refusal(self.config, selected))
 
-    def test_the_check_names_split_on_whether_the_adapter_runs_a_suite(self) -> None:
-        self.assertEqual(cli._agent_check_names(self.config, True), "tests, crap")
-        self.assertEqual(cli._agent_check_names(self.config, False), "lint")
-
     def test_the_variable_refuses_only_the_value_one(self) -> None:
         selected = [self.config.checks["tests"]]
         with mock.patch.dict(
@@ -230,12 +231,19 @@ class AgentHelperTests(unittest.TestCase):
 
 
 class SuiteAdapterRegistryTests(unittest.TestCase):
-    def test_every_registered_suite_adapter_declares_it(self) -> None:
-        declared = {
-            name for name in adapters.adapter_names()
-            if adapters.adapter_for(name).runs_suite
-        }
-        self.assertEqual(declared, SUITE_ADAPTERS)
+    def test_every_registered_adapter_declares_a_boolean_suite_flag(self) -> None:
+        for name, descriptor in adapters.ADAPTERS.items():
+            with self.subTest(adapter=name):
+                self.assertIs(type(descriptor.runs_suite), bool)
+
+    def test_agent_refusal_flag_required(self) -> None:
+        command = adapters.ADAPTERS["command"]
+        with mock.patch.dict(adapters.ADAPTERS), self.assertRaisesRegex(
+            TypeError, "runs_suite"
+        ):
+            adapters.register_adapter(adapters.AdapterDescriptor(
+                "missing-suite-flag", command.keys, command.parse, command.run,
+            ))
 
 
 if __name__ == "__main__":

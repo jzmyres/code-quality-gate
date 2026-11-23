@@ -7,7 +7,7 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,7 +78,7 @@ class AdapterDescriptor:
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
     no_tests_hint: str = ""
-    runs_suite: bool = False
+    runs_suite: bool = field(kw_only=True)
 
     def allowed_keys(self) -> tuple[str, ...]:
         return (*COMMON_CHECK_KEYS, *self.keys)
@@ -175,6 +175,7 @@ register_adapter(AdapterDescriptor(
     command._run_command,
     no_tests_hint=" (no tests_pattern)",
     budget=_spec_budget,
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "clones",
@@ -185,6 +186,7 @@ register_adapter(AdapterDescriptor(
     subject_noun="clone",
     failure_wording="occurrences",
     extras=("files",),
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "source_chars",
@@ -194,6 +196,7 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     subject_noun="character",
     failure_wording="occurrences",
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "python_tests",
@@ -219,6 +222,7 @@ register_adapter(AdapterDescriptor(
     elisp_lint.run_lint,
     budget=_spec_budget,
     parse_candidate_inputs=True,
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "elisp_checkdoc",
@@ -227,6 +231,7 @@ register_adapter(AdapterDescriptor(
     elisp_lint.run_lint,
     budget=_spec_budget,
     parse_candidate_inputs=True,
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "python_crap",
@@ -247,6 +252,7 @@ register_adapter(AdapterDescriptor(
     python_shape._python_shape_spec,
     python_shape._run_python_shape,
     location_coverage="complete",
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "python_mutation",
@@ -263,6 +269,7 @@ register_adapter(AdapterDescriptor(
     variant_dispatch._variant_dispatch_spec,
     variant_dispatch._run_variant_dispatch,
     location_coverage="complete",
+    runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
     "elisp_crap",
@@ -283,4 +290,5 @@ register_adapter(AdapterDescriptor(
     default_direction="max",
     requires_tests=True,
     entry_direction=verification._verification_entry_direction,
+    runs_suite=False,
 ))

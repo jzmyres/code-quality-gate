@@ -60,6 +60,7 @@ STUB = adapters.AdapterDescriptor(
     ("count",),
     parse_stub,
     run_stub,
+    runs_suite=False,
     display=lambda value: f"{value:.2f}",
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
@@ -71,6 +72,7 @@ FLOOR_STUB = adapters.AdapterDescriptor(
     ("count", "baseline"),
     parse_stub,
     run_stub,
+    runs_suite=False,
     default_direction="max",
     budget=lambda spec: 3,
     entry_direction=floor_entry_direction,
@@ -236,7 +238,8 @@ class CheckDependencyTests(unittest.TestCase):
 
     def descriptor(self, *, requires_tests: bool) -> adapters.AdapterDescriptor:
         return adapters.AdapterDescriptor(
-            "stub", (), parse_stub, run_stub, requires_tests=requires_tests
+            "stub", (), parse_stub, run_stub, requires_tests=requires_tests,
+            runs_suite=False,
         )
 
     def test_test_dependencies_use_the_configured_check(self) -> None:

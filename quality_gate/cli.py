@@ -10,9 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import checks
 from .adapters import ADAPTERS
-from .checks import _selected_check_ids
-from .checks import command_check as _execute_check
 from .files import (
     BUILTIN_RESULT_KINDS,
     command_hygiene,
@@ -27,7 +26,7 @@ from .tools import (
     command_tools_path,
     load_tools,
 )
-from .trust import Trust, prepare_trust
+from .trust import prepare_trust
 from .worklist import command_debt, command_worklist
 
 AGENT_SANDBOX_ENV = "QG_AGENT"
@@ -40,11 +39,11 @@ AGENT_REFUSAL = (
 )
 
 
-def _agent_check_names(config: Config, runs_suite: bool) -> str:
-    """The policy's check ids whose adapters do, or do not, run a suite."""
+def _agent_allowed_check_names(config: Config) -> str:
+    """The policy's check ids whose adapters do not run a suite."""
     return ", ".join(
         check.id for check in config.checks.values()
-        if ADAPTERS[check.adapter].runs_suite is runs_suite
+        if not ADAPTERS[check.adapter].runs_suite
     )
 
 
@@ -54,7 +53,8 @@ def _agent_selected_checks(
     """The checks `check` selects, exactly as the check command selects them."""
     if only_ids is None:
         return list(config.checks.values())
-    identifiers = _selected_check_ids(config, only_ids) or []
+    identifiers = checks._selected_check_ids(config, only_ids)
+    assert identifiers is not None
     return [config.checks[identifier] for identifier in identifiers]
 
 
@@ -68,7 +68,7 @@ def _agent_refusal(config: Config, selected: list[CheckDef]) -> str | None:
         return None
     return AGENT_REFUSAL.format(
         refused=", ".join(f"{check.id} ({check.adapter})" for check in refused),
-        allowed=_agent_check_names(config, False) or "none",
+        allowed=_agent_allowed_check_names(config) or "none",
     )
 
 
@@ -79,28 +79,6 @@ def _refuse_in_agent_sandbox(config: Config, only_ids: list[str] | None) -> None
     message = _agent_refusal(config, _agent_selected_checks(config, only_ids))
     if message is not None:
         raise UsageError(message)
-
-
-def command_check(
-    root: Path,
-    config: Config,
-    *,
-    json_output: bool,
-    prune_ids: list[str],
-    only_ids: list[str] | None,
-    trust: Trust | None = None,
-) -> int:
-    """Apply the CLI refusal before handing the check and trust to the runner."""
-    try:
-        _refuse_in_agent_sandbox(config, only_ids)
-    except UsageError:
-        if trust is not None:
-            trust.close()
-        raise
-    return _execute_check(
-        root, config, json_output=json_output, prune_ids=prune_ids,
-        only_ids=only_ids, trust=trust,
-    )
 
 
 class _Parser(argparse.ArgumentParser):
@@ -255,7 +233,8 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         return _run_builtin(root, config, args)
     if args.command == "worklist":
         return command_worklist(root, config, args.check_ids, args.json)
-    return command_check(
+    _refuse_in_agent_sandbox(config, args.only)
+    return checks.command_check(
         root,
         config,
         json_output=args.json,
@@ -282,7 +261,12 @@ def _run_trusted_check(root: Path, args: Any) -> int:
             "qg.py: --prune: cannot be combined with --policy-from"
         )
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
-    return command_check(
+    try:
+        _refuse_in_agent_sandbox(trust.config, args.only)
+    except UsageError:
+        trust.close()
+        raise
+    return checks.command_check(
         root,
         trust.config,
         json_output=args.json,

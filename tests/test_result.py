@@ -48,6 +48,7 @@ def _run_chain(context):
 
 CHAIN_STUB = adapters.AdapterDescriptor(
     "chain-stub", ("requires",), _parse_chain, _run_chain,
+    runs_suite=False,
 )
 
 
@@ -90,6 +91,7 @@ def _parse_test_chain(raw, root, path, full_key):
 
 TEST_CHAIN_STUB = adapters.AdapterDescriptor(
     "test-chain-stub", ("requires",), _parse_test_chain, _run_chain,
+    runs_suite=False,
 )
 
 

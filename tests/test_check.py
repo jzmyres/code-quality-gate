@@ -80,6 +80,7 @@ SLEEP_STUB = adapters.AdapterDescriptor(
     ("sleep_seconds", "budget_seconds", "baseline", "threshold"),
     _parse_sleep,
     _run_sleep,
+    runs_suite=False,
     budget=lambda spec: spec.budget_seconds,
 )
 
@@ -98,6 +99,7 @@ def _run_requires(context):
 
 REQUIRES_STUB = adapters.AdapterDescriptor(
     "requires-stub", ("requires",), _parse_requires, _run_requires,
+    runs_suite=False,
 )
 
 

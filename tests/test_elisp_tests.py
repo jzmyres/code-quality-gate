@@ -183,6 +183,7 @@ requires = "legacy-tests"
         descriptor = adapters.AdapterDescriptor(
             "evidence_consumer", ("requires",), _evidence_consumer_parse,
             _evidence_consumer_run, requires_adapter="elisp_tests",
+            runs_suite=False,
         )
         with mock.patch.dict(adapters.ADAPTERS, {"evidence_consumer": descriptor}):
             result = self.run_qg("check", "--json")
