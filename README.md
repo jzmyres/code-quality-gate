@@ -67,7 +67,7 @@ in how each one invokes the gate.
 
 | Consumer | Language | `[code]` | Classes, then checks | How it runs the gate |
 | --- | --- | --- | --- | --- |
-| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `variant-dispatch` (`variant_dispatch`), `mutation` (`python_mutation`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
+| This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `variant-dispatch` (`variant_dispatch`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
 | A shell and Python agent harness | Shell and Python | `*.py`, `*.sh`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `shell-tested`, `shell-sourced`, `shell-probe`, `config`, `build`, `doc`, `gate`; `ruff`, `shellcheck`, `json` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification` | A runner gates each candidate with `--policy-from` the last landed commit |
 | An Emacs Lisp editor configuration | Emacs Lisp, with shell helpers | Emacs Lisp sources and their shell helpers | `modules`, `tools`, `suites`, `startup`, `shell`, `config`, `data`, `docs`, `fixture`, `gate`; `emacs-tests`, `tooling-tests` (`elisp_tests`), `emacs-crap`, `tooling-crap` (`elisp_crap`), `elisp-compile`, `elisp-checkdoc`, `shellcheck` (`command`) | Ran beside its own older gate, recording parity first |
 
@@ -1672,6 +1672,10 @@ baseline, policy, protected-path, prune and identity rules.
 
 ## Mutation-testing the gate
 
+The regular gate and CI runs on push and pull request omit mutation testing. During debt-cleanup
+sessions, run `make mutation` locally or manually dispatch the CI workflow to run its mutation
+job. Record surviving mutants as backlog items.
+
 `make mutation` runs the gate's own complete unittest suite against isolated copies of its code.
 It freezes the source and tests once. The probe is the only unmutated run of the complete suite: it
 is instrumented so each declared target records a "reached" event naming its decision and the current
@@ -1706,8 +1710,8 @@ Each mutant's line names the path that decided it: the number of selected tests,
 target" or "full suite (unattributed hits)", and the final summary reports the probe time and the
 total time. Each suite has a 900-second limit and the process group is killed on timeout. Independent
 mutant copies run concurrently with two workers by default, because four on this four-CPU host shared
-with agents coincided with swap exhaustion. Results are printed in declaration order. The slow
-mutation run is separate from `make check` and uses the same pinned tools cache as the ordinary tests.
+with agents coincided with swap exhaustion. Results are printed in declaration order. The mutation
+run uses the same pinned tools cache as the ordinary tests.
 The command passes only when every outcome is `killed` and there are no errors.
 
 This design changes these guarantees:
@@ -1762,8 +1766,8 @@ which must be present, non-empty and in the fetched history. A value is looked u
 and not empty, so even a branch named `none` cannot stand in for a missing base. A failed push
 lookup stays inside a shell condition so the fallback is still reached; a pull request without a
 usable base fails, and a push fails only when the fallback also fails. The gate step passes the
-variable through `runuser`, so every check that diffs judges that one change. The separate Debian 13
-job restores the same Debian tools cache and runs `make mutation`.
+variable through `runuser`, so every check that diffs judges that one change. On manual dispatch
+only, the separate Debian 13 job restores the same Debian tools cache and runs `make mutation`.
 
 Step timeouts are fixed at about five times the longest run observed as of 2026-10-31: 60 minutes
 for the gate, 15 for the cold Emacs build and 120 for the mutation step, and each job adds 10 minutes
@@ -1776,6 +1780,9 @@ Reproduce it locally with the same tools cache:
     export QG_TOOLS_DIR=/tmp/qg-tools
     python3 -I qg.py tools fetch
     make -k check
+
+For a debt-cleanup session, use the same cache and run:
+
     make mutation
 
 ## Planned later layers

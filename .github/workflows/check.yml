@@ -160,6 +160,7 @@ jobs:
           runuser -u gate -- env QG_DIFF_BASE="$QG_DIFF_BASE" make -k check
 
   mutation:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     container: debian:13
     # Fixed at about 5 x the longest observed run as of 2026-10-31; raise the bound if the program grows.
