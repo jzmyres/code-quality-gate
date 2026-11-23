@@ -17,7 +17,7 @@ class CommentsTests(FixtureCase):
     def setUp(self):
         super().setUp()
         config = BASE_CONFIG.replace('checks = ["smoke"]', 'checks = ["comments"]')
-        config = config.replace('pattern = "*.py"', 'pattern = "[as]*"')
+        config = config.replace('pattern = "*.py"', 'pattern = "[asz]*"')
         self.write_config(config + '''
 [checks.comments]
 adapter = "comments"
@@ -55,7 +55,8 @@ enforcement = "enforced"
         rows, errors = comments.measure(self.repo, ["sample.el"], emacs=str(self.repo / "missing-emacs"))
         self.assertEqual(rows, [])
         self.assertEqual(len(errors), 1)
-        self.assertIn("cannot read Emacs Lisp files sample.el", errors[0])
+        self.assertEqual(errors[0].path, "sample.el")
+        self.assertIn("cannot read sample.el", errors[0].text)
 
     def test_comments_none_python_findings(self):
         long_comment = "# " + "x" * 70
@@ -91,29 +92,41 @@ enforcement = "enforced"
                 self.assertIn("sample.py", self.check_comments_none(1)["reason"])
 
     def test_comments_none_elisp_findings(self):
-        self.add_file("sample.el", "(list 1 ; single\n  2 ;; double\n  #| block |# 3)\n;;; History:\n")
+        self.add_file("sample.el", "(list ?; ; single\n  2 ;; double\n  3)\n;;; History:\n")
         check = self.check_comments_none(1)
         self.assertEqual(check["measurement"]["findings"], [
             {"path": "sample.el", "line": 1, "text": "; single"},
             {"path": "sample.el", "line": 2, "text": ";; double"},
-            {"path": "sample.el", "line": 3, "text": "#| block |#"},
             {"path": "sample.el", "line": 4, "text": ";;; History:"},
         ])
 
-    def test_comments_none_elisp_adjacent_blocks_and_character(self):
-        self.add_file("sample.el", "(list ?; ; after literal\n  #|a #|nested|# b|##|second|# 1)\n")
+    def test_comments_none_elisp_invalid_reader_syntax(self):
+        self.add_file("a.el", "(list 1 #|a|#) ; c\n")
         check = self.check_comments_none(1)
-        self.assertEqual(check["measurement"]["findings"], [
-            {"path": "sample.el", "line": 1, "text": "; after literal"},
-            {"path": "sample.el", "line": 2, "text": "#|a #|nested|# b|#"},
-            {"path": "sample.el", "line": 2, "text": "#|second|#"},
-        ])
+        self.assertIn("cannot read a.el: Invalid read syntax:", check["reason"])
+        self.assertEqual(check["measurement"]["findings"], [])
 
     def test_comments_none_elisp_tool_lines_and_literals(self):
-        for prefix in ("", "#!/usr/bin/emacs --script\n"):
+        for prefix in ("", "#!/usr/bin/emacs --script\n", "#!/usr/bin/env emacs --script\n"):
             with self.subTest(prefix=prefix):
                 self.add_file("sample.el", prefix + fixture_source("elisp"))
                 self.assertEqual(self.check_comments_none(0)["measurement"]["findings"], [])
+
+    def test_comments_none_elisp_shebang_requires_emacs(self):
+        for shebang in ("#! TODO replace this", "#!/bin/sh", "#!/usr/bin/env python3"):
+            with self.subTest(shebang=shebang):
+                self.add_file("a.el", f"{shebang}\n(list 1)\n")
+                check = self.check_comments_none(1)
+                self.assertEqual(check["measurement"]["findings"], [
+                    {"path": "a.el", "line": 1, "text": shebang},
+                ])
+
+    def test_comments_none_elisp_bom_prevents_shebang_exemption(self):
+        self.add_file("a.el", "\ufeff#!/usr/bin/emacs --script\n(list 1)\n")
+        check = self.check_comments_none(1)
+        self.assertEqual(check["measurement"]["findings"], [
+            {"path": "a.el", "line": 1, "text": "#!/usr/bin/emacs --script"},
+        ])
 
     def test_comments_none_elisp_near_matches(self):
         self.add_file("sample.el", fixture_source("elisp").replace(
@@ -132,14 +145,21 @@ enforcement = "enforced"
         ])
 
     def test_comments_none_elisp_unterminated_source(self):
-        for source in ("(list 1\n", "#| unfinished\n"):
-            with self.subTest(source=source):
-                self.add_file("sample.el", source)
-                self.assertIn("sample.el", self.check_comments_none(1)["reason"])
+        self.add_file("sample.el", "(list 1\n")
+        self.assertIn("cannot read sample.el", self.check_comments_none(1)["reason"])
 
-    def test_comments_none_missing_driver(self):
-        self.add_file("sample.sh", "#!/bin/sh\ntrue\n")
-        self.assertIn("sample.sh: no comments driver", self.check_comments_none(1)["reason"])
+    def test_comments_none_reason_orders_errors_and_findings(self):
+        self.add_file("a.sh", "#!/bin/sh\ntrue\n")
+        self.add_file("a.py", "# first\n# second\n")
+        self.add_file("z.py", "x = 1  # c\n")
+        check = self.check_comments_none(1)
+        reason = check["reason"].splitlines()
+        self.assertEqual(reason, [
+            "a.py:1: # first", "a.py:2: # second", "a.sh: no comments driver", "z.py:1: # c",
+        ])
+        self.assertEqual([*reason[:2], reason[-1]], [
+            "{path}:{line}: {text}".format(**row) for row in check["measurement"]["findings"]
+        ])
 
     def test_comments_none_measures_gate_package_directly(self):
         files = [

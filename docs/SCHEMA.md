@@ -265,7 +265,8 @@ enforcement = "enforced"
 
 The check reads `.py`, Python shebang scripts, and `.el` files. Any forbidden
 comment, parser error, or selected file without a driver produces an outcome
-of `fail`. The reason includes each finding and the path of each unread file.
+of `fail`. The reason includes each finding and each file error, sorted by
+repository-relative path and line. File errors sort at line 0.
 A complete scan with zero findings passes.
 
 ### Evidence and obligations
@@ -672,9 +673,8 @@ that were read successfully when other files fail.
 
 A `comments` check reports `measurement.findings` sorted by repository-relative
 `path` and one-based `line`. Each row has `path`, `line`, and `text`. The text
-contains the first 60 characters of the forbidden comment. A block comment
-produces one row at its opening line. Findings from successfully parsed files
-remain in the result when another file fails to parse.
+contains the first 60 characters of the forbidden comment. Findings from
+successfully parsed files remain in the result when another file fails to parse.
 
 Python CRAP findings carry `measurement` with `cc`, `statements`, `executed` and `excluded_lines`.
 Emacs Lisp CRAP findings carry `measurement` with `cc` (cyclomatic complexity), `points` (Edebug

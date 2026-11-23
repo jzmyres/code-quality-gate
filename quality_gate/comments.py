@@ -21,6 +21,12 @@ class Finding:
     text: str
 
 
+@dataclass(frozen=True)
+class ReadError:
+    path: str
+    text: str
+
+
 _SHEBANG = r"#![ \t]*/[^ \t\r\n]+(?:[ \t]+[^\r\n]*)?"
 _PYTHON_INTERPRETER = re.compile(r"python(?:[23](?:\.[0-9]+)?)?")
 _ALLOWED_LINES = {
@@ -43,11 +49,16 @@ def _env_command(arguments: list[str]) -> str:
     return ""
 
 
+def _shebang_words(line: str) -> list[str]:
+    return line[2:].split() if _allowed("shebang", line) else []
+
+
 def _python_script(first_line: bytes) -> bool:
     line = first_line.decode("utf-8", errors="replace").rstrip("\r\n")
-    if not _allowed("shebang", line):
+    words = _shebang_words(line)
+    if not words:
         return False
-    interpreter, *arguments = line[2:].split()
+    interpreter, *arguments = words
     name = Path(interpreter).name
     if name == "env":
         name = Path(_env_command(arguments)).name
@@ -86,21 +97,11 @@ _ELISP_SCAN = r"""
                  (and (eq (char-before start) ?@)
                       (eq (char-before (1- start)) ?,))))))
 
-  (defun qg-comments-block-end ()
-    "Find the end of a block after its opener, including nested blocks."
-    (let ((depth 1))
-      (while (and (> depth 0) (re-search-forward "#|\\||#" nil t))
-        (setq depth (+ depth (if (eq (char-after (match-beginning 0)) ?#) 1 -1))))
-      (unless (zerop depth) (error "Unterminated block comment"))))
-
   (defun qg-comments-scan ()
     "Record comments and mask them for the reader.
 Temporarily mask character literals during the syntax scan."
-    (let ((table (copy-syntax-table (syntax-table))) rows characters)
-      (modify-syntax-entry ?# "' 14" table)
-      (modify-syntax-entry ?| "_ 23bn" table)
-      (set-syntax-table table)
-      (while (re-search-forward "#|\\|;\\|[?]" nil t)
+    (let (rows characters)
+      (while (re-search-forward "[;?]" nil t)
         (let* ((start (match-beginning 0))
                (end (point))
                (state (syntax-ppss start)))
@@ -114,9 +115,7 @@ Temporarily mask character literals during the syntax scan."
               (qg-comments-mask start (point)))
              ((let ((after (syntax-ppss end)))
                 (and (nth 4 after) (eq (nth 8 after) start)))
-              (if (eq (char-after start) ?#)
-                  (qg-comments-block-end)
-                (end-of-line))
+              (end-of-line)
               (push (vector (line-number-at-pos start)
                             (buffer-substring-no-properties start (min (+ start 60) (point)))
                             (save-excursion
@@ -142,7 +141,9 @@ Temporarily mask character literals during the syntax scan."
             (code (lm-code-start)))
         (goto-char (point-min))
         (let* ((shebang (when (looking-at "#!")
-                          (prog1 (buffer-substring-no-properties (point) (line-end-position))
+                          (prog1 (concat (when (coding-system-get buffer-file-coding-system :bom)
+                                           "\uFEFF")
+                                         (buffer-substring-no-properties (point) (line-end-position)))
                             (qg-comments-mask (point) (line-end-position))
                             (goto-char (point-min)))))
                (rows (qg-comments-scan)))
@@ -183,10 +184,10 @@ def _elisp_sections(
     return sections
 
 
-def _elisp_exempt_lines(rows: list, name: str, positions: list) -> set[int]:
-    last, first_code, commentary, code, shebang = positions
+def _elisp_exempt_lines(rows: list, name: str, positions: list, emacs_script: bool) -> set[int]:
+    last, first_code, commentary, code = positions
     physical_lines = {line: physical for line, _, physical in rows}
-    eligible = {"header": 2 if shebang else 1, "footer": last}
+    eligible = {"header": 2 if emacs_script else 1, "footer": last}
     eligible.update(_elisp_sections(physical_lines, first_code, commentary, code))
     return {
         line for kind, line in eligible.items()
@@ -203,20 +204,41 @@ def _elisp_reports(root: Path, files: list[str], emacs: str, budget: int) -> lis
     return json.loads(result.stdout)
 
 
-def _elisp_findings(root: Path, files: list[str], emacs: str, budget: int) -> tuple[list[Finding], list[str]]:
+def _emacs_script(shebang: str) -> bool:
+    words = _shebang_words(shebang)
+    if not words:
+        return False
+    interpreter, *arguments = words
+    name = Path(interpreter).name
+    if name == "env":
+        return bool(arguments) and Path(arguments[0]).name == "emacs"
+    return name == "emacs"
+
+
+def _elisp_rows(path: str, report: list) -> list[Finding]:
+    rows, *positions, shebang = report
+    emacs_script = _emacs_script(shebang or "")
+    exempt = _elisp_exempt_lines(rows, Path(path).name, positions, emacs_script)
+    findings = [Finding(path, line, text) for line, text, _ in rows if line not in exempt]
+    if shebang and not emacs_script:
+        findings.insert(0, Finding(path, 1, shebang.removeprefix("\ufeff")[:60]))
+    return findings
+
+
+def _elisp_findings(
+    root: Path, files: list[str], emacs: str, budget: int,
+) -> tuple[list[Finding], list[ReadError]]:
     try:
         reports = _elisp_reports(root, files, emacs, budget)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        return [], [f"cannot read Emacs Lisp files {', '.join(files)}: {error}"]
+        return [], [ReadError(path, f"cannot read {path}: {error}") for path in files]
 
     findings, errors = [], []
     for path, report, error in reports:
-        if error is not None:
-            errors.append(f"cannot read {path}: {error}")
-            continue
-        rows, *positions = report
-        exempt = _elisp_exempt_lines(rows, Path(path).name, positions)
-        findings.extend(Finding(path, line, text) for line, text, _ in rows if line not in exempt)
+        if error is None:
+            findings.extend(_elisp_rows(path, report))
+        else:
+            errors.append(ReadError(path, f"cannot read {path}: {error}"))
     return findings, errors
 
 
@@ -227,19 +249,19 @@ def _python_source(source: Path) -> bool:
         return _python_script(stream.readline(4096))
 
 
-def _read_python(root: Path, path: str) -> tuple[list[Finding], list[str]]:
+def _read_python(root: Path, path: str) -> tuple[list[Finding], list[ReadError]]:
     source = root / path
     try:
         if _python_source(source):
             return _python_findings(source, path), []
     except (OSError, SyntaxError, tokenize.TokenError, ValueError) as error:
-        return [], [f"cannot read {path}: {error}"]
-    return [], [f"{path}: no comments driver"]
+        return [], [ReadError(path, f"cannot read {path}: {error}")]
+    return [], [ReadError(path, f"{path}: no comments driver")]
 
 
 def measure(
     root: Path, files: list[str], emacs: str = "emacs", budget: int = 30,
-) -> tuple[list[Finding], list[str]]:
+) -> tuple[list[Finding], list[ReadError]]:
     """Report forbidden comments and files that could not be analyzed."""
     paths = sorted(set(files))
     elisp = [path for path in paths if path.endswith(".el")]

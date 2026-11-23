@@ -285,12 +285,19 @@ def _comments_spec(_raw: dict[str, Any], _root: Path, _path: Path, _key: str) ->
     return ParsedSpec(None, "comments/1", ("static",))
 
 
+def _comments_problems(findings: list[comments.Finding], errors: list[comments.ReadError]) -> list[str]:
+    ordered = [(error.path, 0, error.text) for error in errors]
+    ordered.extend((row.path, row.line, f"{row.path}:{row.line}: {row.text}") for row in findings)
+    ordered.sort(key=lambda item: item[:2])
+    return [text for _, _, text in ordered]
+
+
 def _run_comments(context: AdapterContext) -> Any:
     from .checks import _adapter_selection, _check_result
 
     _spec, start, selected, _classes = _adapter_selection(context)
     findings, errors = comments.measure(context.root, selected)
-    problems = [*errors, *(f"{row.path}:{row.line}: {row.text}" for row in findings)]
+    problems = _comments_problems(findings, errors)
     for problem in problems:
         print(f"{context.prefix}: {problem}", file=sys.stderr)
     return _check_result(
