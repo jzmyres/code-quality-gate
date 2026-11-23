@@ -74,3 +74,145 @@ class SkipCase(unittest.TestCase):
     def test_runtime_skip(self):
         self.skipTest("runtime skip")
 '''
+
+"review_warn_helper.py" = '''
+import warnings
+
+
+def deprecated():
+    warnings.warn("fixture deprecation", DeprecationWarning)
+'''
+
+"review_warn.py" = '''
+import unittest
+import warnings
+
+from review_warn_helper import deprecated
+
+
+class WarningCase(unittest.TestCase):
+    def test_default_filter_is_active(self):
+        with warnings.catch_warnings(record=True) as caught:
+            deprecated()
+        self.assertEqual(len(caught), 1)
+'''
+
+"review_duplicate.py" = '''
+import unittest
+
+
+class Parameter(unittest.TestCase):
+    def test_value(self):
+        self.assertIn(self.value, (1, 2, 3))
+
+
+def load_tests(loader, standard_tests, pattern):
+    suite = unittest.TestSuite()
+    for value in (1, 2, 3):
+        test = Parameter("test_value")
+        test.value = value
+        suite.addTest(test)
+    return suite
+'''
+
+"review_custom_run.py" = '''
+import unittest
+
+
+class ResourceCase(unittest.TestCase):
+    def test_resource(self):
+        self.assertTrue(self.ready)
+
+
+class ResourceSuite(unittest.TestSuite):
+    def run(self, result, debug=False):
+        for test in self:
+            test.ready = True
+        return super().run(result, debug)
+
+
+def load_tests(loader, standard_tests, pattern):
+    return ResourceSuite(loader.loadTestsFromTestCase(ResourceCase))
+'''
+
+"review_custom_call.py" = '''
+import unittest
+
+
+class ResourceCase(unittest.TestCase):
+    def test_resource(self):
+        self.assertTrue(self.ready)
+
+
+class CallableSuite(unittest.TestSuite):
+    def __call__(self, result):
+        for test in self:
+            test.ready = True
+        return super().__call__(result)
+
+
+def load_tests(loader, standard_tests, pattern):
+    return CallableSuite(loader.loadTestsFromTestCase(ResourceCase))
+'''
+
+"review_group_a.py" = '''
+raise ImportError("first failed import")
+'''
+
+"review_group_b.py" = '''
+import unittest
+
+
+class First(unittest.TestCase):
+    def test_first(self):
+        self.assertTrue(True)
+'''
+
+"review_group_c.py" = '''
+import unittest
+
+
+class Second(unittest.TestCase):
+    def test_second(self):
+        self.assertTrue(True)
+'''
+
+"review_group_z.py" = '''
+raise ImportError("last failed import")
+'''
+
+"review_crash.py" = '''
+import os
+import resource
+import signal
+import unittest
+
+
+class CrashCase(unittest.TestCase):
+    def test_a_completed(self):
+        self.assertTrue(True)
+
+    def test_b_crash(self):
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        for number in range(60):
+            os.write(1, f"fixture stdout {number:02d}\n".encode())
+        print("fixture Python stdout before crash")
+        os.write(2, b"fixture stderr before crash\n")
+        signal.raise_signal(signal.SIGSEGV)
+
+    def test_c_pending(self):
+        self.fail("must not run after process crash")
+'''
+
+"review_missing.py" = '''
+import os
+import unittest
+
+
+class MissingCase(unittest.TestCase):
+    def run(self, result):
+        os.write(1, b"fixture returned without reporting a test\n")
+
+    def test_unreported(self):
+        self.fail("the custom run bypasses this test")
+'''

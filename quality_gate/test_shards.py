@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import faulthandler
+import functools
 import itertools
 import json
 import os
@@ -12,7 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 
@@ -20,42 +22,74 @@ class ShardError(Exception):
     pass
 
 
-class ShardResult(unittest.TestResult):
-    def __init__(self):
-        super().__init__()
-        self.started = []
+class ShardResult(unittest.TextTestResult):
+    event_fields = (
+        ("skipped", "skipped"),
+        ("expected failure", "expectedFailures"),
+        ("unexpected success", "unexpectedSuccesses"),
+        ("failure", "failures"),
+        ("error", "errors"),
+    )
+
+    def __init__(self, stream, descriptions, verbosity, *, ids, journal):
+        super().__init__(stream, descriptions, verbosity)
+        self.ids = ids
+        self.journal = journal
+        self.records = []
+        self.fixtures = []
+        self.offsets = dict.fromkeys((field for _, field in self.event_fields), 0)
 
     def startTest(self, test):
+        self.fixtures.extend(self.events())
         super().startTest(test)
-        self.started.append(test)
 
-    def events(self):
-        for test, reason in self.skipped:
-            yield test, "skipped", reason
-        yield from self._tracebacks("expected failure", self.expectedFailures)
-        for test in self.unexpectedSuccesses:
-            yield test, "unexpected success", ""
-        yield from self._tracebacks("failure", self.failures)
-        yield from self._tracebacks("error", self.errors)
+    def stopTest(self, test):
+        events = list(self.events(test))
+        outcome = events[-1][1] if events else "passed"
+        self.record(outcome, events)
+        super().stopTest(test)
 
-    @staticmethod
-    def _tracebacks(outcome, entries):
-        for test, traceback in entries:
-            yield test, outcome, traceback
+    def record(self, outcome, events):
+        record = [self.position, self.ids[self.position], outcome, events]
+        if self.journal is None:
+            self.records.append(record)
+        else:
+            print(json.dumps(record), file=self.journal, flush=True)
+
+    def events(self, current=None):
+        for outcome, field in self.event_fields:
+            entries = getattr(self, field)
+            for entry in entries[self.offsets[field]:]:
+                test, detail = entry if isinstance(entry, tuple) else (entry, "")
+                name = self.ids[self.position] if test is current else _test_ids([test])[0]
+                yield name, outcome, detail
+            self.offsets[field] = len(entries)
 
 
 class ShardSuite(unittest.TestSuite):
-    def __init__(self, tests):
+    def __init__(self, tests, positions):
         super().__init__(tests)
-        self.blocked = []
+        self.positions = iter(positions)
 
     def _handleClassSetUp(self, test, result):
         super()._handleClassSetUp(test, result)
+        result.position = next(self.positions)
         if result._moduleSetUpFailed or getattr(type(test), "_classSetupFailed", False):
-            self.blocked.append(test)
+            result.record("blocked", [])
+
+
+def _check_suite(suite):
+    cls = type(suite)
+    base = unittest.suite.BaseTestSuite
+    if cls.run not in (base.run, unittest.TestSuite.run) or cls.__call__ is not base.__call__:
+        raise ShardError(
+            f"discovery suite {cls.__qualname__} in module {cls.__module__}: "
+            "expected standard unittest suite execution, got a custom run or __call__"
+        )
 
 
 def _flatten(suite):
+    _check_suite(suite)
     for test in suite:
         if isinstance(test, unittest.suite.BaseTestSuite):
             yield from _flatten(test)
@@ -83,8 +117,14 @@ def _module_blocks(modules):
             start = end + 1
 
 
-def assign_shares(tests, workers):
-    modules = [type(test).__module__ for test in tests]
+def _fixture_module(test, test_id):
+    if isinstance(test, unittest.loader._FailedTest):
+        return test_id.removeprefix("unittest.loader._FailedTest.")
+    return type(test).__module__
+
+
+def assign_shares(tests, ids, workers):
+    modules = [_fixture_module(test, test_id) for test, test_id in zip(tests, ids, strict=True)]
     blocks = list(_module_blocks(modules))
     shares = [[] for _ in range(min(workers, len(blocks)))]
     for block in sorted(blocks, key=len, reverse=True):
@@ -108,42 +148,16 @@ def _test_ids(tests):
         return [test.id() for test in tests]
 
 
-def _execute(tests, ids, positions=None):
+def _execute(tests, ids, positions=None, journal=None):
     selected = range(len(tests)) if positions is None else positions
-    cases = [tests[position] for position in selected]
-    names = {id(tests[position]): ids[position] for position in selected}
-    suite = ShardSuite(cases)
-    result = ShardResult()
-    suite.run(result)
-    return _report(ids, result, suite.blocked, names)
-
-
-def _report(ids, result, blocked, names):
-    events = list(result.events())
-    unnamed = [test for test, _, _ in events if id(test) not in names]
-    names.update(zip(map(id, unnamed), _test_ids(unnamed), strict=True))
-    return _format_report(ids, result.started, blocked, events, names)
-
-
-def _format_report(ids, started, blocked, events, names):
-    records = {id(test): [names[id(test)], "passed", []] for test in started}
-    fixtures = _attach_events(events, records, names)
-    omitted = [[names[id(test)], "blocked", []] for test in blocked]
-    return {"ids": ids, "records": [*records.values(), *omitted], "fixtures": fixtures}
-
-
-def _attach_events(events, records, names):
-    fixtures = []
-    for test, outcome, traceback in events:
-        owner = test.test_case if isinstance(test, unittest.case._SubTest) else test
-        record = records.get(id(owner))
-        event = (names[id(test)], outcome, traceback)
-        if record is None:
-            fixtures.append(event)
-        else:
-            record[1] = outcome
-            record[2].append(event)
-    return fixtures
+    suite = ShardSuite([tests[position] for position in selected], selected)
+    result_class = functools.partial(ShardResult, ids=ids, journal=journal)
+    with open(os.devnull, "w", encoding="utf-8") as stream:
+        result = unittest.TextTestRunner(
+            stream=stream, resultclass=result_class, warnings=None if sys.warnoptions else "default",
+        ).run(suite)
+    result.fixtures.extend(result.events())
+    return {"ids": ids, "records": result.records, "fixtures": result.fixtures}
 
 
 def _discovery_difference(expected, actual, worker):
@@ -155,19 +169,33 @@ def _discovery_difference(expected, actual, worker):
     return None
 
 
-def _record_problems(ids, reported):
-    expected = set(ids)
-    counts = Counter(reported)
+def _record_problems(expected, records):
+    counts = Counter(record[0] for record in records)
     return {
-        "missing": sorted(expected - counts.keys()),
-        "unexpected": sorted(counts.keys() - expected),
-        "duplicated": _duplicate_ids(counts),
-        "duplicated in discovery": _duplicate_ids(Counter(ids)),
+        "missing": sorted(set(expected) - counts.keys()),
+        "unexpected": sorted(counts.keys() - set(expected)),
+        "duplicated": sorted(position for position, count in counts.items() if count > 1),
     }
 
 
-def _duplicate_ids(counts):
-    return sorted(test_id for test_id, count in counts.items() if count > 1)
+def _position_label(ids, position):
+    name = ids[position] if 0 <= position < len(ids) else "<outside discovery>"
+    return f"position {position + 1} ({name!r})"
+
+
+def _position_labels(ids, positions):
+    return ", ".join(_position_label(ids, position) for position in positions)
+
+
+def _validate_records(ids, expected, records):
+    problems = _record_problems(expected, records)
+    details = "; ".join(
+        f"{name} {_position_labels(ids, positions)}" for name, positions in problems.items() if positions
+    )
+    if details:
+        raise ShardError(
+            f"shard record validation failed: expected one record per discovery position, got {details}"
+        )
 
 
 def validate_reports(ids, reports):
@@ -175,20 +203,11 @@ def validate_reports(ids, reports):
         difference = _discovery_difference(ids, report["ids"], worker)
         if difference:
             raise ShardError(difference)
-    _validate_records(ids, _records(reports))
+    _validate_records(ids, range(len(ids)), _records(reports))
 
 
 def _records(reports):
     return [record for report in reports for record in report["records"]]
-
-
-def _validate_records(ids, records):
-    problems = _record_problems(ids, (record[0] for record in records))
-    details = ", ".join(f"{name} {values!r}" for name, values in problems.items() if values)
-    if details:
-        raise ShardError(
-            f"shard record validation failed: expected one record per discovered id, got {details}"
-        )
 
 
 def _worker_prefix():
@@ -208,27 +227,54 @@ def _valid_prefix(prefix):
     return isinstance(prefix, list) and bool(prefix) and all(isinstance(arg, str) and arg for arg in prefix)
 
 
-def _worker(options, tests, ids):
+def _worker(options):
+    sys.stdout.reconfigure(line_buffering=True)
     plan_file, index = options.worker
+    path = Path(plan_file).with_name(f"worker-{index}.json")
     plan = json.loads(Path(plan_file).read_text(encoding="utf-8"))
+    tests = _discover(options.start, options.pattern)
+    ids = _test_ids(tests)
     selected = plan["shares"][int(index)] if ids == plan["ids"] else []
-    report = _execute(tests, ids, selected)
-    _report_path(Path(plan_file), index).write_text(json.dumps(report), encoding="utf-8")
+    with path.with_suffix(".jsonl").open("w", encoding="utf-8") as journal:
+        report = _execute(tests, ids, selected, journal)
+    path.write_text(json.dumps({"ids": ids, "fixtures": report["fixtures"]}), encoding="utf-8")
 
 
-def _report_path(plan, index):
-    return plan.with_name(f"worker-{index}.json")
+def _completed_records(path):
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    return [json.loads(line) for line in contents.split("\n")[:-1]]
 
 
-def _read_worker(process, path, log):
-    status = process.wait()
-    if status:
-        diagnostic = log.read_text(encoding="utf-8", errors="replace").strip()
-        raise ShardError(f"shard worker {path.name}: expected exit status 0, got {status}\n{diagnostic}")
+def _worker_failure(path, ids, positions, records, reason):
+    missing = _record_problems(positions, records)["missing"]
+    outstanding = _position_labels(ids, missing) or "none"
+    with path.with_suffix(".log").open(encoding="utf-8", errors="replace") as stream:
+        tail = "".join(deque(stream, maxlen=50))
+    return ShardError(f"shard worker {path.name}: {reason}\nUnrecorded tests: {outstanding}\n{tail}")
+
+
+def _load_worker_report(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
-        raise ShardError(f"shard worker: expected a readable JSON report at {path}, got {error}") from error
+        raise ShardError(f"expected a readable JSON report at {path}, got {error}") from error
+
+
+def _read_worker(process, path, ids, positions):
+    status = process.wait()
+    records = _completed_records(path.with_suffix(".jsonl"))
+    try:
+        if status:
+            raise ShardError(f"expected exit status 0, got {status}")
+        report = _load_worker_report(path)
+        if ids == report["ids"]:
+            _validate_records(ids, positions, records)
+        return {**report, "records": records}
+    except ShardError as error:
+        raise _worker_failure(path, ids, positions, records, str(error)) from error
 
 
 def _stop_worker(process):
@@ -237,29 +283,28 @@ def _stop_worker(process):
     process.wait()
 
 
-def _spawn_worker(argv, output, log):
+def _spawn_worker(argv, log):
     try:
-        with log.open("wb") as stderr:
-            return subprocess.Popen(argv, stdout=output, stderr=stderr)
+        with log.open("wb") as output:
+            return subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT)
     except OSError as error:
         raise ShardError(f"shard worker {shlex.join(argv)}: expected to start, got {error}") from error
 
 
-def _parallel(options, tests, ids, output):
-    shares = assign_shares(tests, options.workers)
+def _parallel(options, tests, ids):
+    shares = assign_shares(tests, ids, options.workers)
     prefix = _worker_prefix()
     command = [*prefix, str(Path(__file__).resolve()), "-s", options.start, "-p", options.pattern]
     with tempfile.TemporaryDirectory(prefix="qg-shards-") as directory, contextlib.ExitStack() as workers:
         plan = Path(directory) / "plan.json"
         plan.write_text(json.dumps({"ids": ids, "shares": shares}), encoding="utf-8")
         processes = []
-        for index in range(len(shares)):
+        for index, positions in enumerate(shares):
             argv = [*command, "--worker", str(plan), str(index)]
-            path = _report_path(plan, index)
-            log = path.with_suffix(".log")
-            process = _spawn_worker(argv, output, log)
+            path = plan.with_name(f"worker-{index}.json")
+            process = _spawn_worker(argv, path.with_suffix(".log"))
             workers.callback(_stop_worker, process)
-            processes.append((process, path, log))
+            processes.append((process, path, ids, positions))
         return [_read_worker(*worker) for worker in processes]
 
 
@@ -271,9 +316,9 @@ def _print_details(events):
             print(traceback, end="")
 
 
-def _events(ids, records, reports):
-    for test_id in ids:
-        yield from records[test_id][2]
+def _events(records, reports):
+    for record in records:
+        yield from record[3]
     for report in reports:
         yield from report["fixtures"]
 
@@ -289,15 +334,24 @@ def _summary_status(counts):
     return failed, f"{status} ({suffix})" if suffix else status
 
 
-def _summary(ids, reports, elapsed):
-    records = {record[0]: record for record in _records(reports)}
-    events = list(_events(ids, records, reports))
-    _print_details(events)
-    ran = sum(record[1] != "blocked" for record in records.values())
-    failed, status = _summary_status(Counter(event[1] for event in events))
+def _print_summary(ran, elapsed, status):
     noun = "test" if ran == 1 else "tests"
     print(f"{'-' * 70}\nRan {ran} {noun} in {elapsed:.3f}s\n")
     print(status)
+
+
+def _summary(reports, elapsed):
+    records = sorted(_records(reports))
+    events = list(_events(records, reports))
+    _print_details(events)
+    outcomes = [record[2] for record in records]
+    ran = len(records) - outcomes.count("blocked")
+    counts = Counter(event[1] for event in events)
+    failed, status = _summary_status(counts)
+    if ran == 0 and not counts["skipped"]:
+        _print_summary(ran, elapsed, status if failed else "NO TESTS RAN")
+        return 5
+    _print_summary(ran, elapsed, status)
     return int(failed)
 
 
@@ -325,27 +379,31 @@ def _quiet(output):
             yield
 
 
+def _run(options):
+    with open(os.devnull, "w", encoding="utf-8") as output, _quiet(output):
+        tests = _discover(options.start, options.pattern)
+        ids = _test_ids(tests)
+        if options.workers == 1:
+            return ids, [_execute(tests, ids)]
+    return ids, _parallel(options, tests, ids)
+
+
 def main(argv=None):
     options = _options(argv)
     start = time.monotonic()
     try:
-        with open(os.devnull, "w", encoding="utf-8") as output:
-            with _quiet(output):
-                tests = _discover(options.start, options.pattern)
-                ids = _test_ids(tests)
-                if options.worker:
-                    _worker(options, tests, ids)
-                    return 0
-                if options.workers == 1:
-                    reports = [_execute(tests, ids)]
-                else:
-                    reports = _parallel(options, tests, ids, output)
+        if options.worker:
+            _worker(options)
+            return 0
+        ids, reports = _run(options)
         validate_reports(ids, reports)
     except (ShardError, ImportError, OSError) as error:
         print(f"unittest shards: {error}", file=sys.stderr)
         return 1
-    return _summary(ids, reports, time.monotonic() - start)
+    return _summary(reports, time.monotonic() - start)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    with os.fdopen(os.dup(2), "w", encoding="utf-8") as diagnostics:
+        faulthandler.enable(file=diagnostics)
+        sys.exit(main())

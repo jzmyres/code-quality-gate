@@ -331,8 +331,10 @@ The runner uses standard unittest discovery in every worker. It keeps discovered
 `load_tests` and assigns whole classes to workers, keeping tests that share module fixtures
 together. Within each worker it runs the assigned tests in discovery order. Tests running in
 different workers need to be independent. The runner reports failures and errors with tracebacks
-and prints the usual unittest counts. It suppresses test output so the adapter sees one summary,
-and runs every worker under the gate's coverage prefix.
+and prints the usual unittest counts. Empty discovery prints `NO TESTS RAN` and exits 5.
+The runner refuses suites that override `run` or `__call__`. Each worker uses the gate's coverage
+prefix. If a worker crashes or leaves test records missing, the runner lists the unrecorded tests
+and shows the last 50 lines of that worker's output.
 
 `python_tests` runs the consumer's own test command once from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's

@@ -133,11 +133,12 @@ class ShardsTests(unittest.TestCase):
                 mock.patch.object(shards, "_summary", return_value=1) as summary,
             ):
                 self.assertEqual(shards.main(["-s", str(start), "-j", str(workers)]), 1)
-                ids, reports, _ = summary.call_args.args
+                reports, _ = summary.call_args.args
+                ids = reports[0]["ids"]
                 self.assertEqual(set(ids), set(EXPECTED))
                 records = {
                     test_id: outcome
-                    for report in reports for test_id, outcome, _ in report["records"]
+                    for report in reports for _, test_id, outcome, _ in report["records"]
                 }
                 self.assertEqual(records, EXPECTED)
 
@@ -167,8 +168,8 @@ class ShardsTests(unittest.TestCase):
 
     def test_shards_missing_duplicate_and_unexpected_records_name_ids(self):
         ids = ["case.a", "case.b"]
-        records = [[test_id, "passed", []] for test_id in ("case.a", "case.a", "case.c")]
-        diagnostic = r"missing.*case.b.*unexpected.*case.c.*duplicated.*case.a"
+        records = [[position, "case.a", "passed", []] for position in (0, 0, 2)]
+        diagnostic = r"missing position 2.*case.b.*unexpected position 3.*duplicated position 1.*case.a"
         with self.assertRaisesRegex(shards.ShardError, diagnostic):
             shards.validate_reports(ids, [{"ids": ids, "records": records}])
 
@@ -177,8 +178,9 @@ class ShardsTests(unittest.TestCase):
         self.enterContext(mock.patch.object(sys, "path", sys.path.copy()))
         tests = shards._discover(str(self.root / "tests"), "test*.py")
         for workers in (2, 4):
-            first = shards.assign_shares(tests, workers)
-            second = shards.assign_shares(shards._discover(str(self.root / "tests"), "test*.py"), workers)
+            first = shards.assign_shares(tests, shards._test_ids(tests), workers)
+            rediscovered = shards._discover(str(self.root / "tests"), "test*.py")
+            second = shards.assign_shares(rediscovered, shards._test_ids(rediscovered), workers)
             self.assertEqual(first, second)
             self.assertEqual(sorted(pos for share in first for pos in share), list(range(len(tests))))
             for share in first:
@@ -206,7 +208,7 @@ class ShardsTests(unittest.TestCase):
         report = shards._execute(tests, ids)
         shards.validate_reports(ids, [report])
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            status = shards._summary(ids, [report], 0)
+            status = shards._summary([report], 0)
         self.assertEqual(status, 1)
         self.assertIn("Ran 1 test in 0.000s", output.getvalue())
         self.assertIn("FAILED (failures=2, skipped=1)", output.getvalue())
@@ -238,15 +240,111 @@ class ShardsTests(unittest.TestCase):
         log = self.temporary / "worker.log"
         path = self.temporary / "worker.json"
         with self.assertRaisesRegex(shards.ShardError, "absent-interpreter.*expected to start"):
-            shards._spawn_worker(["absent-interpreter"], subprocess.DEVNULL, log)
+            shards._spawn_worker(["absent-interpreter"], log)
         process = mock.Mock()
         process.wait.return_value = 7
         log.write_text("worker diagnostic", encoding="utf-8")
         with self.assertRaisesRegex(shards.ShardError, r"worker.json.*expected exit status 0, got 7"):
-            shards._read_worker(process, path, log)
+            shards._read_worker(process, path, ["case.a"], [0])
         process.wait.return_value = 0
         with self.assertRaisesRegex(shards.ShardError, r"expected a readable JSON report.*worker.json"):
-            shards._read_worker(process, path, log)
+            shards._read_worker(process, path, ["case.a"], [0])
         process.poll.return_value = None
         shards._stop_worker(process)
         process.kill.assert_called_once()
+
+    def _run_fixture(self, pattern, workers=None):
+        argv = [sys.executable, "-I", "-B", "-X", "faulthandler"]
+        if workers is None:
+            argv.extend(["-m", "unittest", "discover"])
+        else:
+            argv.extend([str(self.script), "-j", str(workers)])
+        environment = os.environ.copy()
+        environment.pop("QG_PYTHON", None)
+        return subprocess.run(
+            [*argv, "-s", "tests", "-p", pattern],
+            cwd=self.root, env=environment, text=True, capture_output=True, timeout=15,
+        )
+
+    def test_shards_inherit_serial_warning_filters(self):
+        self._assert_serial_success("review_warn.py", "Ran 1 test in")
+
+    def test_shards_keep_all_instances_with_the_same_id(self):
+        self._assert_serial_success("review_duplicate.py", "Ran 3 tests in")
+
+    def _assert_serial_success(self, pattern, summary):
+        for workers in (None, 1, 2):
+            with self.subTest(workers=workers):
+                result = self._run_fixture(pattern, workers)
+                report = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, report)
+                self.assertIn(summary, report)
+                self.assertIn("OK", report)
+
+    def test_shards_refuse_suites_with_custom_execution(self):
+        suites = (("review_custom_run", "ResourceSuite"), ("review_custom_call", "CallableSuite"))
+        for filename, name in suites:
+            pattern = f"{filename}.py"
+            serial = self._run_fixture(pattern)
+            self.assertEqual(serial.returncode, 0, serial.stderr)
+            for workers in (1, 2):
+                with self.subTest(filename=filename, workers=workers):
+                    result = self._run_fixture(pattern, workers)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(f"suite {name} in module {filename}", result.stderr)
+                    self.assertIn("expected standard unittest suite execution", result.stderr)
+                    self.assertNotIn("Ran ", result.stdout)
+
+    def test_shards_import_errors_do_not_merge_unrelated_shares(self):
+        pattern = "review_group_*.py"
+        serial, lines = self._covered_run("group-serial", ["-m", "unittest", "discover",
+                                                         "-s", "tests", "-p", pattern], 1)
+        parallel, parallel_lines = self._covered_run(
+            "group-parallel", [str(self.script), "-s", "tests", "-p", pattern, "-j", "4"], 5,
+        )
+        self.assertEqual(lines, parallel_lines)
+        for result in (serial, parallel):
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = result.stdout + result.stderr
+            self.assertIn("Ran 4 tests in", report)
+            self.assertIn("FAILED (errors=2)", report)
+
+    def test_shards_crashes_report_outstanding_tests_and_tail(self):
+        serial = self._run_fixture("review_crash.py")
+        inline = self._run_fixture("review_crash.py", 1)
+        self.assertLess(serial.returncode, 0, serial.stderr)
+        self.assertEqual(inline.returncode, serial.returncode, inline.stderr)
+        for result in (serial, inline):
+            self.assertIn("Fatal Python error: Segmentation fault", result.stderr)
+            self.assertIn("in test_b_crash", result.stderr)
+        parallel = self._run_fixture("review_crash.py", 2)
+        self.assertEqual(parallel.returncode, 1, parallel.stderr)
+        self.assertIn(f"expected exit status 0, got {serial.returncode}", parallel.stderr)
+        self.assertIn("position 2 ('review_crash.CrashCase.test_b_crash')", parallel.stderr)
+        self.assertIn("position 3 ('review_crash.CrashCase.test_c_pending')", parallel.stderr)
+        self.assertNotIn("test_a_completed", parallel.stderr)
+        self.assertIn("fixture stdout 59", parallel.stderr)
+        self.assertIn("fixture stderr before crash", parallel.stderr)
+        self.assertIn("fixture Python stdout before crash", parallel.stderr)
+        self.assertNotIn("fixture stdout 00", parallel.stderr)
+        self.assertIn("Fatal Python error: Segmentation fault", parallel.stderr)
+
+    def test_shards_missing_worker_record_includes_log(self):
+        result = self._run_fixture("review_missing.py", 2)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("missing position 1 ('review_missing.MissingCase.test_unreported')", result.stderr)
+        self.assertIn("fixture returned without reporting a test", result.stderr)
+
+    def test_shards_empty_discovery_matches_serial(self):
+        self.enterContext(mock.patch.object(sys, "path", sys.path.copy()))
+        argv = ["-s", str(self.root / "tests"), "-p", "no_matches_*.py", "-j", "1"]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shards.main(argv), 5)
+        self.assertTrue(output.getvalue().rstrip().endswith("NO TESTS RAN"))
+        for workers in (None, 1, 4):
+            with self.subTest(workers=workers):
+                result = self._run_fixture("no_matches_*.py", workers)
+                report = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 5, report)
+                self.assertIn("Ran 0 tests in", report)
+                self.assertTrue(report.rstrip().endswith("NO TESTS RAN"), report)
