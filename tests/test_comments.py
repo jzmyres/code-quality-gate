@@ -270,6 +270,22 @@ enforcement = "enforced"
                     expected.insert(0, {"path": path, "line": 1, "text": "#!./bash"})
                 self.assertEqual(result.measurement["findings"], expected)
 
+    def test_comments_none_unknown_interpreter_leaves_shell_suffix_in_charge(self):
+        config = self.read_file("quality-gate.toml").replace(
+            'shebangs = ["sh", "bash", "python*"]', 'shebangs = ["sh", "bash", "python*", "zsh"]',
+        )
+        self.write_config(config)
+        source = "#!/bin/zsh\n# shell comment\ntrue\n"
+        tree = {"Stmts": [{"Comments": [
+            {"Hash": {"Line": 1}, "Text": "!/bin/zsh"},
+            {"Hash": {"Line": 2}, "Text": " shell comment"},
+        ]}]}
+        result = self.shell_check("script.sh", source, tree)
+        self.assertEqual(result.outcome, "fail")
+        self.assertEqual(result.measurement["findings"], [
+            {"path": "script.sh", "line": 2, "text": "# shell comment"},
+        ])
+
     def test_comments_none_polyglot_uses_inventory_shell_language(self):
         config = self.read_file("quality-gate.toml")
         for shebang, pattern in (

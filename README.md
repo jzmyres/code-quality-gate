@@ -219,7 +219,7 @@ exist, or a code file (by pattern or shebang) is placed in a class whose `code` 
 Inventory also fails when a code class lists no check or lists an id with no `[checks.ID]` table.
 Whether a class has the evidence a required tier demands is reported by `check` as obligations, so
 `inventory` alone does not decide assurance. A code file is detected by fnmatch against
-`[code].patterns` or by a shebang interpreter matching `[code].shebangs` after
+`[code].patterns` or by a recognized shebang interpreter matching `[code].shebangs` after
 removing any `env` launcher and options, taking the interpreter basename, and stripping its version.
 
 ### hygiene

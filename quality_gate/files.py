@@ -416,8 +416,8 @@ def source_language(path: Path, relative: str, config: Config) -> SourceClassifi
     if not config.code_shebangs:
         return SourceClassification(code_by_path, suffix)
     regular, interpreter = _source_interpreter(path, suffix)
-    if interpreter and _matches_patterns(interpreter, config.code_shebangs):
-        language = _INTERPRETER_LANGUAGE.get(interpreter)
+    language = _INTERPRETER_LANGUAGE.get(interpreter)
+    if language is not None and _matches_patterns(interpreter, config.code_shebangs):
         return SourceClassification(code_by_path or regular, language)
     return SourceClassification(code_by_path, suffix)
 

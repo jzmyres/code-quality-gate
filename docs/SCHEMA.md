@@ -271,8 +271,9 @@ version digits, including dotted versions. If that name matches a configured
 name is in the family table.
 The shell family includes `sh`, `bash`, `rbash`, `dash`, `ksh`, `mksh`, and
 `posh`. The Python and Emacs Lisp families use `python` and `emacs`,
-respectively. Without a configured shebang match, inventory uses the
-suffix, including `.sh` and `.bash` for shell. An eligible extensionless symlink
+respectively. The suffix decides the language when the interpreter is unmatched
+or outside the family table. For example, a `.sh` file with a configured `zsh`
+shebang still uses the shell driver. An eligible extensionless symlink
 to a regular file with a configured Python shebang uses the Python driver.
 The recorded language is independent of which checks a class lists.
 
