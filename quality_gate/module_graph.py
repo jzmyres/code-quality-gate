@@ -401,6 +401,15 @@ def _check_shell_parts(node: dict, source: str) -> None:
         _check_fields(part, {"Type": str}, source)
 
 
+def _shell_args(call: dict, source: str) -> Sequence[dict]:
+    if "Args" not in call and (assigns := call.get("Assigns")):
+        end = _check_fields(call, {"End.Offset": int}, source)["End"]["Offset"]
+        assignment_end = _check_fields(assigns[-1], {"End.Offset": int}, source)["End"]["Offset"]
+        if end == assignment_end:
+            return ()
+    return _check_fields(call, {"Args": list}, source)["Args"]
+
+
 def _shell_calls(tree: dict, source: str) -> Iterator[dict]:
     pending = [tree]
     while pending:
@@ -417,10 +426,13 @@ def _shell_calls(tree: dict, source: str) -> Iterator[dict]:
 
 _SHELL_PATH_CHARS = rb"[A-Za-z0-9._/+-]+"
 _SHELL_PATH = re.compile(rb"(?!-)" + _SHELL_PATH_CHARS)
-_SHELL_DIRECTORY_TAIL = re.compile(rb"/" + _SHELL_PATH_CHARS)
 _SHELL_POSSIBLE_RUN = re.compile(rb"[/{}*?\[]|^~|=~")
 _SHELL_DIRNAME = b'"$(dirname "$0")"'
 _SHELL_BASH_SOURCE = b'"${BASH_SOURCE%/*}"'
+_SHELL_DIRECTORY_PATH = re.compile(
+    rb"(" + re.escape(_SHELL_DIRNAME) + rb"|" + re.escape(_SHELL_BASH_SOURCE)
+    + rb")(/" + _SHELL_PATH_CHARS + rb")"
+)
 _SHELL_ARGUMENT_COMMANDS = {b"source": "source", b".": "source", b"bash": "execute", b"sh": "execute"}
 
 
@@ -437,48 +449,57 @@ def _shell_literal(word: dict, spelling: bytes) -> bool:
             return False
 
 
-def _shell_directory_spelling(quote: dict, tail: bytes) -> bytes | None:
-    match quote:
-        case {"Type": "DblQuoted", "Parts": [{"Type": "CmdSubst"}]}:
-            return _SHELL_DIRNAME + tail
-        case {"Type": "DblQuoted", "Parts": [{"Type": "ParamExp", "Exp": {"Op": "%"}}]}:
-            return _SHELL_BASH_SOURCE + tail
+def _shell_directory_part(quote: dict, prefix: bytes, source: str) -> bool:
+    _check_shell_parts(quote, source)
+    match quote["Parts"]:
+        case [{"Type": "CmdSubst"}]:
+            return prefix == _SHELL_DIRNAME
+        case [{"Type": "ParamExp"} as part] if prefix == _SHELL_BASH_SOURCE:
+            _check_fields(part, {"Exp": dict, "Exp.Op": str}, source)
+            return part["Exp"]["Op"] == "%"
         case _:
-            return None
+            return False
 
 
-def _shell_target(word: dict, spelling: bytes) -> str | None:
-    if _SHELL_PATH.fullmatch(spelling) and _shell_literal(word, spelling):
-        return spelling.decode("ascii")
+def _shell_directory_target(word: dict, prefix: bytes, tail: bytes, source: str) -> str | None:
     match word["Parts"]:
-        case [quote, {"Type": "Lit", "Value": value}]:
-            tail = value.encode()
-            if _SHELL_DIRECTORY_TAIL.fullmatch(tail) and spelling == _shell_directory_spelling(quote, tail):
+        case [{"Type": "DblQuoted"} as quote, {"Type": "Lit", "Value": value}]:
+            if _shell_directory_part(quote, prefix, source) and value.encode() == tail:
                 return "." + tail.decode("ascii")
     return None
 
 
-def _shell_dependency(call: dict, content: bytes) -> tuple[str, str | None] | None:
-    args = call.get("Args", ())
+def _shell_target(word: dict, spelling: bytes, source: str) -> str | None:
+    if _SHELL_PATH.fullmatch(spelling) and _shell_literal(word, spelling):
+        return spelling.decode("ascii")
+    if directory := _SHELL_DIRECTORY_PATH.fullmatch(spelling):
+        prefix, tail = directory.groups()
+        return _shell_directory_target(word, prefix, tail, source)
+    return None
+
+
+def _shell_dependency(args: Sequence[dict], content: bytes, source: str) -> tuple[str, str | None] | None:
     if not args:
         return None
     head = _shell_spelling(args[0], content)
     if not _shell_literal(args[0], head):
-        return "execute", _shell_target(args[0], head)
+        return "execute", _shell_target(args[0], head, source)
     match _SHELL_ARGUMENT_COMMANDS.get(head):
         case str() as kind if len(args) > 1:
-            return kind, _shell_target(args[1], _shell_spelling(args[1], content))
+            operand = _shell_spelling(args[1], content)
+            return kind, None if operand.startswith((b"-", b"+")) else _shell_target(args[1], operand, source)
         case None if _SHELL_POSSIBLE_RUN.search(head):
-            return "execute", _shell_target(args[0], head)
+            return "execute", _shell_target(args[0], head, source)
     return None
 
 
 def _shell_dependencies(shell: dict[str, tuple[bytes, dict]]) -> Iterator[tuple[str, int, str, str | None]]:
     for source, (content, tree) in shell.items():
         for call in _shell_calls(tree, source):
-            for word in call.get("Args", ()):
+            args = _shell_args(call, source)
+            for word in args:
                 _check_fields(word, _SHELL_WORD_FIELDS, source)
-            dependency = _shell_dependency(call, content)
+            dependency = _shell_dependency(args, content, source)
             if dependency is not None:
                 yield source, call["Pos"]["Line"], *dependency
 

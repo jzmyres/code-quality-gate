@@ -383,8 +383,8 @@ bytes and the character class `[A-Za-z0-9._/+-]+`. It cannot start with `-`.
 The exact script-directory prefixes `"$(dirname "$0")"` and `"${BASH_SOURCE%/*}"`
 are also accepted when followed by a slash and an unquoted suffix in the same character class.
 The graph reports other quoted, expanded, globbed, or unsupported targets as outside the parser.
-It reports the same diagnostic for `source` and `.` with a dash-prefixed first operand
-and for `bash` and `sh` with an option before the script. These diagnostics appear in
+It reports the same diagnostic for `source` and `.` with a first operand starting with
+`-` or `+` and for `bash` and `sh` with such an option before the script. These diagnostics appear in
 `outside_extractor` with the calling file and line. A literal path without a measured target
 is reported there as unresolved and includes the path. Shell syntax and shfmt schema errors
 fail the check and name the affected file. Schema errors also name the affected field.

@@ -560,9 +560,11 @@ sh
         source_word = (
             '"${BASH_SOURCE%/*}"/sibling.sh', [shell_quote(bash_source), shell_literal("/sibling.sh")],
         )
+        assignment_end = {"Offset": len("value=café".encode())}
         measurement = self.shell_graph(0, {
             "scripts/main.sh": shell_tree(
-                {"Cmd": {"Type": "CallExpr", "Pos": {"Line": 1}, "Assigns": [{"Name": {"Value": "value"}}]}},
+                {"Cmd": {"Type": "CallExpr", "Pos": {"Line": 1}, "End": assignment_end,
+                         "Assigns": [{"End": assignment_end}]}},
                 shell_call(2, "source", "sibling.sh", script=script),
                 shell_call(3, ".", "./sibling.sh", script=script),
                 shell_call(4, "source", dirname_word, script=script),
@@ -704,6 +706,58 @@ reason = "Shell option lookalike measured by the graph"
         self.assertEqual(check["outcome"], "error")
         self.assertIn("broken.sh: shfmt parse failed", check["reason"])
         self.assertNotIn("measurement", check)
+
+    def test_module_graph_shell_rejects_plus_options(self) -> None:
+        self.configure_graph("""
+[[rule]]
+pattern = "+e"
+class = "python"
+reason = "Shell option lookalike measured by the graph"
+""", shell=True)
+        self.add_file("sibling.sh", "")
+        self.add_file("+e", "#!/bin/sh\n")
+        for command, kind in (("bash", "execute"), ("sh", "execute"), ("source", "source"), (".", "source")):
+            with self.subTest(command=command):
+                words = (command, "+e", "./sibling.sh")
+                script = " ".join(words) + "\n"
+                self.add_file("main.sh", script)
+                measurement = self.shell_graph(0, {
+                    "main.sh": shell_tree(shell_call(1, *words, script=script)),
+                    "+e": shell_tree(),
+                    "sibling.sh": shell_tree(),
+                })["measurement"]
+                self.assertEqual(measurement["edges"], [])
+                self.assertEqual(measurement["outside_extractor"], [{
+                    "file": "main.sh", "line": 1, "message": f"shell {kind}: target is outside the parser",
+                }])
+
+    def test_module_graph_shell_requires_fields_for_exact_directory_prefixes(self) -> None:
+        self.configure_graph(shell=True)
+        for prefix, quote, field in (
+            ('"$(dirname "$0")"', {"Type": "DblQuoted"}, "Parts"),
+            ('"${BASH_SOURCE%/*}"', shell_quote({"Type": "ParamExp"}), "Exp"),
+        ):
+            with self.subTest(field=field):
+                operand = prefix + "/sibling.sh"
+                script = f"source {operand}\n"
+                self.add_file("main.sh", script)
+                target = operand, [quote, shell_literal("/sibling.sh")]
+                statement = shell_call(1, "source", target, script=script)
+                check = self.shell_graph(1, {"main.sh": shell_tree(statement)})
+                self.assertEqual(check["outcome"], "error")
+                self.assertIn(f"main.sh: shfmt JSON missing field {field}", check["reason"])
+
+    def test_module_graph_shell_requires_args_after_leading_assignment(self) -> None:
+        self.configure_graph(shell=True)
+        script = "value=1 source ./sibling.sh\n"
+        self.add_file("main.sh", script)
+        statement = shell_call(1, "source", "./sibling.sh", script=script)
+        call = statement["Cmd"]
+        call["Assigns"] = [{"End": {"Offset": len("value=1")}}]
+        call["End"] = call.pop("Args")[-1]["End"]
+        check = self.shell_graph(1, {"main.sh": shell_tree(statement)})
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("main.sh: shfmt JSON missing field Args", check["reason"])
 
     def test_module_graph_shell_schema_errors_name_file_and_field(self) -> None:
         self.configure_graph(shell=True)
