@@ -1153,8 +1153,8 @@ is kept only when its payload digest matches the lock; otherwise `tools fetch` r
 
 `python3 -BI qg.py tools fetch --check` verifies every installed payload against the lock offline.
 It accepts the same `--lock FILE` option and checks that each install directory resolves inside
-the tools cache before hashing its payload. It reads the lock and existing installs without
-downloading archives, writing files, changing modes, or running tools. Python's `-B` flag
+the tools cache and every hashed path resolves inside its install directory, including the
+declared binary in a Debian package. It only reads the lock and existing installs. Python's `-B` flag
 prevents bytecode cache writes in the gate checkout. It exits 0 if all installs match, 1 for a
 missing, unsafe, unreadable, or changed install, and 2 for a missing, unreadable, or invalid lock.
 Failures identify the affected tool and install path or the lock file.
@@ -1190,10 +1190,14 @@ Python adapters put on `sys.path`; for coverage that is `coverage-7.16.2/`, and 
 `coverage/__init__.py` is looked up inside the verified tree.
 `format = "conda"` marks a conda v2 artifact. The gate checks the archive SHA-256 before opening
 the ZIP. It requires a `metadata.json` marker with `conda_pkg_format_version` set to the integer 2,
-and matching `info-<stem>.tar.zst` and `pkg-<stem>.tar.zst` tarballs. The gate uses the host
-`libzstd.so.1` runtime to decompress both tarballs. It applies the tar safety rules to the payload
-and extracts it into the user-owned tools cache. It discards the info tarball and runs no installer
-or package scripts. The payload digest covers the full installed tree.
+and matching `info-<stem>.tar.zst` and `pkg-<stem>.tar.zst` tarballs. The outer ZIP must contain
+exactly these three regular members stored without ZIP compression, with valid framing and CRCs.
+The JSON marker rejects duplicate keys and non-JSON constants. The gate uses the host
+`libzstd.so.1` runtime to decompress both tarballs and
+validates their headers, end markers, paths, and member types before writing any payload file.
+The gate discards the info tarball and extracts the payload directly into the user-owned tools
+cache with no installer or package script execution. It omits pre-link, post-link, and pre-unlink
+hooks under `bin/` and `Scripts/`. The payload digest covers the full installed tree.
 `format = "deb"` marks a Debian package. The gate reads the `ar` container and unpacks its single
 `data.tar.*` member under the same tar safety rules. Both fetch and check use the declared binary's
 content hash as the payload digest for this format, including the current shfmt pin.
@@ -1846,9 +1850,9 @@ not installed. Command-check tests use the real command; the real ruff test runs
 ruff binary exists and proves enforcement: an unused import is rejected with F401, then the repaired
 fixture is accepted, including files whose names contain a space and begin with `-`. `tools fetch`
 tests build local tarballs, wheels, Debian packages, and conda archives and fetch them via `file://`
-URLs. They cover wrong hashes, unknown keys, unsafe archive members, payload mismatches, and
-destinations outside the tools directory. Offline check tests seed local installs and exercise
-the write-free CLI invocation from a fresh copy of the gate.
+URLs. They cover wrong hashes, unknown keys, malformed archive framing, unsafe members, and
+payload mismatches. Offline check tests seed local installs, reject paths outside the tools cache
+or install directory, and exercise the write-free `-BI` invocation from a fresh copy of the gate.
 Tool-use tests prove that a tampered Ruff or coverage install is `unsupported` before it runs
 and that a full run leaves the coverage install unchanged. Contract tests cover result typing,
 obligations and exemptions, diagnostics, baseline identity and domain rules, prune reporting and
