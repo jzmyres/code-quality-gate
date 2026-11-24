@@ -202,7 +202,9 @@ def _graph_findings(
     return findings
 
 
-def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> tuple[list[str], list[str]]:
+def _graph_modules(
+    context: AdapterContext, spec: module_graph.GraphSpec,
+) -> tuple[list[str], list[str], list[str]]:
     unknown = sorted(set(spec.classes) - context.config.classes.keys())
     if unknown:
         key = f"checks.{context.check.id}.classes"
@@ -210,11 +212,11 @@ def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> tup
         raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
     selected = sorted(path for path in context.files if context.classes.get(path) in spec.classes)
     languages = source_languages(context.root, selected, context.config, context.classes)
-    modules: dict[str, list[str]] = {"python": [], "lisp": []}
+    modules: dict[str, list[str]] = {"python": [], "lisp": [], "bash": []}
     for path, language in languages.items():
         if language in modules:
             modules[language].append(path)
-    return modules["python"], modules["lisp"]
+    return modules["python"], modules["lisp"], modules["bash"]
 
 
 def _graph_elisp_records(records: Any) -> list[dict]:
@@ -257,12 +259,13 @@ def _run_module_graph(context: AdapterContext) -> Any:
     start = time.monotonic()
     check = context.check
     try:
-        python_modules, elisp_modules = _graph_modules(context, check.spec)
-        modules = [*python_modules, *elisp_modules]
+        python_modules, elisp_modules, shell_modules = _graph_modules(context, check.spec)
+        modules = [*python_modules, *elisp_modules, *shell_modules]
         test_sources = frozenset(path for path in modules if python_shape._is_test_path(path))
         elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}
         measurement, cycles, suite_edges, program_edges = module_graph.measure(
-            context.root, python_modules, check.spec, elisp=elisp, test_sources=test_sources,
+            context.root, python_modules, check.spec, elisp=elisp, shell_modules=shell_modules,
+            parse_shell=_parse_shell, test_sources=test_sources,
         )
     except (GateError, ValueError) as error:
         return _ratchet_error(check, start, context.prefix, error)

@@ -343,7 +343,8 @@ check configuration and result.
 
 ### Module graph
 
-The `module_graph` adapter measures Python and Emacs Lisp files in the named inventory classes.
+The `module_graph` adapter measures Python, Emacs Lisp, and shell files in the named inventory
+classes, using the inventory's language classification.
 Python imports anywhere in a file count, including function bodies and `TYPE_CHECKING` blocks.
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
@@ -370,6 +371,19 @@ type aliases, and type parameter bounds and defaults are always unresolved. When
 code assigns or destructures a loader into an alias, the diagnostic points to the
 original loader spelling. Later references using only the alias and dynamic namespace
 writes are outside the static analysis.
+
+Shell files are parsed by the shared shfmt reader. A literal path argument to
+`source` or `.` gives a `source` edge. A literal command name containing `/`
+or a literal script argument to `bash` or `sh` gives an `execute` edge.
+Relative paths resolve from the calling script's directory and can identify a measured
+module in any language. The reader also recognizes a `$(dirname "$0")` or
+`${BASH_SOURCE%/*}` prefix, including `${BASH_SOURCE[0]%/*}`, followed by a
+slash and a literal name.
+
+Targets with other expansions, substitutions, or globs are reported as outside the parser
+in `outside_extractor` with the calling file and line. A literal path without a measured
+target is reported there as unresolved and includes the path. A shell syntax error
+or shfmt schema error fails the check and names the affected file.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
