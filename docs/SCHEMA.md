@@ -275,7 +275,10 @@ respectively. The suffix decides the language when the interpreter is unmatched
 or outside the family table. For example, a `.sh` file with a configured `zsh`
 shebang still uses the shell driver. An eligible extensionless symlink
 to a regular file with a configured Python shebang uses the Python driver.
-The recorded language is independent of which checks a class lists.
+Inventory resolves such a symlink's language when a check selects it for
+language dispatch and caches the result for the rest of the run. Inventory
+leaves unselected symlink targets unopened. Language precedence is
+independent of which checks a class lists.
 
 The shared `quality_gate/shell_syntax.py` module feeds source bytes to the
 pinned shfmt from the tools directory on stdin with `--to-json` and

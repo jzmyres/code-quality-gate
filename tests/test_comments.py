@@ -314,6 +314,45 @@ enforcement = "enforced"
         (self.repo / "sample").symlink_to("source.py")
         self.assertEqual(self.check_comments_none(0)["measurement"]["findings"], [])
 
+    def test_inventory_reuses_selected_symlink_language(self):
+        self.add_file("source.py", fixture_source("python"))
+        link = self.repo / "sample"
+        link.symlink_to("source.py")
+        config = policy.load_config(self.repo)
+        with mock.patch.object(inventory, "_shebang_line", wraps=inventory._shebang_line) as reads:
+            _, classes, violations = inventory.validate_inventory(self.repo, config)
+            self.assertEqual(violations, [])
+            self.assertNotIn(mock.call(link), reads.call_args_list)
+            for _ in range(2):
+                self.assertEqual(
+                    inventory.source_languages(self.repo, ["sample"], config, classes),
+                    {"sample": "python"},
+                )
+        self.assertEqual(reads.call_args_list.count(mock.call(link)), 1)
+
+    def test_inventory_does_not_open_unselected_extensionless_symlink(self):
+        config = self.read_file("quality-gate.toml") + """
+[[rule]]
+pattern = "linked"
+class = "doc"
+reason = "Reference outside the repository"
+"""
+        self.write_config(config)
+        target = self.base / "unreadable"
+        target.write_text(fixture_source("python"), encoding="utf-8")
+        target.chmod(0)
+        link = self.repo / "linked"
+        link.symlink_to(target)
+
+        with mock.patch.object(inventory, "_shebang_line", wraps=inventory._shebang_line) as reads:
+            paths, classes, violations = inventory.validate_inventory(
+                self.repo, policy.load_config(self.repo),
+            )
+        self.assertEqual(violations, [])
+        self.assertIn("linked", paths)
+        self.assertEqual(classes["linked"], "doc")
+        self.assertNotIn(mock.call(link), reads.call_args_list)
+
     def test_comments_none_shell_deadline_already_spent(self):
         result = self.shell_check("sample.sh", "true\n", {}, elapsed=31)
         self.assertEqual(result.outcome, "fail")

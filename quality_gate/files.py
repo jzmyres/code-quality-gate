@@ -388,61 +388,83 @@ def _regular_interpreter(path: Path) -> str | None:
 class SourceClassification:
     code: bool
     language: str | None
-
-
-def _eligible_python_link(path: Path, suffix: str | None) -> bool:
-    return suffix is None and path.is_symlink() and path.is_file()
-
-
-def _source_interpreter(path: Path, suffix: str | None) -> tuple[bool, str]:
-    name = _regular_interpreter(path)
-    if name is not None:
-        return True, _INTERPRETER_VERSION.sub("", name)
-    if _eligible_python_link(path, suffix):
-        name = _shebang_interpreter(_shebang_line(path)) or ""
-        if _INTERPRETER_VERSION.sub("", name) == "python":
-            return False, "python"
-    return False, ""
+    deferred: bool = False
 
 
 def _matches_patterns(value: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns)
 
 
-def source_language(path: Path, relative: str, config: Config) -> SourceClassification:
+def _configured_shebang_language(path: Path, patterns: tuple[str, ...]) -> str | None:
+    name = _shebang_interpreter(_shebang_line(path)) or ""
+    interpreter = _INTERPRETER_VERSION.sub("", name)
+    if _matches_patterns(interpreter, patterns):
+        return _INTERPRETER_LANGUAGE.get(interpreter)
+    return None
+
+
+def _classify_link(
+    path: Path, patterns: tuple[str, ...], code_by_path: bool, selected: bool,
+) -> SourceClassification:
+    if not selected:
+        return SourceClassification(code_by_path, None, deferred=True)
+    if path.is_file() and _configured_shebang_language(path, patterns) == "python":
+        return SourceClassification(code_by_path, "python")
+    return SourceClassification(code_by_path, None)
+
+
+def source_language(
+    path: Path, relative: str, config: Config, *, selected: bool = True,
+) -> SourceClassification:
     """Classify a file by its configured interpreter first and its suffix second."""
     suffix = SOURCE_LANGUAGE_BY_SUFFIX.get(path.suffix.lower())
     code_by_path = _matches_patterns(relative, config.code_patterns)
-    if not config.code_shebangs:
-        return SourceClassification(code_by_path, suffix)
-    regular, interpreter = _source_interpreter(path, suffix)
-    language = _INTERPRETER_LANGUAGE.get(interpreter)
-    if language is not None and _matches_patterns(interpreter, config.code_shebangs):
-        return SourceClassification(code_by_path or regular, language)
-    return SourceClassification(code_by_path, suffix)
+    fallback = SourceClassification(code_by_path, suffix)
+    patterns = config.code_shebangs
+    if not patterns:
+        return fallback
+    mode = path.lstat().st_mode
+    if stat.S_ISREG(mode):
+        language = _configured_shebang_language(path, patterns)
+        return fallback if language is None else SourceClassification(True, language)
+    if suffix is None and stat.S_ISLNK(mode):
+        return _classify_link(path, patterns, code_by_path, selected)
+    return fallback
 
 
 class InventoryClasses(dict[str, str]):
     """Inventory classes and the source languages decided alongside them."""
 
-    def __init__(self, classes: dict[str, str], languages: dict[str, str | None]) -> None:
+    def __init__(
+        self, classes: dict[str, str], sources: dict[str, SourceClassification],
+    ) -> None:
         super().__init__(classes)
-        self.languages = languages
+        self.languages: dict[str, str | None] = {}
+        self.deferred_links: set[str] = set()
+        for path, source in sources.items():
+            if source.deferred:
+                self.deferred_links.add(path)
+            else:
+                self.languages[path] = source.language
+
+
+def _selected_language(root: Path, path: str, config: Config) -> str | None:
+    try:
+        return source_language(root / path, path, config).language
+    except OSError as error:
+        raise GateError(f"cannot read shebang of {path}: {error}") from error
 
 
 def source_languages(
     root: Path, paths: list[str], config: Config, classes: dict[str, str],
 ) -> dict[str, str | None]:
-    """Return the inventory's language decisions for the requested paths."""
-    if isinstance(classes, InventoryClasses):
-        return {path: classes.languages.get(path) for path in paths}
-    languages = {}
-    for path in paths:
-        try:
-            languages[path] = source_language(root / path, path, config).language
-        except OSError as error:
-            raise GateError(f"cannot read shebang of {path}: {error}") from error
-    return languages
+    """Return recorded languages, resolving deferred links among selected paths."""
+    if not isinstance(classes, InventoryClasses):
+        return {path: _selected_language(root, path, config) for path in paths}
+    for path in sorted(classes.deferred_links.intersection(paths)):
+        classes.languages[path] = _selected_language(root, path, config)
+        classes.deferred_links.remove(path)
+    return {path: classes.languages.get(path) for path in paths}
 
 
 def _reject_special_files(
@@ -527,7 +549,7 @@ class _InventoryValidator:
     matched: list[int]
     classes: dict[str, str]
     gitlinks: set[str]
-    languages: dict[str, str | None] = field(default_factory=dict)
+    sources: dict[str, SourceClassification] = field(default_factory=dict)
 
     def validate(self) -> tuple[list[str], dict[str, str], list[str]]:
         files = [entry.path for entry in self.entries]
@@ -542,7 +564,7 @@ class _InventoryValidator:
             for invalid, message in _STALE_RULE_CHECKS:
                 if invalid(self.matched[index]):
                     self.violations.append(message.format(**values))
-        return files, InventoryClasses(self.classes, self.languages), self.violations
+        return files, InventoryClasses(self.classes, self.sources), self.violations
 
     def _check_classes(self) -> None:
         known = _known_names(self.config.checks)
@@ -606,13 +628,13 @@ class _InventoryValidator:
         if relative in self.gitlinks:
             return
         try:
-            source = source_language(self.root / relative, relative, self.config)
+            source = source_language(self.root / relative, relative, self.config, selected=False)
         except OSError as error:
             self.violations.append(
                 f"{relative}: cannot read shebang: {error}"
             )
             return
-        self.languages[relative] = source.language
+        self.sources[relative] = source
         message = _FILE_CLASS_MESSAGES.get((source.code, class_def.code))
         if message is not None:
             self.violations.append(
