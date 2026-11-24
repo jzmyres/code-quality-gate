@@ -386,10 +386,11 @@ The graph reports other quoted, expanded, globbed, or unsupported targets as out
 It reports the same diagnostic for `source` and `.` with a first operand starting with
 `-` or `+` and for `bash` and `sh` with such an option before the script. These diagnostics appear in
 `outside_extractor` with the calling file and line. A literal path without a measured target
-is reported there as unresolved and includes the path. The graph validates the shfmt fields it
-reads. Missing or mistyped fields fail the check and identify the file and field. Empty files,
-assignment-only commands, and redirect-only statements are valid. Shell syntax errors fail the
-check and identify the file.
+is reported there as unresolved and includes the path. The pinned shfmt prints the JSON tree
+with `--from-json` and formats the original source. The check fails and names the file if the
+two outputs differ byte for byte. Missing required fields and mistyped fields fail the check
+and identify the file and field. Empty files, assignment-only commands, and redirect-only
+statements are valid. Shell syntax errors fail the check and identify the file.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
@@ -451,11 +452,11 @@ python3 -I qg.py check --only module-graph
 ```
 
 The check allows zero findings, so any finding fails the gate under this policy.
-The JSON result includes the sorted modules and edges, each edge's kind (`import`, `path-load`, or `require`),
+The JSON result includes the sorted modules and edges, each edge's kind
+(`import`, `path-load`, `require`, `source`, or `execute`),
 and fan-in and fan-out for each module.
 
-Follow-ups cover subprocess dependencies (`GATE-MODULE-GRAPH-SUBPROCESS`) and
-Shell dependency extraction (`GATE-MODULE-GRAPH-SHELL`).
+Subprocess dependencies are tracked in `GATE-MODULE-GRAPH-SUBPROCESS`.
 
 ### Source-character checks
 

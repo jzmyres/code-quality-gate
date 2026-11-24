@@ -6,6 +6,7 @@ import sys
 import tomllib
 from collections import Counter
 from contextlib import contextmanager, redirect_stderr
+from copy import deepcopy
 from dataclasses import replace
 from io import StringIO
 from inspect import getsource
@@ -87,15 +88,33 @@ reason = "Shell measured by the graph"
         return self.check_by_id(document, "module-graph")
 
     @contextmanager
-    def mock_shell_parser(self, trees: dict[str, runner.RunResult]):
+    def mock_shell_parser(
+        self, trees: dict[str, runner.RunResult], replay: dict[str, runner.RunResult] | None = None,
+        *, formatted: dict[str, bytes] | None = None,
+    ):
+        def run_shfmt(argv, *, stdin, **_):
+            filename = argv[-1]
+            if "--to-json" in argv:
+                return trees[filename]
+            if "--from-json" in argv:
+                if replay and filename in replay:
+                    return replay[filename]
+                stdin = (self.repo / filename).read_bytes()
+            if formatted and filename in formatted:
+                stdin = formatted[filename]
+            return runner.RunResult((), "completed", 0, stdout=stdin)
+
         with (
             mock.patch.object(adapters, "tool_binary", return_value=self.repo / "shfmt"),
-            mock.patch.object(adapters, "run", side_effect=lambda argv, **_: trees[argv[-1]]) as run,
+            mock.patch.object(adapters, "run", side_effect=run_shfmt) as run,
         ):
             yield run
 
-    def shell_graph(self, exit_code: int, trees: dict[str, runner.RunResult]) -> dict[str, Any]:
-        with self.mock_shell_parser(trees):
+    def shell_graph(
+        self, exit_code: int, trees: dict[str, runner.RunResult], *,
+        replay: dict[str, runner.RunResult] | None = None,
+    ) -> dict[str, Any]:
+        with self.mock_shell_parser(trees, replay):
             return self.graph(exit_code)
 
     def assert_elisp_outcomes(
@@ -593,20 +612,23 @@ sh
 
     def test_module_graph_shell_uses_shared_parser_for_inventory_shell_files(self) -> None:
         self.configure_graph(shell=True)
-        content = "#!/bin/sh\ntrue\n"
+        content = "#!/bin/sh\n  true\n"
         self.add_file("script.py", content)
         self.add_file("sibling.sh", "")
         trees = {"script.py": shell_tree(shell_call(2, "true", script=content)), "sibling.sh": shell_tree()}
-        with self.mock_shell_parser(trees) as run:
+        with self.mock_shell_parser(trees, formatted={"script.py": b"#!/bin/sh\ntrue\n"}) as run:
             check = self.graph(0)
         self.assertEqual(check["measurement"]["modules"], ["a.py", "script.py", "sibling.sh"])
         self.assertEqual(check["measurement"]["edges"], [])
         self.assertEqual(run.call_args_list, [
             mock.call(
-                [str(self.repo / "shfmt"), "--to-json", "-ln=bash", "--filename", path],
-                stdin=data, budget_seconds=30, capture_limit=None,
+                [str(self.repo / "shfmt"), *flags, "-ln=bash", "--filename", path],
+                stdin=stdin, budget_seconds=30, capture_limit=None,
             )
             for path, data in (("script.py", content.encode()), ("sibling.sh", b""))
+            for flags, stdin in (
+                (["--to-json"], data), (["--from-json"], trees[path].stdout), ([], data),
+            )
         ])
 
     def test_module_graph_shell_reports_computed_and_missing_paths(self) -> None:
@@ -735,34 +757,6 @@ reason = "Shell option lookalike measured by the graph"
                     "file": "main.sh", "line": 1, "message": f"shell {kind}: target is outside the parser",
                 }])
 
-    def test_module_graph_shell_requires_fields_for_exact_directory_prefixes(self) -> None:
-        self.configure_graph(shell=True)
-        for prefix, quote, field in (
-            ('"$(dirname "$0")"', {"Type": "DblQuoted"}, "Parts"),
-            ('"${BASH_SOURCE%/*}"', shell_quote({"Type": "ParamExp"}), "Exp"),
-        ):
-            with self.subTest(field=field):
-                operand = prefix + "/sibling.sh"
-                script = f"source {operand}\n"
-                self.add_file("main.sh", script)
-                target = operand, [quote, shell_literal("/sibling.sh")]
-                statement = shell_call(1, "source", target, script=script)
-                check = self.shell_graph(1, {"main.sh": shell_tree(statement)})
-                self.assertEqual(check["outcome"], "error")
-                self.assertIn(f"main.sh: shfmt JSON missing field {field}", check["reason"])
-
-    def test_module_graph_shell_requires_args_after_leading_assignment(self) -> None:
-        self.configure_graph(shell=True)
-        script = "value=1 source ./sibling.sh\n"
-        self.add_file("main.sh", script)
-        statement = shell_call(1, "source", "./sibling.sh", script=script)
-        call = statement["Cmd"]
-        call["Assigns"] = [{"End": {"Offset": len("value=1")}}]
-        call["End"] = call.pop("Args")[-1]["End"]
-        check = self.shell_graph(1, {"main.sh": shell_tree(statement)})
-        self.assertEqual(check["outcome"], "error")
-        self.assertIn("main.sh: shfmt JSON missing field Args", check["reason"])
-
     def test_module_graph_shell_schema_errors_name_file_and_field(self) -> None:
         self.configure_graph(shell=True)
         script = 'source "${BASH_SOURCE%/*}"/sibling.sh\n'
@@ -773,7 +767,6 @@ reason = "Shell option lookalike measured by the graph"
         call = statement["Cmd"]
         word, operand = call["Args"]
         for args, detail in (
-            (None, "missing field Args"),
             ([None], "field Args must contain objects"),
             ([{}], "missing field Parts"),
             ([{**word, "Parts": ""}], "field Parts must be list"),
@@ -802,8 +795,6 @@ reason = "Shell option lookalike measured by the graph"
         self.add_file("main.sh", script)
         self.add_file("sibling.sh", "")
         for tree, detail in (
-            ({"Type": "File"}, "missing field Stmts"),
-            ({"Type": "File", "Stmts": [{}]}, "missing field Cmd"),
             ({"Type": "File", "Stmts": [{"Cmd": {}}]}, "missing field Type"),
             ({"Type": "File", "Stmts": [{"Cmd": [], "Redirs": []}]}, "field Cmd must be dict"),
             ({"Type": "File", "Stmts": [{"Cmd": {"Type": "Unknown"}}]},
@@ -814,36 +805,80 @@ reason = "Shell option lookalike measured by the graph"
                 self.assertEqual(check["outcome"], "error")
                 self.assertIn(f"main.sh: shfmt JSON {detail}", check["reason"])
 
-    def test_module_graph_shell_requires_nested_statement_fields(self) -> None:
+    def test_module_graph_shell_rejects_trees_that_drop_source_fields(self) -> None:
         self.configure_graph(shell=True)
-        script = "if true; then source ./sibling.sh; fi\n"
-        self.add_file("main.sh", script)
         self.add_file("sibling.sh", "")
-        command = {
-            "Type": "IfClause", "Cond": [shell_call(1, "true", script=script)],
-            "Then": [shell_call(1, "source", "./sibling.sh", script=script)],
-        }
-        trees = {"main.sh": shell_tree({"Cmd": command}), "sibling.sh": shell_tree()}
-        measurement = self.shell_graph(0, trees)["measurement"]
-        self.assertEqual(measurement["edges"], [edge("main.sh", "sibling.sh", 1, "source")])
-        command.pop("Then")
-        trees["main.sh"] = shell_tree({"Cmd": command})
-        check = self.shell_graph(1, trees)
-        self.assertEqual(check["outcome"], "error")
-        self.assertIn("main.sh: shfmt JSON missing field Then", check["reason"])
-
-    def test_module_graph_shell_block_omission_requires_empty_body(self) -> None:
-        self.configure_graph(shell=True)
-        for body, exit_code in ((" ", 0), (" source ./sibling.sh; ", 1)):
-            with self.subTest(body=body):
-                script = "{" + body + "}\n"
+        source = "source ./sibling.sh"
+        script = source + "\n"
+        statement = shell_call(1, "source", "./sibling.sh", script=script)
+        assigned_script = "value=1 " + script
+        assigned = shell_call(1, "source", "./sibling.sh", script=assigned_script)
+        assigned["Cmd"]["Assigns"] = [{"Value": {"Parts": [shell_literal("1")]}}]
+        redirected = {**statement, "Redirs": [{"Word": {"Parts": [shell_literal("out")]}}]}
+        fixtures = [
+            (script, statement, ("Stmts",), b""),
+            (script, statement, ("Stmts", 0, "Cmd"), b""),
+            (source + " >out\n", redirected, ("Stmts", 0, "Cmd"), b">out\n"),
+            (assigned_script, assigned, ("Stmts", 0, "Cmd", "Args"), b"value=1\n"),
+        ]
+        for kind, prefix, expansion, field in (
+            ("CmdSubst", '"$(dirname "$0")"', {"Stmts": []}, ("Parts",)),
+            ("ParamExp", '"${BASH_SOURCE%/*}"', {"Exp": {"Op": "%"}}, ("Parts", 0, "Exp")),
+            ("ParamExp", '"${BASH_SOURCE%/*}"', {"Exp": {"Op": "%"}}, ("Parts", 0, "Exp", "Op")),
+        ):
+            operand = prefix + "/sibling.sh"
+            script = f"source {operand}\n"
+            word = operand, [shell_quote({"Type": kind, **expansion}), shell_literal("/sibling.sh")]
+            fixtures.append((
+                script, shell_call(1, "source", word, script=script),
+                ("Stmts", 0, "Cmd", "Args", 1, "Parts", 0, *field), b'source ""/sibling.sh\n',
+            ))
+        for kind, operand in (("CmdSubst", f'"$({source})"'), ("ProcSubst", f"<({source})")):
+            script = f"echo {operand}\n"
+            substitution = {"Type": kind, "Stmts": [shell_call(1, "source", "./sibling.sh", script=script)]}
+            parts = [shell_quote(substitution)] if kind == "CmdSubst" else [substitution]
+            path = ("Stmts", 0, "Cmd", "Args", 1, "Parts", 0)
+            if kind == "CmdSubst":
+                path += ("Parts", 0)
+            fixtures.append((
+                script, shell_call(1, "echo", (operand, parts), script=script),
+                (*path, "Stmts"), script.replace(source, "").encode(),
+            ))
+        script = "if true; then " + source + "; fi\n"
+        fixtures.append((
+            script, {"Cmd": {
+                "Type": "IfClause", "Cond": [shell_call(1, "true", script=script)],
+                "Then": [shell_call(1, "source", "./sibling.sh", script=script)],
+            }}, ("Stmts", 0, "Cmd", "Then"), b"if true; then fi\n",
+        ))
+        for script, statement, path, printed in fixtures:
+            with self.subTest(script=script.strip(), field=path[-1]):
                 self.add_file("main.sh", script)
-                block = {"Type": "Block", "Pos": {"Offset": 0}, "End": {"Offset": len(script) - 1}}
-                check = self.shell_graph(exit_code, {"main.sh": shell_tree({"Cmd": block})})
-                if exit_code:
-                    self.assertIn("main.sh: shfmt JSON missing field Stmts", check["reason"])
-                else:
-                    self.assertEqual(check["measurement"]["edges"], [])
+                tree = {"Type": "File", "Stmts": [statement]}
+                trees = {"main.sh": shell_json(tree), "sibling.sh": shell_tree()}
+                check = self.shell_graph(0, trees)
+                self.assertEqual(check["measurement"]["edges"], [edge("main.sh", "sibling.sh", 1, "source")])
+                damaged = deepcopy(tree)
+                node = damaged
+                for key in path[:-1]:
+                    node = node[key]
+                del node[path[-1]]
+                trees["main.sh"] = shell_json(damaged)
+                check = self.shell_graph(1, trees, replay={
+                    "main.sh": runner.RunResult((), "completed", 0, stdout=printed),
+                })
+                self.assertEqual(check["outcome"], "error")
+                self.assertIn("main.sh: shfmt parser tree does not reproduce the file", check["reason"])
+                self.assertNotIn("measurement", check)
+
+    def test_module_graph_shell_fails_when_shfmt_cannot_print_json(self) -> None:
+        self.configure_graph(shell=True)
+        self.add_file("main.sh", "true\n")
+        failure = runner.RunResult((), "completed", 2, stderr=b"flag provided but not defined: -from-json")
+        check = self.shell_graph(1, {"main.sh": shell_tree()}, replay={"main.sh": failure})
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("main.sh: shfmt parser tree does not reproduce the file", check["reason"])
+        self.assertIn("flag provided but not defined: -from-json", check["reason"])
 
     def test_module_graph_shell_accepts_omitted_empty_fields(self) -> None:
         self.configure_graph(shell=True)

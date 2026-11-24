@@ -266,7 +266,8 @@ def _run_module_graph(context: AdapterContext) -> Any:
         elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}
         measurement, cycles, suite_edges, program_edges = module_graph.measure(
             context.root, python_modules, check.spec, elisp=elisp, shell_modules=shell_modules,
-            parse_shell=partial(_parse_shell, required_fields=lambda _node: {}), test_sources=test_sources,
+            parse_shell=partial(_parse_shell, required_fields=lambda _node: {}, verify_reproduction=True),
+            test_sources=test_sources,
         )
     except (GateError, ValueError) as error:
         return _ratchet_error(check, start, context.prefix, error)
@@ -358,13 +359,15 @@ def _comments_problems(findings: list[comments.Finding], errors: list[comments.R
     return [text for _, _, text in ordered]
 
 
-def _parse_shell(content: bytes, filename: str, required_fields: Callable) -> dict[str, Any]:
+def _parse_shell(
+    content: bytes, filename: str, required_fields: Callable, *, verify_reproduction: bool = False,
+) -> dict[str, Any]:
     mark_step(f"shfmt parsing {filename}")
     try:
         return shell_syntax.parse(
             content, filename, required_fields,
             tool_binary=tool_binary, run=run, execution_outcome=execution_outcome,
-            remaining_budget=remaining_budget,
+            remaining_budget=remaining_budget, verify_reproduction=verify_reproduction,
         )
     except (GateError, OSError) as error:
         raise ValueError(f"{filename}: cannot run shfmt: {error}") from error

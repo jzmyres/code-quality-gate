@@ -407,70 +407,45 @@ _SHELL_SCHEMA = {
     "ExtGlob": {},
 }
 
-_SHELL_TRIVIA = re.compile(rb"(?:[ \t\r\n]|#[^\n]*(?=\n|\Z)|\\\r?\n)*")
-
-
-def _shell_assignment_only(fields: _ShellFields, node: dict) -> bool:
-    assigns = fields.read(node, "Assigns", list, "CallExpr")
-    return bool(assigns) and (
-        fields.read(node, "End.Offset", int) == fields.read(assigns[-1], "End.Offset", int)
-    )
-
-
-def _shell_allows_omission(fields: _ShellFields, node: dict, condition: str) -> bool:
-    match condition:
-        case "empty file":
-            return _SHELL_TRIVIA.fullmatch(fields.content) is not None
-        case "empty block":
-            start = fields.read(node, "Pos.Offset", int) + 1
-            end = fields.read(node, "End.Offset", int) - 1
-            return _SHELL_TRIVIA.fullmatch(fields.content, start, end) is not None
-        case "redirect only":
-            return bool(fields.read(node, "Redirs", list, "Stmt"))
-        case "assignment only":
-            return _shell_assignment_only(fields, node)
-    raise AssertionError(f"unsupported shfmt omission condition {condition!r}")
-
-
 _SHELL_OPTIONAL_FIELDS = {
-    ("File", "Stmts"): ([], "empty file"),
-    ("Stmt", "Cmd"): (None, "redirect only"),
-    ("Stmt", "Redirs"): ([], None),
-    ("CallExpr", "Assigns"): ([], None),
-    ("CallExpr", "Args"): ([], "assignment only"),
-    ("Assign", "Index"): (None, None),
-    ("Assign", "Value"): (None, None),
-    ("Assign", "Array"): (None, None),
-    ("Redirect", "Hdoc"): (None, None),
-    ("Block", "Stmts"): ([], "empty block"),
-    ("Subshell", "Stmts"): ([], "empty block"),
-    ("IfClause", "Else"): (None, None),
-    ("ElseClause", "Cond"): ([], None),
-    ("ElseClause", "Else"): (None, None),
-    ("WordIter", "Items"): ([], None),
-    ("CStyleLoop", "Init"): (None, None),
-    ("CStyleLoop", "Cond"): (None, None),
-    ("CStyleLoop", "Post"): (None, None),
-    ("DblQuoted", "Parts"): ([], None),
-    ("CmdSubst", "Stmts"): ([], None),
-    ("ProcSubst", "Stmts"): ([], None),
-    ("ParamExp", "Index"): (None, None),
-    ("ParamExp", "Slice"): (None, None),
-    ("ParamExp", "Repl"): (None, None),
-    ("ParamExp", "Exp"): (None, None),
-    ("Slice", "Offset"): (None, None),
-    ("Slice", "Length"): (None, None),
-    ("Replace", "Orig"): (None, None),
-    ("Replace", "With"): (None, None),
-    ("Expansion", "Word"): (None, None),
-    ("CaseClause", "Items"): ([], None),
-    ("CaseItem", "Stmts"): ([], None),
-    ("DeclClause", "Args"): ([], None),
-    ("ArrayExpr", "Elems"): ([], None),
-    ("ArrayElem", "Index"): (None, None),
-    ("ArrayElem", "Value"): (None, None),
-    ("TimeClause", "Stmt"): (None, None),
-    ("CoprocClause", "Name"): (None, None),
+    ("File", "Stmts"): [],
+    ("Stmt", "Cmd"): None,
+    ("Stmt", "Redirs"): [],
+    ("CallExpr", "Assigns"): [],
+    ("CallExpr", "Args"): [],
+    ("Assign", "Index"): None,
+    ("Assign", "Value"): None,
+    ("Assign", "Array"): None,
+    ("Redirect", "Hdoc"): None,
+    ("Block", "Stmts"): [],
+    ("Subshell", "Stmts"): [],
+    ("IfClause", "Else"): None,
+    ("ElseClause", "Cond"): [],
+    ("ElseClause", "Else"): None,
+    ("WordIter", "Items"): [],
+    ("CStyleLoop", "Init"): None,
+    ("CStyleLoop", "Cond"): None,
+    ("CStyleLoop", "Post"): None,
+    ("DblQuoted", "Parts"): [],
+    ("CmdSubst", "Stmts"): [],
+    ("ProcSubst", "Stmts"): [],
+    ("ParamExp", "Index"): None,
+    ("ParamExp", "Slice"): None,
+    ("ParamExp", "Repl"): None,
+    ("ParamExp", "Exp"): None,
+    ("Slice", "Offset"): None,
+    ("Slice", "Length"): None,
+    ("Replace", "Orig"): None,
+    ("Replace", "With"): None,
+    ("Expansion", "Word"): None,
+    ("CaseClause", "Items"): [],
+    ("CaseItem", "Stmts"): [],
+    ("DeclClause", "Args"): [],
+    ("ArrayExpr", "Elems"): [],
+    ("ArrayElem", "Index"): None,
+    ("ArrayElem", "Value"): None,
+    ("TimeClause", "Stmt"): None,
+    ("CoprocClause", "Name"): None,
 }
 
 
@@ -482,12 +457,10 @@ class _ShellFields:
     def error(self, detail: str) -> ValueError:
         return ValueError(f"{self.source}: shfmt JSON {detail}")
 
-    def missing(self, node: dict, field: str, kind: str) -> Any:
+    def missing(self, field: str, kind: str) -> Any:
         key = kind, field
         if key in _SHELL_OPTIONAL_FIELDS:
-            empty, condition = _SHELL_OPTIONAL_FIELDS[key]
-            if condition is None or _shell_allows_omission(self, node, condition):
-                return empty
+            return _SHELL_OPTIONAL_FIELDS[key]
         raise self.error(f"missing field {field}")
 
     def read(self, node: dict, field: str, expected: type, kind: str = "") -> Any:
@@ -497,7 +470,7 @@ class _ShellFields:
         try:
             value = node[key]
         except KeyError:
-            return self.missing(node, field, kind)
+            return self.missing(field, kind)
         return self.checked(value, field, expected)
 
     def checked(self, value: Any, field: str, expected: type) -> Any:

@@ -39,7 +39,7 @@ def _require_time(filename: str, remaining: float) -> None:
         raise ValueError(f"{filename}: shfmt deadline exceeded")
 
 
-def _output(result: Any, filename: str, execution_outcome: Callable[[str], Any]) -> bytes:
+def _output(result: Any, filename: str, execution_outcome: Callable[[str], Any], failure: str) -> bytes:
     outcome = execution_outcome(result.execution)
     if outcome.budget:
         _require_time(filename, 0)
@@ -47,7 +47,7 @@ def _output(result: Any, filename: str, execution_outcome: Callable[[str], Any])
         raise ValueError(f"{filename}: cannot run shfmt: {result.error}")
     if not outcome.completed or result.returncode != 0:
         detail = result.stderr_text.strip() or f"{result.execution}, exit {result.returncode}"
-        raise ValueError(f"{filename}: shfmt parse failed: {detail}")
+        raise ValueError(f"{filename}: {failure}: {detail}")
     return result.stdout
 
 
@@ -55,17 +55,27 @@ def parse(
     content: bytes, filename: str, required_fields: Callable[[dict[str, Any]], dict[str, type]],
     *, tool_binary: Callable[[str], Path], run: Callable[..., Any],
     execution_outcome: Callable[[str], Any], remaining_budget: Callable[[float], float],
-    budget: int = 30,
+    budget: int = 30, verify_reproduction: bool = False,
 ) -> dict[str, Any]:
     """Parse bytes and validate the caller's required dotted fields for each object."""
+
+    def invoke(data: bytes, *flags: str, failure: str = "shfmt parse failed") -> bytes:
+        _require_time(filename, remaining_budget(budget))
+        result = run(
+            [str(binary), *flags, "-ln=bash", "--filename", filename],
+            stdin=data, budget_seconds=budget, capture_limit=None,
+        )
+        _require_time(filename, remaining_budget(budget))
+        return _output(result, filename, execution_outcome, failure)
+
     _require_time(filename, remaining_budget(budget))
     binary = tool_binary("shfmt").absolute()
-    _require_time(filename, remaining_budget(budget))
-    result = run(
-        [str(binary), "--to-json", "-ln=bash", "--filename", filename],
-        stdin=content, budget_seconds=budget, capture_limit=None,
-    )
-    _require_time(filename, remaining_budget(budget))
-    tree = _decode_tree(_output(result, filename, execution_outcome), filename, required_fields)
+    encoded = invoke(content, "--to-json")
+    tree = _decode_tree(encoded, filename, required_fields)
+    if verify_reproduction:
+        failure = "shfmt parser tree does not reproduce the file"
+        reproduced = invoke(encoded, "--from-json", failure=failure)
+        if reproduced != invoke(content):
+            raise ValueError(f"{filename}: {failure}")
     _require_time(filename, remaining_budget(budget))
     return tree
