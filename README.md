@@ -372,20 +372,22 @@ code assigns or destructures a loader into an alias, the diagnostic points to th
 original loader spelling. Later references using only the alias and dynamic namespace
 writes are outside the static analysis.
 
-Shell files are parsed by the shared shfmt reader. A literal path argument to
-`source` or `.` gives a `source` edge. A literal command name containing `/`
+The graph parses files classified as shell by the inventory using the shared shfmt reader.
+A literal path argument to `source` or `.` gives a `source` edge. A literal command name containing `/`
 or a literal script argument to `bash` or `sh` gives an `execute` edge.
 Relative paths resolve from the calling script's directory and can identify a measured
-module in any language. The reader also recognizes a `$(dirname "$0")` or
-`${BASH_SOURCE%/*}` prefix, including `${BASH_SOURCE[0]%/*}`, followed by a
-slash and a literal name.
+module in any language.
 
-A literal target consists of unquoted parts free of `{`, `}`, `*`, `?`, and `[`, or quoted
-parts free of expansions and substitutions. Targets with other expansions, substitutions,
-or globs and `bash` or `sh` calls with a leading option are reported as outside the parser
-in `outside_extractor` with the calling file and line. A literal path without a measured
-target is reported there as unresolved and includes the path. Shell syntax and shfmt schema
-errors fail the check and name the affected file. Schema errors also name the affected field.
+A literal target must be a single unquoted shfmt literal that matches the original source
+bytes and the character class `[A-Za-z0-9._/+-]+`. It cannot start with `-`.
+The exact script-directory prefixes `"$(dirname "$0")"` and `"${BASH_SOURCE%/*}"`
+are also accepted when followed by a slash and an unquoted suffix in the same character class.
+The graph reports other quoted, expanded, globbed, or unsupported targets as outside the parser.
+It reports the same diagnostic for `source` and `.` with a dash-prefixed first operand
+and for `bash` and `sh` with an option before the script. These diagnostics appear in
+`outside_extractor` with the calling file and line. A literal path without a measured target
+is reported there as unresolved and includes the path. Shell syntax and shfmt schema errors
+fail the check and name the affected file. Schema errors also name the affected field.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends

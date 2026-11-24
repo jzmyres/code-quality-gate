@@ -15,6 +15,8 @@ from pathlib import Path
 from runpy import run_path
 from tokenize import open as open_source
 
+from .shell_syntax import _check_fields
+
 
 @dataclass(frozen=True)
 class GraphSpec:
@@ -359,60 +361,30 @@ def _python_edges(
         yield from _source_edges(root, module, paths, literal_paths, shadow_modules, outside)
 
 
-_SHELL_STATEMENT_MODIFIERS = {"Redirs": list, "Negated": bool, "Background": bool, "Coprocess": bool}
-
-
-def _shell_field_present(node: object, path: str) -> bool:
-    for key in path.split("."):
-        if not isinstance(node, dict) or key not in node:
-            return False
-        node = node[key]
-    return True
-
-
-def _present_shell_fields(node: dict, fields: dict[str, type]) -> dict[str, type]:
-    return {
-        field: expected for field, expected in fields.items()
-        if _shell_field_present(node, field.rpartition(".")[0] or field)
-    }
-
-
-_SHELL_SCHEMAS = {
-    "CallExpr": ({"Pos.Line": int}, {"Args": list, "Assigns": list}, {"Args": list}),
-    "CmdSubst": ({}, {"Stmts": list, "TempFile": bool, "ReplyVar": bool}, {}),
-    "DblQuoted": ({}, {"Parts": list, "Dollar": bool}, {}),
-    "Lit": ({"Value": str}, {}, {}),
-    "ParamExp": (
-        {"Param.Value": str},
-        {"Short": bool, "Excl": bool, "Index.Type": str, "Exp.Op": str, "Exp.Word.Parts": list},
-        {},
-    ),
-    "SglQuoted": ({}, {"Value": str, "Dollar": bool}, {}),
-    "Word": ({"Parts": list}, {}, {}),
-}
-
-
-def _shell_statement_fields(node: dict) -> dict[str, type]:
-    if "Cmd" not in node:
-        return {}
-    return {"Cmd.Type": str, **_present_shell_fields(node, _SHELL_STATEMENT_MODIFIERS)}
+_SHELL_FIELDS = {"CallExpr": {"Pos.Line": int, "Args": list}, "Lit": {"Value": str}}
+_SHELL_WORD_FIELDS = {"Parts": list, "Pos.Offset": int, "End.Offset": int}
 
 
 def _shell_fields(node: dict) -> dict[str, type]:
-    kind = node.get("Type", "")
-    if not isinstance(kind, str):
-        return {"Type": str}
-    required, optional, required_without_assigns = _SHELL_SCHEMAS.get(kind, ({}, {}, {}))
-    fields = {**required, **_present_shell_fields(node, optional), **_shell_statement_fields(node)}
-    if "Assigns" not in node:
-        fields.update(required_without_assigns)
-    return fields
+    match node:
+        case {"Cmd": _}:
+            return {"Cmd.Type": str}
+        case {"Type": "CallExpr", "Assigns": _} if "Args" not in node:
+            return {"Pos.Line": int, "Assigns": list}
+        case {"Type": "ParamExp", "Exp": _}:
+            return {"Exp.Op": str}
+        case {"Type": str() as kind}:
+            return _SHELL_FIELDS.get(kind, {})
+        case {"Type": _}:
+            return {"Type": str}
+        case _:
+            return {}
 
 
 def _read_shell(
     root: Path, sources: Sequence[str], parse_shell: Callable[..., dict] | None,
-) -> dict[str, dict]:
-    trees = {}
+) -> dict[str, tuple[bytes, dict]]:
+    scripts = {}
     for source in sources:
         if parse_shell is None:
             raise ValueError(f"{source}: shell parser is required")
@@ -420,12 +392,16 @@ def _read_shell(
             content = (root / source).read_bytes()
         except OSError as error:
             raise ValueError(f"cannot read {source}: {error}") from error
-        trees[source] = parse_shell(content, source, _shell_fields)
-    return trees
+        scripts[source] = content, parse_shell(content, source, _shell_fields)
+    return scripts
 
 
-def _shell_calls(tree: dict, source: str) -> list[dict]:
-    calls = []
+def _check_shell_parts(node: dict, source: str) -> None:
+    for part in _check_fields(node, {"Parts": list}, source)["Parts"]:
+        _check_fields(part, {"Type": str}, source)
+
+
+def _shell_calls(tree: dict, source: str) -> Iterator[dict]:
     pending = [tree]
     while pending:
         node = pending.pop()
@@ -433,149 +409,82 @@ def _shell_calls(tree: dict, source: str) -> list[dict]:
             pending.extend(reversed(node))
         if isinstance(node, dict):
             if "Parts" in node:
-                _check_shell_parts(node["Parts"], source)
+                _check_shell_parts(node, source)
             if node.get("Type") == "CallExpr":
-                _check_shell_words(node.get("Args", ()), source)
-                calls.append(node)
+                yield node
             pending.extend(reversed(node.values()))
-    return calls
 
 
-_UNQUOTED_SHELL_EXPANSION = re.compile(r"^~|[{}*?\[]")
-_SHELL_ESCAPE = re.compile(r"\\(.)", re.DOTALL)
-_DOUBLE_QUOTED_ESCAPE = re.compile(r'\\(["\\$\x60])')
-_SHELL_DIRECTORY_SUFFIX = re.compile(r"/.+", re.DOTALL)
+_SHELL_PATH_CHARS = rb"[A-Za-z0-9._/+-]+"
+_SHELL_PATH = re.compile(rb"(?!-)" + _SHELL_PATH_CHARS)
+_SHELL_DIRECTORY_TAIL = re.compile(rb"/" + _SHELL_PATH_CHARS)
+_SHELL_POSSIBLE_RUN = re.compile(rb"[/{}*?\[]|^~|=~")
+_SHELL_DIRNAME = b'"$(dirname "$0")"'
+_SHELL_BASH_SOURCE = b'"${BASH_SOURCE%/*}"'
+_SHELL_ARGUMENT_COMMANDS = {b"source": "source", b".": "source", b"bash": "execute", b"sh": "execute"}
 
 
-def _check_shell_words(words: Sequence[dict], source: str) -> None:
-    for word in words:
-        if not isinstance(word, dict) or "Parts" not in word:
-            raise ValueError(f"{source}: shfmt JSON missing field Parts")
+def _shell_spelling(word: dict, content: bytes) -> bytes:
+    start, end = word["Pos"]["Offset"], word["End"]["Offset"]
+    return content[start:end] if 0 <= start < end <= len(content) else b""
 
 
-def _check_shell_parts(parts: object, source: str) -> None:
-    if not isinstance(parts, list):
-        raise ValueError(f"{source}: shfmt JSON field Parts must be list")
-    for part in parts:
-        if not isinstance(part, dict) or "Type" not in part:
-            raise ValueError(f"{source}: shfmt JSON missing word part field Type")
-
-
-def _shell_literal_parts(parts: list[dict], quoted: bool = False) -> Iterator[tuple[dict, bool]]:
-    for part in parts:
-        match part:
-            case {"Type": "DblQuoted", "Parts": children} if not part.get("Dollar"):
-                yield from _shell_literal_parts(children, quoted=True)
-            case _:
-                yield part, quoted
-
-
-def _shell_literal_fragment(part: dict, quoted: bool) -> tuple[str, str] | None:
-    match part:
-        case {"Type": "Lit", "Value": value} if quoted:
-            return _DOUBLE_QUOTED_ESCAPE.sub(r"\1", value), "\0"
-        case {"Type": "Lit", "Value": value}:
-            return _SHELL_ESCAPE.sub(r"\1", value), value
-        case {"Type": "SglQuoted"} if not part.get("Dollar"):
-            return part.get("Value", ""), "\0"
-        case {"Type": "DblQuoted"} if not part.get("Dollar"):
-            return "", "\0"
-        case _:
-            return None
-
-
-def _shell_literal(parts: list[tuple[dict, bool]]) -> str | None:
-    values, patterns = [], []
-    for part, quoted in parts:
-        fragment = _shell_literal_fragment(part, quoted)
-        if fragment is None:
-            return None
-        value, pattern = fragment
-        values.append(value)
-        patterns.append(pattern)
-    if _UNQUOTED_SHELL_EXPANSION.search("".join(patterns)):
-        return None
-    return "".join(values)
-
-
-def _shell_dirname(part: dict) -> bool:
-    if {"TempFile", "ReplyVar"} & part.keys():
-        return False
-    match part:
-        case {"Type": "CmdSubst", "Stmts": [{"Cmd": {"Type": "CallExpr", "Args": [
-            {"Parts": [{"Type": "Lit", "Value": "dirname"}]},
-            {"Parts": [{"Type": "DblQuoted", "Parts": [
-                {"Type": "ParamExp", "Short": True, "Param": {"Value": "0"}},
-            ]} as argument]},
-        ]} as call} as statement]}:
-            return (
-                "Dollar" not in argument and "Assigns" not in call
-                and not _SHELL_STATEMENT_MODIFIERS.keys() & statement.keys()
-            )
+def _shell_literal(word: dict, spelling: bytes) -> bool:
+    match word["Parts"]:
+        case [{"Type": "Lit", "Value": value}]:
+            return bool(spelling) and spelling == value.encode()
         case _:
             return False
 
 
-def _shell_bash_source(part: dict) -> bool:
-    match part:
-        case {"Type": "ParamExp", "Param": {"Value": "BASH_SOURCE"},
-              "Exp": {"Op": "%", "Word": {"Parts": [{"Type": "Lit", "Value": "/*"}]}}}:
-            if part.get("Excl"):
-                return False
-            match part.get("Index"):
-                case None | {"Type": "Word", "Parts": [{"Type": "Lit", "Value": "0"}]}:
-                    return True
-                case _:
-                    return False
+def _shell_directory_spelling(quote: dict, tail: bytes) -> bytes | None:
+    match quote:
+        case {"Type": "DblQuoted", "Parts": [{"Type": "CmdSubst"}]}:
+            return _SHELL_DIRNAME + tail
+        case {"Type": "DblQuoted", "Parts": [{"Type": "ParamExp", "Exp": {"Op": "%"}}]}:
+            return _SHELL_BASH_SOURCE + tail
         case _:
-            return False
+            return None
 
 
-def _shell_target(parts: list[tuple[dict, bool]]) -> str | None:
-    if not parts or not (_shell_dirname(parts[0][0]) or _shell_bash_source(parts[0][0])):
-        return _shell_literal(parts)
-    suffix = _shell_literal(parts[1:])
-    return f".{suffix}" if suffix is not None and _SHELL_DIRECTORY_SUFFIX.fullmatch(suffix) else None
-
-
-_SHELL_ARGUMENT_COMMANDS = {"source": "source", ".": "source", "bash": "execute", "sh": "execute"}
-
-
-def _shell_argument(command: str, args: list[dict]) -> tuple[str, str | None] | None:
-    if len(args) < 2:
-        return None
-    kind = _SHELL_ARGUMENT_COMMANDS[command]
-    target = _shell_target(list(_shell_literal_parts(args[1]["Parts"])))
-    if kind == "execute" and target is not None and target.startswith("-"):
-        return kind, None
-    return kind, target
-
-
-def _shell_dependency(call: dict) -> tuple[str, str | None] | None:
-    args = call.get("Args", ())
-    if not args:
-        return None
-    head = list(_shell_literal_parts(args[0]["Parts"]))
-    command = _shell_literal(head)
-    if command in _SHELL_ARGUMENT_COMMANDS:
-        return _shell_argument(command, args)
-    if command is None:
-        return "execute", _shell_target(head)
-    if "/" in command:
-        return "execute", command
+def _shell_target(word: dict, spelling: bytes) -> str | None:
+    if _SHELL_PATH.fullmatch(spelling) and _shell_literal(word, spelling):
+        return spelling.decode("ascii")
+    match word["Parts"]:
+        case [quote, {"Type": "Lit", "Value": value}]:
+            tail = value.encode()
+            if _SHELL_DIRECTORY_TAIL.fullmatch(tail) and spelling == _shell_directory_spelling(quote, tail):
+                return "." + tail.decode("ascii")
     return None
 
 
-def _shell_dependencies(shell: dict[str, dict]) -> Iterator[tuple[str, int, str, str | None]]:
-    for source, tree in shell.items():
+def _shell_dependency(call: dict, content: bytes) -> tuple[str, str | None] | None:
+    args = call.get("Args", ())
+    if not args:
+        return None
+    head = _shell_spelling(args[0], content)
+    if not _shell_literal(args[0], head):
+        return "execute", _shell_target(args[0], head)
+    match _SHELL_ARGUMENT_COMMANDS.get(head):
+        case str() as kind if len(args) > 1:
+            return kind, _shell_target(args[1], _shell_spelling(args[1], content))
+        case None if _SHELL_POSSIBLE_RUN.search(head):
+            return "execute", _shell_target(args[0], head)
+    return None
+
+
+def _shell_dependencies(shell: dict[str, tuple[bytes, dict]]) -> Iterator[tuple[str, int, str, str | None]]:
+    for source, (content, tree) in shell.items():
         for call in _shell_calls(tree, source):
-            dependency = _shell_dependency(call)
+            for word in call.get("Args", ()):
+                _check_fields(word, _SHELL_WORD_FIELDS, source)
+            dependency = _shell_dependency(call, content)
             if dependency is not None:
                 yield source, call["Pos"]["Line"], *dependency
 
 
 def _shell_edges(
-    root: Path, shell: dict[str, dict], paths: dict[str, str], outside: list[dict],
+    root: Path, shell: dict[str, tuple[bytes, dict]], paths: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
     for source, line, kind, operand in _shell_dependencies(shell):
         target = _measured_path(root, source, paths, operand) if operand else None
@@ -594,7 +503,7 @@ def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[st
 
 def _graph_edges(
     root: Path, modules: list[str], python_modules: list[str],
-    elisp: dict[str, list[dict]], shell: dict[str, dict], outside: list[dict],
+    elisp: dict[str, list[dict]], shell: dict[str, tuple[bytes, dict]], outside: list[dict],
 ) -> list[Edge]:
     resolved_root = root.resolve()
     paths = {str(resolved_root / module): module for module in modules}

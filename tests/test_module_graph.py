@@ -33,12 +33,18 @@ def shell_quote(*parts: str | dict) -> dict:
     }
 
 
-def shell_call(line: int, *words: str | list[dict]) -> dict:
-    return {"Cmd": {
-        "Type": "CallExpr",
-        "Pos": {"Line": line},
-        "Args": [{"Parts": [shell_literal(word)] if isinstance(word, str) else word} for word in words],
-    }}
+def shell_call(line: int, *words: str | tuple[str, list[dict]], script: str) -> dict:
+    lines = script.encode().splitlines(keepends=True)
+    offset = sum(map(len, lines[:line - 1]))
+    cursor = 0
+    args = []
+    for word in words:
+        spelling, parts = (word, [shell_literal(word)]) if isinstance(word, str) else word
+        raw = spelling.encode()
+        start = lines[line - 1].index(raw, cursor)
+        cursor = start + len(raw)
+        args.append({"Parts": parts, "Pos": {"Offset": offset + start}, "End": {"Offset": offset + cursor}})
+    return {"Cmd": {"Type": "CallExpr", "Pos": {"Line": line}, "Args": args}}
 
 
 def shell_tree(*statements: dict) -> runner.RunResult:
@@ -535,84 +541,56 @@ reason = "package measured by the graph"
 
     def test_module_graph_shell_literal_paths(self) -> None:
         self.configure_graph(shell=True)
-        self.add_file("scripts/main.sh", r"""source sibling.sh
+        script = """value=café
+source sibling.sh
 . ./sibling.sh
-source "$(dirname "$0")/sibling.sh"
-. "${BASH_SOURCE[0]%/*}/sibling.sh"
+source "$(dirname "$0")"/sibling.sh
+. "${BASH_SOURCE%/*}"/sibling.sh
 bash ./sibling.sh
-if true; then sh "./sibling.sh"; fi
+if true; then sh ./sibling.sh; fi
 ./sibling.sh
-source './with space.sh'
-source './literal*.sh'
-source ./"sibling".sh
-"${BASH_SOURCE%/*}"/sibling.sh
-bash -c true
+"$(dirname "$0")"/sibling.sh
 sh
-""")
-        self.add_file("scripts/sibling.sh", "value=1\n")
-        self.add_file("scripts/with space.sh", "")
-        self.add_file("scripts/literal*.sh", "")
-        dirname = {
-            "Type": "CmdSubst",
-            "Stmts": [shell_call(3, "dirname", [shell_quote({
-                "Type": "ParamExp", "Short": True, "Param": {"Value": "0"},
-            })])],
-        }
-        bash_source = {
-            "Type": "ParamExp",
-            "Param": {"Value": "BASH_SOURCE"},
-            "Exp": {"Op": "%", "Word": {"Parts": [shell_literal("/*")]}},
-        }
-        indexed_source = {**bash_source, "Index": {"Type": "Word", "Parts": [shell_literal("0")]}}
+"""
+        self.add_file("scripts/main.sh", script)
+        self.add_file("scripts/sibling.sh", "")
+        dirname = {"Type": "CmdSubst"}
+        bash_source = {"Type": "ParamExp", "Exp": {"Op": "%"}}
+        dirname_word = ('"$(dirname "$0")"/sibling.sh', [shell_quote(dirname), shell_literal("/sibling.sh")])
+        source_word = (
+            '"${BASH_SOURCE%/*}"/sibling.sh', [shell_quote(bash_source), shell_literal("/sibling.sh")],
+        )
         measurement = self.shell_graph(0, {
             "scripts/main.sh": shell_tree(
-                shell_call(1, "source", "sibling.sh"),
-                shell_call(2, ".", "./sibling.sh"),
-                shell_call(3, "source", [shell_quote(dirname, "/sibling.sh")]),
-                shell_call(4, ".", [shell_quote(indexed_source, "/sibling.sh")]),
-                shell_call(5, "bash", "./sibling.sh"),
-                {"Cmd": {"Type": "IfClause", "Cond": [shell_call(6, "true")],
-                         "Then": [shell_call(6, "sh", [shell_quote("./sibling.sh")])]}},
-                shell_call(7, "./sibling.sh"),
-                shell_call(8, "source", [{"Type": "SglQuoted", "Value": "./with space.sh"}]),
-                shell_call(9, "source", [{"Type": "SglQuoted", "Value": "./literal*.sh"}]),
-                shell_call(10, "source", [shell_literal("./"), shell_quote("sibling"), shell_literal(".sh")]),
-                shell_call(11, [shell_quote(bash_source), shell_literal("/sibling.sh")]),
-                shell_call(12, "bash", "-c", "true"),
-                shell_call(13, "sh"),
+                {"Cmd": {"Type": "CallExpr", "Pos": {"Line": 1}, "Assigns": [{"Name": {"Value": "value"}}]}},
+                shell_call(2, "source", "sibling.sh", script=script),
+                shell_call(3, ".", "./sibling.sh", script=script),
+                shell_call(4, "source", dirname_word, script=script),
+                shell_call(5, ".", source_word, script=script),
+                shell_call(6, "bash", "./sibling.sh", script=script),
+                {"Cmd": {"Type": "IfClause", "Cond": [shell_call(7, "true", script=script)],
+                         "Then": [shell_call(7, "sh", "./sibling.sh", script=script)]}},
+                shell_call(8, "./sibling.sh", script=script),
+                shell_call(9, dirname_word, script=script),
+                shell_call(10, "sh", script=script),
             ),
-            "scripts/sibling.sh": shell_tree({"Cmd": {
-                "Type": "CallExpr", "Pos": {"Line": 1}, "Assigns": [{"Name": {"Value": "value"}}],
-            }}),
-            "scripts/with space.sh": shell_tree(),
-            "scripts/literal*.sh": shell_tree(),
+            "scripts/sibling.sh": shell_tree(),
         })["measurement"]
         self.assertEqual(measurement["edges"], [
-            edge("scripts/main.sh", target, line, kind)
-            for target, line, kind in (
-                ("scripts/literal*.sh", 9, "source"),
-                ("scripts/sibling.sh", 1, "source"),
-                ("scripts/sibling.sh", 2, "source"),
-                ("scripts/sibling.sh", 3, "source"),
-                ("scripts/sibling.sh", 4, "source"),
-                ("scripts/sibling.sh", 5, "execute"),
-                ("scripts/sibling.sh", 6, "execute"),
-                ("scripts/sibling.sh", 7, "execute"),
-                ("scripts/sibling.sh", 10, "source"),
-                ("scripts/sibling.sh", 11, "execute"),
-                ("scripts/with space.sh", 8, "source"),
+            edge("scripts/main.sh", "scripts/sibling.sh", line, kind)
+            for line, kind in (
+                (2, "source"), (3, "source"), (4, "source"), (5, "source"),
+                (6, "execute"), (7, "execute"), (8, "execute"), (9, "execute"),
             )
         ])
-        self.assertEqual(measurement["outside_extractor"], [
-            {"file": "scripts/main.sh", "line": 12, "message": "shell execute: target is outside the parser"},
-        ])
+        self.assertNotIn("outside_extractor", measurement)
 
     def test_module_graph_shell_uses_shared_parser_for_inventory_shell_files(self) -> None:
         self.configure_graph(shell=True)
         content = "#!/bin/sh\ntrue\n"
         self.add_file("script.py", content)
         self.add_file("sibling.sh", "")
-        trees = {"script.py": shell_tree(shell_call(2, "true")), "sibling.sh": shell_tree()}
+        trees = {"script.py": shell_tree(shell_call(2, "true", script=content)), "sibling.sh": shell_tree()}
         with self.mock_shell_parser(trees) as run:
             check = self.graph(0)
         self.assertEqual(check["measurement"]["modules"], ["a.py", "script.py", "sibling.sh"])
@@ -627,7 +605,7 @@ sh
 
     def test_module_graph_shell_reports_computed_and_missing_paths(self) -> None:
         self.configure_graph(shell=True)
-        self.add_file("scripts/main.sh", """source "$dir/sibling.sh"
+        script = """source "$dir/sibling.sh"
 . "$(printf .)/sibling.sh"
 bash ./sib*.sh
 ./$name
@@ -636,23 +614,36 @@ source ./absent.sh
 source ./foo{a,{b}}.sh
 bash -e "$dir/sibling.sh"
 sh -- ./sibling.sh
-""")
+source './sibling.sh'
+source "$(dirname "$0")/sibling.sh"
+. "${BASH_SOURCE[0]%/*}"/sibling.sh
+"""
+        self.add_file("scripts/main.sh", script)
         self.add_file("scripts/sibling.sh", "")
         self.add_file("scripts/foo{a,{b}}.sh", "")
         directory = {"Type": "ParamExp", "Short": True, "Param": {"Value": "dir"}}
-        substitution = {"Type": "CmdSubst", "Stmts": [shell_call(2, "printf", ".")]}
+        variable_word = ('"$dir/sibling.sh"', [shell_quote(directory, "/sibling.sh")])
+        substitution = {"Type": "CmdSubst"}
         name = {"Type": "ParamExp", "Short": True, "Param": {"Value": "name"}}
+        bash_source = {"Type": "ParamExp", "Exp": {"Op": "%"}}
+        quoted_suffix = ('"$(dirname "$0")/sibling.sh"', [shell_quote(substitution, "/sibling.sh")])
         measurement = self.shell_graph(0, {
             "scripts/main.sh": shell_tree(
-                shell_call(1, "source", [shell_quote(directory, "/sibling.sh")]),
-                shell_call(2, ".", [shell_quote(substitution, "/sibling.sh")]),
-                shell_call(3, "bash", "./sib*.sh"),
-                shell_call(4, [shell_literal("./"), name]),
-                shell_call(5, "source", "../README.md"),
-                shell_call(6, "source", "./absent.sh"),
-                shell_call(7, "source", "./foo{a,{b}}.sh"),
-                shell_call(8, "bash", "-e", [shell_quote(directory, "/sibling.sh")]),
-                shell_call(9, "sh", "--", "./sibling.sh"),
+                shell_call(1, "source", variable_word, script=script),
+                shell_call(2, ".", ('"$(printf .)/sibling.sh"', [shell_quote(substitution, "/sibling.sh")]),
+                           script=script),
+                shell_call(3, "bash", "./sib*.sh", script=script),
+                shell_call(4, ("./$name", [shell_literal("./"), name]), script=script),
+                shell_call(5, "source", "../README.md", script=script),
+                shell_call(6, "source", "./absent.sh", script=script),
+                shell_call(7, "source", "./foo{a,{b}}.sh", script=script),
+                shell_call(8, "bash", "-e", variable_word, script=script),
+                shell_call(9, "sh", "--", "./sibling.sh", script=script),
+                shell_call(10, "source", ("'./sibling.sh'", [{"Type": "SglQuoted", "Value": "./sibling.sh"}]),
+                           script=script),
+                shell_call(11, "source", quoted_suffix, script=script),
+                shell_call(12, ".", ('"${BASH_SOURCE[0]%/*}"/sibling.sh',
+                           [shell_quote(bash_source), shell_literal("/sibling.sh")]), script=script),
             ),
             "scripts/sibling.sh": shell_tree(),
             "scripts/foo{a,{b}}.sh": shell_tree(),
@@ -660,13 +651,50 @@ sh -- ./sibling.sh
         self.assertEqual(measurement["edges"], [])
         diagnostics = measurement["outside_extractor"]
         self.assertEqual([(row["file"], row["line"]) for row in diagnostics], [
-            ("scripts/main.sh", line) for line in range(1, 10)
+            ("scripts/main.sh", line) for line in range(1, 13)
         ])
         for row in (*diagnostics[:4], *diagnostics[6:]):
             self.assertIn("outside the parser", row["message"])
         for row, target in zip(diagnostics[4:6], ("../README.md", "./absent.sh"), strict=True):
             self.assertIn("unresolved", row["message"])
             self.assertIn(target, row["message"])
+
+    def test_module_graph_shell_rejects_tildes_options_and_words_changed_by_parser(self) -> None:
+        self.configure_graph("""
+[[rule]]
+pattern = "scripts/--"
+class = "python"
+reason = "Shell option lookalike measured by the graph"
+""", shell=True)
+        self.add_file("scripts/name=~/sibling.sh", "")
+        self.add_file("scripts/--", "#!/bin/sh\n")
+        self.add_file("scripts/sibling.sh", "")
+        directory = {"Type": "ParamExp", "Short": True, "Param": {"Value": "dir"}}
+        variable_word = ('"$dir/sibling.sh"', [shell_quote(directory, "/sibling.sh")])
+        for words in (
+            ("source", "name=~/sibling.sh"),
+            ("source", "--", variable_word),
+            (".", "--", variable_word),
+            ("source", ("./'other-'sibling.sh", [
+                shell_literal("./"), {"Type": "SglQuoted"}, shell_literal("sibling.sh"),
+            ])),
+            ("source", ("./'other-'sibling.sh", [shell_literal("./sibling.sh")])),
+        ):
+            with self.subTest(words=words):
+                script = " ".join(word if isinstance(word, str) else word[0] for word in words) + "\n"
+                self.add_file("scripts/main.sh", script)
+                measurement = self.shell_graph(0, {
+                    "scripts/main.sh": shell_tree(shell_call(1, *words, script=script)),
+                    "scripts/name=~/sibling.sh": shell_tree(),
+                    "scripts/--": shell_tree(),
+                    "scripts/sibling.sh": shell_tree(),
+                })["measurement"]
+                self.assertEqual(measurement["edges"], [])
+                self.assertEqual(measurement["outside_extractor"], [{
+                    "file": "scripts/main.sh",
+                    "line": 1,
+                    "message": "shell source: target is outside the parser",
+                }])
 
     def test_module_graph_shell_syntax_error(self) -> None:
         self.configure_graph(shell=True)
@@ -679,35 +707,42 @@ sh -- ./sibling.sh
 
     def test_module_graph_shell_schema_errors_name_file_and_field(self) -> None:
         self.configure_graph(shell=True)
-        self.add_file("broken.sh", "source sibling.sh\n")
-        call = {"Type": "CallExpr", "Pos": {"Line": 1}}
-        for tree, detail in (
-            (call, "missing field Args"),
-            ({**call, "Args": [{}]}, "missing field Parts"),
-            ({**call, "Args": [{"Parts": ""}]}, "field Parts must be list"),
-            ({**call, "Args": [{"Parts": [{}]}]}, "missing word part field Type"),
-            ({**call, "Args": [{"Parts": [{"Type": "Lit"}]}]}, "missing field Value"),
-            (shell_call(1, "source", [shell_quote({})]), "missing word part field Type"),
-            (shell_call(1, "source", [shell_quote({
-                "Type": "ParamExp", "Param": {"Value": "BASH_SOURCE"},
-                "Exp": {"Word": {"Parts": [shell_literal("/*")]}},
-            }, "/sibling.sh")]), "missing field Exp.Op"),
+        script = 'source "${BASH_SOURCE%/*}"/sibling.sh\n'
+        self.add_file("broken.sh", script)
+        statement = shell_call(1, "source", ('"${BASH_SOURCE%/*}"/sibling.sh', [
+            shell_quote({"Type": "ParamExp", "Exp": {"Op": "%"}}), shell_literal("/sibling.sh"),
+        ]), script=script)
+        call = statement["Cmd"]
+        word, operand = call["Args"]
+        for args, detail in (
+            (None, "missing field Args"),
+            ([{}], "missing field Parts"),
+            ([{**word, "Parts": ""}], "field Parts must be list"),
+            ([{**word, "Parts": [{}]}], "missing field Type"),
+            ([{**word, "Parts": [{"Type": 0}]}], "field Type must be str"),
+            ([{**word, "Parts": [{"Type": "Lit"}]}], "missing field Value"),
+            ([{**word, "Pos": {}}], "missing field Pos.Offset"),
+            ([{**word, "End": {}}], "missing field End.Offset"),
+            ([word, {**operand, "Parts": [shell_quote({})]}], "missing field Type"),
+            ([word, {**operand, "Parts": [
+                shell_quote({"Type": "ParamExp", "Exp": {}}), shell_literal("/sibling.sh"),
+            ]}], "missing field Exp.Op"),
         ):
             with self.subTest(detail=detail):
-                result = self.shell_graph(1, {"broken.sh": shell_tree(tree)})
+                tree = {key: value for key, value in call.items() if key != "Args"}
+                if args is not None:
+                    tree["Args"] = args
+                result = self.shell_graph(1, {"broken.sh": shell_tree({"Cmd": tree})})
                 self.assertEqual(result["outcome"], "error")
                 self.assertIn(f"broken.sh: shfmt JSON {detail}", result["reason"])
 
-    def test_module_graph_shell_schema_accepts_omitted_empty_fields(self) -> None:
+    def test_module_graph_shell_schema_distinguishes_omitted_fields(self) -> None:
         for node, fields in (
             ({"Type": "CallExpr"}, {"Pos.Line": int, "Args": list}),
             ({"Type": "CallExpr", "Assigns": [{}]}, {"Pos.Line": int, "Assigns": list}),
-            ({"Type": "CallExpr", "Assigns": [{}], "Args": [{}]},
-             {"Pos.Line": int, "Assigns": list, "Args": list}),
-            ({"Type": "DblQuoted"}, {}),
-            ({"Type": "DblQuoted", "Parts": [{}]}, {"Parts": list}),
-            ({"Type": "SglQuoted"}, {}),
-            ({"Type": "SglQuoted", "Value": "file.sh"}, {"Value": str}),
+            ({"Type": "CallExpr", "Assigns": [{}], "Args": [{}]}, {"Pos.Line": int, "Args": list}),
+            ({"Type": "ParamExp"}, {}),
+            ({"Type": "ParamExp", "Exp": {}}, {"Exp.Op": str}),
         ):
             with self.subTest(node=node):
                 self.assertEqual(module_graph._shell_fields(node), fields)
@@ -1281,14 +1316,15 @@ tier = 1
 enforcement = "enforced"
 """
         (self.repo / "a.py").unlink()
-        self.add_file("polyglot.py", '#!/bin/sh\n""":"\n# shell-only comment\ntrue\n":"""\n')
+        script = '#!/bin/sh\n""":"\n# shell-only comment\ntrue\n":"""\n'
+        self.add_file("polyglot.py", script)
         args_file = self.base / "jscpd-args.txt"
         env = self.install_fake_jscpd(args_file=args_file)
 
         for checks in ('["smoke", "clones", "comments"]', '["smoke", "clones"]'):
             with self.subTest(checks=checks):
                 self.write_config(config.replace('checks = ["smoke"]', f"checks = {checks}"))
-                graph = self.shell_graph(0, {"polyglot.py": shell_tree(shell_call(2, ':'))})
+                graph = self.shell_graph(0, {"polyglot.py": shell_tree(shell_call(2, ":", script=script))})
                 self.assertEqual(graph["measurement"]["modules"], ["polyglot.py"])
                 loaded = policy.load_config(self.repo)
                 _, classes, violations = inventory.validate_inventory(self.repo, loaded)
