@@ -18,6 +18,10 @@ from collections import Counter, deque
 from pathlib import Path
 
 
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+CGROUP_MEMBERSHIP = Path("/proc/self/cgroup")
+
+
 class ShardError(Exception):
     pass
 
@@ -366,14 +370,19 @@ def _cpu_max_cores(content):
     return (int(quota) + period_us - 1) // period_us
 
 
-def _cgroup_cpu_quota(root, membership):
+def _cgroup_directory(root, membership):
     for line in membership.read_text(encoding="utf-8").splitlines():
-        if line.startswith("0::"):
-            path = root / line[3:].lstrip("/") / "cpu.max"
-            break
-    else:
-        return None
+        if not line.startswith("0::"):
+            continue
+        relative = Path(line[3:].lstrip("/"))
+        directory = root / relative
+        if ".." in relative.parts or not directory.is_dir():
+            raise ShardError(f"{directory}: expected an existing cgroup directory under {root}")
+        return directory
+    return None
 
+
+def _read_cpu_max(path):
     try:
         content = path.read_bytes()
     except FileNotFoundError:
@@ -386,7 +395,21 @@ def _cgroup_cpu_quota(root, membership):
         raise ShardError(f"{path}: expected a CPU quota and positive period, got {content!r}") from error
 
 
-def _options(argv, *, cgroup_root=Path("/sys/fs/cgroup"), cgroup_membership=Path("/proc/self/cgroup")):
+def _cgroup_cpu_quota(root, membership):
+    directory = _cgroup_directory(root, membership)
+    if directory is None:
+        return None
+    quotas = []
+    for ancestor in (directory, *directory.parents):
+        quota = _read_cpu_max(ancestor / "cpu.max")
+        if quota is not None:
+            quotas.append(quota)
+        if ancestor == root:
+            break
+    return min(quotas, default=None)
+
+
+def _options(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-s", "--start-directory", dest="start", required=True)
     parser.add_argument("-p", "--pattern", default="test*.py")
@@ -396,7 +419,7 @@ def _options(argv, *, cgroup_root=Path("/sys/fs/cgroup"), cgroup_membership=Path
     if options.workers is None:
         if not options.worker:
             affinity = len(os.sched_getaffinity(0))
-            quota = _cgroup_cpu_quota(cgroup_root, cgroup_membership)
+            quota = _cgroup_cpu_quota(CGROUP_ROOT, CGROUP_MEMBERSHIP)
             options.workers = max(1, min(affinity, quota if quota is not None else affinity))
     elif options.workers < 1:
         parser.error(f"--workers: expected an integer >= 1, got {options.workers}")

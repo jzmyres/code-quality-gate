@@ -43,12 +43,14 @@ class WorkerCountTests(unittest.TestCase):
         self.cgroup_membership.write_text("0::/user.slice/gate.scope\n", encoding="utf-8")
         self.cpu_max = self.cgroup_root / "user.slice/gate.scope/cpu.max"
         self.cpu_max.parent.mkdir(parents=True)
+        self.parent_cpu_max = self.cpu_max.parent.parent / "cpu.max"
+        self.enterContext(mock.patch.object(shards, "CGROUP_ROOT", self.cgroup_root, create=True))
+        self.enterContext(mock.patch.object(shards, "CGROUP_MEMBERSHIP", self.cgroup_membership, create=True))
+        self.enterContext(mock.patch.object(shards.os, "cpu_count", return_value=16))
         self.enterContext(mock.patch.object(shards.os, "sched_getaffinity", return_value=set(range(12))))
 
     def _workers(self, *args):
-        return shards._options(
-            ["-s", "tests", *args], cgroup_root=self.cgroup_root, cgroup_membership=self.cgroup_membership,
-        ).workers
+        return shards._options(["-s", "tests", *args]).workers
 
     def test_default_workers_respect_quota_and_affinity(self):
         for content, expected in (
@@ -66,6 +68,45 @@ class WorkerCountTests(unittest.TestCase):
 
     def test_default_workers_without_cpu_max(self):
         self.assertEqual(self._workers(), 12)
+
+    def test_default_workers_inherit_parent_quota_without_child_quota(self):
+        self.parent_cpu_max.write_text("300000 100000\n", encoding="utf-8")
+        self.assertEqual(self._workers(), 3)
+
+    def test_default_workers_use_tighter_of_parent_and_child_quotas(self):
+        for parent, child in ((600000, 200000), (200000, 600000)):
+            with self.subTest(parent=parent, child=child):
+                self.parent_cpu_max.write_text(f"{parent} 100000\n", encoding="utf-8")
+                self.cpu_max.write_text(f"{child} 100000\n", encoding="utf-8")
+                self.assertEqual(self._workers(), 2)
+
+    def test_default_workers_walk_to_cgroup_root(self):
+        (self.cgroup_root / "cpu.max").write_text("100000 100000\n", encoding="utf-8")
+        self.parent_cpu_max.write_text("max 100000\n", encoding="utf-8")
+        self.cpu_max.write_text("200000 100000\n", encoding="utf-8")
+        self.assertEqual(self._workers(), 1)
+
+    def test_default_workers_reject_missing_cgroup_directory(self):
+        self.cgroup_membership.write_text("0::/user.slice/missing.scope\n", encoding="utf-8")
+        with self.assertRaises(shards.ShardError) as raised:
+            self._workers()
+        self.assertIn(str(self.cgroup_root / "user.slice/missing.scope"), str(raised.exception))
+
+    def test_default_workers_reject_invalid_ancestor_cpu_max(self):
+        self.cpu_max.write_text("100000 100000\n", encoding="utf-8")
+        content = b"invalid\n"
+        self.parent_cpu_max.write_bytes(content)
+        with self.assertRaises(shards.ShardError) as raised:
+            self._workers()
+        self.assertIn(str(self.parent_cpu_max), str(raised.exception))
+        self.assertIn(repr(content), str(raised.exception))
+
+    def test_default_workers_reject_unreadable_ancestor_cpu_max(self):
+        self.parent_cpu_max.mkdir()
+        with self.assertRaises(shards.ShardError) as raised:
+            self._workers()
+        self.assertIn(str(self.parent_cpu_max), str(raised.exception))
+        self.assertIn("content unavailable", str(raised.exception))
 
     def test_default_workers_reject_invalid_cpu_max(self):
         for content in (b"invalid\n", b"300000 0\n", b"max nope\n", b"\xff 100000\n"):

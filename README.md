@@ -401,10 +401,13 @@ The `run` value above uses the shared unittest runner from a gate submodule at
 `code-quality-gate/`. Pass `-s DIR` (`--start-directory DIR`) to select the discovery directory
 and optionally `-p GLOB` (`--pattern GLOB`) to change unittest's default `test*.py` pattern.
 `-j N` (`--workers N`) sets the maximum number of workers. By default the runner uses the smaller
-of the process's CPU affinity size and its own cgroup v2 CPU quota (`quota / period` from `cpu.max`,
-rounded up), with a minimum of one worker. It uses the affinity size when `cpu.max` is absent,
-the quota is `max`, or the process has no cgroup v2 entry. An explicit count bypasses this default.
-Use `-j 1` to run in-process. The gate's own policy uses the default.
+of the process's CPU affinity size and its effective cgroup v2 CPU quota, with a minimum of one
+worker. The runner walks from the process's cgroup up to and including the cgroup root and takes
+the smallest rounded-up `quota / period` from each `cpu.max`. A missing `cpu.max` or a quota of
+`max` sets no limit at that level. With no finite quota or no cgroup v2 entry, the runner uses the
+affinity size. An unreadable or unparsable `cpu.max` at any level raises an error naming the file.
+If the process's cgroup directory is missing, the error names the directory. An explicit count
+bypasses this default. Use `-j 1` to run in-process. The gate's own policy uses the default.
 
 The runner uses standard unittest discovery in every worker. It keeps discovered instances from
 `load_tests` and assigns whole classes to workers, keeping tests that share module fixtures
