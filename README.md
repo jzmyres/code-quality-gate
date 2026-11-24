@@ -324,24 +324,25 @@ The `module_graph` adapter measures Python and Emacs Lisp files in the named inv
 Python imports anywhere in a file count, including function bodies and `TYPE_CHECKING` blocks.
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
-Python calls to `runpy.run_path` and `importlib.util.spec_from_file_location` add
-`path-load` edges when the compiler's symbol tables and a unique, unconditional
-module-level import identify the standard-library loader. The import must be on a
-line before the call's enclosing top-level statement. Supported imports are
-`import runpy`, `from runpy import run_path`, `import importlib.util`,
-`from importlib import util`, and `from importlib.util import spec_from_file_location`,
-all with optional import aliases. The call must match the loader's signature and pass
-a string literal path positionally or as `path_name=` or `location=`, respectively.
-Relative paths are resolved from the calling file's directory and must identify a measured
-Python file.
+Python recognizes two forms for `path-load` edges.
 
-Recognized loader calls are reported as unresolved for shadowed or rebound names,
-assignment aliases, conditional, star, relative, unsupported or late imports, and
-imports that resolve to a measured repository module. Calls in unevaluated function-local
-variable annotations, calls with invalid or unpacked arguments, computed paths, and paths
-outside the measured Python files are also unresolved. Each unresolved call produces an
-`outside_extractor` entry with its file, line, and reason. Dynamic namespace writes are
-outside the scope of this static graph.
+- `import runpy` followed by `runpy.run_path(...)`, with a string literal path passed
+  as the first positional argument or as `path_name=`.
+- `import importlib.util` followed by `importlib.util.spec_from_file_location(...)`,
+  with a string literal path passed as the second positional argument or as `location=`.
+
+The exact import must appear directly in the module body before the call's enclosing
+top-level statement. The whole file must have a single binding for the loader's head
+name. A star import or a repository module or package that provides the head name also
+makes the loader unresolved. Arguments must match the loader's signature and use no
+unpacking. Relative paths are resolved from the calling file's directory and must
+identify a measured Python file.
+
+Every other name or attribute reference ending in `run_path` or
+`spec_from_file_location` is reported as unresolved in `outside_extractor`, with its
+file, line, and reason. This includes references used to create aliases, calls through a
+noncanonical spelling, and calls in function-local variable annotations. Discovery uses
+the spelling at the reference. Dynamic namespace writes are outside the static analysis.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends

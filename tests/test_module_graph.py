@@ -168,48 +168,21 @@ reason = "package measured by the graph"
         self.configure_graph()
         fixtures = {
             "module": ("import runpy\nrunpy.run_path('../target.py')", 2),
-            "global": ("import runpy\ndef f():\n global runpy\n runpy.run_path('../target.py')", 4),
+            "global_read": ("import runpy\ndef f():\n global runpy\n runpy.run_path('../target.py')", 4),
             "method": (
                 "import runpy\nclass C:\n other = 1\n def f(self):\n  runpy.run_path('../target.py')", 5,
             ),
-            "from_alias": ("from runpy import run_path as rp\nrp('../target.py')", 2),
-            "private_module_alias": ("from runpy import run_path as __rp\n__rp('../target.py')", 2),
-            "alias": ("import runpy as r\nr.run_path(path_name='../target.py')", 2),
-            "dotted_alias": (
-                "import importlib.util as ilu\n"
-                "ilu.spec_from_file_location('target', location='../target.py')", 2,
-            ),
-            "dotted": (
+            "runpy_keyword": ("import runpy\nrunpy.run_path(path_name='../target.py')", 2),
+            "spec_positional": (
                 "import importlib.util\n"
                 "importlib.util.spec_from_file_location('target', '../target.py')", 2,
             ),
-            "parent_and_submodule": (
-                "import importlib\nimport importlib.util\n"
-                "importlib.util.spec_from_file_location('target', '../target.py')", 3,
+            "spec_keyword": (
+                "import importlib.util\n"
+                "importlib.util.spec_from_file_location(location='../target.py', name='target')", 2,
             ),
-            "from_util": (
-                "from importlib import util as iu\n"
-                "iu.spec_from_file_location('target', '../target.py')", 2,
-            ),
-            "from_spec": (
-                "from importlib.util import spec_from_file_location as spec\n"
-                "spec(location='../target.py', name='target')", 2,
-            ),
-            "outer_default": ("import runpy\ndef f(runpy=runpy.run_path('../target.py')): pass", 2),
-            "outer_iter": ("import runpy\n(runpy for runpy in runpy.run_path('../target.py'))", 2),
-            "inlined_iter": ("import runpy\n[runpy for runpy in runpy.run_path('../target.py')]", 2),
+            "same_line": ("import runpy; runpy.run_path('../target.py')", 1),
             "lambda": ("import runpy\nf = lambda: runpy.run_path('../target.py')", 2),
-            "nested_import": ("import runpy\ndef f(): import runpy\nrunpy.run_path('../target.py')", 3),
-            "type_alias": ("import runpy\ntype Loaded = runpy.run_path('../target.py')", 2),
-            "type_bound": ("import runpy\ndef f[T: runpy.run_path('../target.py')](): pass", 2),
-            "private_alias": (
-                "from runpy import run_path as _C__load\nclass C:\n"
-                " def f(self): __load('../target.py')", 3,
-            ),
-            "generic_class_base": (
-                "from runpy import run_path as __load\nclass Outer:\n"
-                " class Inner[T](__load('../target.py')): pass", 3,
-            ),
         }
         self.add_file("target.py", "")
         for name, (source, _) in fixtures.items():
@@ -221,158 +194,168 @@ reason = "package measured by the graph"
         ])
         self.assertNotIn("outside_extractor", measurement)
 
-    def test_module_graph_reports_unresolved_path_loads(self) -> None:
+    def test_module_graph_refuses_other_bindings_anywhere_in_the_file(self) -> None:
         self.configure_graph()
         fixtures = {
-            "parameter": ("import runpy\ndef f(runpy): runpy.run_path('target.py')", 2, "local"),
-            "local": ("import runpy\ndef f():\n runpy = other\n runpy.run_path('target.py')", 4, "local"),
-            "del": ("import runpy\ndel runpy\nrunpy.run_path('target.py')", 3, "assigned"),
-            "closure": (
-                "from runpy import run_path as rp\ndef f(rp):\n def g(): rp('target.py')", 3, "free",
+            "parameter": "def f(runpy): pass",
+            "local": "def f(): runpy = other",
+            "delete": "del runpy",
+            "closure": "def f(runpy):\n def g(): return runpy",
+            "comprehension": "def f():\n return [runpy for runpy in items]",
+            "module_comprehension": "[runpy for runpy in items]",
+            "generator": "(runpy for runpy in items)",
+            "method": "class C:\n def f(self, runpy): pass",
+            "class": "class C:\n runpy = other",
+            "module_assignment": "runpy = other",
+            "global_assignment": "def f():\n global runpy\n runpy = other",
+            "global_import": "def f():\n global runpy\n import runpy",
+            "global_walrus": "[(runpy := x) for x in items]",
+            "local_annotation": "def f():\n runpy: object",
+            "type_parameter": "def f[runpy](): pass",
+            "type_alias": "type runpy = object",
+            "duplicate_import": "import runpy",
+            "conditional_import": "try:\n import runpy\nexcept ImportError: pass",
+            "local_import": "def f(): import runpy",
+            "relative_import": "from . import runpy",
+            "lambda_parameter": "lambda runpy: None",
+            "pattern": "match other:\n case {'key': runpy}: pass",
+            "except_alias": "try: pass\nexcept Error as runpy: pass",
+            "inlined_class_comprehension": "class C:\n value = [runpy for runpy in items]",
+        }
+        self.add_file("target.py", "")
+        context = self.graph_context(["caller.py", "target.py"])
+        for name, binding in fixtures.items():
+            with self.subTest(name=name):
+                self.add_file("caller.py", f"import runpy\nrunpy.run_path('target.py')\n{binding}\n")
+                measurement = adapters._run_module_graph(context).measurement
+                self.assertEqual(measurement["edges"], [])
+                self.assert_unresolved_path_load(measurement, 2, "binding")
+
+    def test_module_graph_reports_unresolved_loader_references(self) -> None:
+        self.configure_graph()
+        fixtures = {
+            "alias": ("import runpy as r\nr.run_path('target.py')", 2, "canonical"),
+            "dotted_alias": (
+                "import importlib.util as ilu\nilu.spec_from_file_location('n', 'target.py')", 2, "canonical",
             ),
-            "comprehension": (
-                "import runpy\ndef f():\n return [runpy.run_path('target.py') for runpy in items]",
-                3, "local",
+            "from_import": ("from runpy import run_path\nrun_path('target.py')", 2, "canonical"),
+            "parent_only": (
+                "import importlib\nimportlib.util.spec_from_file_location('n', 'target.py')",
+                2, "top-level import importlib.util",
             ),
-            "generator": ("import runpy\n(runpy.run_path('target.py') for runpy in items)", 2, "local"),
-            "method": (
-                "import runpy\nclass C:\n def f(self, runpy): runpy.run_path('target.py')", 3, "local",
+            "parent_and_submodule": (
+                "import importlib\nimport importlib.util\n"
+                "importlib.util.spec_from_file_location('n', 'target.py')", 3, "binding",
             ),
-            "class": (
-                "import runpy\nclass C:\n runpy = other\n def f(self): runpy.run_path('target.py')",
-                4, "class",
+            "missing": ("runpy.run_path('target.py')", 1, "top-level import runpy"),
+            "try_import": (
+                "try:\n import runpy\nexcept ImportError: pass\nrunpy.run_path('target.py')",
+                4, "top-level import runpy",
             ),
-            "computed": ("import runpy\nrunpy.run_path(path)", 2, "string literal"),
-            "try_import": ("try:\n import runpy\nexcept ImportError: pass\nrunpy.run_path('target.py')", 4,
-                           "conditional"),
-            "rebound": ("import runpy\nrunpy = other\nrunpy.run_path('target.py')", 3, "assigned"),
-            "local_import": ("def f():\n import runpy as r\n r.run_path('target.py')", 3, "local"),
-            "global_write": (
-                "import runpy\ndef f():\n global runpy\n runpy = other\nrunpy.run_path('target.py')",
-                5, "global",
-            ),
+            "early_call": ("runpy.run_path('target.py')\nimport runpy", 1, "before"),
+            "early_definition": ("def f():\n runpy.run_path('target.py')\nimport runpy", 2, "before"),
             "star": ("import runpy\nfrom other import *\nrunpy.run_path('target.py')", 3, "star import"),
-            "relative": ("from .runpy import run_path as rp\nrp('target.py')", 2, "relative import"),
-            "missing": ("runpy.run_path('target.py')", 1, "import"),
+            "computed": ("import runpy\nrunpy.run_path(path)", 2, "string literal"),
             "outside": ("import runpy\nrunpy.run_path('not_measured.py')", 2, "'not_measured.py'"),
-            "global_walrus": (
-                "import runpy\nrunpy.run_path('target.py')\n[(runpy := x) for x in items]", 2, "global",
+            "unpacked_path": ("import runpy\nrunpy.run_path(*args)", 2, "positional argument unpacking"),
+            "unpacked_keyword": (
+                "import runpy\nrunpy.run_path('target.py', **kwargs)", 2, "keyword argument unpacking",
             ),
             "duplicate_operand": (
                 "import runpy\nrunpy.run_path('target.py', path_name='target.py')", 2, "argument",
             ),
-            "lookalike": ("from other import run_path as rp\nrp('target.py')", 2, "other.run_path"),
-            "ambiguous_scope": (
-                "from runpy import run_path as __rp\n"
-                "f = lambda: __rp('target.py'); g = lambda: None", 2, "scope",
-            ),
-            "private_local_import": (
-                "class C:\n def f(self):\n  from runpy import run_path as __rp\n"
-                "  __rp('target.py')", 4, "local",
-            ),
-            "ambiguous_import": (
-                "import runpy as r\nimport other as r\nr.run_path('target.py')", 3, "unique",
-            ),
-            "unpacked_path": ("import runpy\nrunpy.run_path(*args, path_name='target.py')", 2, "argument"),
-        }
-        self.add_file("target.py", "")
-        for name, (source, _, _) in fixtures.items():
-            self.add_file(f"{name}.py", source + "\n")
-        measurement = self.graph(0)["measurement"]
-        self.assertEqual(measurement["edges"], [])
-        diagnostics = measurement.get("outside_extractor", [])
-        self.assertEqual(len(diagnostics), len(fixtures))
-        for row, (name, (_, line, reason)) in zip(diagnostics, sorted(fixtures.items()), strict=True):
-            with self.subTest(name=name):
-                self.assertEqual((row["file"], row["line"]), (f"{name}.py", line))
-                self.assertIn("unresolved", row["message"])
-                self.assertIn(reason, row["message"])
-
-    def test_module_graph_refuses_invalid_path_loads(self) -> None:
-        self.configure_graph()
-        fixtures = {
-            "non_module": ("import runpy.run_path as rp\nrp('target.py')", 2, "provenance"),
-            "parent_only": (
-                "import importlib\nimportlib.util.spec_from_file_location('target', 'target.py')",
-                2, "provenance",
-            ),
-            "early_call": ("runpy.run_path('target.py')\nimport runpy", 1, "before"),
-            "early_builtin": (
-                "breakpoint('target.py')\nfrom runpy import run_path as breakpoint", 1, "before",
-            ),
-            "early_definition": (
-                "def f():\n runpy.run_path('target.py')\nimport runpy", 2, "before",
-            ),
-            "early_submodule": (
-                "import importlib\n"
-                "importlib.util.spec_from_file_location('target', 'target.py')\nimport importlib.util",
-                2, "before",
-            ),
-            "same_line": ("import runpy; runpy.run_path('target.py')", 1, "before"),
-            "multiline_import": ("from runpy import (\n run_path as rp); rp('target.py')", 2, "before"),
-            "extra_positional": ("import runpy\nrunpy.run_path('target.py', {}, 'n', 0)", 2, "argument"),
-            "unknown_keyword": (
-                "from importlib import util\n"
-                "util.spec_from_file_location('n', 'target.py', unknown=True)", 2, "argument",
-            ),
-            "missing_name": (
-                "from importlib import util\nutil.spec_from_file_location(location='target.py')",
-                2, "argument",
-            ),
             "duplicate_keyword": (
                 "import runpy\nrunpy.run_path(path_name='target.py', run_name='a', run_name='b')",
-                2, "repeated keyword argument 'run_name'",
+                2, "repeated keyword argument",
             ),
-            "unpacked_keyword": (
-                "import runpy\nrunpy.run_path('target.py', **kwargs)", 2, "keyword argument unpacking",
+            "extra_positional": ("import runpy\nrunpy.run_path('target.py', {}, 'n', 0)", 2, "argument"),
+            "unknown_keyword": ("import runpy\nrunpy.run_path('target.py', bogus=True)", 2, "argument"),
+            "missing_name": (
+                "import importlib.util\nimportlib.util.spec_from_file_location(location='target.py')",
+                2, "argument",
             ),
-            "module_alias": (
-                "from runpy import run_path\nrp = run_path\nrp('target.py')", 3, "assigned",
+            "from_spec_without_name": (
+                "from importlib.util import spec_from_file_location\n"
+                "spec_from_file_location(location='target.py')",
+                2, "canonical",
             ),
-            "local_alias": (
-                "from runpy import run_path as load\ndef f():\n rp = load\n rp('target.py')", 4, "local",
+            "destructured": (
+                "import runpy\nload, = (runpy.run_path,)\nload('target.py')", 2, "not called directly",
+            ),
+            "chained": (
+                "import runpy\nload = other = runpy.run_path\nload('target.py')", 2, "not called directly",
+            ),
+            "as_argument": ("import runpy\nregister(runpy.run_path)", 2, "not called directly"),
+            "complex_receiver": ("factory().run_path('target.py')", 1, "canonical"),
+            "local_annotation": (
+                "import runpy\ndef f():\n value: runpy.run_path('target.py')", 3, "annotation",
             ),
         }
         self.add_file("target.py", "")
+        context = self.graph_context(["caller.py", "target.py"])
         for name, (source, line, reason) in fixtures.items():
             with self.subTest(name=name):
                 self.add_file("caller.py", source + "\n")
-                result = adapters._run_module_graph(self.graph_context(["caller.py", "target.py"]))
-                self.assert_unresolved_path_load(result.measurement, line, reason)
-                self.assertEqual(result.measurement["edges"], [])
+                measurement = adapters._run_module_graph(context).measurement
+                self.assertEqual(measurement["edges"], [])
+                self.assert_unresolved_path_load(measurement, line, reason)
 
-    def assert_unresolved_path_load(self, measurement: dict[str, Any], line: int, reason: str) -> None:
+    def assert_unresolved_path_load(
+        self, measurement: dict[str, Any], line: int, reason: str, *, source: str = "caller.py",
+    ) -> None:
         self.assertEqual(len(measurement.get("outside_extractor", [])), 1)
         diagnostic, = measurement["outside_extractor"]
-        self.assertEqual((diagnostic["file"], diagnostic["line"]), ("caller.py", line))
+        self.assertEqual((diagnostic["file"], diagnostic["line"]), (source, line))
         self.assertIn("unresolved", diagnostic["message"])
         self.assertIn(reason, diagnostic["message"])
 
     def test_module_graph_refuses_repository_loader(self) -> None:
         self.configure_graph()
         self.add_file("target.py", "")
-        self.add_file("importlib/util.py", "")
-        self.add_file("caller.py", (
-            "import importlib.util as ilu\n"
-            "ilu.spec_from_file_location('target', 'target.py')\n"
-        ))
-        context = self.graph_context(["caller.py", "importlib/util.py", "target.py"])
-        result = adapters._run_module_graph(context)
-        self.assert_unresolved_path_load(result.measurement, 2, "importlib/util.py")
-        self.assertEqual(result.measurement["edges"], [edge("caller.py", "importlib/util.py", 1)])
+        fixtures = (
+            ("runpy", "runpy.run_path('target.py')", "runpy/run_path.py"),
+            ("runpy", "runpy.run_path('target.py')", "vendor/runpy.py"),
+            ("importlib.util", "importlib.util.spec_from_file_location('target', 'target.py')",
+             "vendor/importlib/util.py"),
+        )
+        for imported, call, shadow in fixtures:
+            with self.subTest(shadow=shadow):
+                self.add_file(shadow, "")
+                self.add_file("caller.py", f"import {imported}\n{call}\n")
+                measurement = adapters._run_module_graph(
+                    self.graph_context(["caller.py", "target.py", shadow]),
+                ).measurement
+                self.assertEqual(measurement["edges"], [])
+                self.assert_unresolved_path_load(measurement, 2, shadow)
 
-    def test_module_graph_refuses_local_annotation_only(self) -> None:
+    def test_module_graph_keeps_ordinary_import_edge_to_repository_loader(self) -> None:
         self.configure_graph()
         self.add_file("target.py", "")
+        self.add_file("importlib/util.py", "")
         self.add_file("caller.py", (
-            "from runpy import run_path\n"
-            "def f():\n"
-            " value: run_path('target.py') = (\n"
-            "     run_path('target.py'))\n"
+            "import importlib.util\nimportlib.util.spec_from_file_location('n', 'target.py')\n"
         ))
-        result = adapters._run_module_graph(self.graph_context(["caller.py", "target.py"]))
-        self.assert_unresolved_path_load(result.measurement, 3, "annotation")
-        self.assertEqual(result.measurement["edges"], [edge("caller.py", "target.py", 4, "path-load")])
+        measurement = adapters._run_module_graph(
+            self.graph_context(["caller.py", "target.py", "importlib/util.py"]),
+        ).measurement
+        self.assertEqual(measurement["edges"], [edge("caller.py", "importlib/util.py", 1)])
+        self.assert_unresolved_path_load(measurement, 2, "importlib/util.py")
+
+    def test_module_graph_refuses_unmeasured_repository_loader(self) -> None:
+        self.configure_graph()
+        self.add_file("target.py", "")
+        for folder, filename, diagnostic_path in (
+            ("namespace", "util.py", "namespace/runpy"),
+            ("package", "__init__.py", "package/runpy/__init__.py"),
+        ):
+            with self.subTest(folder=folder):
+                self.add_file(f"{folder}/runpy/{filename}", "")
+                source = f"{folder}/caller.py"
+                self.add_file(source, "import runpy\nrunpy.run_path('../target.py')\n")
+                context = self.graph_context([source, "target.py"])
+                measurement = adapters._run_module_graph(context).measurement
+                self.assertEqual(measurement["edges"], [])
+                self.assert_unresolved_path_load(measurement, 2, repr(diagnostic_path), source=source)
 
     def test_module_graph_path_loads_count_as_program_dependencies(self) -> None:
         self.configure_graph('programs = ["target.py"]\n')
@@ -383,70 +366,6 @@ reason = "package measured by the graph"
         self.assertEqual(check["measurement"]["edges"], [expected, expected])
         finding, = check["findings"]
         self.assertEqual(finding["measurement"], {"edge": expected})
-
-    def test_module_graph_path_load_import_proof(self) -> None:
-        self.add_file("caller.py", "import runpy as r\nif choice:\n import runpy as conditional\n")
-        tree, table = module_graph._parse_source(self.repo, "caller.py")
-        bindings = module_graph._LoaderBindings.collect(tree, table, [tree.body[0], tree.body[1].body[0]])
-        self.assertEqual(bindings.direct, {"r": {"runpy"}})
-        self.assertIsNone(bindings.import_refusal("r"))
-        self.assertIsNone(bindings.module_refusal(table, "r"))
-        self.assertIn("conditional", bindings.import_refusal("conditional"))
-        self.assertIn("no module-level import", bindings.module_refusal(table, "absent"))
-
-    def test_module_graph_path_load_scope_proof(self) -> None:
-        self.add_file("caller.py", (
-            "import runpy\n"
-            "class C:\n"
-            " runpy = other\n"
-            " f = lambda: runpy.run_path('target.py')\n"
-        ))
-        tree, table = module_graph._parse_source(self.repo, "caller.py")
-        visitor = module_graph._PathLoadCalls(table, module_graph._LoaderBindings(), False)
-        self.assertIn("absent", visitor.scope_refusal("missing"))
-        class_table, = table.get_children()
-        with visitor.scope(class_table):
-            self.assertTrue(visitor.class_binds("runpy"))
-            self.assertFalse(visitor.class_binds("other"))
-            visitor.visit_Lambda(tree.body[1].body[1].value)
-        call, = visitor.calls
-        self.assertIn("class body", call.refusal)
-
-    def test_module_graph_path_load_comprehension_scopes(self) -> None:
-        self.add_file("caller.py", (
-            "import runpy\n"
-            "(runpy.run_path('target.py') for runpy in items)\n"
-            "[runpy.run_path('target.py') for runpy in items]\n"
-        ))
-        tree, table = module_graph._parse_source(self.repo, "caller.py")
-        visitor = module_graph._PathLoadCalls(table, module_graph._LoaderBindings(), False)
-        generator, inlined = (node.value for node in tree.body[1:])
-        self.assertEqual(len(visitor.comprehension_tables(generator)), 1)
-        self.assertEqual(visitor.comprehension_tables(inlined), [])
-        visitor.visit_ListComp(generator)
-        visitor.visit_inlined(inlined.generators, [inlined.elt])
-        self.assertEqual([call.refusal for call in visitor.calls], [
-            "'runpy' is local to the scope", "'runpy' is a local iteration variable",
-        ])
-        self.assertIsNone(visitor.scope_refusal("runpy"))
-
-    def test_module_graph_path_load_annotation_scopes(self) -> None:
-        self.add_file("caller.py", (
-            "import runpy\n"
-            "type Alias = runpy.run_path('target.py')\n"
-            "def f[T: runpy.run_path('target.py')](): pass\n"
-            "(name := runpy)\n"
-        ))
-        tree, table = module_graph._parse_source(self.repo, "caller.py")
-        visitor = module_graph._PathLoadCalls(table, module_graph._LoaderBindings(), False)
-        visitor.visit_TypeAlias(tree.body[1])
-        parameters, = visitor.children("type parameters", "f")
-        with visitor.scope(parameters):
-            visitor.visit_TypeVar(tree.body[2].type_params[0])
-        visitor.visit_NamedExpr(tree.body[3].value)
-        outcomes = [(call.node.lineno, call.refusal) for call in visitor.calls]
-        self.assertEqual(outcomes, [(2, None), (3, None)])
-        self.assertEqual(visitor.bindings.global_writes, {"name"})
 
     def test_module_graph_syntax_error(self) -> None:
         self.configure_graph()
