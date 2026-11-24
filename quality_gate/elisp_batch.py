@@ -89,47 +89,47 @@ MODULE_GRAPH_READER = r"""
 
   (defun qg-graph-file (path)
     (let ((read-circle nil)
+          (caller-buffer (current-buffer))
           (error-line 1)
           (error-stage "preparation")
           (read-shorthands hack-read-symbol-shorthands-function)
+          shorthand-source-buffer
           rows)
       (condition-case failure
-          (let ((hack-read-symbol-shorthands-function
-                 (when read-shorthands
-                   (lambda ()
-                     (let ((source-buffer (current-buffer)))
-                       (handler-bind
-                           ((error
-                             (lambda (_failure)
-                               (let ((line (line-number-at-pos)))
-                                 (setq error-line
-                                       (if (eq (current-buffer) source-buffer)
-                                           line
-                                         (+ line (with-current-buffer source-buffer
-                                                   (line-number-at-pos)) -1)))))))
-                         (funcall read-shorthands)))))))
-            (load-with-code-conversion
-             (expand-file-name path) path nil t
-             (lambda (buffer _filename)
-               (setq error-stage "reader")
-               (with-current-buffer buffer
-                 (goto-char (point-min))
-                 (let ((load-read-function
-                        (lambda (stream)
-                          (let ((load-read-function nil)
-                                (read-start (point))
-                                (symbols-with-pos-enabled t))
-                            (handler-bind
-                                ((error
-                                  (lambda (failure)
-                                    (setq error-line
-                                          (line-number-at-pos
-                                           (if (eq (car failure) 'end-of-file) read-start (point)))))))
+          (handler-bind
+              ((error
+                (lambda (_failure)
+                  (setq error-line
+                        (cond
+                         ((eq (current-buffer) caller-buffer) 1)
+                         ((and shorthand-source-buffer
+                               (not (eq (current-buffer) shorthand-source-buffer)))
+                          (+ (line-number-at-pos)
+                             (with-current-buffer shorthand-source-buffer
+                               (1- (line-number-at-pos)))))
+                         (t (line-number-at-pos)))))))
+            (let ((hack-read-symbol-shorthands-function
+                   (when read-shorthands
+                     (lambda ()
+                       (setq shorthand-source-buffer (current-buffer))
+                       (unwind-protect
+                           (funcall read-shorthands)
+                         (setq shorthand-source-buffer nil))))))
+              (load-with-code-conversion
+               (expand-file-name path) path nil t
+               (lambda (buffer _filename)
+                 (setq error-stage "reader")
+                 (with-current-buffer buffer
+                   (goto-char (point-min))
+                   (let ((load-read-function
+                          (lambda (stream)
+                            (let ((load-read-function nil)
+                                  (symbols-with-pos-enabled t))
                               (dolist (row (qg-graph-top-level (read-positioning-symbols stream)))
-                                (push row rows))))
-                          nil)))
-                   (eval-buffer buffer)))))
-            (nreverse rows))
+                                (push row rows)))
+                            nil)))
+                     (eval-buffer buffer)))))
+              (nreverse rows)))
         (error
          (list (list 'outside error-line
                      (format "Emacs Lisp source with a %s error (%s)"

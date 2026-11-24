@@ -347,9 +347,9 @@ Uninterned features in requires or providers are reported there as well.
 The Emacs reader refuses reader labels (`#N=` and `#N#`) so each positioned head
 identifies a single source occurrence. An error in coding or file-local variable
 processing, a reader label, or any other reader error, including EOF inside a form,
-refuses the whole file. The graph reports one `outside_extractor` entry with the file
-and error line, discards the file's outgoing edges and feature providers, and continues
-measuring the other files.
+refuses the whole file. The graph reports one `outside_extractor` entry naming the file
+and the line where Emacs reported the error. It discards the file's outgoing edges and
+feature providers and continues measuring the other files.
 Requires nested elsewhere, including in functions or quasiquote unquotes, give no edge.
 `load` and `load-file` also give no edge. An Emacs launch failure or a Python
 syntax error produces a check error that names the affected file.

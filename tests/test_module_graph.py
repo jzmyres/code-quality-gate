@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tomllib
 from collections import Counter
 from contextlib import redirect_stderr
@@ -483,21 +484,44 @@ reason = "package measured by the graph"
         self.assertEqual(finding.measurement, {"edge": expected_edge})
 
     def test_module_graph_elisp_truncated_form_refuses_file(self) -> None:
-        self.configure_graph(elisp=True)
         self.add_file("a.el", "(require 'fixture)\n(provide 'a)\n(")
+        self.assert_truncated_elisp_refused(3)
+
+    def assert_truncated_elisp_refused(self, line: int) -> None:
+        self.configure_graph(elisp=True)
         self.add_file("fixture.el", "(provide 'fixture)\n")
         self.add_file("consumer.el", "(require 'a)\n")
         context = self.graph_context(["a.el", "consumer.el", "fixture.el"], ("fixture.el",))
         result = adapters._run_module_graph(context)
+        self.assertEqual(result.outcome, "pass", result.diagnostics.error)
+        self.assertEqual(result.findings, [])
         self.assertEqual(result.measurement["edges"], [])
         outside, = result.measurement["outside_extractor"]
         self.assertIn("End of file during parsing", outside["message"])
         self.assertTrue(outside["message"].endswith("is outside the extractor"))
         self.assert_elisp_outcomes(result.measurement, [], [{
-            "file": "a.el", "line": 3, "message": outside["message"],
+            "file": "a.el", "line": line, "message": outside["message"],
         }])
-        self.assertEqual(result.outcome, "pass")
-        self.assertEqual(result.findings, [])
+
+    def test_module_graph_elisp_refusal_uses_emacs_signal_line(self) -> None:
+        read_signal_line = """
+        (with-temp-buffer
+          (insert-file-contents "a.el")
+          (goto-char (point-min))
+          (condition-case nil
+              (handler-bind
+                  ((end-of-file (lambda (_failure) (princ (line-number-at-pos (point))))))
+                (while t (read (current-buffer))))
+            (end-of-file nil)))
+        """
+        for preceding_line in ("", "#! ignored\n"):
+            with self.subTest(preceding_line=preceding_line):
+                self.add_file("a.el", f"(require 'fixture)\n(provide 'a)\n{preceding_line}(")
+                emacs = subprocess.run(
+                    ["emacs", "-Q", "--batch", "--eval", read_signal_line],
+                    cwd=self.repo, capture_output=True, text=True, check=True,
+                )
+                self.assert_truncated_elisp_refused(int(emacs.stdout))
 
     def test_module_graph_elisp_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -517,6 +541,13 @@ reason = "package measured by the graph"
         self.assert_labelled_provider_refused(
             f"(require 'other)\n(provide 'fixture)\n'{table}\n", 3, ("other.el",),
         )
+
+    def test_module_graph_elisp_round10_shared_operand_exact(self) -> None:
+        self.assert_labelled_provider_refused("(progn\n  '#1='fixture\n  (provide #1#))\n", 2)
+
+    def test_module_graph_elisp_round10_char_table_exact(self) -> None:
+        table = "#^[nil nil #1#" + " nil" * 65 + "]"
+        self.assert_labelled_provider_refused(f"(eval-when-compile\n  (#1=require 'fixture)\n  {table})\n", 2)
 
     def assert_labelled_provider_refused(
         self, decoy_source: str, label_line: int, other_files: tuple[str, ...] = (),
