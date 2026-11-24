@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from .files import source_languages
+from .files import SOURCE_LANGUAGE_BY_SUFFIX, source_languages
 from .json_input import load_json
 from .policy import (
     DEFAULT_MAX_BYTES,
@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 
 
 DEFAULT_MIN_TOKENS = 50
+_JSCPD_FORMAT_BY_LANGUAGE = {
+    language: language for language in SOURCE_LANGUAGE_BY_SUFFIX.values()
+}
 _IGNORE_PREFIX = "jscpd:" + "ignore"
 _IGNORE_DIRECTIVES = (_IGNORE_PREFIX + "-start", _IGNORE_PREFIX + "-end")
 
@@ -323,19 +326,19 @@ def _format_sources(data: dict[str, Any]) -> dict[str, int] | None:
     return analyzed
 
 
-def _selected_skipped(languages: dict[str, str | None], data: dict[str, Any]) -> list[str]:
+def _selected_skipped(formats: dict[str, str], data: dict[str, Any]) -> list[str]:
     analyzed = _format_sources(data)
     if analyzed is None:
-        return list(languages)
-    selected = Counter(languages.values())
+        return list(formats)
+    selected = Counter(formats.values())
     candidates = [
-        path for path, language in languages.items()
-        if language is None or analyzed.get(language, 0) < selected[language]
+        path for path, source_format in formats.items()
+        if analyzed.get(source_format, 0) < selected[source_format]
     ]
-    return sorted(candidates or languages)
+    return sorted(candidates or formats)
 
 
-def _parse_jscpd_json(report: Path, languages: dict[str, str | None]) -> None:
+def _parse_jscpd_json(report: Path, formats: dict[str, str]) -> None:
     data = _required_object(
         _read_report(report), report, "expected a JSON object"
     )
@@ -352,25 +355,24 @@ def _parse_jscpd_json(report: Path, languages: dict[str, str | None]) -> None:
         raise _no_completed(
             report, "statistics.total.sources is not an integer"
         )
-    if sources != len(languages):
-        skipped = _selected_skipped(languages, data)
+    if sources != len(formats):
+        skipped = _selected_skipped(formats, data)
         raise _no_completed(
             report,
-            f"analysed {sources} of {len(languages)} selected files; "
+            f"analysed {sources} of {len(formats)} selected files; "
             f"not analysed: {', '.join(skipped)}",
         )
 
 
 def _jscpd_command(
     binary: Path,
-    languages: dict[str, str | None],
+    inputs: dict[str, str],
     min_tokens: int,
     max_bytes: int,
     output: Path,
     config: Path,
 ) -> list[str]:
-    formats = set(languages.values())
-    command = [
+    return [
         str(binary),
         "--config",
         str(config),
@@ -385,23 +387,18 @@ def _jscpd_command(
         "--no-gitignore",
         "--mode",
         "mild",
+        "--format",
+        ",".join(sorted(set(inputs.values()))),
+        "--reporters",
+        "json,sarif",
+        "--output",
+        str(output),
+        "--fail-on-empty",
+        "--no-tips",
+        "--no-colors",
+        "--",
+        *inputs,
     ]
-    if None not in formats:
-        command.extend(["--format", ",".join(sorted(formats))])
-    command.extend(
-        [
-            "--reporters",
-            "json,sarif",
-            "--output",
-            str(output),
-            "--fail-on-empty",
-            "--no-tips",
-            "--no-colors",
-            "--",
-            *languages,
-        ]
-    )
-    return command
 
 
 def _raise_jscpd_termination(
@@ -444,7 +441,7 @@ def _raise_jscpd_failure(result: Any, diagnostics: Diagnostics) -> None:
 def _run_jscpd(
     root: Path,
     binary: Path,
-    languages: dict[str, str | None],
+    formats: dict[str, str],
     min_tokens: int,
     max_bytes: int,
 ) -> tuple[list[Clone], Diagnostics, str]:
@@ -452,7 +449,7 @@ def _run_jscpd(
         output = Path(temporary)
         config = output / "jscpd-config.json"
         mark_step("clone setup")
-        inputs, aliases = _clone_inputs(root, output, languages)
+        inputs, aliases = _clone_inputs(root, output, formats)
         _write_clone_config(config, inputs)
         mark_step("clone command preparation")
         command = _jscpd_command(
@@ -471,7 +468,7 @@ def _run_jscpd(
             )
         try:
             mark_step("clone report analysis")
-            clones = _parse_reports(json_report, sarif, root, languages, aliases)
+            clones = _parse_reports(json_report, sarif, root, formats, aliases)
         except UnsupportedError as error:
             raise CloneEvidenceError(
                 str(error),
@@ -500,17 +497,17 @@ def _clone_spans(clones: list[Clone]) -> tuple[Location, ...]:
 
 
 def _clone_inputs(
-    root: Path, output: Path, languages: dict[str, str | None],
-) -> tuple[dict[str, str | None], dict[str, str]]:
+    root: Path, output: Path, formats: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
     """Use temporary names for files whose jscpd basename mappings conflict."""
-    by_name: dict[str, set[str | None]] = {}
-    for path, language in languages.items():
-        by_name.setdefault(Path(path).name, set()).add(language)
+    by_name: dict[str, set[str]] = {}
+    for path, source_format in formats.items():
+        by_name.setdefault(Path(path).name, set()).add(source_format)
     inputs, aliases = {}, {}
-    for index, (path, language) in enumerate(languages.items()):
+    for index, (path, source_format) in enumerate(formats.items()):
         name = Path(path).name
-        if language is None or len(by_name[name]) == 1:
-            inputs[path] = language
+        if len(by_name[name]) == 1:
+            inputs[path] = source_format
             continue
         alias = f"source-{index}"
         while alias in by_name:
@@ -519,7 +516,7 @@ def _clone_inputs(
         _copy_clone_input(root, path, target)
         aliases[str(target)] = path
         aliases[alias] = path
-        inputs[str(target)] = language
+        inputs[str(target)] = source_format
     return inputs, aliases
 
 
@@ -533,21 +530,20 @@ def _copy_clone_input(root: Path, path: str, target: Path) -> None:
         raise GateError(f"cannot copy clone input {path}: {error}") from error
 
 
-def _write_clone_config(config: Path, languages: dict[str, str | None]) -> None:
+def _write_clone_config(config: Path, inputs: dict[str, str]) -> None:
     formats: dict[str, set[str]] = {}
-    for path, language in languages.items():
-        if language is not None:
-            formats.setdefault(language, set()).add(Path(path).name)
+    for path, source_format in inputs.items():
+        formats.setdefault(source_format, set()).add(Path(path).name)
     config.write_text(json.dumps({
-        "formatsNames": {language: sorted(names) for language, names in formats.items()},
+        "formatsNames": {source_format: sorted(names) for source_format, names in formats.items()},
     }), encoding="utf-8")
 
 
 def _parse_reports(
-    json_report: Path, sarif: Path, root: Path, languages: dict[str, str | None],
+    json_report: Path, sarif: Path, root: Path, formats: dict[str, str],
     aliases: dict[str, str],
 ) -> list[Clone]:
-    _parse_jscpd_json(json_report, languages)
+    _parse_jscpd_json(json_report, formats)
     return _parse_sarif(sarif, root, aliases)
 
 
@@ -645,6 +641,16 @@ def _prepare_clones(
     return binary, None
 
 
+def _clone_formats(languages: dict[str, str | None]) -> dict[str, str]:
+    formats: dict[str, str] = {}
+    for path, language in languages.items():
+        source_format = _JSCPD_FORMAT_BY_LANGUAGE.get(language or "")
+        if source_format is None:
+            raise GateError(f"{path}: no jscpd format for inventory language {language!r}")
+        formats[path] = source_format
+    return formats
+
+
 def measure_clones(
     root: Path,
     languages: dict[str, str | None],
@@ -652,12 +658,13 @@ def measure_clones(
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> CloneMeasurement:
     files = list(languages)
-    binary, failure = _prepare_clones(root, files)
-    if failure is not None:
-        return failure
     try:
+        formats = _clone_formats(languages)
+        binary, failure = _prepare_clones(root, files)
+        if failure is not None:
+            return failure
         clones, diagnostics, execution = _run_jscpd(
-            root, binary, languages, min_tokens, max_bytes
+            root, binary, formats, min_tokens, max_bytes
         )
     except CloneEvidenceError as error:
         return CloneMeasurement(

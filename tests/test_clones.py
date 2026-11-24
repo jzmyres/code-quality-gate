@@ -7,6 +7,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import (
     GATE,
@@ -418,8 +419,11 @@ class CloneGateTests(FixtureCase):
 
     def test_jscpd_is_invoked_with_the_gate_options_and_files(self) -> None:
         args_file = self.base / "jscpd-args.txt"
+        self.add_file("a.sh", SHELL_SOURCE)
         self.write_config(
-            with_clones(min_tokens=77).replace(
+            with_clones(min_tokens=77)
+            .replace('pattern = "*.py"', 'pattern = "a.*"')
+            .replace(
                 "[code]",
                 "[hygiene]\nmax_bytes = 12345\n\n[code]",
             )
@@ -447,8 +451,27 @@ class CloneGateTests(FixtureCase):
         self.assertEqual(arguments[index + 1], "12345")
         index = arguments.index("--ignore")
         self.assertTrue(arguments[index + 1])
+        index = arguments.index("--format")
+        self.assertEqual(arguments[index + 1], "bash,python")
         separator = arguments.index("--")
-        self.assertIn("a.py", arguments[separator + 1:])
+        self.assertEqual(arguments[separator + 1:], ["a.py", "a.sh"])
+
+    def test_jscpd_refuses_a_selected_file_without_an_inventory_language(self) -> None:
+        args_file = self.base / "jscpd-args.txt"
+        self.add_file("a.xml", "<root />\n")
+        self.write_config(with_clones().replace("*.py", "a.*"))
+        self.add_file("quality-gate-clones.toml", baseline_text([]))
+        env = self.install_fake_jscpd(args_file=args_file)
+        self.clone_failure(env, "a.xml", "inventory language", "None")
+        self.assertFalse(args_file.exists())
+
+    def test_unmapped_inventory_language_refuses_the_input(self) -> None:
+        self.add_file("a.xml", "<root />\n")
+        with mock.patch.object(clones, "_jscpd_binary") as binary:
+            result = clones.measure_clones(self.repo, {"a.xml": "xml"}, min_tokens=50)
+        binary.assert_not_called()
+        self.assertIn("a.xml", result.error)
+        self.assertIn("inventory language 'xml'", result.error)
 
     def test_jscpd_source_count_mismatch_is_unsupported(self) -> None:
         env = self.clone_env(
