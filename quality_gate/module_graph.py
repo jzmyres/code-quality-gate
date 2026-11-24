@@ -101,28 +101,40 @@ def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[st
 
 def _require_target(
     row: dict, paths: set[str], providers: dict[str, set[str]],
-) -> str | None:
+) -> tuple[str | None, str | None]:
     filename = row["filename"]
     if filename is not None:
-        with_suffix = f"{filename}.el"
-        if with_suffix in paths:
-            return with_suffix
-        return filename if filename in paths else None
-    candidates = providers.get(row["feature"], ())
-    return next(iter(candidates)) if len(candidates) == 1 else None
+        candidates = paths.intersection((f"{filename}.el", filename))
+        if not candidates:
+            return None, f"require filename {filename!r} has no measured target"
+        if len(candidates) > 1:
+            return None, f"require filename {filename!r} matches multiple measured files"
+    else:
+        feature = row["feature"]
+        candidates = providers.get(feature, set())
+        if len(candidates) > 1:
+            return None, f"require feature {feature!r} has multiple measured providers"
+    return next(iter(candidates), None), None
 
 
-def _require_edges(elisp: dict[str, list[dict]], modules: list[str]) -> set[Edge]:
+def _require_edges(elisp: dict[str, list[dict]], modules: list[str]) -> tuple[set[Edge], list[dict]]:
     paths = set(modules)
     providers: dict[str, set[str]] = defaultdict(set)
     for source, row in _elisp_records(elisp, "provide"):
         providers[row["feature"]].add(source)
     edges = set()
+    outside = []
     for source, row in _elisp_records(elisp, "require"):
-        target = _require_target(row, paths, providers)
+        target, problem = _require_target(row, paths, providers)
         if target is not None:
             edges.add(Edge(source, target, row["line"], "require"))
-    return edges
+        elif problem is not None:
+            outside.append({
+                "file": source,
+                "line": row["line"],
+                "message": f"{problem} and is outside the extractor",
+            })
+    return edges, outside
 
 
 Outgoing = dict[str, dict[str, Edge]]
@@ -226,7 +238,7 @@ def _program_dependencies(edges: list[Edge], programs: set[str], test_sources: f
 
 def _graph_report(
     modules: list[str], edges: list[Edge], outgoing: Outgoing, incoming: Incoming, findings: int,
-    elisp: dict[str, list[dict]],
+    outside: list[dict],
 ) -> dict:
     report = {
         "modules": modules,
@@ -236,12 +248,8 @@ def _graph_report(
         "value": findings,
         "threshold": 0,
     }
-    outside = [
-        {"file": source, "line": row["line"], "message": row["message"]}
-        for source, row in _elisp_records(elisp, "outside")
-    ]
     if outside:
-        report["outside_extractor"] = outside
+        report["outside_extractor"] = sorted(outside, key=lambda row: (row["file"], row["line"]))
     return report
 
 
@@ -252,7 +260,12 @@ def measure(
     root = root.absolute()
     elisp = elisp or {}
     modules = sorted([*python_modules, *elisp])
-    edges = sorted(_import_edges(root, python_modules) | _require_edges(elisp, modules))
+    require_edges, outside = _require_edges(elisp, modules)
+    outside.extend(
+        {"file": source, "line": row["line"], "message": row["message"]}
+        for source, row in _elisp_records(elisp, "outside")
+    )
+    edges = sorted(_import_edges(root, python_modules) | require_edges)
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [
         (component, _shortest_cycle(component, outgoing))
@@ -262,5 +275,5 @@ def measure(
     programs = _matched_paths(modules, spec.programs)
     program_edges = _program_dependencies(edges, programs, test_sources)
     findings = len(cycles) + len(suite_edges) + len(program_edges)
-    measurement = _graph_report(modules, edges, outgoing, incoming, findings, elisp)
+    measurement = _graph_report(modules, edges, outgoing, incoming, findings, outside)
     return measurement, cycles, suite_edges, program_edges

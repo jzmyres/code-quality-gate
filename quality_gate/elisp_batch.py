@@ -45,22 +45,24 @@ MODULE_GRAPH_READER = r"""
              (quoted-feature (qg-graph-quoted-symbol-p (cadr form)))
              (feature (and quoted-feature (qg-graph-interned-name (cadadr form))))
              (feature-problem
-              (cond ((not quoted-feature) "computed require feature")
-                    ((not feature) "uninterned require feature")))
+              (cond ((not quoted-feature) "computed")
+                    ((not feature) "uninterned")))
              (filename (nth 2 form))
              (filename-problem
               (cond ((stringp filename)
                      (unless (qg-graph-canonical-filename-p filename)
-                       "noncanonical require filename"))
-                    (filename "computed require filename")))
-             (outside (delq nil
-                            (list (when feature-problem
-                                    (qg-graph-outside line feature-problem))
-                                  (when filename-problem
-                                    (qg-graph-outside line filename-problem))))))
-        (or outside (list (list (cons 'kind "require") (cons 'line line)
-                                (cons 'feature feature)
-                                (cons 'filename filename)))))))
+                       "noncanonical"))
+                    ((not (null filename)) "computed")))
+             (problem
+              (cond ((and feature-problem filename-problem)
+                     (format "require with a %s feature and a %s filename"
+                             feature-problem filename-problem))
+                    (feature-problem (format "%s require feature" feature-problem))
+                    (filename-problem (format "%s require filename" filename-problem)))))
+        (if problem
+            (qg-graph-outside line problem)
+          (list (cons 'kind "require") (cons 'line line)
+                (cons 'feature feature) (cons 'filename filename))))))
 
   (defun qg-graph-provide (form &optional line)
     (when (and (eq (car-safe form) 'provide)
@@ -80,14 +82,16 @@ MODULE_GRAPH_READER = r"""
       ('progn
        (when (proper-list-p form)
          (delq nil (mapcar #'qg-graph-provide (cdr form)))))
-      ('require (qg-graph-require form line))
+      ('require
+       (let ((row (qg-graph-require form line)))
+         (when row (list row))))
       ('eval-when-compile
        (when (proper-list-p form)
-         (apply #'append (mapcar #'qg-graph-require (cdr form)))))))
+         (delq nil (mapcar #'qg-graph-require (cdr form)))))))
 
   (defun qg-graph-file (path)
     (with-temp-buffer
-      (let ((line 1) rows)
+      (let ((load-file-name (expand-file-name path)) (line 1) rows)
         (condition-case failure
             (progn
               (insert-file-contents path)

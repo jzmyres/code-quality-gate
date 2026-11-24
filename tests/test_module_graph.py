@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tomllib
+from contextlib import redirect_stderr
 from dataclasses import replace
+from io import StringIO
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -230,7 +232,93 @@ reason = "package measured by the graph"
         self.add_file("b.el", "(provide 'b)\n")
         measurement = self.graph(0)["measurement"]
         self.assertEqual(measurement["edges"], [edge("a.el", "nested/target.el", 1, "require")])
-        self.assertNotIn("outside_extractor", measurement)
+        self.assertEqual(measurement.get("outside_extractor"), [
+            {"file": "a.el", "line": 2,
+             "message": "require filename 'missing' has no measured target and is outside the extractor"},
+        ])
+
+    def assert_require_outside(self, measurement: dict[str, Any], line: int, message: str) -> None:
+        self.assertEqual(measurement["edges"], [])
+        self.assertEqual(measurement.get("outside_extractor"), [
+            {"file": "a.el", "line": line, "message": message},
+        ])
+
+    def test_module_graph_elisp_require_load_file_name(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "\n(require 'fixture #$)\n")
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        context = self.graph_context(["a.el", "fixture.el"])
+        result = adapters._run_module_graph(context)
+        self.assert_require_outside(
+            result.measurement, 2, "noncanonical require filename is outside the extractor",
+        )
+
+    def test_module_graph_elisp_duplicate_providers(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "\n(require 'fixture)\n")
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        self.add_file("other.el", "(provide 'fixture)\n")
+        context = self.graph_context(["a.el", "fixture.el", "other.el"])
+        result = adapters._run_module_graph(context)
+        self.assert_require_outside(
+            result.measurement, 2,
+            "require feature 'fixture' has multiple measured providers and is outside the extractor",
+        )
+
+    def test_module_graph_elisp_ambiguous_literal_filename(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "\n(require 'fixture \"fixture.el\")\n")
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        self.add_file("fixture.el.el", "")
+        context = self.graph_context(["a.el", "fixture.el", "fixture.el.el"])
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = adapters._run_module_graph(context)
+        message = "require filename 'fixture.el' matches multiple measured files and is outside the extractor"
+        self.assert_require_outside(result.measurement, 2, message)
+        self.assertIn(f"check: a.el:2: {message}", stderr.getvalue().splitlines())
+
+    def test_module_graph_elisp_require_outcome_invariant(self) -> None:
+        self.configure_graph(elisp=True)
+        source = "a.el"
+        self.add_file(source, (
+            "(require 'unique)\n"
+            "(eval-when-compile\n"
+            "  (\n"
+            "   require 'unique nil))\n"
+            "(require 'unused \"unique\")\n"
+            "(require 'unused \"unique.el\")\n"
+            "(require 'unique \"missing\")\n"
+            "(require 'unique \"both.el\")\n"
+            "(require 'shared)\n"
+            "(require (intern \"unique\") (concat \"unique\" \".el\"))\n"
+            "(require 'external)\n"
+            "(defun later () (require 'unique))\n"
+            "`(outer ,(require 'unique))\n"
+            "(eval-when-compile (progn (require 'unique)))\n"
+            "(load \"unique\")\n"
+            "(load-file \"unique.el\")\n"
+        ))
+        targets = {
+            "unique.el": "(provide 'unique)\n(progn (provide 'unique))\n",
+            "both.el": "(provide 'shared)\n",
+            "both.el.el": "(provide 'shared)\n",
+        }
+        for target, contents in targets.items():
+            self.add_file(target, contents)
+        result = adapters._run_module_graph(self.graph_context([source, *targets]))
+        self.assertEqual(result.measurement["edges"], [
+            edge(source, "unique.el", line, "require") for line in (1, 4, 5, 6)
+        ])
+        expected = {
+            7: "require filename 'missing' has no measured target and is outside the extractor",
+            8: "require filename 'both.el' matches multiple measured files and is outside the extractor",
+            9: "require feature 'shared' has multiple measured providers and is outside the extractor",
+            10: "require with a computed feature and a computed filename is outside the extractor",
+        }
+        self.assertEqual(result.measurement.get("outside_extractor"), [
+            {"file": source, "line": line, "message": message} for line, message in expected.items()
+        ])
 
     def test_module_graph_elisp_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -251,7 +339,7 @@ reason = "package measured by the graph"
         self.add_file("other.el", "(provide 'dotted-fixture)\n")
         self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "odd.name.el", 1, "require")])
 
-    def test_module_graph_elisp_literal_filename_prefers_el_suffix(self) -> None:
+    def test_module_graph_elisp_dotted_literal_filename_with_two_candidates(self) -> None:
         self.configure_graph("""
 [[rule]]
 pattern = "odd.name"
@@ -263,14 +351,14 @@ reason = "Python script measured by the graph"
         self.add_file("odd.name.el", "(provide 'dotted-fixture)\n")
         context = self.graph_context(["a.el", "odd.name", "odd.name.el"], ("odd.name.el",))
         result = adapters._run_module_graph(context)
-        expected_edge = edge("a.el", "odd.name.el", 1, "require")
-        self.assertEqual(result.measurement["edges"], [expected_edge])
+        self.assert_require_outside(
+            result.measurement, 1,
+            "require filename 'odd.name' matches multiple measured files and is outside the extractor",
+        )
         self.assertIn("odd.name", result.measurement["modules"])
-        self.assertEqual(result.outcome, "fail")
-        finding, = result.findings
-        self.assertIn("a.el -> odd.name.el", finding.subject)
-        self.assertEqual(finding.location, "a.el:1")
-        self.assertEqual(finding.measurement, {"edge": expected_edge})
+        self.assertIn("odd.name.el", result.measurement["modules"])
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.findings, [])
 
     def test_module_graph_elisp_noncanonical_literal_filenames(self) -> None:
         self.configure_graph(elisp=True)
