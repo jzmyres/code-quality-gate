@@ -154,6 +154,7 @@ class ElispTests(FixtureCase):
     def test_pass_definitions_and_version(self) -> None:
         result, check = self.assert_outcome("pass")
         self.assertEqual(check["measurement"], {"tests": 2})
+        self.assertEqual(check["findings"], [])
         definitions = check["definitions"]
         functions = {item["symbol"]: item for item in definitions}
         used, unused = functions["sample-used"], functions["sample-unused"]
@@ -292,6 +293,18 @@ requires = "legacy-tests"
         tail = check["diagnostics"]["output_tail"]
         self.assertIn("broken", tail)
         self.assertIn("(= 1 2)", tail)
+
+    def test_two_unexpected_results_report_both_symbols(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest failing () (should (= 1 2)))\n"
+                      "(ert-deftest surprising () :expected-result :failed (should t))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("fail", "failing", "surprising", "(= 1 2)")
+        self.assertEqual(check["findings"], [{
+            "subject": symbol, "value": 1, "threshold": 0, "blocking": True,
+            "bound": None, "baseline_reason": None, "covered_by_baseline": False,
+            "expired": False, "location": "tests/suite.el", "locations": None,
+        } for symbol in ("failing", "surprising")])
 
     def test_no_tests_and_all_skipped_fail(self) -> None:
         suites = [

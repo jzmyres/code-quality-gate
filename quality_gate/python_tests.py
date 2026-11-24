@@ -18,6 +18,7 @@ from .coverage_tool import (
     registry_dir,
     write_coverage_config,
 )
+from .json_input import load_json
 from .policy import (
     CheckDef,
     DEFAULT_TESTS_BUDGET_SECONDS,
@@ -27,6 +28,7 @@ from .policy import (
     _config_error,
     _integer,
 )
+from .ratchet import FindingResult
 from .runner import Diagnostics, RunResult, execution_outcome, mark_step, run
 from .tools import installed_tool
 
@@ -124,6 +126,64 @@ def expand_run(run: tuple[str, ...], prefix: list[str]) -> list[str]:
     return expanded
 
 
+def _uses_shard_runner(root: Path, command: tuple[str, ...]) -> bool:
+    if len(command) < 2 or command[0] != "{python}":
+        return False
+    try:
+        return (root / command[1]).samefile(Path(__file__).with_name("test_shards.py"))
+    except OSError:
+        return False
+
+
+def _test_command(
+    root: Path, argv: tuple[str, ...], prefix: list[str], data_dir: Path,
+) -> tuple[list[str], Path | None]:
+    command = expand_run(argv, prefix)
+    if not _uses_shard_runner(root, argv):
+        return command, None
+    report = data_dir / "failed-tests.json"
+    return [*command, "--failed-report", str(report)], report
+
+
+def _report_ids(document: Any, path: Path) -> list[str]:
+    if not isinstance(document, dict) or set(document) != {"failed"}:
+        raise ValueError(f"{path}: expected a JSON object with only the 'failed' key")
+    ids = document["failed"]
+    if not isinstance(ids, list) or not all(isinstance(test_id, str) for test_id in ids):
+        raise ValueError(f"{path}: expected 'failed' to be a list of strings")
+    return sorted(set(ids))
+
+
+def _read_failed_report(path: Path) -> list[str]:
+    try:
+        document = load_json(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(f"{path}: failed test report is missing") from error
+    except OSError as error:
+        raise ValueError(f"{path}: cannot read failed test report: {error}") from error
+    except ValueError as error:
+        raise ValueError(f"{path}: invalid JSON in failed test report: {error}") from error
+    return _report_ids(document, path)
+
+
+def _attach_failed_report(result: Any, path: Path | None) -> Any:
+    if path is None:
+        return result
+    try:
+        ids = _read_failed_report(path)
+    except ValueError as error:
+        result.reason = f"{result.reason}; {error}"
+        return result
+    result.findings = [
+        FindingResult(
+            subject=test_id, value=1, bound=None, threshold=0, baseline_reason=None,
+            blocking=True, location="unittest",
+        )
+        for test_id in ids
+    ]
+    return result
+
+
 def _executed_tests(
     ran: int | None, skipped: int | None
 ) -> int | None:
@@ -215,6 +275,7 @@ def _tests_failed(
     prefix: str,
     start: float,
     deadline: float,
+    failed_report: Path | None,
 ) -> Any:
     from .checks import _tests_result
 
@@ -224,7 +285,7 @@ def _tests_failed(
     if failure is not None:
         return failure
     if count_error is not None and "ambiguous test summary" in count_error:
-        return _tests_result(
+        result = _tests_result(
             check,
             spec,
             start,
@@ -234,19 +295,21 @@ def _tests_failed(
             diagnostics=diagnostics,
             report=False,
         )
-    executed = _executed_tests(ran, skipped)
-    return _tests_result(
-        check,
-        spec,
-        start,
-        prefix,
-        _tests_failure_reason(run_result, ran, skipped, executed),
-        diagnostics=diagnostics,
-        measurement={"tests": executed} if executed is not None else None,
-        tests_ran=ran,
-        tests_skipped=skipped,
-        report=False,
-    )
+    else:
+        executed = _executed_tests(ran, skipped)
+        result = _tests_result(
+            check,
+            spec,
+            start,
+            prefix,
+            _tests_failure_reason(run_result, ran, skipped, executed),
+            diagnostics=diagnostics,
+            measurement={"tests": executed} if executed is not None else None,
+            tests_ran=ran,
+            tests_skipped=skipped,
+            report=False,
+        )
+    return _attach_failed_report(result, failed_report)
 
 
 def _test_environment(python_prefix: list[str]) -> dict[str, str]:
@@ -517,7 +580,7 @@ def _run_python_tests(context: Any) -> Any:
         return setup
     data_dir, python_prefix = setup
 
-    command = expand_run(spec.run, python_prefix)
+    command, failed_report = _test_command(root, spec.run, python_prefix, data_dir)
     environment = _test_environment(python_prefix)
     temporary = _temporary_test_directory()
     environment["TMPDIR"] = str(temporary)
@@ -550,6 +613,7 @@ def _run_python_tests(context: Any) -> Any:
             prefix,
             start,
             deadline,
+            failed_report,
         )
         return _finish_test_result(result, temporary_reason, prefix, combined)
 

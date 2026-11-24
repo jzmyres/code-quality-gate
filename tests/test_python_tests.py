@@ -202,6 +202,7 @@ class PythonTestsTests(FixtureCase):
         check = assert_tests_pass(self, result, document, 2)
         self.assertEqual(check["execution"], "completed")
         self.assertEqual(check["metric_version"], "test-count/1")
+        self.assertEqual(check["findings"], [])
         self.assertIn("passed (2 tests", result.stderr)
 
     def test_a_crashing_suite_fails_with_its_exit_status(self) -> None:
@@ -408,16 +409,65 @@ class PythonTestsTests(FixtureCase):
         )
         self.failed_tests("command exited 1", "deliberate")
 
+    def use_shard_runner(self, start: str = "tests") -> None:
+        script = GATE / "quality_gate" / "test_shards.py"
+        self.write_config(tests_config(run=json.dumps([
+            "{python}", str(script), "-s", start, "-j", "1",
+        ])))
+
+    def assert_failed_ids(self, check: dict[str, object], *ids: str) -> None:
+        self.assertEqual(check["findings"], [{
+            "subject": test_id, "value": 1, "threshold": 0, "blocking": True,
+            "bound": None, "baseline_reason": None, "covered_by_baseline": False,
+            "expired": False, "location": "unittest", "locations": None,
+        } for test_id in ids])
+
+    def test_shard_suite_reports_two_failing_test_ids(self) -> None:
+        self.use_shard_runner()
+        self.add_test(
+            "test_failures",
+            "    def test_one(self):\n        self.fail('first failure')\n"
+            "    def test_two(self):\n        self.fail('second failure')\n",
+        )
+        _result, check = self.failed_tests("command exited 1", "first failure", "second failure")
+        self.assert_failed_ids(check, "test_failures.Sample.test_one", "test_failures.Sample.test_two")
+        self.assertEqual(check["measurement"], {"tests": 2})
+
+    def test_shard_suite_reports_unittest_import_error_id(self) -> None:
+        self.use_shard_runner()
+        self.add_file("tests/test_broken.py", "raise ImportError('broken fixture import')\n")
+        _result, check = self.failed_tests("command exited 1", "broken fixture import")
+        self.assert_failed_ids(check, "unittest.loader._FailedTest.test_broken")
+
+    def test_shard_suite_reports_setup_class_error_id(self) -> None:
+        self.use_shard_runner()
+        self.add_test(
+            "test_setup",
+            "    @classmethod\n    def setUpClass(cls):\n"
+            "        raise RuntimeError('broken class fixture')\n"
+            "    def test_blocked(self):\n        self.fail('must not run')\n",
+        )
+        _result, check = self.failed_tests("command exited 5", "broken class fixture")
+        self.assert_failed_ids(check, "setUpClass (test_setup.Sample)")
+
+    def test_shard_discovery_failure_preserves_the_exit_reason(self) -> None:
+        self.use_shard_runner("missing")
+        self.add_test("test_unused", "    def test_passes(self):\n        pass\n")
+        _result, check = self.failed_tests("command exited 1", "expected an importable test directory")
+        self.assertIn("failed-tests.json: failed test report is missing", check["reason"])
+        self.assertEqual(check["findings"], [])
+
     def test_failed_command_without_summary_has_no_measurement(self) -> None:
         self.add_file(
-            "tests/failing.py",
-            "import sys\nprint('no summary')\nsys.exit(1)\n",
+            "tests/test_shards.py",
+            "import sys\nassert len(sys.argv) == 1\nprint('no summary')\nsys.exit(1)\n",
         )
         self.write_config(
-            tests_config(run='["{python}", "tests/failing.py"]')
+            tests_config(run='["{python}", "tests/test_shards.py"]')
         )
         _result, check = self.failed_tests("command exited 1", "no summary")
         self.assertNotIn("measurement", check)
+        self.assertEqual(check["findings"], [])
 
     def test_failed_command_with_zero_executed_tests_reports_counts(self) -> None:
         self.add_file(
@@ -1084,6 +1134,57 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             time.monotonic() + 60,
         )
 
+    def failed_report_path(self) -> Path:
+        return Path(self.enterContext(tempfile.TemporaryDirectory())) / "failed.json"
+
+    def assert_report_refused(self, path: Path, defect: str) -> None:
+        with self.assertRaises(ValueError) as raised:
+            python_tests._read_failed_report(path)
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn(defect, str(raised.exception))
+
+    def test_failed_report_reads_test_ids(self) -> None:
+        path = self.failed_report_path()
+        path.write_text('{"failed": ["test_example.Case.test_failure"]}', encoding="utf-8")
+        self.assertEqual(python_tests._read_failed_report(path), ["test_example.Case.test_failure"])
+
+    def test_failed_report_refuses_missing_file(self) -> None:
+        self.assert_report_refused(self.failed_report_path(), "missing")
+
+    def test_failed_report_refuses_unreadable_file(self) -> None:
+        path = self.failed_report_path()
+        path.mkdir()
+        self.assert_report_refused(path, "cannot read")
+
+    def test_failed_report_refuses_invalid_json(self) -> None:
+        path = self.failed_report_path()
+        for document in ('{"failed":', '{"failed": [], "failed": []}'):
+            with self.subTest(document=document):
+                path.write_text(document, encoding="utf-8")
+                self.assert_report_refused(path, "invalid JSON")
+
+    def test_failed_report_refuses_extra_key(self) -> None:
+        path = self.failed_report_path()
+        path.write_text('{"failed": [], "extra": []}', encoding="utf-8")
+        self.assert_report_refused(path, "only the 'failed' key")
+
+    def test_failed_report_refuses_invalid_failed_value(self) -> None:
+        path = self.failed_report_path()
+        for value in (42, ["valid.id", 42]):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({"failed": value}), encoding="utf-8")
+                self.assert_report_refused(path, "a list of strings")
+
+    def test_test_command_matches_policy_runner_relative_to_the_root(self) -> None:
+        data = self.failed_report_path().parent
+        command, report = python_tests._test_command(
+            GATE, ("{python}", "quality_gate/test_shards.py", "-s", "tests"), ["covered"], data,
+        )
+        self.assertEqual(report, data / "failed-tests.json")
+        self.assertEqual(command, [
+            "covered", "quality_gate/test_shards.py", "-s", "tests", "--failed-report", str(report),
+        ])
+
     def test_missing_or_unreadable_coverage_configuration_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary)
@@ -1216,21 +1317,23 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 "command terminated by signal 15",
             ),
         )
+        report_path = self.failed_report_path()
+        context = mock.Mock(root=GATE, check=self.check, prefix="check: tests")
         for run_result, outcome, execution, reason in cases:
             with self.subTest(execution=run_result.execution):
-                with contextlib.redirect_stderr(io.StringIO()):
-                    result = python_tests._tests_execution_failure(
-                        self.check,
-                        self.spec,
-                        run_result,
-                        runner.Diagnostics(),
-                        "",
-                        "check: tests",
-                        0.0,
-                    )
+                with (
+                    mock.patch.object(python_tests, "_tests_setup", return_value=(report_path.parent, [])),
+                    mock.patch.object(python_tests, "_test_command", return_value=([], report_path)),
+                    mock.patch.object(python_tests, "run", return_value=run_result),
+                    mock.patch.object(python_tests, "_read_failed_report") as read_report,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    result = python_tests._run_python_tests(context)
+                read_report.assert_not_called()
             assert result is not None
             self.assertEqual(result.outcome, outcome)
             self.assertEqual(result.execution, execution)
+            self.assertEqual(result.findings, [])
             self.assertTrue(result.reason.startswith(reason))
             if execution == "budget":
                 self.assertIn("deadline:", result.reason)

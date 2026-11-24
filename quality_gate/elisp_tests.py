@@ -19,6 +19,7 @@ from .policy import (
     _optional_string_list,
     _string,
 )
+from .ratchet import FindingResult
 from .runner import execution_outcome, mark_step, run
 
 
@@ -298,6 +299,17 @@ def _temporary() -> tempfile.TemporaryDirectory[str]:
     return tempfile.TemporaryDirectory(prefix="qg-elisp-")
 
 
+def _failure_findings(document: dict[str, Any], suite: str) -> list[FindingResult]:
+    names = sorted({item["name"] for item in document["failures"]})
+    return [
+        FindingResult(
+            subject=name, value=1, bound=None, threshold=0, baseline_reason=None,
+            blocking=True, location=suite,
+        )
+        for name in names
+    ]
+
+
 def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any],
             evidence: Path) -> Any:
     from .checks import _check_result, _tests_result
@@ -316,6 +328,7 @@ def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any
     reason = _verdict(document)
     result = _check_result(check, start, "fail" if reason else "pass", budget_seconds=spec.budget_seconds,
                            diagnostics=diagnostics, reason=reason, evidence_path=evidence)
+    result.findings = _failure_findings(document, spec.suite)
     apply_document(result, document)
     return result
 

@@ -20,6 +20,7 @@ from pathlib import Path
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 CGROUP_MEMBERSHIP = Path("/proc/self/cgroup")
+FAILED_OUTCOMES = ("failure", "error", "unexpected success")
 
 
 class ShardError(Exception):
@@ -359,6 +360,23 @@ def _summary(reports, elapsed):
     return int(failed)
 
 
+def _failed_ids(reports):
+    tests = {name for _, name, outcome, _ in _records(reports) if outcome in FAILED_OUTCOMES}
+    fixtures = {name for name, outcome, _ in _events((), reports) if outcome in FAILED_OUTCOMES}
+    return sorted(tests | fixtures)
+
+
+def _write_failed_report(path, reports, status):
+    if path is None:
+        return status
+    try:
+        path.write_text(json.dumps({"failed": _failed_ids(reports)}), encoding="utf-8")
+    except OSError as error:
+        print(f"unittest shards: cannot write failed test report {path}: {error}", file=sys.stderr)
+        return 1
+    return status
+
+
 def _cpu_max_cores(content):
     quota, period = content.split()
     if not period.isdigit() or not (period_us := int(period)):
@@ -414,6 +432,7 @@ def _options(argv):
     parser.add_argument("-s", "--start-directory", dest="start", required=True)
     parser.add_argument("-p", "--pattern", default="test*.py")
     parser.add_argument("-j", "--workers", type=int)
+    parser.add_argument("--failed-report", type=Path, metavar="PATH")
     parser.add_argument("--worker", nargs=2, help=argparse.SUPPRESS)
     options = parser.parse_args(argv)
     if options.workers is None:
@@ -448,6 +467,7 @@ def _run(options):
 
 
 def main(argv=None):
+    options = None
     try:
         options = _options(argv)
         start = time.monotonic()
@@ -458,8 +478,12 @@ def main(argv=None):
         validate_reports(ids, reports)
     except (ShardError, ImportError, OSError) as error:
         print(f"unittest shards: {error}", file=sys.stderr)
+        if options is not None and options.failed_report is not None:
+            print(f"unittest shards: no failed test report written to {options.failed_report}",
+                  file=sys.stderr)
         return 1
-    return _summary(reports, time.monotonic() - start)
+    status = _summary(reports, time.monotonic() - start)
+    return _write_failed_report(options.failed_report, reports, status)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,9 @@ from __future__ import annotations
 import contextlib
 import importlib
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -308,6 +310,89 @@ class ShardsTests(unittest.TestCase):
         self.assertIn("Ran 1 test in 0.000s", output.getvalue())
         self.assertIn("FAILED (failures=2, skipped=1)", output.getvalue())
 
+    def test_failed_report_is_sorted_and_unique(self):
+        (self.root / "tests" / "test_report.py").write_text(
+            "import unittest\n"
+            "class Blocked(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        raise RuntimeError('fixture error')\n"
+            "    def test_blocked(self):\n"
+            "        self.fail('must not run')\n"
+            "class Cases(unittest.TestCase):\n"
+            "    def test_subtests(self):\n"
+            "        with self.subTest(value=1):\n"
+            "            self.fail('one')\n"
+            "        with self.subTest(value=2):\n"
+            "            self.fail('two')\n"
+            "    @unittest.expectedFailure\n"
+            "    def test_unexpected_success(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        path = self.temporary / "suite report.json"
+        for workers in (1, 2):
+            with self.subTest(workers=workers):
+                result = self._run_fixture("test*.py", workers, "--failed-report", str(path))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"failed": [
+                    "setUpClass (test_report.Blocked)", "test_output.OutputCase.test_failure",
+                    "test_report.Cases.test_subtests", "test_report.Cases.test_unexpected_success",
+                    "unittest.loader._FailedTest.test_broken",
+                ]})
+                self.assertIn("failures=3, errors=2, skipped=2, unexpected successes=1", result.stdout)
+                path.unlink()
+
+    def _run_local_report_fixture(self, path):
+        self.enterContext(mock.patch.dict(sys.modules))
+        self.enterContext(mock.patch.object(sys, "path", sys.path.copy()))
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            status = shards.main([
+                "-s", str(self.root / "tests"), "-p", "test_skips.py", "-j", "1",
+                "--failed-report", str(path),
+            ])
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_failed_report_is_empty_on_pass(self):
+        path = self.temporary / "passed.json"
+        status, _, error = self._run_local_report_fixture(path)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"failed": []})
+
+    def test_failed_report_write_error_names_path(self):
+        path = self.temporary / "missing" / "failed.json"
+        status, output, error = self._run_local_report_fixture(path)
+        self.assertEqual(status, 1)
+        self.assertIn(str(path), error)
+        self.assertIn("cannot write", error)
+        self.assertIn("OK (skipped=2)", output)
+
+    def test_failed_report_discovery_error_names_path(self):
+        path = self.temporary / "failed.json"
+        missing = self.root / "missing"
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(shards.main(["-s", str(missing), "-j", "1", "--failed-report", str(path)]), 1)
+        self.assertIn(
+            f"discovery start {str(missing)!r}: expected an importable test directory", stderr.getvalue(),
+        )
+        self.assertIn(str(path), stderr.getvalue())
+        self.assertFalse(path.exists())
+
+    def test_no_failed_report_option_leaves_output_and_status_unchanged(self):
+        path = self.temporary / "failed.json"
+        plain = self._run_fixture("test_output.py", 1)
+        self.assertEqual(list(self.temporary.rglob("*.json")), [])
+        reported = self._run_fixture("test_output.py", 1, "--failed-report", str(path))
+        self.assertEqual(reported.returncode, plain.returncode)
+        self.assertEqual(reported.stderr, plain.stderr)
+        self.assertEqual(
+            re.sub(r" in \d+\.\d+s", "", reported.stdout),
+            re.sub(r" in \d+\.\d+s", "", plain.stdout),
+        )
+
     def test_shards_success_and_refusals(self):
         self.enterContext(mock.patch.dict(sys.modules))
         self.enterContext(mock.patch.object(sys, "path", sys.path.copy()))
@@ -316,11 +401,14 @@ class ShardsTests(unittest.TestCase):
             self.assertEqual(shards.main(argv), 0)
         self.assertIn("OK (skipped=2)", output.getvalue())
         with contextlib.redirect_stderr(io.StringIO()) as error:
-            self.assertEqual(shards.main(["-s", str(self.root / "missing")]), 1)
+            self.assertEqual(shards.main(["-s", str(self.root / "missing"), "-j", "1"]), 1)
             with self.assertRaises(SystemExit) as raised:
                 shards._options(["-s", "tests", "-j", "0"])
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn(f"discovery start {str(self.root / 'missing')!r}: expected", error.getvalue())
+        self.assertIn(
+            f"discovery start {str(self.root / 'missing')!r}: expected an importable test directory",
+            error.getvalue(),
+        )
         self.assertIn("--workers: expected an integer >= 1, got 0", error.getvalue())
 
     def test_shards_worker_prefix_rejects_invalid_input(self):
@@ -346,7 +434,7 @@ class ShardsTests(unittest.TestCase):
         shards._stop_worker(process)
         process.kill.assert_called_once()
 
-    def _run_fixture(self, pattern, workers=None):
+    def _run_fixture(self, pattern, workers=None, *report_args):
         argv = [sys.executable, "-I", "-B", "-X", "faulthandler"]
         if workers is None:
             argv.extend(["-m", "unittest", "discover"])
@@ -355,7 +443,7 @@ class ShardsTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.pop("QG_PYTHON", None)
         return subprocess.run(
-            [*argv, "-s", "tests", "-p", pattern],
+            [*argv, "-s", "tests", "-p", pattern, *report_args],
             cwd=self.root, env=environment, text=True, capture_output=True, timeout=15,
         )
 

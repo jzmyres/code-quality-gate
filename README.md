@@ -418,6 +418,14 @@ The runner refuses suites that override `run` or `__call__`. Each worker uses th
 prefix. If a worker crashes or leaves test records missing, the runner lists the unrecorded tests
 and shows the last 50 lines of that worker's output.
 
+Pass `--failed-report PATH` to write a UTF-8 JSON object after the run. Its only key is
+`"failed"`, whose value is a sorted array of unique unittest IDs, empty when no tests fail.
+Failures, errors, and unexpected successes use the test's ID, ordinarily `module.Class.test_name`.
+Subtest failures use their parent test's ID. Fixture and import errors use unittest's IDs,
+such as `setUpClass (module.Class)` or `unittest.loader._FailedTest.module`.
+The runner exits nonzero and names the path if it cannot produce the requested report.
+Without the option, it writes no report.
+
 `python_tests` runs the consumer's own test command once from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
 `covrun.py`, a fresh data directory, the source root, the pinned coverage install, that install's
@@ -446,6 +454,13 @@ runner with a measured script that reports every `quality_gate` module in its `s
 one parses `covrun.py` for a `quality_gate` import. With `--policy-from`, the version and payload
 digest are the authorized effective lock's, so the parent and the coverage runner agree on an
 authorized coverage upgrade.
+
+When `run` starts with `{python}` immediately followed by this gate installation's
+`test_shards.py` script, the adapter adds `--failed-report` with a path in the check's fresh
+data directory. On a completed failure, each reported test ID becomes one finding.
+If the report is missing or invalid, the check reason names the report path and the defect.
+Other commands produce no per-test findings. Timeouts, signals, and execution errors keep
+their existing reasons without reading the report.
 
 Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
 directly in the caller's temporary directory with a short `qg-t-` prefix, so the caller's `TMPDIR`
@@ -538,6 +553,7 @@ in `suite-guard-run` does. The helper intercepts that call and records ERT's sta
 the suite runs once, in that same child Emacs. Expected ERT results count as passed, unexpected results
 as failed, and skipped tests are counted separately. A passing check requires an exit status of zero,
 a valid result, at least one executed test (`selected - skipped`), and no unexpected results.
+Each unexpected result in the child report yields a finding whose subject is the ERT symbol name.
 
 `elisp_tests` gives its suite the same temporary-directory rule as `python_tests`: `TMPDIR` is a
 fresh gate-owned directory created in the caller's temporary directory with the same short prefix,
@@ -1231,6 +1247,10 @@ A finding has `subject`, its raw `value`, `bound` (or null when no baseline entr
 errors carry `error`. Python CRAP findings carry `cc`, `statements`, `executed` and `excluded_lines` in
 `measurement`; Emacs Lisp CRAP findings carry `cc`, `points` and `hits`. Unrounded values are compared: exactly at a bound passes, and a value `0.1` above the
 bound fails.
+
+Test failure findings use value `1` and threshold `0` and are blocking, with no baseline.
+Their display location is `unittest` for Python or the configured suite path for ERT.
+Source spans are unavailable, so `locations` is null. Failure details stay in the check's log.
 
 ### worklist
 
