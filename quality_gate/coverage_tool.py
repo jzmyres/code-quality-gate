@@ -33,10 +33,13 @@ _COVERAGE_FILE_KINDS = {
 
 
 def coverage_config_text(root: Path) -> str:
-    """The one gate-owned coverage configuration for collection and analysis."""
+    """The one gate-owned coverage configuration for collection and analysis.
+
+    Coverage splits at commas and line feeds, substitutes variables and
+    strips whitespace. Analysis also recognizes every str.splitlines()
+    separator.
+    """
     source = str(root)
-    # Coverage splits commas/LF, substitutes variables and strips whitespace;
-    # analysis also splits every str.splitlines() separator.
     for index, character in enumerate(source):
         if character in ",$\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029" or (
             character.isspace() and index in (0, len(source) - 1)

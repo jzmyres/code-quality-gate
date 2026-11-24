@@ -172,7 +172,7 @@ class PythonCrapTests(FixtureCase):
         self.assertIn("value 12.0 exceeds threshold 6.0", result.stderr)
 
     def test_imported_but_uncalled_function_scores_zero_coverage(self) -> None:
-        # Importing runs the decorator and def lines; they must not count as exercising the body.
+        """Importing runs the decorator and definition lines without exercising the body."""
         self.add_tests(
             "    def test_import_only(self):\n"
             "        import pkg.new\n"
@@ -638,7 +638,7 @@ class PythonCrapTests(FixtureCase):
         self.assertEqual(finding["value"], 1.0)
 
     def test_module_lambda_body_decisions_are_measured(self) -> None:
-        # Importing defines the lambda; its two decisions run only when it is called.
+        """Importing defines the lambda. Its two decisions run only when called."""
         self.add_tests(
             "    def test_import_only(self):\n"
             "        import pkg.lambdas\n"
@@ -1125,11 +1125,11 @@ class CoverageConfigurationAttackTests(FixtureCase):
                     self.assert_root_rule_matches_parsers(Path(source), coverage)
 
     def assert_root_rule_matches_parsers(self, root: Path, coverage: object) -> None:
+        """Construct each refused setting independently with parseable LF continuations."""
         from quality_gate.coverage_tool import _analysis_list, coverage_config_text
         from quality_gate.policy import UsageError
 
         source = str(root)
-        # Construct refused settings independently, keeping LF continuations parseable.
         settings = "[run]\nsource =\n    " + source.replace("\n", "\n    ") + "\n"
         collection = coverage.config.HandyConfigParser(our_file=True)
         collection.read_string(settings)

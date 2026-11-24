@@ -4,6 +4,8 @@ The adapter selects the production functions a diff touches, generates a fixed
 set of statement and expression mutations for each, and runs the test files
 that name the function or import its module against a copy of the repository.
 A mutant the tests catch is killed; one they do not catch is a finding.
+
+Comparison mutants use the operator's complement and its source spelling.
 """
 from __future__ import annotations
 
@@ -120,7 +122,6 @@ class _Change:
     index: int = -1
 
 
-# Every comparison operator's complement and the complement's text.
 _FLIPS: dict[type[ast.cmpop], tuple[type[ast.cmpop], str]] = {
     ast.Eq: (ast.NotEq, "!="),
     ast.NotEq: (ast.Eq, "=="),

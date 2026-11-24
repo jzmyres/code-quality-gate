@@ -157,6 +157,7 @@ class MeasurementTests(FixtureCase):
             measure_source_chars(self.repo, ["missing.py"])
 
     def test_a_symlink_out_of_the_tree_is_not_scanned_and_not_read(self) -> None:
+        """The outside file contains an ESC marker that a scan would report."""
         outside = self.base / "outside.py"
         outside.write_bytes(b"MARKER = 1\x1b\n")
         (self.repo / "pkg").mkdir()
@@ -170,7 +171,6 @@ class MeasurementTests(FixtureCase):
         self.assertEqual(finding.location, "pkg/link.py")
         self.assertEqual(finding.measurement, {"path": "pkg/link.py"})
         self.assertIsNone(finding.locations)
-        # The outside file holds an ESC marker: reading it would report it.
         self.assertNotIn(
             "U+001B", "".join(item.subject for item in findings)
         )

@@ -1,4 +1,7 @@
-"""Shared helpers for the code-quality-gate tests."""
+"""Shared helpers for the code-quality-gate tests.
+
+The test process and the gate entry point can both run under covrun.
+"""
 from __future__ import annotations
 
 import contextlib
@@ -25,7 +28,6 @@ TOOLS_LOCK = GATE / "tools.lock.toml"
 if str(GATE) not in sys.path:
     sys.path.insert(0, str(GATE))
 
-# The test process can itself run under covrun, just like the gate entry point.
 
 BASE_CONFIG = """\
 schema = 2

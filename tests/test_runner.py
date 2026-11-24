@@ -22,6 +22,68 @@ sys.path.insert(0, str(GATE))
 runner = importlib.import_module("quality_gate.runner")
 
 
+ORPHAN_PROGRAM = """
+import os
+import time
+from pathlib import Path
+
+
+def start_grandchildren(release_reader, pid_writer):
+    pids = []
+    for _ in range(24):
+        pid = os.fork()
+        if pid == 0:
+            os.close(pid_writer)
+            os.setsid()
+            os.read(release_reader, 1)
+            os._exit(0)
+        pids.append(pid)
+    os.write(pid_writer, " ".join(map(str, pids)).encode())
+    os._exit(0)
+
+
+def process_fields(pid):
+    try:
+        record = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return [b"X", b""]
+    return record.rpartition(b")")[2].split()
+
+
+gate_pid = str(os.getppid()).encode()
+pid_reader, pid_writer = os.pipe()
+release_reader, release_writer = os.pipe()
+middle = os.fork()
+if middle == 0:
+    os.close(pid_reader)
+    os.close(release_writer)
+    start_grandchildren(release_reader, pid_writer)
+os.close(pid_writer)
+os.close(release_reader)
+try:
+    assert os.waitpid(middle, 0) == (middle, 0)
+    with os.fdopen(pid_reader) as stream:
+        pids = [int(pid) for pid in stream.read().split()]
+    assert len(pids) == 24
+    assert all(process_fields(pid)[1] == gate_pid for pid in pids)
+finally:
+    os.close(release_writer)
+
+deadline = time.monotonic() + 3
+while any(process_fields(pid)[0] not in (b"X", b"Z") for pid in pids):
+    assert time.monotonic() < deadline, "grandchildren did not exit"
+    time.sleep(0.01)
+
+deadline = time.monotonic() + 1
+while True:
+    zombies = [pid for pid in pids if process_fields(pid)[:2] == [b"Z", gate_pid]]
+    if not zombies or time.monotonic() >= deadline:
+        break
+    time.sleep(0.02)
+print(len(zombies), *zombies)
+"""
+
+
 class _FakeProcess:
     pid = 4242
 
@@ -130,6 +192,34 @@ class ReadChunkTests(unittest.TestCase):
         self.assertTrue(result.output_truncated)
         self.assertLess(time.monotonic() - start, 8.0)
 
+    def test_reap_scans_follow_the_poll_interval_during_continuous_output(self) -> None:
+        now = 0.0
+        ticks = iter((0.03125, 0.0625, 0.125, 0.15625, 0.25, 0.28125, 0.3125, 0.34375, 0.375))
+        scan_times = []
+        key = SimpleNamespace(fd=12, data="stdout")
+
+        def select(_timeout):
+            nonlocal now
+            now = next(ticks)
+            return [(key, 1)]
+
+        selector = mock.Mock()
+        selector.select.side_effect = select
+        capture = runner._Capture(20)
+        with (
+            mock.patch.object(runner, "time", SimpleNamespace(monotonic=lambda: now)),
+            mock.patch.object(runner, "_finished", side_effect=lambda *_: now == 0.375),
+            mock.patch.object(runner, "_signal_group"),
+            mock.patch.object(runner, "_read_chunk", return_value=b"x"),
+            mock.patch.object(runner, "_reap_during_run", side_effect=lambda _: scan_times.append(now)),
+        ):
+            execution = runner._drain(
+                _FakeProcess([]), selector, {"stdout": mock.Mock()}, capture, 0.25, 0.5, set(),
+            )
+        self.assertEqual(execution, "budget")
+        self.assertEqual(capture.total, 9)
+        self.assertEqual(scan_times, [0.0, 0.125, 0.25, 0.3125])
+
 
 class ReapTests(unittest.TestCase):
     def test_reap_returns_when_the_child_exits(self) -> None:
@@ -200,6 +290,13 @@ class GroupAliveTests(unittest.TestCase):
         self.assertEqual(execution, "completed")
         self.assertLess(float(duration), 5.0)
 
+    def test_reaps_exited_adopted_children_during_run(self) -> None:
+        result = runner.run([sys.executable, "-I", "-c", ORPHAN_PROGRAM], budget_seconds=8)
+        self.assertEqual((result.execution, result.returncode), ("completed", 0), result)
+        count, *pids = result.stdout_text.split()
+        self.assertEqual(int(count), len(pids), result.stdout_text)
+        self.assertEqual(int(count), 0, f"Retained zombie PIDs: {', '.join(pids)}")
+
 
 class ChildProcessTests(unittest.TestCase):
     """The subreaper's reads of /proc and its cleanup decisions."""
@@ -236,6 +333,59 @@ class ChildProcessTests(unittest.TestCase):
             runner.os, "listdir", side_effect=OSError("denied")
         ), self.assertRaises(OSError):
             runner._children(os.getpid())
+
+    def test_reaps_later_adopted_children_after_an_unreadable_record(self) -> None:
+        known, unreadable, first, second = ("9000001", "9000002", "9000003", "9000004")
+        gate_pid = str(os.getpid())
+        direct = ""
+        draining = False
+        original_spawn = runner._spawn
+        original_close = runner._close
+        original_fields = runner._proc_fields
+
+        def spawn(*args):
+            nonlocal direct, draining
+            process, failure = original_spawn(*args)
+            if process is not None:
+                direct = str(process.pid)
+                draining = True
+            return process, failure
+
+        def close(*args):
+            nonlocal draining
+            draining = False
+            original_close(*args)
+
+        def listing(path):
+            if draining and path == "/proc":
+                return [direct, known, unreadable, first, second]
+            return [*os.listdir(path), known] if path == "/proc" else os.listdir(path)
+
+        def fields(path):
+            name = Path(path).parent.name
+            if name == unreadable:
+                raise PermissionError("synthetic unreadable process record")
+            if name in (direct, known, first, second):
+                return ["Z", gate_pid]
+            return original_fields(path)
+
+        runner_os = mock.Mock(wraps=os)
+        runner_os.WNOHANG = os.WNOHANG
+        runner_os.listdir.side_effect = listing
+        runner_os.waitpid.side_effect = ChildProcessError
+        with (
+            mock.patch.object(runner, "os", runner_os),
+            mock.patch.object(runner, "_spawn", side_effect=spawn),
+            mock.patch.object(runner, "_close", side_effect=close),
+            mock.patch.object(runner, "_proc_fields", side_effect=fields),
+        ):
+            result = runner.run([sys.executable, "-I", "-c", "pass"], budget_seconds=5)
+        self.assertEqual((result.execution, result.returncode), ("completed", 0), result)
+        expected = {(int(pid), os.WNOHANG) for pid in (first, second)}
+        observed = {call.args for call in runner_os.waitpid.call_args_list}
+        missing = expected - observed
+        self.assertFalse(missing, f"Missing waitpid(pid, WNOHANG) calls: {sorted(missing)}")
+        self.assertEqual(observed, expected)
 
     def test_an_unreadable_process_table_with_a_detached_child_is_an_error(
         self,

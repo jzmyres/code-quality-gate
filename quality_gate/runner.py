@@ -135,8 +135,6 @@ class ExecutionOutcome:
     signal: bool = False
 
 
-# The one termination-outcome table: every adapter reads a run's execution
-# through it instead of comparing the names itself.
 EXECUTION_OUTCOMES = {
     "completed": ExecutionOutcome("completed", completed=True),
     "error": ExecutionOutcome("error", error=True),
@@ -146,7 +144,11 @@ EXECUTION_OUTCOMES = {
 
 
 def execution_outcome(execution: str) -> ExecutionOutcome:
-    """The table's record for EXECUTION, or an unknown one with no flags."""
+    """The table's record for EXECUTION, or an unknown one with no flags.
+
+    Adapters use this shared interpretation to avoid comparing execution
+    names themselves.
+    """
     outcome = EXECUTION_OUTCOMES.get(execution)
     if outcome is None:
         return ExecutionOutcome(execution)
@@ -251,20 +253,22 @@ def _proc_group_member(path: str, group: int) -> bool:
     )
 
 
-def _fields_of(name: str) -> list[str] | None:
-    """One process's /proc fields, or None when its record has disappeared."""
+def _fields_of(name: str, *, strict: bool = True) -> list[str] | None:
+    """Read one process record, skipping unreadable records during a run."""
     try:
         return _proc_fields(f"/proc/{name}/stat")
     except OSError as error:
+        if not strict:
+            return None
         raise OSError(
             f"cannot read the process record for pid {name}: "
             f"{type(error).__name__}: {error}"
         ) from error
 
 
-def _child_pid(name: str, pid: int) -> int | None:
+def _child_pid(name: str, pid: int, *, strict: bool = True) -> int | None:
     """The pid NAME names, when its parent is PID."""
-    fields = _fields_of(name)
+    fields = _fields_of(name, strict=strict)
     if fields is None or len(fields) < 2:
         return None
     return int(name) if fields[1] == str(pid) else None
@@ -277,16 +281,17 @@ def _enumeration_error(error: OSError) -> str:
     )
 
 
-def _children(pid: int) -> set[int]:
+def _children(pid: int, *, strict: bool = True) -> set[int]:
     """The pids whose parent is PID, read from /proc.
 
-    An unreadable or absent process table raises OSError: treating it as an
-    empty set would confirm a cleanup that was never seen.
+    Strict scans raise on unreadable records so cleanup can report an
+    unconfirmed result. In-run scans skip unreadable records and retry on
+    the next poll. An unreadable or absent process table always raises.
     """
     names = [name for name in os.listdir("/proc") if name.isdigit()]
     found: set[int] = set()
     for name in names:
-        child = _child_pid(name, pid)
+        child = _child_pid(name, pid, strict=strict)
         if child is not None:
             found.add(child)
     return found
@@ -342,11 +347,23 @@ def _kill_adopted(adopted: set[int]) -> None:
         _signal_group(pid, signal.SIGKILL)
         with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGKILL)
+    _wait_adopted(adopted)
+
+
+def _wait_adopted(adopted: set[int]) -> None:
+    """Reap exited adopted children without blocking on live ones."""
     for pid in adopted:
-        try:
+        with contextlib.suppress(ChildProcessError):
             os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
+
+
+def _reap_during_run(excluded: set[int]) -> None:
+    """Reap available adoptees while the check and its pipes are active."""
+    try:
+        children = _children(os.getpid(), strict=False)
+    except OSError:
+        return
+    _wait_adopted(children - excluded)
 
 
 def _stop_remaining(known: set[int]) -> str | None:
@@ -435,14 +452,18 @@ class _DrainState:
             and now >= self.hard_deadline
         )
 
+    def poll_interval(self) -> float:
+        return 0.1 if self.terminated_at is None else 0.05
+
     def timeout(self, now: float) -> float:
+        interval = self.poll_interval()
         if self.terminated_at is None:
-            return max(0.0, min(0.1, self.deadline - now))
+            return max(0.0, min(interval, self.deadline - now))
         if self.killed:
-            return 0.05
+            return interval
         return max(
             0.0,
-            min(0.05, self.terminated_at + self.grace_seconds - now),
+            min(interval, self.terminated_at + self.grace_seconds - now),
         )
 
 
@@ -488,8 +509,10 @@ def _drain(
     capture: _Capture,
     deadline: float,
     grace_seconds: float,
+    excluded: set[int],
 ) -> str:
     state = _DrainState(deadline, grace_seconds)
+    last_reap = float("-inf")
     while True:
         now = time.monotonic()
         state.advance(now, process.pid)
@@ -497,7 +520,13 @@ def _drain(
             break
         if state.past_hard_deadline(now):
             break
-        events = selector.select(state.timeout(now))
+        interval = state.poll_interval()
+        if now >= last_reap + interval:
+            last_reap = now
+            _reap_during_run(excluded)
+            now = time.monotonic()
+        until_reap = max(0.0, last_reap + interval - now)
+        events = selector.select(min(state.timeout(now), until_reap))
         _read_ready(events, selector, streams, capture)
     return state.execution
 
@@ -552,7 +581,12 @@ def _was_signalled(execution: str, returncode: int | None) -> bool:
 
 
 def _cleanup_error(group_gone: bool, adopted_error: str | None) -> str | None:
-    """The cleanup failure that wins over the drained execution, if any."""
+    """The cleanup failure that wins over the drained execution, if any.
+
+    Unconfirmed cleanup takes precedence over the drained execution so the
+    run cannot silently succeed with a process group or adopted descendants
+    whose absence could not be verified.
+    """
     if group_gone and adopted_error is None:
         return None
     return CLEANUP_ERROR if not group_gone else adopted_error
@@ -626,7 +660,7 @@ def _spawn(
 
 def _capture_process(
     process: subprocess.Popen[bytes], deadline: float,
-    grace_seconds: float, capture_limit: int | None,
+    grace_seconds: float, capture_limit: int | None, excluded: set[int],
 ) -> tuple[str, _Capture]:
     assert process.stdout is not None and process.stderr is not None
     limit = 2**63 if capture_limit is None else max(0, capture_limit)
@@ -637,7 +671,7 @@ def _capture_process(
         os.set_blocking(stream.fileno(), False)
         selector.register(stream.fileno(), selectors.EVENT_READ, name)
     try:
-        execution = _drain(process, selector, streams, capture, deadline, grace_seconds)
+        execution = _drain(process, selector, streams, capture, deadline, grace_seconds, excluded)
     finally:
         _close(selector, streams)
     return execution, capture
@@ -683,14 +717,11 @@ def run(
     assert process is not None
     try:
         execution, capture = _capture_process(
-            process, deadline, grace_seconds, capture_limit
+            process, deadline, grace_seconds, capture_limit, known | {process.pid}
         )
         group_gone = _reap(process)
         adopted_error = _stop_adopted(known)
         returncode = process.poll()
-        # Cleanup that could not show the group or its adopted descendants gone
-        # wins over the drained execution: the run must never report a silent
-        # success in that case.
         execution, error, timed_out = _execution_fields(
             execution, returncode, _cleanup_error(group_gone, adopted_error)
         )

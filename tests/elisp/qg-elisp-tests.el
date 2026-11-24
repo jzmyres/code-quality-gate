@@ -1,9 +1,6 @@
-;;; qg-elisp-tests.el --- ERT suite for the gate's Emacs Lisp helpers -*- lexical-binding: t -*-
+;;; qg-elisp-tests.el --- ERT suite for the gate's Emacs Lisp helpers  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Exercise the complexity, child and lint helpers in one batch process.
-;; The gate instruments these helpers, so the tests call the loaded
-;; definitions instead of loading the files again.
 
 ;;; Code:
 
@@ -205,7 +202,10 @@
       (qg-elisp-tests--delete directory))))
 
 (ert-deftest qg-elisp-tests-child-run-tests ()
-  "Intercept exactly one ERT batch call and report its statistics."
+  "Intercept exactly one ERT batch call and report its statistics.
+This suite exercises the complexity, child and lint helpers in one
+batch process.  Tests call the loaded definitions to preserve the
+gate's instrumentation."
   (let ((directory (qg-elisp-tests--temporary-directory)))
     (unwind-protect
         (progn

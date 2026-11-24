@@ -1,4 +1,4 @@
-;;; qg-env-surface.el --- Inventory environment accesses -*- lexical-binding: t -*-
+;;; qg-env-surface.el --- Inventory environment accesses  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 

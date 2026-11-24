@@ -1,4 +1,11 @@
-"""Python CRAP measurement: ast complexity joined with coverage line data."""
+"""Python CRAP measurement: ast complexity joined with coverage line data.
+
+Cyclomatic complexity starts at one, then adds the table counter's
+result for each matching construct. The walk includes nested function
+and lambda bodies in the enclosing function's score. Counters for
+selections from named tables also receive the scope's boolean-keyed
+tables.
+"""
 from __future__ import annotations
 
 import ast
@@ -389,9 +396,6 @@ def _match_case(node: ast.match_case) -> int:
     return 1
 
 
-# One data table for the cyclomatic-complexity constructs.  Every match adds
-# the counter's result; the function's base is 1.  Nested function and lambda
-# bodies are walked too, so they add to their enclosing function.
 CC_RULES: tuple[
     tuple[type[ast.AST], Callable[[Any], int]], ...
 ] = (
@@ -413,8 +417,6 @@ CC_RULES: tuple[
     (ast.BinOp, _repetition),
 )
 
-# Selections of a named table read the scope's boolean-keyed tables, so their
-# counters take that table beside the node.
 _BOUND_RULES: tuple[
     tuple[type[ast.AST], Callable[[Any, dict[str, int]], int]], ...
 ] = (
@@ -551,8 +553,11 @@ def _function_complexity(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_tables: dict[str, int] | None = None,
 ) -> int:
-    # Defaults, decorators and annotations run at definition time and belong
-    # to the enclosing owner, so only the executable body counts here.
+    """Count the executable body of a function.
+
+    Defaults, decorators and annotations run at definition time and belong
+    to the enclosing owner.
+    """
     tables = _boolean_tables(node.body)
     for name, count in _boolean_tables(node.body, scoped=True).items():
         tables[name] = max(tables.get(name, 0), count)
@@ -710,8 +715,10 @@ def _module_subject(
 
 
 def _lambda_lines(node: ast.Lambda) -> tuple[int, ...]:
-    # The declaration line only runs when the module is imported; the body
-    # runs when the lambda is called, so it measures on its own lines.
+    """Measure a lambda on its own body lines.
+
+    The declaration line runs at module import. The body runs when called.
+    """
     return tuple(
         line
         for line in _node_lines(list(ast.walk(node.body)))
@@ -848,8 +855,11 @@ def _measure_one(
     missing: list[int],
     executed_lines: list[int],
 ) -> tuple[float | None, dict[str, Any] | None, str | None]:
-    # The def and decorator lines run when the module is imported, not when the function is called, so
-    # only the body's statements measure whether the tests exercised the function.
+    """Measure whether the tests exercised the function body.
+
+    The definition and decorator lines run during import. Only the body's
+    statements count toward coverage of the function.
+    """
     if isinstance(function.node, ast.Lambda):
         return _measure_lambda(function, excluded, executed_lines)
     if function.lines is not None:

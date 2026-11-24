@@ -166,6 +166,10 @@ branch = ["if", "when", "unless", "while", "dolist", "dotimes", "cl-dolist", "cl
                 self.assertEqual(findings[f"src/core.el:{name}"]["measurement"]["cc"], expected)
 
     def test_policy_replaces_each_family_and_auxiliary_symbols(self) -> None:
+        """Count the base 1, branch 1, operands 2, cond 1, bindings 2,
+        handlers 2, case and its branch body 1 each, and loop and its
+        keyword 1 each.
+        """
         self.add_file("src/core.el", "(defun fixture (x)\n"
                       " (if x 1 2) (and x x) (cond (x 1) (t 0))\n"
                       " (identity x) (list x x x) (progn (x 1) (otherwise 0))\n"
@@ -188,8 +192,6 @@ catch_all = ["otherwise"]
 ''')
         result, _document, check = self.run_crap()
         self.assertEqual(result.returncode, 0, output(result))
-        # Base 1 + branch 1 + operands 2 + cond 1 + bindings 2 + handlers 2
-        # + case 1 and its branch body 1 + loop 1 and its keyword 1.
         self.assertEqual(by_subject(check)["src/core.el:fixture"]["measurement"]["cc"], 13)
 
     def test_empty_rule_lists_disable_decisions_and_catchall_exemption(self) -> None:

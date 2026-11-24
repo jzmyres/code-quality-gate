@@ -1379,6 +1379,7 @@ class IdentityDecisionTests(unittest.TestCase):
 
 class PreparationCleanupTests(TrustCase):
     def test_failed_preparation_removes_its_temporary_directories(self) -> None:
+        """Require explicit directory cleanup while the traceback still holds the failed call's locals."""
         revision = self.directory_revision()
         scratch = self.base / "scratch-tmp"
         scratch.mkdir()
@@ -1388,8 +1389,6 @@ class PreparationCleanupTests(TrustCase):
             try:
                 prepare_trust(self.repo, revision, [])
             except RuntimeError:
-                # The traceback still holds the failed call's locals here, so only an
-                # explicit cleanup can have removed its directories already.
                 remaining = sorted(path.name for path in scratch.iterdir())
             else:
                 self.fail("preparation did not fail")

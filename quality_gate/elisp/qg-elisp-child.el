@@ -1,8 +1,6 @@
-;;; qg-elisp-child.el --- Measure ERT tests in a child Emacs -*- lexical-binding: t -*-
+;;; qg-elisp-child.el --- Measure ERT tests in a child Emacs  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; A staged copy instruments the selected files, runs one batch suite and
-;; writes its results and Edebug stop-point counts as JSON.
 
 ;;; Code:
 
@@ -114,7 +112,9 @@
       (insert (json-encode document)))))
 
 (defun qg-elisp-child-run (root files suite result-file)
-  "Instrument FILES under ROOT, run SUITE and write JSON to RESULT-FILE."
+  "Instrument FILES under ROOT, run SUITE and write JSON to RESULT-FILE.
+ROOT is a staged copy.  Run one batch suite and report its results and
+Edebug stop-point counts."
   (let ((default-directory root))
     (condition-case failure
         (let* ((names (qg-elisp-child--instrument root files))

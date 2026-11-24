@@ -1,4 +1,8 @@
-"""Shared check machinery, the check runner and the combined check command."""
+"""Shared check machinery, the check runner and the combined check command.
+
+DECISION_MESSAGES supplies the accepted decisions for both reporting
+and exit-status selection.
+"""
 from __future__ import annotations
 
 import contextlib
@@ -49,10 +53,6 @@ from .runner import (
 
 
 RATCHET_BUDGET_SECONDS = 600
-# In-process analysis over bounded input takes seconds, so this allowance keeps
-# the run's wall-clock backstop from racing a subprocess budget, which must end
-# its check and never the run.  The timer starts before every subprocess, so a
-# run limit of exactly the budgets would always win over a hanging last check.
 RUN_ALLOWANCE_SECONDS = 300
 
 
@@ -645,6 +645,11 @@ def _prune_option_error(
 
 
 def _run_limit(selected_checks: Iterable[CheckDef]) -> float:
+    """In-process analysis takes time even over bounded inputs, so the run
+    allowance lets a subprocess exhaust its own budget and end the check.
+    The run timer starts before any subprocess, so a limit of exactly the
+    check budgets would always fire first for a hanging last check.
+    """
     return (
         sum(_check_budget(check) for check in selected_checks)
         + RUN_ALLOWANCE_SECONDS
@@ -1141,8 +1146,6 @@ def _hygiene_check(root: Path, config: Config) -> CheckResult:
         ),
     )
 
-# The accepted decisions and what the human report calls each one.  Both the
-# printed message and the exit status read this one table.
 DECISION_MESSAGES = {
     "accepted": "check: passed",
     "accepted_with_exceptions": "check: passed with exceptions",

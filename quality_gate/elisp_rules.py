@@ -1,4 +1,8 @@
-"""The Emacs Lisp default decision rules and repository overrides."""
+"""The Emacs Lisp default decision rules and repository overrides.
+
+REPEATED_FAMILIES lists the two families whose forms may repeat forms
+from other families. The defaults and their validation share this list.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,8 +11,6 @@ from typing import Any
 from .policy import _check_keys, _config_error, _optional_table, _string_list
 
 
-# The two families whose forms may repeat a form from another family; one
-# table, read by the default rules and by their validation.
 REPEATED_FAMILIES = ("loop_clauses", "catch_all")
 
 DEFAULT_RULES = {

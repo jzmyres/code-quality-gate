@@ -16,22 +16,22 @@ paths = ["ruff.toml"]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "tests", "crap", "shape", "variant-dispatch", "verification", "source-chars"]
+checks = ["ruff", "clones", "tests", "crap", "shape", "variant-dispatch", "verification", "source-chars", "comments"]
 
 [classes.test]
 code = true
 description = "Python tests that execute the gate on fixture repositories"
-checks = ["ruff", "clones", "tests", "verification", "source-chars"]
+checks = ["ruff", "clones", "tests", "verification", "source-chars", "comments"]
 
 [classes.elisp]
 code = true
 description = "Emacs Lisp measurement helpers, measured by the gate's own Elisp checks"
-checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars"]
+checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars", "comments"]
 
 [classes.elisp-suite]
 code = true
 description = "The ERT suite that exercises the Emacs Lisp helpers"
-checks = ["elisp-compile", "elisp-checkdoc", "source-chars"]
+checks = ["elisp-compile", "elisp-checkdoc", "source-chars", "comments"]
 
 [classes.config]
 code = false
@@ -117,6 +117,11 @@ min_tokens = 50
 
 [checks.source-chars]
 adapter = "source_chars"
+tier = 1
+enforcement = "enforced"
+
+[checks.comments]
+adapter = "comments"
 tier = 1
 enforcement = "enforced"
 

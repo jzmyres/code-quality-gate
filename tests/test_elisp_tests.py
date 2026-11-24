@@ -390,7 +390,7 @@ baseline = "crap.toml"
                          ["-Q --batch --eval (princ emacs-version)"] * 4)
 
     def test_oversized_emacs_versions_are_unsupported_for_every_elisp_check(self) -> None:
-        # Exercise the integer limit, component bound, and total text bound separately.
+        """Exercise the integer limit, component bound and total text bound separately."""
         for version in ("999999999" * 5000 + ".1", "1234567890.1", "1." * 64 + "1", "garbage"):
             with self.subTest(version=version[:32]):
                 wrapper, log = self.version_probe(version)
@@ -427,8 +427,8 @@ baseline = "crap.toml"
                 self.assertEqual(check["diagnostics"]["exit_code"], exit_code)
 
     def test_truncated_emacs_version_is_unsupported_before_any_measurement(self) -> None:
+        """Isolate the truncation flag with a captured prefix that fits the version bound."""
         version = "30.1" + " " * (1024 * 1024) + "suffix"
-        # Also isolate the truncation flag when the captured prefix fits the version bound.
         for capture_limit in (None, 128):
             with self.subTest(capture_limit=capture_limit):
                 wrapper, log = self.version_probe(version)
@@ -691,9 +691,9 @@ baseline = "crap.toml"
                 self.assertIn("got", result.stderr)
 
     def test_measuring_an_identical_helper_keeps_the_stage_separate(self) -> None:
+        """Bind the same vector for the before hook that an Edebug entry would bind."""
         helper = (GATE / "quality_gate/elisp/qg-elisp-child.el").read_text(encoding="utf-8")
         self.add_file("src/core.el", helper)
-        # The before hook needs the same dynamically bound vector as an Edebug entry.
         self.add_file("tests/suite.el", "(require 'ert)\n"
                       "(ert-deftest helper-test () (let ((qg-elisp-child--counts [0])) "
                       "(should (= (qg-elisp-child--before 0) 0))))\n"

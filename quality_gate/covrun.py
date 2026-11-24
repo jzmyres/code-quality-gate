@@ -170,10 +170,13 @@ def _prepared(
 
 
 def _run(argv: list[str]) -> int:
+    """Run coverage with the gate-owned metric settings.
+
+    The metric measures lines only. The consumer's configuration cannot
+    add branch measurement or omit rules.
+    """
     if len(argv) < 9:
         return _usage()
-    # A consumer's coverage configuration must not change this metric: line
-    # coverage only, with no branch measurement or omit rules of its own.
     _remove_overrides()
     try:
         (

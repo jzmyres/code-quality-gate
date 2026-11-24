@@ -24,12 +24,14 @@ runner = importlib.import_module("quality_gate.runner")
 
 
 def process_state(pid: int) -> str | None:
-    """Return a process's state letter from /proc, or None once it no longer exists."""
+    """Return a process's state letter from /proc, or None once it no longer exists.
+
+    The state follows the parenthesized command name, which can include spaces.
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    # The state follows the parenthesised command name, which may itself contain spaces.
     return stat.rpartition(")")[2].split()[0]
 
 
@@ -348,8 +350,11 @@ class CommandCheckTests(FixtureCase):
         self.assertEqual(check["diagnostics"]["signal"], 15)
 
     def wait_for_process_death(self, pid: int) -> None:
-        # A killed grandchild is reparented to PID 1, which in a CI container may never reap it: a
-        # zombie is dead, so only a running state fails.
+        """Wait until the grandchild stops running.
+
+        A killed grandchild reparented to PID 1 can stay a zombie in a CI
+        container. A zombie is already dead for this assertion.
+        """
         deadline = time.monotonic() + 5
         state = process_state(pid)
         while state not in (None, "Z", "X") and time.monotonic() < deadline:
@@ -391,8 +396,11 @@ class CommandCheckTests(FixtureCase):
         self.wait_for_process_death(child_pid)
 
     def test_budget_kills_a_descendant_after_the_leader_and_pipes_are_gone(self) -> None:
-        # Sol's reproduction: the leader exits and its output goes to a file, so the pipes close
-        # before the budget; the runner must still escalate against the process group.
+        """Require escalation against the group after the leader exits.
+
+        Redirecting output to a file lets the leader close the pipes before
+        the budget expires.
+        """
         pid_file = self.base / "grandchild.pid"
         sink_file = self.base / "grandchild.log"
         script = (

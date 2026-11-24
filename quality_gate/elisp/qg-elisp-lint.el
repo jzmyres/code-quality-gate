@@ -1,8 +1,6 @@
-;;; qg-elisp-lint.el --- Batch byte compilation and checkdoc -*- lexical-binding: t -*-
+;;; qg-elisp-lint.el --- Batch byte compilation and checkdoc  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; The gate calls these entry points in batch Emacs and reads their JSON report.
-;; Compilation output is confined to a directory owned by the gate.
 
 ;;; Code:
 
@@ -27,7 +25,8 @@
 
 (defun qg-elisp-lint-compile (files output result)
   "Compile FILES into OUTPUT and write RESULT.
-The gate normally calls this once per file in a fresh Emacs."
+The gate normally calls this once per file in a fresh batch Emacs.
+It owns the OUTPUT directory and reads RESULT as JSON."
   (let ((byte-compile-error-on-warn t)
         (create-lockfiles nil)
         (byte-compile-dest-file-function
@@ -46,7 +45,8 @@ The gate normally calls this once per file in a fresh Emacs."
     (message . ,text)))
 
 (defun qg-elisp-lint-checkdoc (files result)
-  "Run checkdoc on FILES and write RESULT with every issue."
+  "Run checkdoc on FILES and write RESULT with every issue.
+The gate calls this in batch Emacs and reads RESULT as JSON."
   (let ((create-lockfiles nil)
         (issues nil)
         (current-file nil))

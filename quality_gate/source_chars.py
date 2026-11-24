@@ -1,4 +1,11 @@
-"""Source-character lint: reject invisible control characters in source."""
+"""Source-character lint: reject invisible control characters in source.
+
+The character table rejects C0 controls except TAB, LF and the
+contextual form feed and CR, plus DEL, C1 and bidi controls. Form feed
+is allowed at the start of a line and CR is allowed in CRLF. If the data
+cannot be decoded, scan for ASCII controls and report columns as byte
+offsets.
+"""
 from __future__ import annotations
 
 import bisect
@@ -36,11 +43,6 @@ _SUBJECT_CODES = (
     + tuple(range(0x202A, 0x202F))
     + tuple(range(0x2066, 0x206A))
 )
-# One table for the rejected characters: the C0 controls except TAB, LF and
-# the two contextual ones, DEL, the C1 controls and the bidi controls.  A form
-# feed is rejected unless it starts a line; a CR is rejected unless it is part
-# of CRLF.  Data that does not decode is scanned as bytes, where only the
-# ASCII controls are meaningful and a column is a byte.
 _CONTEXT = r"|(?<=[^\n])\x0c|\r(?!\n)"
 _REJECTED = re.compile(
     r"[\x00-\x08\x0b\x0e-\x1f\x7f\x80-\x9f\u202a-\u202e\u2066-\u2069]"

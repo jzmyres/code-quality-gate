@@ -1,9 +1,6 @@
-;;; qg-elisp-complexity.el --- Read Emacs Lisp complexity -*- lexical-binding: t -*-
+;;; qg-elisp-complexity.el --- Read Emacs Lisp complexity  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Count the Emacs Lisp default or policy decision rules on top-level definitions.
-;; The caller supplies the effective rules as data.
-;; This helper reads source and never evaluates or instruments it.
 
 ;;; Code:
 
@@ -122,7 +119,9 @@
 
 (defun qg-elisp-complexity-run (root files result-file)
   "Read FILES under ROOT and write complexity JSON to RESULT-FILE.
-Use the effective rules in `qg-elisp-complexity--rules'."
+Count decisions in top-level definitions using the default or policy
+rules that the caller supplies in `qg-elisp-complexity--rules'.
+Read the source without evaluating or instrumenting it."
   (let ((default-directory root)
         (create-lockfiles nil))
     (condition-case failure

@@ -7,6 +7,8 @@ one declared table read through one path.  A second rule reports a function
 that guesses a format by trying two same-annotation readers in a fallback
 chain.  A missing or invalid input is a configuration error, never a skipped
 rule, and the check has no baseline or exemption list.
+
+The literal-set reader is selected from one dispatch table keyed by node kind.
 """
 from __future__ import annotations
 
@@ -299,7 +301,6 @@ def _selection_into(
     displays.append(literals or frozenset())
 
 
-# The one dispatch table from a node kind to its literal-set reader.
 _FUNCTION_SET_HANDLERS = {
     ast.Compare: _compare_literals,
     ast.Match: _match_into,

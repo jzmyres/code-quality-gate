@@ -263,9 +263,13 @@ def _required(context: Any, start: float) -> tuple[Any, Any]:
 
 
 def _domain(context: Any, selected: list[str], entries: list[Any]) -> Domain:
+    """Determine the domain of a finding from the file inventory.
+
+    Both paths and symbol names can contain colons. Match the longest
+    actual inventory path to keep an unselected file from masquerading
+    as a symbol.
+    """
     mark_step("Elisp measured domain")
-    # Both paths and symbol names can contain colons.  Use the longest actual
-    # inventory path so an unselected file cannot masquerade as a symbol.
     subjects = []
     for entry in entries:
         candidates = [

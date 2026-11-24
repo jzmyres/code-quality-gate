@@ -1,4 +1,8 @@
-"""Repository resolution, file enumeration, inventory and hygiene."""
+"""Repository resolution, file enumeration, inventory and hygiene.
+
+BUILTIN_RESULT_KINDS is the shared set of results reported on every
+check run. The runner, decision rule and command dispatch all read it.
+"""
 from __future__ import annotations
 
 import fnmatch
@@ -16,8 +20,6 @@ from .runner import execution_outcome, run
 
 SHEBANG_LIMIT = 4096
 DIFF_BASE_ENV = "QG_DIFF_BASE"
-# The built-in results every check run reports; one table, read by the check
-# runner, the decision rule and the command dispatch.
 BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
 _SHEBANG_ENV = "env"
 _TYPE_NAMES = {
@@ -277,9 +279,12 @@ def _deleted_paths(root: Path) -> set[str]:
 
 
 def enumerate_entries(root: Path) -> list[GitFile]:
+    """Enumerate repository entries, including gitlinks with no worktree entry.
+
+    A gitlink names a commit rather than a file.
+    """
     entries = _staged_entries(root)
     deleted = _deleted_paths(root)
-    # Gitlinks are not files and stay enumerated without a worktree entry.
     entries = [
         entry for entry in entries
         if entry.gitlink or entry.path not in deleted

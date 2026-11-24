@@ -54,12 +54,17 @@ class InProcessRunQGTests(FixtureCase):
         self.assert_state_restored(before)
 
     def test_in_process_and_process_runs_agree(self) -> None:
+        """Compare in-process execution with a plain process.
+
+        Normalize only the elapsed seconds in each check line because timings
+        differ between runs. When the gate measures itself, covrun.py lies
+        inside the measured source. Using the coverage wrapper for this
+        comparison would add an already-imported warning on stderr.
+        """
         failing = BASE_CONFIG.replace(
             'run = ["python3", "-c", "print(1)"]',
             'run = ["python3", "-c", "import sys; sys.exit(1)"]',
         )
-        # Each check line reports its own elapsed seconds ("(exit 0, 0.02s)"), which differ between any
-        # two runs, so only that field is normalized before the outputs are compared.
         elapsed = re.compile(r", \d+\.\d+s\)")
 
         def comparable(result: subprocess.CompletedProcess[str]) -> tuple[int, str, str]:
@@ -73,9 +78,6 @@ class InProcessRunQGTests(FixtureCase):
             with self.subTest(check=name):
                 self.write_config(text)
                 in_process = self.run_qg("check")
-                # The subject is the in-process call against a plain process, not the coverage wrapper:
-                # when the gate measures itself, QG_PYTHON's covrun.py lies inside the measured source
-                # and coverage warns on stderr that it was already imported.
                 with mock.patch.dict(os.environ):
                     os.environ.pop("QG_PYTHON", None)
                     process = self.run_qg_process("check")

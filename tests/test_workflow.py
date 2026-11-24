@@ -14,6 +14,7 @@ RUN = "        run: |"
 
 
 def workflow_script() -> str:
+    """Read the workflow script without its Git user wrapper because the test uses its own user."""
     lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
     start = lines.index(STEP)
     run_at = lines.index(RUN, start)
@@ -22,7 +23,6 @@ def workflow_script() -> str:
         if not line.startswith("          "):
             break
         body.append(line[10:])
-    # The test runs as its own user, so it drops the wrapper that runs git as gate.
     return "\n".join(body).replace("runuser -u gate -- ", "") + "\n"
 
 

@@ -534,8 +534,8 @@ class PythonTestsTests(FixtureCase):
         self.unsupported_tests("not a test count")
 
     def test_a_child_that_exits_without_saving_is_unsupported(self) -> None:
-        # The child registers before it runs and exits before coverage saves.
 
+        """The child registers before it runs and exits before coverage saves its data."""
         self.add_file("tests/abrupt_child.py", "import os\nos._exit(0)\n")
         self.add_test(
             "test_abrupt",

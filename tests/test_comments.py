@@ -168,4 +168,4 @@ enforcement = "enforced"
         ]
         findings, errors = comments.measure(GATE, files)
         self.assertEqual(errors, [])
-        self.assertTrue(findings)
+        self.assertEqual(findings, [])

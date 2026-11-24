@@ -1,4 +1,7 @@
-"""Pinned tool locks, installation and binary lookup."""
+"""Pinned tool locks, installation and binary lookup.
+
+The lock validator and extraction dispatch share the archive format table.
+"""
 from __future__ import annotations
 
 import contextlib
@@ -24,8 +27,6 @@ from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
 TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
-# The one archive-format table: the lock validates against it and extraction
-# dispatches through it.
 ARCHIVE_FORMATS = ("tar", "wheel", "deb")
 LOCK_KEYS = (
     "version",
@@ -625,10 +626,13 @@ def _remove_install(destination: Path) -> None:
 
 
 def _replace_destination(build: Path, destination: Path) -> None:
+    """Replace the installed payload and restore its read-only mode.
+
+    Renaming a directory across parents requires its own write bit, so
+    the payload root is writable only during the move.
+    """
     _remove_install(destination)
     mode = stat.S_IMODE(build.lstat().st_mode)
-    # Renaming a directory across parents needs its own write bit, so the
-    # payload root is writable only for the move and read-only afterwards.
     os.chmod(build, mode | stat.S_IWUSR)
     os.replace(build, destination)
     os.chmod(destination, mode & ~0o222)

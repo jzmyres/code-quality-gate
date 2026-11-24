@@ -48,7 +48,7 @@ def _elisp_tests_spec(
 
 
 def _numeric_version(version: str) -> bool:
-    # Bound both total work and each integer conversion, independently of Python's limit.
+    """Bound total parsing work and each integer conversion independently of Python's limit."""
     return (len(version) <= _VERSION_TEXT_LIMIT
             and re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9})+", version) is not None)
 

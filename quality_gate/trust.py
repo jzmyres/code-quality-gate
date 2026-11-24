@@ -231,8 +231,11 @@ class _TrustedTree:
 
 
 def _candidate_files(root: Path) -> list[str]:
-    # The protected scope includes ignored untracked files, so no
-    # --exclude-standard here.
+    """Enumerate files in the protected scope.
+
+    The protected scope includes ignored untracked files, so Git must
+    include those files in its listing.
+    """
     result = _git(root, ["ls-files", "-z", "-c", "-o"])
     if result.execution != "completed" or result.returncode != 0:
         raise UsageError(

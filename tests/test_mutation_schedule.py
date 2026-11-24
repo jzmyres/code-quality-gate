@@ -18,9 +18,9 @@ class MutationScheduleTests(unittest.TestCase):
         )
 
     def test_mutation_on_demand_workflow_jobs_require_manual_dispatch(self) -> None:
+        """Match job headers and inline or block run steps by workflow indentation."""
         workflow = (GATE / ".github" / "workflows" / "check.yml").read_text(encoding="utf-8")
         _, _, jobs = workflow.partition("\njobs:\n")
-        # Match the workflow's job headers and inline or block run steps by indentation.
         mutation_jobs = []
         for job in re.split(r"(?m)(?=^  [\w-]+: *$)", jobs):
             run_steps = re.findall(r"(?m)^        run:([^\n]*(?:\n {10,}[^\n]*)*)", job)

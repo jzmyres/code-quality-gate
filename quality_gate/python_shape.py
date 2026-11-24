@@ -6,6 +6,9 @@ finding is a violation of the rule's predicate, reported as value 1 against
 threshold 0, so any finding fails the check: there is no baseline key and no
 suppression.  A missing or invalid input is a configuration error, never a
 skipped rule.
+
+The duplicate-fragment rule tops out at 49 tokens, just below the
+clone detector's 50-token minimum.
 """
 from __future__ import annotations
 
@@ -49,18 +52,13 @@ SCOPES = ("changed", "tree")
 DEFAULT_MAX_CHAIN = 6
 DEFAULT_CLONE_MIN_TOKENS = 30
 DEFAULT_CLONE_SIMILARITY = 0.95
-# One below the clone detector's 50-token minimum: this rule covers the gap.
 CLONE_MAX_TOKENS = 49
 _SKIPPED_TOKENS = frozenset({
     tokenize.ENCODING, tokenize.NEWLINE, tokenize.NL, tokenize.INDENT,
     tokenize.DEDENT, tokenize.COMMENT, tokenize.ENDMARKER,
 })
-# A string literal is one token; the literal pieces of an f-string are data,
-# so only its interpolated expressions stay tokens.  The start stands for the
-# whole literal prefix and the end closes it without adding structure.
 _STRING_TOKENS = frozenset({tokenize.STRING, tokenize.FSTRING_START})
 _DATA_TOKENS = frozenset({tokenize.FSTRING_MIDDLE, tokenize.FSTRING_END})
-# A number and a string literal are the same token however they are written.
 _TOKEN_TEXTS = {
     tokenize.NUMBER: "N",
     **dict.fromkeys(_STRING_TOKENS, "S"),
@@ -547,15 +545,17 @@ def _measured_paths(
 def _shape_input(
     context: Any, spec: ShapeSpec, limit: float, base: DiffBase
 ) -> ShapeInput:
-    """One parse of the measured files, and the indexes every rule reads."""
+    """One parse of the measured files, and the indexes every rule reads.
+
+    The CRAP-payoff rule compares against the before tree for files
+    touched by the diff. The other rules use the after tree alone.
+    """
     diff = _diff_lines(context.root, base.commit)
     scoped = _measured_paths(context, spec, diff)
     indexes = {
         path: _file_index(path, _read_source(context.root, path))
         for path in scoped
     }
-    # CPF is the one rule that compares against the before tree, and only for
-    # the files the diff touches; every other rule reads the after tree alone.
     base_functions = _base_functions(
         context.root, base.commit, sorted(diff.paths.intersection(scoped))
     )
@@ -907,7 +907,13 @@ def _normalised_tokens(
 
 
 def _token_text(token: tokenize.TokenInfo) -> str:
-    """A keyword stays itself; an identifier, number and literal do not."""
+    """A keyword stays itself; an identifier, number and literal do not.
+
+    Each string literal is one token regardless of spelling, as is each
+    number. For f-strings the start represents the whole literal prefix,
+    the literal pieces carry data, and the end only closes the string.
+    Only the interpolated expressions add structural tokens.
+    """
     if token.type == tokenize.NAME and not keyword.iskeyword(token.string):
         return "ID"
     return _TOKEN_TEXTS.get(token.type, token.string)

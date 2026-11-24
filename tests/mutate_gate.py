@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run a fixed set of decision mutations against isolated copies of the gate."""
+"""Run a fixed set of decision mutations against isolated copies of the gate.
+
+Each entry defines exactly one deliberate fault. Exact AST source
+matches make drift an error.
+"""
 
 from __future__ import annotations
 
@@ -29,8 +33,6 @@ class Decision:
     reason: str
 
 
-# Each entry specifies exactly one deliberate fault, not every syntactic
-# mutation in the function. Exact AST source matches make drift an error.
 DECISIONS = (
     Decision(
         "elisp_compile_warning",
@@ -333,7 +335,7 @@ def _replacement(node: ast.AST, decision: Decision) -> str | None:
 
 
 def _offset(source: str, line: int, column: int) -> int:
-    # AST columns are UTF-8 byte offsets, not Unicode character offsets.
+    """Convert the AST's UTF-8 byte column to a string offset."""
     lines = source.splitlines(keepends=True)
     prefix = lines[line - 1].encode("utf-8")[:column].decode("utf-8")
     return sum(len(item) for item in lines[: line - 1]) + len(prefix)

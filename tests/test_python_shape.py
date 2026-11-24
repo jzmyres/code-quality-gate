@@ -1,4 +1,40 @@
-"""Tests for the python_shape adapter: its five rules, keys, scope and messages."""
+"""Tests for the python_shape adapter: its five rules, keys, scope and messages.
+
+COMPLEX_BASE has complexity seven from a for, three ifs, an elif and
+a while. CPF_FRAGMENT splits it into a complexity-three function and
+a helper. QF12_TEST describes the same split with direct tests for
+every helper. SINGLE_USE_METHOD_CALLER gives a new method and static
+method one caller each in another module and no direct tests.
+
+The PTW fixtures distinguish an untested render_json with one call and
+one call site from bodies where no parameter can be forwarded, a call
+is only one of two statements, the callee is the wrapper's own
+parameter, or only one of two parameters is forwarded. SHIPPED_WRAPPER
+adds an untested single-use pass-through wrapper. SHIPPED_FILES covers
+every shipped inventory rule.
+
+The LTC fixtures cover alpha-renamed duplicates below 50 tokens,
+reverse alphabetical source order, a reported false positive with
+30 shared tokens at similarity 0.938, 18 shared tokens at full
+similarity below the minimum, 62 shared tokens above the cap covered
+by the clone check, and a nested function that duplicates its
+enclosing function. TABLE_BASE moves the decisions into one data table.
+DECISION_AND_ADAPTER directly tests the decision function and its
+thin adapter.
+
+For UNCALLED, DISPATCH_BASE routes three decisions through subscripts
+with no named call sites. KEY_BASE passes a function as a keyword
+value, TABLE_REGISTERED registers one in a descriptor table, and
+DEAD_FUNCTION gives a function with no references. SINGLEDISPATCH_BASE
+registers a handler by decorator, GETATTR_BASE names a method only in
+an attribute string, and CALLED_BASE includes one direct call and an
+edited existing function. Editing an existing function does not make
+it an addition.
+
+Each mutant deletes one guard and names both the original fragment
+and its replacement. A missing target string proves nothing, so each
+mutation test runs the gate against a real fixture twice.
+"""
 from __future__ import annotations
 
 import ast
@@ -102,7 +138,6 @@ def shape_config(*, extra: str = "", table: str = SHAPE_TABLE) -> str:
     return text + TEST_CHECK + CRAP_CHECK + table + extra
 
 
-# A base function with CC 7: a for, three ifs, an elif and a while.
 COMPLEX_BASE = """\
 def process(items, flag):
     total = 0
@@ -122,7 +157,6 @@ def process(items, flag):
     return total
 """
 
-# CPF: the complexity-7 function splits into a complexity-3 one and a helper.
 CPF_FRAGMENT = """\
 def process(items, flag):
     total = 0
@@ -147,7 +181,6 @@ def _signed(item):
     return 1
 """
 
-# The QF12 shape: the same split, and every helper has a direct test.
 QF12_TEST = """\
 import sys
 import unittest
@@ -165,7 +198,6 @@ class SplitTests(unittest.TestCase):
         self.assertEqual(_signed(-2), -2)
 """
 
-# PTW-SU: the added render_json is one call, one call site and untested.
 PTW_BASE = """\
 import json
 
@@ -187,7 +219,6 @@ def render_json(data):
     return json.dumps(data, indent=2, sort_keys=True)
 """
 
-# PTW-SU: a zero-parameter function forwards no parameter, so it is not a wrapper.
 PTW_ZERO_PARAMETER = """\
 import json
 
@@ -217,7 +248,6 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(render_json({"a": 1}), '{\\\\n  "a": 1\\\\n}')
 """
 
-# PTW-SU: the body is two statements, so the call is not the whole body.
 PTW_MORE_THAN_ONE_STATEMENT = """\
 import json
 
@@ -231,7 +261,6 @@ def render_json(data):
     return json.dumps(data, indent=2, sort_keys=True)
 """
 
-# PTW-SU: the callee is the wrapper's own parameter, not a function it calls.
 PTW_PARAMETER_CALLEE = """\
 def main(render):
     return render(render)
@@ -244,7 +273,6 @@ def render(render):
 main(render)
 """
 
-# PTW-SU: two own parameters, and only one of them is forwarded.
 PTW_UNFORWARDED = """\
 import json
 
@@ -257,7 +285,6 @@ def render_json(data, flag):
     return json.dumps(data, indent=2)
 """
 
-# LTC: two added functions that are alpha-renamed duplicates below 50 tokens.
 LTC_DUPLICATE = """\
 def chip_class(lane: dict) -> str:
     window = "chip--peak" if lane.get("window") == "peak" else "chip--off"
@@ -275,7 +302,6 @@ chip_class({})
 lane_class({})
 """
 
-# LTC: the source order is the reverse of the identities' alphabetical order.
 LTC_REVERSED = """\
 def lane_class(lane: dict) -> str:
     window = "lane--peak" if lane.get("window") == "peak" else "lane--off"
@@ -293,7 +319,6 @@ lane_class({})
 chip_class({})
 """
 
-# The report's judged false positive: 30 shared tokens at similarity 0.938.
 LTC_NEAR_MISS = """\
 def _codex_payload(record):
     if not isinstance(record, dict):
@@ -320,7 +345,6 @@ _codex_payload({})
 _top_usage({})
 """
 
-# LTC: 18 shared tokens at full similarity, below the token minimum.
 LTC_BELOW_MINIMUM = """\
 def first_label(lane):
     window = "peak" if lane else "off"
@@ -338,7 +362,6 @@ first_label({})
 second_label({})
 """
 
-# LTC: 62 shared tokens, above the cap the 50-token clone check already covers.
 LTC_ABOVE_CAP = """\
 def _first_class(record):
     window = record.get("window")
@@ -380,7 +403,6 @@ _first_class({})
 _second_class({})
 """
 
-# LTC: the nested function duplicates its enclosing function.
 LTC_ANCESTOR = """\
 def outer(lane):
     def inner(lane):
@@ -393,7 +415,6 @@ def outer(lane):
 outer({})
 """
 
-# A table-driven refactor: the decisions leave the function for one data table.
 TABLE_BASE = """\
 def label(kind):
     if kind == "a":
@@ -426,7 +447,6 @@ def label(kind):
     return LABELS.get(kind, "unknown")
 """
 
-# A decision function with tests, plus a thin adapter that also has a test.
 DECISION_AND_ADAPTER = """\
 def decide(kind):
     if kind == "a":
@@ -466,8 +486,6 @@ class DecisionTests(unittest.TestCase):
 """
 
 
-# UNCALLED: the ladder's three decisions live in a dispatch table, which calls
-# them through a subscript, so no call site names any of the three.
 DISPATCH_BASE = """\
 def run(kind):
     return kind
@@ -510,7 +528,6 @@ class DispatchTests(unittest.TestCase):
         )
 """
 
-# UNCALLED: a function passed as a keyword value is named, but no call names it.
 KEY_BASE = """\
 def ordered(items):
     return sorted(items)
@@ -539,7 +556,6 @@ class KeyTests(unittest.TestCase):
         self.assertIs(by_length, by_length)
 """
 
-# UNCALLED: a function registered in a descriptor table is not called.
 TABLE_REGISTERED = """\
 def _files(kind):
     return kind
@@ -548,7 +564,6 @@ def _files(kind):
 TABLE = {"files": _files}
 """
 
-# UNCALLED: a dead function that nothing names at all.
 DEAD_FUNCTION = """\
 def lonely(value):
     return 1 if value else 0
@@ -568,7 +583,6 @@ class DeadTests(unittest.TestCase):
         self.assertIs(lonely, lonely)
 """
 
-# UNCALLED: a singledispatch handler registered by a decorator, not called.
 SINGLEDISPATCH_BASE = """\
 def entry(value):
     return render(value)
@@ -617,7 +631,6 @@ class HandlerTests(unittest.TestCase):
         self.assertIs(render, render)
 """
 
-# UNCALLED: a method reached only through getattr, whose name is a string.
 GETATTR_BASE = """\
 def dispatch(handler):
     return getattr(handler, "handle")
@@ -643,8 +656,6 @@ class HandlerTests(unittest.TestCase):
         self.assertIs(Handler.handle, Handler.handle)
 """
 
-# CPF: an added method and static method each have one caller in another
-# module and no direct test.
 SINGLE_USE_METHOD_CALLER = """\
 from pkg.app import Registry
 
@@ -679,8 +690,6 @@ class RegistryTests(unittest.TestCase):
         self.assertIs(Registry.dependency, Registry.dependency)
 """
 
-# UNCALLED: a function called once by name is called, and an edited existing
-# function is not added.
 CALLED_BASE = """\
 def entry(value):
     return value
@@ -1316,9 +1325,9 @@ class ScopeTests(ShapeCase):
         self.assertEqual(check["measurement"]["added"], 0)
 
     def test_changed_scope_judges_only_the_added_functions(self) -> None:
+        """Change every function in the chain without adding any of them."""
         base = chain_module(6)
         self.base_commit({"pkg/chain.py": base})
-        # The diff changes every function of the chain and adds none of them.
         edited = base.replace("first = value + 1", "first = value + 2").replace(
             "total = value * 2", "total = value * 3"
         )
@@ -1352,9 +1361,11 @@ class CallSiteTests(ShapeCase):
         )
 
     def test_a_caller_without_the_suffix_is_a_second_call_site(self) -> None:
+        """The diff touches only pkg/app.py.
+
+        The existing caller contributes only a mention of render_json.
+        """
         self.suffixless_config()
-        # The caller is old code: the change touches only pkg/app.py, so the
-        # program below is measured only as a mention of render_json.
         self.base_commit({"pkg/app.py": PTW_BASE, "pkg/helper": self.caller()})
         self.commit({"pkg/app.py": PTW_WRAPPED})
         check = self.accepted()
@@ -1463,9 +1474,6 @@ class KeyTests(ShapeCase):
         )
 
 
-# Each mutation deletes one guard: the fragment that holds it, and what the
-# gate reads instead.  A mutant that only makes a test's target string missing
-# proves nothing, so every test below runs the gate on a real fixture twice.
 def function_node(source: str) -> Any:
     """The first function definition of a source snippet."""
     return ast.parse(source).body[0]
@@ -1995,7 +2003,6 @@ class HelperInputTests(ShapeCase):
 
 SHIPPED_POLICY = (GATE / "quality-gate.toml").read_text(encoding="utf-8")
 
-# One file for every rule of the shipped policy, so its inventory is complete.
 SHIPPED_FILES = {
     "qg.py": "VALUE = 1\n",
     "quality_gate/mod.py": "def build(value):\n    return value\n",
@@ -2021,7 +2028,6 @@ SHIPPED_FILES = {
     "LICENSE": "AGPL-3.0\n",
     ".gitignore": "__pycache__/\n",
 }
-# A single-use, untested pass-through wrapper added to a gate module.
 SHIPPED_WRAPPER = """\
 def build(value):
     return render(value)
