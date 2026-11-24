@@ -21,6 +21,7 @@ COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement", "direction")
 TOP_LEVEL_KEYS = (
     "schema",
     "code",
+    "module_dirs",
     "classes",
     "rule",
     "hygiene",
@@ -104,6 +105,7 @@ class Config:
     required_tiers: tuple[int, ...]
     not_applicable: tuple[NotApplicable, ...]
     protect_paths: tuple[str, ...] = ()
+    module_dirs: tuple[str, ...] | None = None
 
 
 def _config_error(path: Path, key: str, expected: str, actual: str) -> ConfigError:
@@ -850,6 +852,19 @@ def _parse_protect(data: dict[str, Any], path: Path) -> tuple[str, ...]:
     return _optional_string_list(protect, "paths", path, "protect.paths")
 
 
+def _parse_module_dirs(data: dict[str, Any], path: Path) -> tuple[str, ...] | None:
+    if "module_dirs" not in data:
+        return None
+    directories = _string_list(data, "module_dirs", path, "module_dirs")
+    for index, directory in enumerate(directories):
+        if {"", ".", ".."}.intersection(directory.split("/")) or "\x00" in directory:
+            raise _config_error(
+                path, f"module_dirs[{index}]", "a repository-relative directory path",
+                repr(directory),
+            )
+    return directories
+
+
 def _config_from_data(
     root: Path, path: Path, data: dict[str, Any], *, validate_headers: bool = True,
     candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
@@ -885,6 +900,7 @@ def _config_from_data(
         required_tiers=required_tiers,
         not_applicable=not_applicable,
         protect_paths=protect_paths,
+        module_dirs=_parse_module_dirs(data, path),
     )
 
 

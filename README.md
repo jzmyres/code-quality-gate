@@ -222,6 +222,20 @@ Whether a class has the evidence a required tier demands is reported by `check` 
 `[code].patterns` or by a recognized shebang interpreter matching `[code].shebangs` after
 removing any `env` launcher and options, taking the interpreter basename, and stripping its version.
 
+Set the optional top-level `module_dirs` field in `quality-gate.toml` to enforce where code lives.
+For example, add this before the first TOML table.
+
+```toml
+module_dirs = ["src", "tools/scripts"]
+```
+
+Each entry is a literal repository-relative subdirectory path with slash-separated components and
+no leading or trailing slash, `.`, or `..` components. Inventory reports every code file outside
+the declared directories, including stageable code, and every declaration with no tracked or staged
+file under it. A tracked non-code file counts toward using a declaration, and non-code files can
+live anywhere. Omit `module_dirs` to disable placement enforcement. An empty list disallows all code
+files.
+
 ### hygiene
 
     python3 -I qg.py hygiene

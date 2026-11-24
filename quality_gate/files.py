@@ -601,6 +601,11 @@ class _InventoryValidator:
         self._check_classes()
         self._check_rules()
         self._classify_files()
+        if self.config.module_dirs is not None:
+            self._check_module_placement(set(files) - self.gitlinks, self.config.module_dirs)
+            self.violations.extend(
+                _unused_module_violations(self.entries, self.gitlinks, self.config.module_dirs)
+            )
         for index, rule in enumerate(self.config.rules):
             values = {
                 "index": rule.index,
@@ -672,14 +677,9 @@ class _InventoryValidator:
         self.classes[relative] = rule.class_name
         if relative in self.gitlinks:
             return
-        try:
-            source = source_language(self.root / relative, relative, self.config, selected=False)
-        except OSError as error:
-            self.violations.append(
-                f"{relative}: cannot read shebang: {error}"
-            )
+        source = self._record_source(relative)
+        if source is None:
             return
-        self.sources[relative] = source
         message = _FILE_CLASS_MESSAGES.get((source.code, class_def.code))
         if message is not None:
             self.violations.append(
@@ -689,6 +689,42 @@ class _InventoryValidator:
                     pattern=repr(rule.pattern),
                 )
             )
+
+    def _record_source(self, relative: str) -> SourceClassification | None:
+        try:
+            source = source_language(self.root / relative, relative, self.config, selected=False)
+        except OSError as error:
+            self.violations.append(f"{relative}: cannot read shebang: {error}")
+            return None
+        self.sources[relative] = source
+        return source
+
+    def _check_module_placement(self, paths: set[str], modules: tuple[str, ...]) -> None:
+        declared = _known_names(map(repr, modules))
+        for relative in _outside_module_paths(paths, modules):
+            if relative not in self.classes:
+                self._record_source(relative)
+            source = self.sources.get(relative)
+            if source is not None and source.code:
+                self.violations.append(
+                    f"{relative}: code file outside declared module directories ({declared})"
+                )
+
+
+def _outside_module_paths(paths: set[str], modules: tuple[str, ...]) -> list[str]:
+    prefixes = tuple(f"{module}/" for module in modules)
+    return [path for path in sorted(paths) if not path.startswith(prefixes)]
+
+
+def _unused_module_violations(
+    entries: list[GitFile], gitlinks: set[str], modules: tuple[str, ...]
+) -> list[str]:
+    tracked = {entry.path for entry in entries if entry.mode is not None} - gitlinks
+    return [
+        f"module_dirs: unused module directory {module!r} (contains no tracked file)"
+        for module in modules
+        if not any(path.startswith(f"{module}/") for path in tracked)
+    ]
 
 
 def validate_inventory(

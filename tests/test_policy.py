@@ -71,6 +71,27 @@ class PolicyTests(FixtureCase):
         self.assertIn("schema", message)
         self.assertIn("checks", message)
 
+    def test_module_dirs_are_optional(self) -> None:
+        self.assertIsNone(policy.load_config(self.repo).module_dirs)
+        self.write_config('module_dirs = ["src", "tools/scripts"]\n' + BASE_CONFIG)
+        self.assertEqual(
+            policy.load_config(self.repo).module_dirs, ("src", "tools/scripts")
+        )
+
+    def test_module_dirs_require_a_list_of_relative_directory_paths(self) -> None:
+        for value, key in (
+            ('"src"', "module_dirs"),
+            ("[1]", "module_dirs[0]"),
+            ('[""]', "module_dirs[0]"),
+            ('["."]', "module_dirs[0]"),
+            ('["/src"]', "module_dirs[0]"),
+            ('["src/../other"]', "module_dirs[0]"),
+            ('["src/"]', "module_dirs[0]"),
+            ('["src\\u0000"]', "module_dirs[0]"),
+        ):
+            with self.subTest(value=value):
+                self.config_error(f"module_dirs = {value}\n" + BASE_CONFIG, key, "expected")
+
     def test_unknown_class_key(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(
