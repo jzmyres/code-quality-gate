@@ -9,7 +9,10 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from importlib.machinery import PathFinder
+from importlib.util import spec_from_file_location
+from inspect import signature
 from pathlib import Path
+from runpy import run_path
 from tokenize import open as open_source
 
 
@@ -79,8 +82,12 @@ def _import_origins(
 
 
 _PATH_LOADERS = {
-    "runpy.run_path": (0, "path_name"),
-    "importlib.util.spec_from_file_location": (1, "location"),
+    "runpy.run_path": (signature(run_path), "path_name"),
+    "importlib.util.spec_from_file_location": (signature(spec_from_file_location), "location"),
+}
+_LOADER_IMPORTS = {
+    ast.Import: {"runpy", "importlib.util"},
+    ast.ImportFrom: {"runpy.run_path", "importlib.util", "importlib.util.spec_from_file_location"},
 }
 _LOADER_NAMES = {target.rsplit(".", 1)[1] for target in _PATH_LOADERS}
 _IMPORTS = (ast.Import, ast.ImportFrom)
@@ -91,19 +98,21 @@ _COMP_NAMES = {
 _SCOPE_TYPES = {"type parameter": "type parameters", "TypeVar bound": "type variable"}
 
 
-def _import_bindings(node: ast.Import | ast.ImportFrom) -> Iterator[tuple[str, str]]:
+def _import_bindings(node: ast.Import | ast.ImportFrom) -> Iterator[tuple[str, str, str]]:
     if isinstance(node, ast.ImportFrom):
         yield from _from_bindings(node)
         return
     for alias in node.names:
         head = alias.name.split(".", 1)[0]
-        yield (alias.asname, alias.name) if alias.asname else (head, head)
+        bound, target = (alias.asname, alias.name) if alias.asname else (head, head)
+        yield bound, target, alias.name
 
 
-def _from_bindings(node: ast.ImportFrom) -> Iterator[tuple[str, str]]:
+def _from_bindings(node: ast.ImportFrom) -> Iterator[tuple[str, str, str]]:
     base = "." * node.level + (f"{node.module}." if node.module else "")
     for alias in node.names:
-        yield alias.asname or alias.name, base + alias.name
+        imported = base + alias.name
+        yield alias.asname or alias.name, imported, imported
 
 
 def _module_imports(node: ast.AST) -> Iterator[ast.Import | ast.ImportFrom]:
@@ -136,18 +145,18 @@ def _callee_parts(node: ast.expr) -> tuple[str, ...]:
     return (node.id, *reversed(attributes)) if isinstance(node, ast.Name) else ()
 
 
-def _has_unpacking(call: ast.Call) -> bool:
-    return any(isinstance(arg, ast.Starred) for arg in call.args) or any(
-        arg.arg is None for arg in call.keywords
-    )
-
-
-def _path_operand(call: ast.Call, position: int, keyword: str) -> ast.expr | None:
-    if _has_unpacking(call):
-        return None
-    values = [arg.value for arg in call.keywords if arg.arg == keyword]
-    values.extend(call.args[position:position + 1])
-    return values[0] if len(values) == 1 else None
+def _path_operand(call: ast.Call, target: str) -> ast.expr | None:
+    if any(isinstance(arg, ast.Starred) for arg in call.args):
+        raise TypeError("positional argument unpacking")
+    keywords = {}
+    for arg in call.keywords:
+        if arg.arg is None:
+            raise TypeError("keyword argument unpacking")
+        if arg.arg in keywords:
+            raise TypeError(f"repeated keyword argument {arg.arg!r}")
+        keywords[arg.arg] = arg.value
+    loader_signature, parameter = _PATH_LOADERS[target]
+    return loader_signature.bind(*call.args, **keywords).arguments.get(parameter)
 
 
 def _loader_spellings(head: str, target: str) -> Iterator[str]:
@@ -159,9 +168,31 @@ def _loader_spellings(head: str, target: str) -> Iterator[str]:
             yield head + loader[len(prefix):]
 
 
+def _assignments(tree: ast.Module) -> Iterator[tuple[ast.expr, ast.expr | None]]:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                yield target, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            yield node.target, node.value
+
+
+def _assignment_aliases(tree: ast.Module, spellings: set[str]) -> Iterator[str]:
+    for target, value in _assignments(tree):
+        if isinstance(target, ast.Name) and value is not None and _loader_spelling(
+            _callee_parts(value), spellings,
+        ):
+            yield target.id
+
+
+def _loader_spelling(parts: tuple[str, ...], spellings: set[str]) -> bool:
+    return bool(parts) and (parts[-1] in _LOADER_NAMES or ".".join(parts) in spellings)
+
+
 @dataclass
 class _LoaderBindings:
     direct: dict[str, set[str]] = field(default_factory=dict)
+    provenance_lines: dict[str, int] = field(default_factory=dict)
     conditional: set[str] = field(default_factory=set)
     spellings: set[str] = field(default_factory=set)
     global_writes: set[str] = field(default_factory=set)
@@ -171,15 +202,18 @@ class _LoaderBindings:
         cls, tree: ast.Module, table: symtable.SymbolTable, imports: list[ast.Import | ast.ImportFrom],
     ) -> _LoaderBindings:
         bindings = cls(global_writes=set(_global_writes(table)))
-        for node in _module_imports(tree):
-            for head, target in _import_bindings(node):
+        module_imports = set(_module_imports(tree))
+        for node in imports:
+            for head, target, imported in _import_bindings(node):
+                bindings.spellings.update(_loader_spellings(head, target))
                 if node in tree.body:
                     bindings.direct.setdefault(head, set()).add(target)
-                else:
+                    if imported in _LOADER_IMPORTS[type(node)]:
+                        assert node.end_lineno is not None
+                        bindings.provenance_lines.setdefault(head, node.end_lineno)
+                elif node in module_imports:
                     bindings.conditional.add(head)
-        for node in imports:
-            for head, target in _import_bindings(node):
-                bindings.spellings.update(_loader_spellings(head, target))
+        bindings.spellings.update(set(_assignment_aliases(tree, bindings.spellings)))
         return bindings
 
     def import_refusal(self, head: str) -> str | None:
@@ -195,10 +229,13 @@ class _LoaderBindings:
         if head in self.global_writes:
             return f"{head!r} is rebound in module globals"
         symbol = _lookup(table, head)
-        if symbol is None or not symbol.is_imported():
-            return f"{head!r} has no module-level import"
+        no_import = f"{head!r} has no module-level import"
+        if symbol is None:
+            return no_import
         if symbol.is_assigned():
             return f"{head!r} is assigned or deleted at module scope"
+        if not symbol.is_imported():
+            return no_import
         if len(self.direct.get(head, ())) != 1:
             return f"{head!r} has no unique module-level import"
         return None
@@ -240,6 +277,15 @@ def _private_class(
     return ""
 
 
+@dataclass(frozen=True)
+class _LoaderCall:
+    node: ast.Call
+    parts: tuple[str, ...]
+    head: str
+    statement_line: int
+    refusal: str | None
+
+
 class _PathLoadCalls(ast.NodeVisitor):
     def __init__(self, module: symtable.SymbolTable, bindings: _LoaderBindings, future_annotations: bool):
         self.module = module
@@ -249,7 +295,9 @@ class _PathLoadCalls(ast.NodeVisitor):
         self.iteration_names: frozenset[str] = frozenset()
         self.generic_classes: dict[int, set[str]] = {}
         self.annotation_lines: dict[int, int] = {}
-        self.calls: list[tuple[ast.Call, tuple[str, ...], str, str | None]] = []
+        self.statement_line = 0
+        self.unevaluated_annotation = False
+        self.calls: list[_LoaderCall] = []
 
     @contextmanager
     def scope(self, table: symtable.SymbolTable | None) -> Iterator[None]:
@@ -317,6 +365,11 @@ class _PathLoadCalls(ast.NodeVisitor):
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.visit_nodes((node.target, node.value))
         current = self.scopes[-1]
+        if current is not None and current.get_type() == "function":
+            self.unevaluated_annotation = True
+            self.visit(node.annotation)
+            self.unevaluated_annotation = False
+            return
         line = node.annotation.lineno
         if current is not None:
             line = self.annotation_lines.setdefault(current.get_id(), line)
@@ -375,10 +428,13 @@ class _PathLoadCalls(ast.NodeVisitor):
         parts = _callee_parts(node.func)
         if parts:
             head = self.compiler_head(parts[0])
-            spelling = ".".join((head, *parts[1:]))
             aliases = self.bindings.spellings
-            if parts[-1] in _LOADER_NAMES or spelling in aliases or ".".join(parts) in aliases:
-                self.calls.append((node, parts, head, self.scope_refusal(head)))
+            if _loader_spelling(parts, aliases) or _loader_spelling((head, *parts[1:]), aliases):
+                refusal = (
+                    "a function-local variable annotation is never evaluated"
+                    if self.unevaluated_annotation else self.scope_refusal(head)
+                )
+                self.calls.append(_LoaderCall(node, parts, head, self.statement_line, refusal))
         self.generic_visit(node)
 
     def compiler_head(self, name: str) -> str:
@@ -422,11 +478,17 @@ def _measured_path(root: Path, source: str, paths: dict[str, str], operand: str)
 
 
 def _resolve_path_load(
-    root: Path, source: str, paths: dict[str, str], call: ast.Call, target: str,
+    root: Path, source: str, paths: dict[str, str], call: _LoaderCall, bindings: _LoaderBindings,
 ) -> tuple[str | None, str | None]:
-    if target not in _PATH_LOADERS:
-        return None, f"the import resolves to {target!r}, outside the supported loaders"
-    value = _path_operand(call, *_PATH_LOADERS[target])
+    imported, = bindings.direct[call.head]
+    target = ".".join((imported, *call.parts[1:]))
+    reason = _provenance_refusal(root, source, paths, call, target, bindings)
+    if reason is not None:
+        return None, reason
+    try:
+        value = _path_operand(call.node, target)
+    except TypeError as error:
+        return None, f"invalid loader arguments ({error})"
     if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
         return None, "the path argument must be an unambiguous string literal"
     module = _measured_path(root, source, paths, value.value)
@@ -435,23 +497,48 @@ def _resolve_path_load(
     return module, None
 
 
+def _loader_shadow(root: Path, source: str, paths: dict[str, str], target: str) -> str | None:
+    directories = [str(root), str(root / Path(source).parent)]
+    module = target.rsplit(".", 1)[0]
+    for name in dict.fromkeys((module, module.split(".", 1)[0])):
+        origin = _origin(name, directories)
+        if origin in paths:
+            return paths[origin]
+    return None
+
+
+def _provenance_refusal(
+    root: Path, source: str, paths: dict[str, str], call: _LoaderCall, target: str,
+    bindings: _LoaderBindings,
+) -> str | None:
+    if target not in _PATH_LOADERS:
+        return f"the import resolves to {target!r}, outside the supported loaders"
+    line = bindings.provenance_lines.get(call.head)
+    if line is None:
+        return f"{call.head!r} has no supported standard-library import provenance"
+    if line >= call.statement_line:
+        return f"the loader import must be on a line before the top-level statement ({call.statement_line})"
+    shadow = _loader_shadow(root, source, paths, target)
+    if shadow is not None:
+        return f"the loader import resolves to measured module {shadow!r}"
+    return None
+
+
 def _path_load_outcome(
     root: Path, source: str, paths: dict[str, str], visitor: _PathLoadCalls,
 ) -> Iterator[tuple[Edge | None, dict | None]]:
     bindings = visitor.bindings
-    for call, parts, head, scope_reason in visitor.calls:
-        reason = scope_reason or bindings.import_refusal(head)
-        reason = reason or bindings.module_refusal(visitor.module, head)
+    for call in visitor.calls:
+        reason = call.refusal or bindings.import_refusal(call.head)
+        reason = reason or bindings.module_refusal(visitor.module, call.head)
         if reason is None:
-            imported, = bindings.direct[head]
-            target = ".".join((imported, *parts[1:]))
-            module, reason = _resolve_path_load(root, source, paths, call, target)
+            module, reason = _resolve_path_load(root, source, paths, call, bindings)
             if module is not None:
-                yield Edge(source, module, call.lineno, "path-load"), None
+                yield Edge(source, module, call.node.lineno, "path-load"), None
                 continue
-        callee = ".".join(parts)
+        callee = ".".join(call.parts)
         message = f"unresolved path load {callee}: {reason}"
-        yield None, {"file": source, "line": call.lineno, "message": message}
+        yield None, {"file": source, "line": call.node.lineno, "message": message}
 
 
 def _path_loads(
@@ -461,7 +548,9 @@ def _path_loads(
     bindings = _LoaderBindings.collect(tree, table, imports)
     future_annotations = any("__future__.annotations" in targets for targets in bindings.direct.values())
     visitor = _PathLoadCalls(table, bindings, future_annotations)
-    visitor.visit(tree)
+    for statement in tree.body:
+        visitor.statement_line = statement.lineno
+        visitor.visit(statement)
     for edge, diagnostic in _path_load_outcome(root, source, paths, visitor):
         if diagnostic is not None:
             outside.append(diagnostic)
@@ -491,7 +580,7 @@ def _source_edges(
         for origin in _import_origins(root, source, node, paths)
         if origin in paths
     }
-    yield from _path_loads(root, source, literal_paths, tree, table, imports, outside)
+    yield from _path_loads(root.resolve(), source, literal_paths, tree, table, imports, outside)
 
 
 def _python_edges(root: Path, modules: list[str], outside: list[dict]) -> Iterator[Edge]:

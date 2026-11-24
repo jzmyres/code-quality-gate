@@ -326,16 +326,22 @@ Files with a Python shebang are read as Python even when their names end in `.el
 
 Python calls to `runpy.run_path` and `importlib.util.spec_from_file_location` add
 `path-load` edges when the compiler's symbol tables and a unique, unconditional
-module-level import identify the loader. Import aliases are supported. The path must
-be a string literal passed positionally or as `path_name=` or `location=`, respectively.
-Relative paths are resolved from the calling file's directory and must identify a
-measured Python file.
+module-level import identify the standard-library loader. The import must be on a
+line before the call's enclosing top-level statement. Supported imports are
+`import runpy`, `from runpy import run_path`, `import importlib.util`,
+`from importlib import util`, and `from importlib.util import spec_from_file_location`,
+all with optional import aliases. The call must match the loader's signature and pass
+a string literal path positionally or as `path_name=` or `location=`, respectively.
+Relative paths are resolved from the calling file's directory and must identify a measured
+Python file.
 
-Recognized loader call spellings with unprovable bindings, including shadowed names,
-rebindings, and conditional, star, or relative imports, are reported as unresolved.
-Computed paths, unpacked arguments, and paths outside the measured Python files are also
-unresolved. Each unresolved call produces an `outside_extractor` entry with its file,
-line, and reason.
+Recognized loader calls are reported as unresolved for shadowed or rebound names,
+assignment aliases, conditional, star, relative, unsupported or late imports, and
+imports that resolve to a measured repository module. Calls in unevaluated function-local
+variable annotations, calls with invalid or unpacked arguments, computed paths, and paths
+outside the measured Python files are also unresolved. Each unresolved call produces an
+`outside_extractor` entry with its file, line, and reason. Dynamic namespace writes are
+outside the scope of this static graph.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
