@@ -38,9 +38,7 @@ class ProcRecordTests(unittest.TestCase):
             "os.close(descriptor)\n"
             "time.sleep(30)\n"
         )
-        process = subprocess.Popen(
-            [sys.executable, "-c", program], start_new_session=True
-        )
+        process = subprocess.Popen([sys.executable, "-c", program])
         self.addCleanup(_kill_and_reap, process)
         stat = Path(f"/proc/{process.pid}/stat")
         deadline = time.monotonic() + 5.0

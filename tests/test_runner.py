@@ -45,15 +45,9 @@ def _timeout() -> subprocess.TimeoutExpired:
 
 def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        process.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+    process.wait()
+
 
 def _detached_child_program(pid_file: Path) -> str:
     return (
@@ -209,6 +203,19 @@ class GroupAliveTests(unittest.TestCase):
 
 class ChildProcessTests(unittest.TestCase):
     """The subreaper's reads of /proc and its cleanup decisions."""
+
+    def test_kill_and_reap_reaps_a_child_without_its_own_group(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.assertIsNone(process.poll())
+        self.assertNotEqual(process.pid, os.getpgid(process.pid))
+
+        start = time.monotonic()
+        _kill_and_reap(process)
+        self.assertLess(time.monotonic() - start, 1.0)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
 
     def test_child_pid_names_only_a_direct_child(self) -> None:
         process = subprocess.Popen(["sleep", "30"])
