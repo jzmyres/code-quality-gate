@@ -324,9 +324,11 @@ The `module_graph` adapter measures Python and Emacs Lisp files in the named inv
 Python imports anywhere in a file count, including function bodies and `TYPE_CHECKING` blocks.
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
-The batch Emacs reader extracts `(require 'FEATURE)` at the top level or directly inside a top-level
-`eval-when-compile`. A top-level edge uses the line where the reader starts the form.
-A direct compile-time edge uses the line of the `require` symbol. An omitted filename
+The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
+file-local `read-symbol-shorthands`. It extracts `(require 'FEATURE)` at the top level or
+directly inside a top-level `eval-when-compile`. A top-level edge uses the line where the
+reader starts the form after skipping whitespace and comments. A direct compile-time
+edge uses the line of the `require` symbol. An omitted filename
 or an explicit `nil` uses feature lookup. The target is the unique measured file with
 a literal `(provide 'FEATURE)` at the top level or directly inside a top-level
 `progn`. With no measured provider, the feature is treated as external and produces

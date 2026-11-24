@@ -90,22 +90,26 @@ MODULE_GRAPH_READER = r"""
          (delq nil (mapcar #'qg-graph-require (cdr form)))))))
 
   (defun qg-graph-file (path)
-    (with-temp-buffer
-      (let ((load-file-name (expand-file-name path)) (line 1) rows)
-        (condition-case failure
-            (progn
-              (insert-file-contents path)
-              (set-syntax-table emacs-lisp-mode-syntax-table)
-              (goto-char (point-min))
-              (when (looking-at-p "#!") (forward-line 1))
-              (while (progn (forward-comment (point-max)) (not (eobp)))
-                (setq line (line-number-at-pos))
-                (let* ((symbols-with-pos-enabled t)
-                       (form (read-positioning-symbols (current-buffer))))
-                  (dolist (row (qg-graph-top-level form line))
-                    (push row rows))))
-              (vconcat (nreverse rows)))
-          (error (format "%s:%d: %s" path line (error-message-string failure)))))))
+    (let ((absolute-path (expand-file-name path)) (source-line 1))
+      (condition-case failure
+          (catch 'qg-graph-records
+            (load-with-code-conversion
+             absolute-path path nil t
+             (lambda (buffer _filename)
+               (with-current-buffer buffer
+                 (let ((syntax (copy-syntax-table emacs-lisp-mode-syntax-table)) rows)
+                   (modify-syntax-entry ?\r " " syntax)
+                   (set-syntax-table syntax)
+                   (goto-char (point-min))
+                   (when (looking-at-p "#!") (forward-line 1))
+                   (while (progn (forward-comment (point-max)) (not (eobp)))
+                     (setq source-line (line-number-at-pos))
+                     (let* ((symbols-with-pos-enabled t)
+                            (form (read-positioning-symbols (current-buffer))))
+                       (dolist (row (qg-graph-top-level form source-line))
+                         (push row rows))))
+                   (throw 'qg-graph-records (vconcat (nreverse rows))))))))
+        (error (format "%s:%d: %s" path source-line (error-message-string failure))))))
 
   (let* ((manifest (pop command-line-args-left))
          (report (pop command-line-args-left))

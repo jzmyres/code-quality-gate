@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tomllib
+from collections import Counter
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
@@ -39,6 +40,24 @@ reason = "Elisp measured by the graph"
         result, document = self.run_json("--only", "module-graph")
         self.assertEqual(result.returncode, exit_code, result.stderr)
         return self.check_by_id(document, "module-graph")
+
+    def assert_elisp_outcomes(
+        self,
+        measurement: dict[str, Any],
+        expected_edges: list[dict[str, Any]],
+        expected_outside: list[dict[str, Any]] | None = None,
+    ) -> None:
+        def counts(edges: list[dict[str, Any]], outside: list[dict[str, Any]]) -> Counter[tuple[str, int]]:
+            locations = Counter((row["source"], row["line"]) for row in edges if row["kind"] == "require")
+            locations.update((row["file"], row["line"]) for row in outside)
+            return locations
+
+        edges = measurement["edges"]
+        outside = measurement.get("outside_extractor", [])
+        expected_outside = expected_outside or []
+        self.assertEqual(counts(edges, outside), counts(expected_edges, expected_outside))
+        self.assertEqual(edges, expected_edges)
+        self.assertEqual(outside, expected_outside)
 
     def test_module_graph_function_local_cycle(self) -> None:
         self.configure_graph()
@@ -171,13 +190,13 @@ reason = "package measured by the graph"
         self.configure_graph(elisp=True)
         self.add_file("a.el", "\n(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 2, "require")])
 
     def test_module_graph_elisp_compile_time_require(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(eval-when-compile\n  (\n   require 'b))\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 3, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 3, "require")])
 
     def test_module_graph_elisp_compile_time_shared_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -188,7 +207,7 @@ reason = "package measured by the graph"
             "  (require 'b))\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 4, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 4, "require")])
 
     def test_module_graph_elisp_compile_time_bare_list_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -199,7 +218,7 @@ reason = "package measured by the graph"
             "  (require 'b))\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 4, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 4, "require")])
 
     def test_module_graph_elisp_compile_time_symbol_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -210,20 +229,20 @@ reason = "package measured by the graph"
             "  (require 'b))\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 4, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 4, "require")])
 
     def test_module_graph_elisp_compile_time_character_literal(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(eval-when-compile\n  ?)\n  (require 'b))\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 3, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 3, "require")])
 
     def test_module_graph_elisp_literal_filename(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", '(require \'b "c")\n')
         self.add_file("b.el", "(provide 'b)\n")
         self.add_file("c.el", "(provide 'c)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "c.el", 1, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "c.el", 1, "require")])
 
     def test_module_graph_elisp_literal_filename_exact_fallback(self) -> None:
         self.configure_graph(elisp=True)
@@ -231,15 +250,13 @@ reason = "package measured by the graph"
         self.add_file("nested/target.el", "")
         self.add_file("b.el", "(provide 'b)\n")
         measurement = self.graph(0)["measurement"]
-        self.assertEqual(measurement["edges"], [edge("a.el", "nested/target.el", 1, "require")])
-        self.assertEqual(measurement.get("outside_extractor"), [
+        self.assert_elisp_outcomes(measurement, [edge("a.el", "nested/target.el", 1, "require")], [
             {"file": "a.el", "line": 2,
              "message": "require filename 'missing' has no measured target and is outside the extractor"},
         ])
 
     def assert_require_outside(self, measurement: dict[str, Any], line: int, message: str) -> None:
-        self.assertEqual(measurement["edges"], [])
-        self.assertEqual(measurement.get("outside_extractor"), [
+        self.assert_elisp_outcomes(measurement, [], [
             {"file": "a.el", "line": line, "message": message},
         ])
 
@@ -278,6 +295,42 @@ reason = "package measured by the graph"
         self.assert_require_outside(result.measurement, 2, message)
         self.assertIn(f"check: a.el:2: {message}", stderr.getvalue().splitlines())
 
+    def test_module_graph_elisp_file_local_shorthand(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", (
+            "(require 'f-f)\n"
+            "\n"
+            ";; Local Variables:\n"
+            ';; read-symbol-shorthands: (("f-" . "fixture-"))\n'
+            ";; End:\n"
+        ))
+        self.add_file("fixture-f.el", "(provide 'fixture-f)\n")
+        context = self.graph_context(["a.el", "fixture-f.el"], ("fixture-f.el",))
+        result = adapters._run_module_graph(context)
+        expected_edge = edge("a.el", "fixture-f.el", 1, "require")
+        self.assert_elisp_outcomes(result.measurement, [expected_edge])
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        self.assertIn("a.el -> fixture-f.el", finding.subject)
+        self.assertEqual(finding.location, "a.el:1")
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
+
+    def test_module_graph_elisp_trailing_mixed_line_endings(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", b"(require 'fixture-f)\n\r\n")
+        self.add_file("fixture-f.el", "(provide 'fixture-f)\n")
+        result = adapters._run_module_graph(self.graph_context(["a.el", "fixture-f.el"]))
+        self.assertEqual(result.outcome, "pass", result.diagnostics.error)
+        self.assert_elisp_outcomes(result.measurement, [edge("a.el", "fixture-f.el", 1, "require")])
+
+    def test_module_graph_elisp_mixed_line_endings_before_require(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", b"; header\n\r\n(require 'fixture-f)\n")
+        self.add_file("fixture-f.el", "(provide 'fixture-f)\n")
+        result = adapters._run_module_graph(self.graph_context(["a.el", "fixture-f.el"]))
+        self.assertEqual(result.outcome, "pass", result.diagnostics.error)
+        self.assert_elisp_outcomes(result.measurement, [edge("a.el", "fixture-f.el", 3, "require")])
+
     def test_module_graph_elisp_require_outcome_invariant(self) -> None:
         self.configure_graph(elisp=True)
         source = "a.el"
@@ -307,37 +360,42 @@ reason = "package measured by the graph"
         for target, contents in targets.items():
             self.add_file(target, contents)
         result = adapters._run_module_graph(self.graph_context([source, *targets]))
-        self.assertEqual(result.measurement["edges"], [
-            edge(source, "unique.el", line, "require") for line in (1, 4, 5, 6)
-        ])
+        expected_edges = [edge(source, "unique.el", line, "require") for line in (1, 4, 5, 6)]
         expected = {
             7: "require filename 'missing' has no measured target and is outside the extractor",
             8: "require filename 'both.el' matches multiple measured files and is outside the extractor",
             9: "require feature 'shared' has multiple measured providers and is outside the extractor",
             10: "require with a computed feature and a computed filename is outside the extractor",
         }
-        self.assertEqual(result.measurement.get("outside_extractor"), [
+        expected_outside = [
             {"file": source, "line": line, "message": message} for line, message in expected.items()
-        ])
+        ]
+        self.assert_elisp_outcomes(result.measurement, expected_edges, expected_outside)
+        extra_outside = {"file": source, "line": 1, "message": "require is outside the extractor"}
+        with self.assertRaises(AssertionError):
+            self.assert_elisp_outcomes(
+                {**result.measurement, "outside_extractor": [extra_outside, *expected_outside]},
+                expected_edges, expected_outside,
+            )
 
     def test_module_graph_elisp_reader_label(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(defconst fixture '#1=(alpha beta))\n(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 2, "require")])
 
     def test_module_graph_elisp_top_level_labelled_require(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "\n#1=\n(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 2, "require")])
 
     def test_module_graph_elisp_dotted_literal_filename(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", '(require \'dotted-fixture "odd.name")\n')
         self.add_file("odd.name.el", "")
         self.add_file("other.el", "(provide 'dotted-fixture)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "odd.name.el", 1, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "odd.name.el", 1, "require")])
 
     def test_module_graph_elisp_dotted_literal_filename_with_two_candidates(self) -> None:
         self.configure_graph("""
@@ -389,7 +447,7 @@ reason = "Python script measured by the graph"
         self.assert_rejected_require_filenames(context, "fixture", rejected)
         self.add_file("a.el", f'\n(require \'fixture "{allowed}")\n')
         measurement = adapters._run_module_graph(context).measurement
-        self.assertEqual(measurement["edges"], [edge("a.el", f"{allowed}.el", 2, "require")])
+        self.assert_elisp_outcomes(measurement, [edge("a.el", f"{allowed}.el", 2, "require")])
         self.assertNotIn("outside_extractor", measurement)
 
     def assert_rejected_require_filenames(
@@ -399,20 +457,18 @@ reason = "Python script measured by the graph"
             with self.subTest(operand=operand):
                 self.add_file("a.el", f'\n(require \'{feature} "{operand}")\n')
                 result = adapters._run_module_graph(context)
-                self.assertEqual(result.measurement["edges"], [])
+                self.assert_require_outside(
+                    result.measurement, 2, "noncanonical require filename is outside the extractor",
+                )
                 self.assertEqual(result.outcome, "pass")
                 self.assertEqual(result.findings, [])
-                self.assertEqual(result.measurement.get("outside_extractor"), [
-                    {"file": "a.el", "line": 2,
-                     "message": "noncanonical require filename is outside the extractor"},
-                ])
 
     def test_module_graph_elisp_top_level_progn_provider(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(require 'b)\n")
         self.add_file("b.el", "(progn (provide 'b) (require 'c))\n")
         self.add_file("c.el", "(provide 'c)\n(progn (progn (provide 'b)))\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 1, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 1, "require")])
 
     def test_module_graph_elisp_uninterned_provider_does_not_hide_edge(self) -> None:
         self.configure_graph(elisp=True)
@@ -425,24 +481,22 @@ reason = "Python script measured by the graph"
             with self.subTest(source=source):
                 self.add_file("decoy.el", source)
                 result = adapters._run_module_graph(context)
-                self.assertEqual(result.measurement["edges"], [expected_edge])
+                self.assert_elisp_outcomes(result.measurement, [expected_edge], [
+                    {"file": "decoy.el", "line": line,
+                     "message": "uninterned provide feature is outside the extractor"},
+                ])
                 self.assertEqual(result.outcome, "fail")
                 finding, = result.findings
                 self.assertIn("a.el -> fixture.el", finding.subject)
                 self.assertEqual(finding.location, "a.el:2")
                 self.assertEqual(finding.measurement, {"edge": expected_edge})
-                self.assertEqual(result.measurement.get("outside_extractor"), [
-                    {"file": "decoy.el", "line": line,
-                     "message": "uninterned provide feature is outside the extractor"},
-                ])
 
     def test_module_graph_elisp_computed_operands(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", '(require (intern "b"))\n(require \'b (concat "b" ".el"))\n')
         self.add_file("b.el", "(provide 'b)\n")
         measurement = self.graph(0)["measurement"]
-        self.assertEqual(measurement["edges"], [])
-        self.assertEqual(measurement.get("outside_extractor"), [
+        self.assert_elisp_outcomes(measurement, [], [
             {"file": "a.el", "line": 1, "message": "computed require feature is outside the extractor"},
             {"file": "a.el", "line": 2, "message": "computed require filename is outside the extractor"},
         ])
@@ -457,9 +511,8 @@ reason = "Python script measured by the graph"
         ))
         self.add_file("fixture.el", "(provide 'fixture)\n")
         result = adapters._run_module_graph(self.graph_context(["a.el", "fixture.el"]))
-        self.assertEqual(result.measurement["edges"], [])
         self.assertEqual(result.outcome, "pass")
-        self.assertEqual(result.measurement.get("outside_extractor"), [
+        self.assert_elisp_outcomes(result.measurement, [], [
             {"file": "a.el", "line": line, "message": "uninterned require feature is outside the extractor"}
             for line in (1, 4)
         ])
@@ -475,7 +528,7 @@ reason = "Python script measured by the graph"
             "(require 'b)\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 6, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 6, "require")])
 
     def test_module_graph_python_shebang_precedes_elisp_suffix(self) -> None:
         self.configure_graph(elisp=True)
@@ -483,13 +536,17 @@ reason = "Python script measured by the graph"
         self.add_file("dep.py", "")
         self.add_file("reader.el", "(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        python_edge, *require_edges = self.graph(0)["measurement"]["edges"]
+        measurement = self.graph(0)["measurement"]
+        python_edge, *require_edges = measurement["edges"]
         self.assertEqual(
             (python_edge["source"], python_edge["target"], python_edge["line"]),
             ("caller.el", "dep.py", 2),
         )
         self.assertEqual(require_edges, [edge("reader.el", "b.el", 1, "require")])
         self.assertEqual(python_edge["kind"], "import")
+        self.assert_elisp_outcomes(measurement, [
+            edge("caller.el", "dep.py", 2), edge("reader.el", "b.el", 1, "require"),
+        ])
 
     def graph_context(self, files: list[str], programs: tuple[str, ...] = ()) -> adapters.AdapterContext:
         config = policy.load_config(self.repo)
@@ -540,7 +597,7 @@ reason = "Python script measured by the graph"
         self.assertEqual(result.outcome, "fail")
         finding, = result.findings
         expected_edge = edge("a.el", "b.el", 1, "require")
-        self.assertEqual(result.measurement["edges"], [expected_edge])
+        self.assert_elisp_outcomes(result.measurement, [expected_edge])
         self.assertEqual(result.measurement["value"], 1)
         self.assertEqual(finding.measurement, {"edge": expected_edge})
         self.assertEqual(finding.location, "a.el:1")
