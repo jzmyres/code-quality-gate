@@ -95,8 +95,7 @@ _LOADER_NAMES = {target.rsplit(".", 1)[1] for target in _PATH_LOADERS}
 _LOADER_MODULES = {target.rsplit(".", 1)[0] for target in _PATH_LOADERS}
 _LOADER_HEADS = {module.split(".", 1)[0] for module in _LOADER_MODULES}
 _IMPORTS = (ast.Import, ast.ImportFrom)
-_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
-_DEFINITIONS = (*_FUNCTIONS, ast.ClassDef)
+_ANNOTATION_FIELDS = ("annotation", "returns", "bound", "default_value")
 
 
 def _assigned_loader_symbols(table: symtable.SymbolTable) -> Iterator[tuple[str, str]]:
@@ -165,13 +164,11 @@ def _path_operand(call: ast.Call, target: str) -> ast.expr | None:
     return loader_signature.bind(*call.args, **keywords).arguments.get(parameter)
 
 
-def _in_local_annotation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
-    local_annotation = False
+def _in_annotation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     while (parent := parents.get(node)) is not None:
-        if isinstance(parent, ast.AnnAssign) and parent.annotation is node:
-            local_annotation = True
-        if isinstance(parent, _DEFINITIONS):
-            return local_annotation and isinstance(parent, _FUNCTIONS)
+        fields = ("value",) if isinstance(parent, ast.TypeAlias) else _ANNOTATION_FIELDS
+        if any(getattr(parent, field, None) is node for field in fields):
+            return True
         node = parent
     return False
 
@@ -248,7 +245,7 @@ class _LoaderReference:
     call: ast.Call | None
     statement: int
     target: str
-    local_annotation: bool
+    in_annotation: bool
 
 
 def _reference_at(
@@ -260,7 +257,7 @@ def _reference_at(
     parent = parents.get(node)
     call = parent if isinstance(parent, ast.Call) and parent.func is node else None
     target = ".".join(_callee_parts(node)) or name
-    yield _LoaderReference(node, call, index, target, _in_local_annotation(node, parents))
+    yield _LoaderReference(node, call, index, target, _in_annotation(node, parents))
 
 
 def _loader_references(tree: ast.Module) -> Iterator[_LoaderReference]:
@@ -275,12 +272,12 @@ def _loader_references(tree: ast.Module) -> Iterator[_LoaderReference]:
 def _loader_reference_refusal(
     reference: _LoaderReference, positions: dict[str, int], import_refusals: dict[str, str],
 ) -> str | None:
+    if reference.in_annotation:
+        return "the loader reference is inside an annotation"
     if reference.call is None:
         return "the loader is not called directly"
     if reference.target not in _PATH_LOADERS:
         return "the call does not use a canonical loader spelling"
-    if reference.local_annotation:
-        return "a function-local variable annotation is never evaluated"
     module = reference.target.rsplit(".", 1)[0]
     if module in import_refusals:
         return import_refusals[module]
@@ -297,15 +294,18 @@ def _path_loads(
     import_refusals = _loader_import_refusals(root, source, binding_refusals, shadow_modules, positions)
     for reference in _loader_references(tree):
         target = reference.target
-        line = reference.node.lineno
         reason = _loader_reference_refusal(reference, positions, import_refusals)
         if reason is None:
             assert reference.call is not None
             module, reason = _resolve_path_load(root, source, paths, reference.call, target)
             if module is not None:
-                yield Edge(source, module, line, "path-load")
+                yield Edge(source, module, reference.node.lineno, "path-load")
                 continue
-        outside.append({"file": source, "line": line, "message": f"unresolved path load {target}: {reason}"})
+        outside.append({
+            "file": source,
+            "line": reference.node.end_lineno,
+            "message": f"unresolved path load {target}: {reason}",
+        })
 
 
 def _parse_source(root: Path, source: str) -> tuple[ast.Module, symtable.SymbolTable]:

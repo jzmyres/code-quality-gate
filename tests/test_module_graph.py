@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import tomllib
 from collections import Counter
 from contextlib import redirect_stderr
@@ -183,6 +184,8 @@ reason = "package measured by the graph"
             ),
             "same_line": ("import runpy; runpy.run_path('../target.py')", 1),
             "lambda": ("import runpy\nf = lambda: runpy.run_path('../target.py')", 2),
+            "argument_default": ("import runpy\ndef f(x: object = runpy.run_path('../target.py')): pass", 2),
+            "variable_value": ("import runpy\nvalue: object = runpy.run_path('../target.py')", 2),
         }
         self.add_file("target.py", "")
         for name, (source, _) in fixtures.items():
@@ -229,7 +232,7 @@ reason = "package measured by the graph"
                 self.add_file("caller.py", f"import runpy\nrunpy.run_path('target.py')\n{binding}\n")
                 measurement = adapters._run_module_graph(context).measurement
                 self.assertEqual(measurement["edges"], [])
-                self.assert_unresolved_path_load(measurement, 2, "binding")
+                self.assert_unresolved_path_loads(measurement, (2,), "binding")
 
     def test_module_graph_reports_unresolved_loader_references(self) -> None:
         self.configure_graph()
@@ -269,9 +272,9 @@ reason = "package measured by the graph"
                 2, "repeated keyword argument",
             ),
             "extra_positional": ("import runpy\nrunpy.run_path('target.py', {}, 'n', 0)", 2, "argument"),
-            "unknown_keyword": ("import runpy\nrunpy.run_path('target.py', bogus=True)", 2, "argument"),
+            "unknown_keyword": ("import runpy\nrunpy.run_path('qg.py', bogus=True)", 2, "argument"),
             "missing_name": (
-                "import importlib.util\nimportlib.util.spec_from_file_location(location='target.py')",
+                "import importlib.util\nimportlib.util.spec_from_file_location(location='qg.py')",
                 2, "argument",
             ),
             "from_spec_without_name": (
@@ -283,7 +286,14 @@ reason = "package measured by the graph"
                 "import runpy\nload, = (runpy.run_path,)\nload('target.py')", 2, "not called directly",
             ),
             "chained": (
+                "from runpy import run_path\nrp = run_path\na = rp; b = a\nb('target.py')",
+                2, "not called directly",
+            ),
+            "chained_assignment": (
                 "import runpy\nload = other = runpy.run_path\nload('target.py')", 2, "not called directly",
+            ),
+            "multiline_alias": (
+                "import runpy\nrp = (runpy\n .run_path)\nrp('target.py')", 3, "not called directly",
             ),
             "as_argument": ("import runpy\nregister(runpy.run_path)", 2, "not called directly"),
             "complex_receiver": ("factory().run_path('target.py')", 1, "canonical"),
@@ -291,23 +301,69 @@ reason = "package measured by the graph"
                 "import runpy\ndef f():\n value: runpy.run_path('target.py')", 3, "annotation",
             ),
         }
+        self.add_file("qg.py", "")
         self.add_file("target.py", "")
-        context = self.graph_context(["caller.py", "target.py"])
+        context = self.graph_context(["caller.py", "qg.py", "target.py"])
         for name, (source, line, reason) in fixtures.items():
             with self.subTest(name=name):
                 self.add_file("caller.py", source + "\n")
                 measurement = adapters._run_module_graph(context).measurement
                 self.assertEqual(measurement["edges"], [])
-                self.assert_unresolved_path_load(measurement, line, reason)
+                self.assert_unresolved_path_loads(measurement, (line,), reason)
 
-    def assert_unresolved_path_load(
-        self, measurement: dict[str, Any], line: int, reason: str, *, source: str = "caller.py",
+    def test_module_graph_reports_loader_references_in_annotations(self) -> None:
+        self.configure_graph()
+        fixtures = {
+            "postponed": (
+                "from __future__ import annotations\n"
+                "import runpy\n"
+                "value: runpy.run_path('qg.py')\n"
+                "def f() -> runpy.run_path('qg.py'): pass\n",
+                (3, 4),
+            ),
+            "eager": (
+                "import runpy\n"
+                "value: runpy.run_path('qg.py')\n"
+                "def f(arg: runpy.run_path('qg.py')) -> (\n"
+                "    runpy.run_path('qg.py')\n"
+                "): pass\n",
+                (2, 3, 4),
+            ),
+            "type_alias": ("import runpy\ntype Alias = runpy.run_path('qg.py')\n", (2,)),
+            "type_bound": ("import runpy\ndef f[T: runpy.run_path('qg.py')](): pass\n", (2,)),
+            "references": (
+                "import runpy\nvalue: tuple[\n    runpy.run_path,\n    run_path('qg.py'), run_path,\n]\n",
+                (3, 4, 4),
+            ),
+        }
+        if sys.version_info >= (3, 13):
+            fixtures["type_defaults"] = (
+                "import runpy\n"
+                "type Alias[\n"
+                "    T = runpy.run_path('qg.py'),\n"
+                "    *Ts = *tuple[runpy.run_path('qg.py')],\n"
+                "    **P = [runpy.run_path('qg.py')],\n"
+                "] = tuple[T, *Ts]\n",
+                (3, 4, 5),
+            )
+        self.add_file("qg.py", "")
+        context = self.graph_context(["caller.py", "qg.py"])
+        for name, (source, lines) in fixtures.items():
+            with self.subTest(name=name):
+                self.add_file("caller.py", source)
+                measurement = adapters._run_module_graph(context).measurement
+                self.assertEqual(measurement["edges"], [])
+                self.assert_unresolved_path_loads(measurement, lines, "annotation")
+
+    def assert_unresolved_path_loads(
+        self, measurement: dict[str, Any], lines: tuple[int, ...], reason: str, *, source: str = "caller.py",
     ) -> None:
-        self.assertEqual(len(measurement.get("outside_extractor", [])), 1)
-        diagnostic, = measurement["outside_extractor"]
-        self.assertEqual((diagnostic["file"], diagnostic["line"]), (source, line))
-        self.assertIn("unresolved", diagnostic["message"])
-        self.assertIn(reason, diagnostic["message"])
+        diagnostics = measurement.get("outside_extractor", [])
+        locations = [(row["file"], row["line"]) for row in diagnostics]
+        self.assertEqual(locations, [(source, line) for line in lines])
+        for diagnostic in diagnostics:
+            self.assertIn("unresolved", diagnostic["message"])
+            self.assertIn(reason, diagnostic["message"])
 
     def test_module_graph_refuses_repository_loader(self) -> None:
         self.configure_graph()
@@ -326,7 +382,7 @@ reason = "package measured by the graph"
                     self.graph_context(["caller.py", "target.py", shadow]),
                 ).measurement
                 self.assertEqual(measurement["edges"], [])
-                self.assert_unresolved_path_load(measurement, 2, shadow)
+                self.assert_unresolved_path_loads(measurement, (2,), shadow)
 
     def test_module_graph_keeps_ordinary_import_edge_to_repository_loader(self) -> None:
         self.configure_graph()
@@ -339,7 +395,7 @@ reason = "package measured by the graph"
             self.graph_context(["caller.py", "target.py", "importlib/util.py"]),
         ).measurement
         self.assertEqual(measurement["edges"], [edge("caller.py", "importlib/util.py", 1)])
-        self.assert_unresolved_path_load(measurement, 2, "importlib/util.py")
+        self.assert_unresolved_path_loads(measurement, (2,), "importlib/util.py")
 
     def test_module_graph_refuses_unmeasured_repository_loader(self) -> None:
         self.configure_graph()
@@ -355,7 +411,7 @@ reason = "package measured by the graph"
                 context = self.graph_context([source, "target.py"])
                 measurement = adapters._run_module_graph(context).measurement
                 self.assertEqual(measurement["edges"], [])
-                self.assert_unresolved_path_load(measurement, 2, repr(diagnostic_path), source=source)
+                self.assert_unresolved_path_loads(measurement, (2,), repr(diagnostic_path), source=source)
 
     def test_module_graph_path_loads_count_as_program_dependencies(self) -> None:
         self.configure_graph('programs = ["target.py"]\n')

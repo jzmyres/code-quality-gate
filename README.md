@@ -339,10 +339,13 @@ unpacking. Relative paths are resolved from the calling file's directory and mus
 identify a measured Python file.
 
 Every other name or attribute reference ending in `run_path` or
-`spec_from_file_location` is reported as unresolved in `outside_extractor`, with its
-file, line, and reason. This includes references used to create aliases, calls through a
-noncanonical spelling, and calls in function-local variable annotations. Discovery uses
-the spelling at the reference. Dynamic namespace writes are outside the static analysis.
+`spec_from_file_location` produces one unresolved diagnostic in `outside_extractor`,
+with the file, the line where the loader is spelled, and the reason. This includes
+references in variable, parameter, and return annotations, type aliases, and type
+parameter bounds and defaults, regardless of when Python evaluates them. When code
+assigns or destructures a loader into an alias, the diagnostic points to the original
+loader spelling. Later references using only the alias and dynamic namespace writes
+are outside the static analysis.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
