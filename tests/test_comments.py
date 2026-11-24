@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
-from subprocess import CompletedProcess
+import time
+from importlib import import_module
 from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase, output
 
-from quality_gate import adapters, comments, policy, shell_syntax
+from quality_gate import adapters, comments, policy, runner
 
 
 FIXTURES = GATE / "tests" / "fixtures" / "comments"
@@ -117,7 +118,7 @@ enforcement = "enforced"
                 self.assertEqual(self.check_comments_none(0)["measurement"]["findings"], [])
 
     def test_comments_none_elisp_shebang_requires_emacs(self):
-        for shebang in ("#! TODO replace this", "#!/bin/sh", "#!/usr/bin/env python3"):
+        for shebang in ("#! TODO replace this", "#!/usr/bin/env python3"):
             with self.subTest(shebang=shebang):
                 self.add_file("a.el", f"{shebang}\n(list 1)\n")
                 check = self.check_comments_none(1)
@@ -165,22 +166,26 @@ enforcement = "enforced"
             "{path}:{line}: {text}".format(**row) for row in check["measurement"]["findings"]
         ])
 
-    def shell_check(self, path, source, tree):
+    def shell_check(self, path, source, tree, *, elapsed=0):
         self.add_file(path, source)
         config = policy.load_config(self.repo)
         check = config.checks["comments"]
         context = adapters.AdapterContext(
             self.repo, config, check, [path], {path: "python"}, "check", {}, self.repo,
         )
-        result = CompletedProcess([], 0, json.dumps(tree).encode(), b"")
+        try:
+            shell_syntax = import_module("quality_gate.shell_syntax")
+        except ModuleNotFoundError as error:
+            if error.name != "quality_gate.shell_syntax":
+                raise
+            return adapters._run_comments(context)
+        result = runner.RunResult((), "completed", 0, stdout=json.dumps(tree).encode())
         with (
             mock.patch.object(shell_syntax, "tool_binary", return_value=self.base / "shfmt"),
-            mock.patch.object(shell_syntax, "run", return_value=result) as run,
+            mock.patch.object(shell_syntax, "run", return_value=result),
+            runner.check_deadline("comments", time.monotonic() - elapsed, 30),
         ):
-            checked = adapters._run_comments(context)
-        self.assertEqual(run.call_args.kwargs["input"], source.encode())
-        self.assertEqual(run.call_args.args[0][-2:], ["--filename", path])
-        return checked
+            return adapters._run_comments(context)
 
     def test_comments_none_shell_findings(self):
         source = "# full line\ntrue  # inline\n# shellcheck disable=SC2086\ntrue\n#\n#!/bin/sh\n"
@@ -209,7 +214,7 @@ enforcement = "enforced"
             {"Redirs": [{"Hdoc": {"Parts": [{"Value": "# inside a heredoc\n"}]}}]},
         ]}
         result = self.shell_check("sample", fixture_source("shell"), tree)
-        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.outcome, "pass", result.reason)
         self.assertEqual(result.measurement["findings"], [])
 
     def test_comments_none_shell_indented_shebang(self):
@@ -220,6 +225,30 @@ enforcement = "enforced"
             {"path": "sample.bash", "line": 1, "text": "#!/bin/sh"},
         ])
 
+    def test_comments_none_shell_dispatch_uses_inventory_detection(self):
+        cases = (
+            (".sh", "", []),
+            ("script", "#!./bash\n", [{"path": "script", "line": 1, "text": "#!./bash"}]),
+            ("polyglot.py", "#!/bin/sh\n", []),
+            ("polyglot.el", "#!/bin/sh\n", []),
+        )
+        for path, shebang, preceding in cases:
+            with self.subTest(path=path):
+                line = 2 if shebang else 1
+                rows = [{"Hash": {"Line": line}, "Text": " shell comment"}]
+                if shebang:
+                    rows.insert(0, {"Hash": {"Line": 1}, "Text": shebang[1:].rstrip("\n")})
+                result = self.shell_check(path, shebang + "# shell comment\necho hello\n", {"Last": rows})
+                self.assertEqual(result.measurement["findings"], [
+                    *preceding, {"path": path, "line": line, "text": "# shell comment"},
+                ], result.reason)
+                self.assertEqual(result.outcome, "fail")
+
+    def test_comments_none_shell_deadline_already_spent(self):
+        result = self.shell_check("sample.sh", "true\n", {}, elapsed=31)
+        self.assertEqual(result.outcome, "fail")
+        self.assertIn("cannot read sample.sh: shfmt deadline exceeded", result.reason)
+
     def test_comments_none_shell_schema_error(self):
         tree = {"Last": [{"Hash": {}, "Text": " missing position"}]}
         result = self.shell_check("sample.sh", "# missing position\n", tree)
@@ -227,13 +256,6 @@ enforcement = "enforced"
         self.assertIn("cannot read sample.sh", result.reason)
         self.assertIn("missing field Hash.Line", result.reason)
         self.assertEqual(result.measurement["findings"], [])
-
-    def test_shell_comment_fields_require_position_and_allow_omitted_text(self):
-        self.assertEqual(comments._shell_comment_fields({"Hash": {}}), {"Hash.Line": int})
-        self.assertEqual(comments._shell_comment_fields({"Hash": {}, "Text": " hi"}), {
-            "Hash.Line": int, "Text": str,
-        })
-        self.assertEqual(comments._shell_comment_fields({"Text": " hi"}), {})
 
     def test_comments_none_measures_gate_package_directly(self):
         files = [

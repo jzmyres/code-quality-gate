@@ -629,12 +629,13 @@ def _popen(
     command: tuple[str, ...],
     cwd: os.PathLike[str] | str | None,
     env: dict[str, str] | None,
+    stdin: int,
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         command,
         cwd=cwd,
         env=env,
-        stdin=subprocess.DEVNULL,
+        stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -646,9 +647,10 @@ def _spawn(
     cwd: os.PathLike[str] | str | None,
     env: dict[str, str] | None,
     started: float,
+    stdin: int,
 ) -> tuple[subprocess.Popen[bytes] | None, RunResult | None]:
     try:
-        return _popen(argv, cwd, env), None
+        return _popen(argv, cwd, env, stdin), None
     except (OSError, subprocess.SubprocessError) as error:
         return None, _empty(
             argv,
@@ -682,11 +684,12 @@ def run(
     *,
     cwd: os.PathLike[str] | str | None = None,
     env: dict[str, str] | None = None,
+    stdin: int = subprocess.DEVNULL,
     budget_seconds: float,
     capture_limit: int | None = CAPTURE_LIMIT,
     grace_seconds: float = GRACE_SECONDS,
 ) -> RunResult:
-    """Run ARGV in its own process group within BUDGET_SECONDS."""
+    """Run ARGV in its own process group with an optional stdin descriptor."""
     argv_tuple = tuple(argv)
     started = time.monotonic()
     subreaper_failure = _subreaper_failure()
@@ -711,7 +714,7 @@ def run(
         )
     budget_seconds, grace_seconds = _run_budget(budget_seconds, grace_seconds)
     deadline = started + max(0.0, budget_seconds)
-    process, failure = _spawn(argv_tuple, cwd, env, started)
+    process, failure = _spawn(argv_tuple, cwd, env, started, stdin)
     if failure is not None:
         return failure
     assert process is not None

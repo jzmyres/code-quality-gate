@@ -263,15 +263,17 @@ tier = 1
 enforcement = "enforced"
 ```
 
-The check reads `.py`, Python shebang scripts, `.el`, `.sh`, `.bash`, and
-scripts with `sh` or `bash` shebangs. For shell files, `quality_gate/shell_syntax.py`
-feeds the file's bytes to the pinned shfmt from the tools directory with
-`--to-json` and `--filename` in Bash mode. The shared parser validates the JSON
-fields declared by its caller. The comments driver uses `Hash.Line` and `Text`
-from objects with a `Hash` key and treats omitted `Text` as an empty comment body.
-Only a shebang on the first line is exempt for shell files.
+The check reads `.py`, Python shebang scripts, `.el`, and names ending in `.sh` or
+`.bash`. It uses inventory's shebang reader and gives `sh` and `bash` shebangs
+priority over suffixes. For shell files, the shared `quality_gate/shell_syntax.py`
+module feeds the file's bytes to the pinned shfmt from the tools directory on
+stdin with `--to-json` and `--filename` in Bash mode. The gate runner enforces the
+remaining check deadline. The shared parser validates the JSON fields declared
+by its caller. The comments driver reads `Hash.Line` and `Text` from every object
+with a `Hash` key and treats omitted `Text` as an empty comment body. The shell
+exception applies to a line-1 shebang that matches the allowed form.
 
-Any forbidden comment, parser error, or selected file without a driver produces
+Any forbidden comment, parser error, timeout, or selected file without a driver produces
 an outcome of `fail`. The reason includes each finding and each file error,
 sorted by repository-relative path and line. File errors sort at line 0.
 A complete scan with zero findings passes.

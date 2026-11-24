@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import stat
 import sys
 from collections.abc import Iterable
@@ -19,11 +20,14 @@ from .runner import execution_outcome, run
 
 
 SHEBANG_LIMIT = 4096
-SCRIPT_LANGUAGE_BY_SUFFIX = {
+SOURCE_LANGUAGE_BY_SUFFIX = {
     ".py": "python",
     ".sh": "bash",
     ".bash": "bash",
+    ".el": "lisp",
 }
+_SHELL_INTERPRETERS = {"sh", "bash"}
+_PYTHON_INTERPRETER = re.compile(r"python(?:[23](?:\.[0-9]+)?)?")
 DIFF_BASE_ENV = "QG_DIFF_BASE"
 BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
 _SHEBANG_ENV = "env"
@@ -340,6 +344,20 @@ def _regular_interpreter(path: Path) -> str | None:
     if not stat.S_ISREG(path.lstat().st_mode):
         return None
     return _shebang_interpreter(_shebang_line(path))
+
+
+def source_language(path: Path) -> str | None:
+    """Choose a driver using inventory's shebang reader and the source suffix."""
+    interpreter = _regular_interpreter(path)
+    if interpreter in _SHELL_INTERPRETERS:
+        return "bash"
+    _, dot, extension = path.name.rpartition(".")
+    suffix_language = SOURCE_LANGUAGE_BY_SUFFIX.get(dot + extension)
+    if suffix_language is not None:
+        return suffix_language
+    if _PYTHON_INTERPRETER.fullmatch(interpreter or ""):
+        return "python"
+    return None
 
 
 def _is_code(path: Path, relative: str, config: Config) -> bool:

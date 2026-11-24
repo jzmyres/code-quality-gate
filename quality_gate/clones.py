@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from .files import SCRIPT_LANGUAGE_BY_SUFFIX
+from .files import SOURCE_LANGUAGE_BY_SUFFIX
 from .json_input import load_json
 from .policy import (
     DEFAULT_MAX_BYTES,
@@ -63,7 +63,7 @@ def _clones_spec(
 
 
 FORMAT_BY_SUFFIX = {
-    **SCRIPT_LANGUAGE_BY_SUFFIX,
+    **SOURCE_LANGUAGE_BY_SUFFIX,
     ".pyi": "python",
     ".js": "javascript",
     ".jsx": "jsx",
@@ -87,7 +87,6 @@ FORMAT_BY_SUFFIX = {
     ".rb": "ruby",
     ".php": "php",
     ".swift": "swift",
-    ".el": "lisp",
     ".lisp": "lisp",
     ".clj": "clojure",
     ".ex": "elixir",
