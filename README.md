@@ -219,7 +219,8 @@ exist, or a code file (by pattern or shebang) is placed in a class whose `code` 
 Inventory also fails when a code class lists no check or lists an id with no `[checks.ID]` table.
 Whether a class has the evidence a required tier demands is reported by `check` as obligations, so
 `inventory` alone does not decide assurance. A code file is detected by fnmatch against
-`[code].patterns` or by the basename of its shebang interpreter after `env` matching `[code].shebangs`.
+`[code].patterns` or by a shebang interpreter matching `[code].shebangs` after
+removing any `env` launcher and options, taking the interpreter basename, and stripping its version.
 
 ### hygiene
 
@@ -239,10 +240,10 @@ followed. It prints every offending path and, for oversized files, the actual an
 `check` runs every configured check, including those whose adapter is `clones`. Each clone check takes
 the files of the classes that list it from the inventory, runs jscpd with its JSON and SARIF reporters
 in a temporary directory, groups the SARIF clone fingerprints into subjects, and sends every fingerprint
-occurrence count through the generic ratchet. The adapter owns the detection configuration: an empty
-`--config`, the configured `--min-tokens`, `--min-lines 5`, `--max-size` at the hygiene limit, an ignore
-pattern that matches nothing, `--no-gitignore` and a format list covering the selected extensions when
-they are all known. Inline jscpd ignore directives are refused: the check reads every selected file with
+occurrence count through the generic ratchet. The adapter owns the detection configuration with
+filename format mappings from inventory, the configured `--min-tokens`, `--min-lines 5`, `--max-size` at the hygiene limit, an ignore
+pattern that matches nothing, `--no-gitignore` and a format list based on the languages recorded by
+inventory when they are all known. Inline jscpd ignore directives are refused: the check reads every selected file with
 the bounded regular-file reader and fails on any line containing either directive, naming the first file,
 line and directive and the total count. A clone is accepted only through a baseline entry with a reason.
 The JSON report's `statistics.total.sources` must equal the number of selected files; a mismatch is
@@ -297,12 +298,13 @@ The `measurement.findings` array includes allowed accesses. See the
 ### Source comments
 
 Use the `comments` check to reject comments in all files of the classes that
-list it. The check uses the language recorded by inventory. A regular file
-whose shebang matches `[code].shebangs` and names `sh` or a `bash` interpreter
-goes to the shell driver regardless of its suffix. Inventory also recognizes
-`.sh` and `.bash` by suffix. Python's tokenizer reads Python files, and
-batch Emacs reads Emacs Lisp files. The shared `quality_gate/shell_syntax.py`
-module sends source bytes to the pinned shfmt from the gate's tools directory
+list it. Inventory records the language once for the comments, module graph,
+and clone adapters. A configured shebang match for a recognized interpreter
+takes precedence over the suffix. The shell family includes `sh`, `bash`,
+`rbash`, `dash`, `ksh`, `mksh`, and `posh`, and the shell suffixes are
+`.sh` and `.bash`. Python's tokenizer reads Python files, and batch Emacs
+reads Emacs Lisp files. The shared `quality_gate/shell_syntax.py` module
+sends source bytes to the pinned shfmt from the gate's tools directory
 and validates the caller's JSON fields within the remaining check deadline.
 Parser errors, timeouts, and missing drivers fail the check and name the file.
 The failure reason lists findings and file errors in path and line order, with

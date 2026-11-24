@@ -11,9 +11,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from support import BASE_CONFIG, GATE, FixtureCase
+from support import BASE_CONFIG, GATE, FixtureCase, output
 
-from quality_gate import adapters, module_graph, policy
+from quality_gate import adapters, clones, module_graph, policy
+from quality_gate import files as inventory
 
 
 def edge(source: str, target: str, line: int, kind: str = "import") -> dict[str, str | int]:
@@ -1042,6 +1043,58 @@ reason = "Python script measured by the graph"
         self.assert_elisp_outcomes(measurement, [
             edge("caller.el", "dep.py", 2), edge("reader.el", "b.el", 1, "require"),
         ])
+
+    def test_shell_shebang_controls_graph_and_clone_dispatch(self) -> None:
+        self.configure_graph()
+        config = self.read_file("quality-gate.toml") + """
+[checks.comments]
+adapter = "comments"
+tier = 1
+enforcement = "enforced"
+
+[checks.clones]
+adapter = "clones"
+tier = 1
+enforcement = "enforced"
+"""
+        (self.repo / "a.py").unlink()
+        self.add_file("polyglot.py", '#!/bin/sh\n""":"\n# shell-only comment\ntrue\n":"""\n')
+        args_file = self.base / "jscpd-args.txt"
+        env = self.install_fake_jscpd(args_file=args_file)
+
+        for checks in ('["smoke", "clones", "comments"]', '["smoke", "clones"]'):
+            with self.subTest(checks=checks):
+                self.write_config(config.replace('checks = ["smoke"]', f"checks = {checks}"))
+                self.assertEqual(self.graph(0)["measurement"]["modules"], [])
+                loaded = policy.load_config(self.repo)
+                _, classes, violations = inventory.validate_inventory(self.repo, loaded)
+                self.assertEqual(violations, [])
+                self.assertEqual(classes.languages["polyglot.py"], "bash")
+                result, report = self.run_json("--only", "clones", env=env)
+                self.assertEqual(result.returncode, 0, output(result))
+                self.assertEqual(self.check_by_id(report, "clones")["outcome"], "pass")
+                arguments = args_file.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(arguments[arguments.index("--format") + 1], "bash")
+                self.assertEqual(arguments[arguments.index("--") + 1:], ["polyglot.py"])
+
+    def test_clones_keep_language_and_report_path_for_conflicting_basenames(self) -> None:
+        shell = "#!/bin/sh\n" + "".join(
+            f'printf "value {index} %s\\n" "item {index}"\n' for index in range(20)
+        )
+        self.add_file("shell/shared.py", shell)
+        self.add_file("shared.py", "print(1)\nprint(2)\n" * 20)
+        self.add_file("script.sh", shell)
+        self.add_file("source-0", "#!/usr/bin/python3\n" + "print('a')\nprint('b')\n" * 20)
+        result = clones.measure_clones(
+            self.repo,
+            {"shell/shared.py": "bash", "shared.py": "python", "script.sh": "bash", "source-0": "python"},
+            min_tokens=20,
+        )
+        self.assertIsNone(result.error)
+        self.assertIn(
+            {"shell/shared.py", "script.sh"},
+            [{location.path for location in finding.locations} for finding in result.findings],
+        )
 
     def graph_context(self, files: list[str], programs: tuple[str, ...] = ()) -> adapters.AdapterContext:
         config = policy.load_config(self.repo)

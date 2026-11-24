@@ -20,7 +20,7 @@ from . import (
     module_graph, python_crap, python_mutation, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .files import DiffBaseOverride, InventoryClasses, source_language
+from .files import DiffBaseOverride, source_languages
 from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -208,15 +208,13 @@ def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> tup
         key = f"checks.{context.check.id}.classes"
         known = ", ".join(sorted(context.config.classes))
         raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
-    python_modules, elisp_modules = [], []
-    for path in sorted(context.files):
-        if context.classes.get(path) not in spec.classes:
-            continue
-        if verification._is_python_program(context.root, path):
-            python_modules.append(path)
-        elif path.endswith(".el"):
-            elisp_modules.append(path)
-    return python_modules, elisp_modules
+    selected = sorted(path for path in context.files if context.classes.get(path) in spec.classes)
+    languages = source_languages(context.root, selected, context.config, context.classes)
+    modules: dict[str, list[str]] = {"python": [], "lisp": []}
+    for path, language in languages.items():
+        if language in modules:
+            modules[language].append(path)
+    return modules["python"], modules["lisp"]
 
 
 def _graph_elisp_records(records: Any) -> list[dict]:
@@ -368,21 +366,13 @@ def _parse_shell(content: bytes, filename: str, required_fields: Callable) -> di
         raise ValueError(f"{filename}: cannot run shfmt: {error}") from error
 
 
-def _source_languages(context: AdapterContext, selected: list[str]) -> dict[str, str | None]:
-    if isinstance(context.classes, InventoryClasses):
-        return context.classes.languages
-    return {
-        path: source_language(context.root / path, path, context.config, selected=True).language
-        for path in selected
-    }
-
-
 def _run_comments(context: AdapterContext) -> Any:
     from .checks import _adapter_selection, _check_result
 
     _spec, start, selected, _classes = _adapter_selection(context)
+    languages = source_languages(context.root, selected, context.config, context.classes)
     findings, errors = comments.measure(
-        context.root, selected, _source_languages(context, selected), _parse_shell, remaining_budget,
+        context.root, selected, languages, _parse_shell, remaining_budget,
     )
     problems = _comments_problems(findings, errors)
     for problem in problems:

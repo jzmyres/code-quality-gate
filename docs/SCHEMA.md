@@ -263,11 +263,18 @@ tier = 1
 enforcement = "enforced"
 ```
 
-The check dispatches using the language recorded by inventory. For regular
-files, an interpreter named `sh` or starting with `bash` that matches
-`[code].shebangs` takes precedence over the filename suffix. The `.sh` and
-`.bash` suffixes also select Bash. A selected extensionless symlink to a
-Python shebang script uses the Python driver.
+The comments, module graph, and clone adapters use the language recorded by
+inventory. For regular files, inventory takes the first-line shebang interpreter
+after any `env` launcher and options, uses its basename, and strips trailing
+version digits, including dotted versions. If that name matches a configured
+`[code].shebangs` pattern, inventory uses its interpreter family when the
+name is in the family table.
+The shell family includes `sh`, `bash`, `rbash`, `dash`, `ksh`, `mksh`, and
+`posh`. The Python and Emacs Lisp families use `python` and `emacs`,
+respectively. Without a configured shebang match, inventory uses the
+suffix, including `.sh` and `.bash` for shell. An eligible extensionless symlink
+to a regular file with a configured Python shebang uses the Python driver.
+The recorded language is independent of which checks a class lists.
 
 The shared `quality_gate/shell_syntax.py` module feeds source bytes to the
 pinned shfmt from the tools directory on stdin with `--to-json` and

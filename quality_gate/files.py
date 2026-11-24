@@ -25,9 +25,47 @@ SOURCE_LANGUAGE_BY_SUFFIX = {
     ".sh": "bash",
     ".bash": "bash",
     ".el": "lisp",
+    ".pyi": "python",
+    ".js": "javascript",
+    ".jsx": "jsx",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".scala": "scala",
+    ".cs": "csharp",
+    ".go": "go",
+    ".rs": "rust",
+    ".c": "c",
+    ".h": "c-header",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".lisp": "lisp",
+    ".clj": "clojure",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".erl": "erlang",
+    ".hs": "haskell",
+    ".ml": "ocaml",
+    ".lua": "lua",
+    ".pl": "perl",
+    ".r": "r",
+    ".sql": "sql",
+    ".md": "markdown",
+    ".json": "json",
 }
-_BASH_INTERPRETER = re.compile(r"sh$|bash")
-_PYTHON_INTERPRETER = re.compile(r"python(?:[23](?:\.[0-9]+)?)?")
+_INTERPRETER_LANGUAGE = dict.fromkeys(
+    ("sh", "bash", "rbash", "dash", "ksh", "mksh", "posh"), "bash",
+) | {"python": "python", "emacs": "lisp"}
+_INTERPRETER_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*$")
 DIFF_BASE_ENV = "QG_DIFF_BASE"
 BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
 _SHEBANG_ENV = "env"
@@ -352,15 +390,18 @@ class SourceClassification:
     language: str | None
 
 
-def _eligible_python_link(path: Path, mode: int, inspect_link: bool) -> bool:
-    return inspect_link and stat.S_ISLNK(mode) and path.is_file()
+def _eligible_python_link(path: Path, suffix: str | None) -> bool:
+    return suffix is None and path.is_symlink() and path.is_file()
 
 
-def _source_interpreter(path: Path, inspect_link: bool) -> tuple[bool, str]:
-    mode = path.lstat().st_mode
-    regular = stat.S_ISREG(mode)
-    if regular or _eligible_python_link(path, mode, inspect_link):
-        return regular, _shebang_interpreter(_shebang_line(path)) or ""
+def _source_interpreter(path: Path, suffix: str | None) -> tuple[bool, str]:
+    name = _regular_interpreter(path)
+    if name is not None:
+        return True, _INTERPRETER_VERSION.sub("", name)
+    if _eligible_python_link(path, suffix):
+        name = _shebang_interpreter(_shebang_line(path)) or ""
+        if _INTERPRETER_VERSION.sub("", name) == "python":
+            return False, "python"
     return False, ""
 
 
@@ -368,31 +409,17 @@ def _matches_patterns(value: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns)
 
 
-def _code_shebang(regular: bool, interpreter: str, config: Config) -> bool:
-    return regular and bool(interpreter) and _matches_patterns(interpreter, config.code_shebangs)
-
-
-def _driver(suffix: str | None, interpreter: str, code_by_shebang: bool) -> str | None:
-    if code_by_shebang and _BASH_INTERPRETER.match(interpreter):
-        return "bash"
-    if suffix is not None:
-        return suffix
-    return "python" if _PYTHON_INTERPRETER.fullmatch(interpreter) else None
-
-
-def source_language(
-    path: Path, relative: str, config: Config, *, selected: bool,
-) -> SourceClassification:
-    """Classify a file for inventory validation and language dispatch."""
+def source_language(path: Path, relative: str, config: Config) -> SourceClassification:
+    """Classify a file by its configured interpreter first and its suffix second."""
+    suffix = SOURCE_LANGUAGE_BY_SUFFIX.get(path.suffix.lower())
     code_by_path = _matches_patterns(relative, config.code_patterns)
-    _, dot, extension = path.name.rpartition(".")
-    suffix = SOURCE_LANGUAGE_BY_SUFFIX.get(dot + extension)
-    if not selected and (code_by_path or not config.code_shebangs):
+    if not config.code_shebangs:
         return SourceClassification(code_by_path, suffix)
-    regular, interpreter = _source_interpreter(path, selected and suffix is None)
-    code_by_shebang = _code_shebang(regular, interpreter, config)
-    language = _driver(suffix, interpreter, code_by_shebang)
-    return SourceClassification(code_by_path or code_by_shebang, language)
+    regular, interpreter = _source_interpreter(path, suffix)
+    if interpreter and _matches_patterns(interpreter, config.code_shebangs):
+        language = _INTERPRETER_LANGUAGE.get(interpreter)
+        return SourceClassification(code_by_path or regular, language)
+    return SourceClassification(code_by_path, suffix)
 
 
 class InventoryClasses(dict[str, str]):
@@ -401,6 +428,21 @@ class InventoryClasses(dict[str, str]):
     def __init__(self, classes: dict[str, str], languages: dict[str, str | None]) -> None:
         super().__init__(classes)
         self.languages = languages
+
+
+def source_languages(
+    root: Path, paths: list[str], config: Config, classes: dict[str, str],
+) -> dict[str, str | None]:
+    """Return the inventory's language decisions for the requested paths."""
+    if isinstance(classes, InventoryClasses):
+        return {path: classes.languages.get(path) for path in paths}
+    languages = {}
+    for path in paths:
+        try:
+            languages[path] = source_language(root / path, path, config).language
+        except OSError as error:
+            raise GateError(f"cannot read shebang of {path}: {error}") from error
+    return languages
 
 
 def _reject_special_files(
@@ -486,7 +528,6 @@ class _InventoryValidator:
     classes: dict[str, str]
     gitlinks: set[str]
     languages: dict[str, str | None] = field(default_factory=dict)
-    language_checks: set[str] = field(default_factory=set)
 
     def validate(self) -> tuple[list[str], dict[str, str], list[str]]:
         files = [entry.path for entry in self.entries]
@@ -565,10 +606,7 @@ class _InventoryValidator:
         if relative in self.gitlinks:
             return
         try:
-            selected = not self.language_checks.isdisjoint(class_def.checks)
-            source = source_language(
-                self.root / relative, relative, self.config, selected=selected,
-            )
+            source = source_language(self.root / relative, relative, self.config)
         except OSError as error:
             self.violations.append(
                 f"{relative}: cannot read shebang: {error}"
@@ -600,9 +638,6 @@ def validate_inventory(
         [0] * len(config.rules),
         {},
         {entry.path for entry in entries if entry.gitlink},
-        language_checks={
-            check.id for check in config.checks.values() if check.adapter == "comments"
-        },
     ).validate()
 
 

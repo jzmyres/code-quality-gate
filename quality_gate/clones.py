@@ -1,17 +1,18 @@
 """jscpd invocation, SARIF parsing and clone measurement."""
 from __future__ import annotations
 
+import json
 import os
 import stat
 import sys
 import tempfile
 import urllib.parse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from .files import SOURCE_LANGUAGE_BY_SUFFIX
+from .files import source_languages
 from .json_input import load_json
 from .policy import (
     DEFAULT_MAX_BYTES,
@@ -60,47 +61,6 @@ def _clones_spec(
         threshold=0,
         baseline=baseline,
     )
-
-
-FORMAT_BY_SUFFIX = {
-    **SOURCE_LANGUAGE_BY_SUFFIX,
-    ".pyi": "python",
-    ".js": "javascript",
-    ".jsx": "jsx",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".scala": "scala",
-    ".cs": "csharp",
-    ".go": "go",
-    ".rs": "rust",
-    ".c": "c",
-    ".h": "c-header",
-    ".cc": "cpp",
-    ".cpp": "cpp",
-    ".cxx": "cpp",
-    ".hpp": "cpp",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".lisp": "lisp",
-    ".clj": "clojure",
-    ".ex": "elixir",
-    ".exs": "elixir",
-    ".erl": "erlang",
-    ".hs": "haskell",
-    ".ml": "ocaml",
-    ".lua": "lua",
-    ".pl": "perl",
-    ".r": "r",
-    ".sql": "sql",
-    ".md": "markdown",
-    ".json": "json",
-}
 
 
 def _no_completed(report: Path, detail: str) -> UnsupportedError:
@@ -303,13 +263,15 @@ def _sarif_raw_location(location: Any, root: Path, where: str, report: Path) -> 
 
 
 def _sarif_locations(
-    locations: list[Any], root: Path, where: str, report: Path
+    locations: list[Any], root: Path, where: str, report: Path,
+    aliases: dict[str, str],
 ) -> tuple[tuple[Location, ...], bool]:
     formatted: list[Location] = []
     seen: set[Location] = set()
     complete = True
     for location in locations:
         span = _sarif_raw_location(location, root, where, report)
+        span = replace(span, path=aliases.get(span.path, span.path))
         complete &= _complete_range(location, span)
         if span not in seen:
             seen.add(span)
@@ -319,20 +281,21 @@ def _sarif_locations(
     return tuple(formatted), complete and len(formatted) >= 2
 
 
-def _sarif_clone(result: Any, index: int, root: Path, report: Path) -> Clone:
+def _sarif_clone(result: Any, index: int, root: Path, report: Path, aliases: dict[str, str]) -> Clone:
     where = f"runs[0].results[{index}]"
     if not isinstance(result, dict):
         raise _no_completed(report, f"{where} is not an object")
     fingerprint = _sarif_fingerprint(result, where, report)
     raw_locations = _sarif_location_list(result, where, report)
-    locations, complete = _sarif_locations(raw_locations, root, where, report)
+    locations, complete = _sarif_locations(raw_locations, root, where, report, aliases)
     return Clone(fingerprint, locations, complete)
 
 
-def _parse_sarif(report: Path, root: Path) -> list[Clone]:
+def _parse_sarif(report: Path, root: Path, aliases: dict[str, str] | None = None) -> list[Clone]:
     run = _sarif_run(_read_report(report), report)
     results = _sarif_results(run, report)
-    return [_sarif_clone(result, index, root, report) for index, result in enumerate(results)]
+    source_paths = aliases or {}
+    return [_sarif_clone(result, index, root, report, source_paths) for index, result in enumerate(results)]
 
 
 def _format_source(name: object, raw: object) -> int | None:
@@ -360,35 +323,19 @@ def _format_sources(data: dict[str, Any]) -> dict[str, int] | None:
     return analyzed
 
 
-def _files_with_suffix(files: list[str], suffix: str) -> list[str]:
-    return [
-        name for name in files if Path(name).suffix.lower() == suffix
-    ]
-
-
-def _missing_formats(
-    files: list[str], analyzed: dict[str, int]
-) -> set[str]:
-    selected = Counter(Path(name).suffix.lower() for name in files)
-    candidates: set[str] = set()
-    for suffix, count in selected.items():
-        format_name = FORMAT_BY_SUFFIX.get(suffix)
-        if format_name is None or analyzed.get(format_name, 0) < count:
-            candidates.update(_files_with_suffix(files, suffix))
-    return candidates
-
-
-def _selected_skipped(files: list[str], data: dict[str, Any]) -> list[str]:
+def _selected_skipped(languages: dict[str, str | None], data: dict[str, Any]) -> list[str]:
     analyzed = _format_sources(data)
     if analyzed is None:
-        return list(files)
-    candidates = _missing_formats(files, analyzed)
-    if not candidates:
-        candidates.update(files)
-    return sorted(candidates)
+        return list(languages)
+    selected = Counter(languages.values())
+    candidates = [
+        path for path, language in languages.items()
+        if language is None or analyzed.get(language, 0) < selected[language]
+    ]
+    return sorted(candidates or languages)
 
 
-def _parse_jscpd_json(report: Path, files: list[str]) -> None:
+def _parse_jscpd_json(report: Path, languages: dict[str, str | None]) -> None:
     data = _required_object(
         _read_report(report), report, "expected a JSON object"
     )
@@ -405,26 +352,24 @@ def _parse_jscpd_json(report: Path, files: list[str]) -> None:
         raise _no_completed(
             report, "statistics.total.sources is not an integer"
         )
-    if sources != len(files):
-        skipped = _selected_skipped(files, data)
+    if sources != len(languages):
+        skipped = _selected_skipped(languages, data)
         raise _no_completed(
             report,
-            f"analysed {sources} of {len(files)} selected files; "
+            f"analysed {sources} of {len(languages)} selected files; "
             f"not analysed: {', '.join(skipped)}",
         )
 
 
 def _jscpd_command(
     binary: Path,
-    files: list[str],
+    languages: dict[str, str | None],
     min_tokens: int,
     max_bytes: int,
     output: Path,
     config: Path,
 ) -> list[str]:
-    formats = {
-        FORMAT_BY_SUFFIX.get(Path(name).suffix.lower()) for name in files
-    }
+    formats = set(languages.values())
     command = [
         str(binary),
         "--config",
@@ -453,7 +398,7 @@ def _jscpd_command(
             "--no-tips",
             "--no-colors",
             "--",
-            *files,
+            *languages,
         ]
     )
     return command
@@ -499,7 +444,7 @@ def _raise_jscpd_failure(result: Any, diagnostics: Diagnostics) -> None:
 def _run_jscpd(
     root: Path,
     binary: Path,
-    files: list[str],
+    languages: dict[str, str | None],
     min_tokens: int,
     max_bytes: int,
 ) -> tuple[list[Clone], Diagnostics, str]:
@@ -507,10 +452,11 @@ def _run_jscpd(
         output = Path(temporary)
         config = output / "jscpd-config.json"
         mark_step("clone setup")
-        _write_clone_config(config)
+        inputs, aliases = _clone_inputs(root, output, languages)
+        _write_clone_config(config, inputs)
         mark_step("clone command preparation")
         command = _jscpd_command(
-            binary, files, min_tokens, max_bytes, output, config
+            binary, inputs, min_tokens, max_bytes, output, config
         )
         mark_step("jscpd")
         result = run(command, cwd=root, budget_seconds=600)
@@ -525,7 +471,7 @@ def _run_jscpd(
             )
         try:
             mark_step("clone report analysis")
-            clones = _parse_reports(json_report, sarif, root, files)
+            clones = _parse_reports(json_report, sarif, root, languages, aliases)
         except UnsupportedError as error:
             raise CloneEvidenceError(
                 str(error),
@@ -553,13 +499,56 @@ def _clone_spans(clones: list[Clone]) -> tuple[Location, ...]:
     return tuple(location for clone in clones for location in clone.locations)
 
 
-def _write_clone_config(config: Path) -> None:
-    config.write_text("{}", encoding="utf-8")
+def _clone_inputs(
+    root: Path, output: Path, languages: dict[str, str | None],
+) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Use temporary names for files whose jscpd basename mappings conflict."""
+    by_name: dict[str, set[str | None]] = {}
+    for path, language in languages.items():
+        by_name.setdefault(Path(path).name, set()).add(language)
+    inputs, aliases = {}, {}
+    for index, (path, language) in enumerate(languages.items()):
+        name = Path(path).name
+        if language is None or len(by_name[name]) == 1:
+            inputs[path] = language
+            continue
+        alias = f"source-{index}"
+        while alias in by_name:
+            alias += "-"
+        target = output / alias
+        _copy_clone_input(root, path, target)
+        aliases[str(target)] = path
+        aliases[alias] = path
+        inputs[str(target)] = language
+    return inputs, aliases
 
 
-def _parse_reports(json_report: Path, sarif: Path, root: Path, files: list[str]) -> list[Clone]:
-    _parse_jscpd_json(json_report, files)
-    return _parse_sarif(sarif, root)
+def _copy_clone_input(root: Path, path: str, target: Path) -> None:
+    content = _read_regular(root, path)
+    if content is None:
+        raise GateError(f"cannot copy clone input {path}: expected a regular file")
+    try:
+        target.write_bytes(content)
+    except OSError as error:
+        raise GateError(f"cannot copy clone input {path}: {error}") from error
+
+
+def _write_clone_config(config: Path, languages: dict[str, str | None]) -> None:
+    formats: dict[str, set[str]] = {}
+    for path, language in languages.items():
+        if language is not None:
+            formats.setdefault(language, set()).add(Path(path).name)
+    config.write_text(json.dumps({
+        "formatsNames": {language: sorted(names) for language, names in formats.items()},
+    }), encoding="utf-8")
+
+
+def _parse_reports(
+    json_report: Path, sarif: Path, root: Path, languages: dict[str, str | None],
+    aliases: dict[str, str],
+) -> list[Clone]:
+    _parse_jscpd_json(json_report, languages)
+    return _parse_sarif(sarif, root, aliases)
 
 
 def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
@@ -658,16 +647,17 @@ def _prepare_clones(
 
 def measure_clones(
     root: Path,
-    files: list[str],
+    languages: dict[str, str | None],
     min_tokens: int,
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> CloneMeasurement:
+    files = list(languages)
     binary, failure = _prepare_clones(root, files)
     if failure is not None:
         return failure
     try:
         clones, diagnostics, execution = _run_jscpd(
-            root, binary, files, min_tokens, max_bytes
+            root, binary, languages, min_tokens, max_bytes
         )
     except CloneEvidenceError as error:
         return CloneMeasurement(
@@ -776,7 +766,7 @@ def _run_clones(context: Any) -> Any:
         )
     measurement = measure_clones(
         root,
-        selected,
+        source_languages(root, selected, config, context.classes),
         spec.min_tokens,
         config.max_bytes,
     )

@@ -122,7 +122,11 @@ enforcement = "enforced"
                 self.assertEqual(self.check_comments_none(0)["measurement"]["findings"], [])
 
     def test_comments_none_elisp_shebang_requires_emacs(self):
-        for shebang in ("#! TODO replace this", "#!/usr/bin/env python3"):
+        config = self.read_file("quality-gate.toml").replace(
+            'shebangs = ["sh", "bash", "python*"]', 'shebangs = ["bash"]',
+        )
+        self.write_config(config)
+        for shebang in ("#! TODO replace this", "#!/bin/sh", "#!/usr/bin/env python3"):
             with self.subTest(shebang=shebang):
                 self.add_file("a.el", f"{shebang}\n(list 1)\n")
                 check = self.check_comments_none(1)
@@ -267,12 +271,17 @@ enforcement = "enforced"
                 self.assertEqual(result.measurement["findings"], expected)
 
     def test_comments_none_polyglot_uses_inventory_shell_language(self):
-        config = self.read_file("quality-gate.toml").replace(
-            'shebangs = ["sh", "bash", "python*"]', 'shebangs = ["sh", "bash*", "python*"]',
-        )
-        self.write_config(config)
-        for shebang in ("#!/bin/sh", "#!/usr/bin/env bash5"):
+        config = self.read_file("quality-gate.toml")
+        for shebang, pattern in (
+            ("#!/bin/sh", "bash*"),
+            ("#!/usr/bin/env bash5", "bash*"),
+            ("#!/usr/bin/env -S bash5.1 -e", "bash"),
+            ("#!/bin/rbash", "*bash"),
+        ):
             with self.subTest(shebang=shebang):
+                self.write_config(config.replace(
+                    'shebangs = ["sh", "bash", "python*"]', f'shebangs = ["sh", "{pattern}", "python*"]',
+                ))
                 source = f'{shebang}\n""":"\n# shell-only comment\ntrue\n":"""\n'
                 tree = {"Stmts": [{"Comments": [
                     {"Hash": {"Line": 1}, "Text": shebang[1:]},
@@ -323,7 +332,7 @@ enforcement = "enforced"
         ]
         config = policy.load_config(GATE)
         languages = {
-            path: inventory.source_language(GATE / path, path, config, selected=True).language
+            path: inventory.source_language(GATE / path, path, config).language
             for path in files
         }
         findings, errors = comments.measure(
