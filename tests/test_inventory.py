@@ -555,7 +555,7 @@ class InventoryTests(FixtureCase):
         )
         self.assertEqual(
             files._shebang_interpreter("#!/usr/bin/env -u VAR python3"),
-            "VAR",
+            "python3",
         )
         self.assertEqual(
             files._shebang_interpreter("#!/usr/bin/env VAR=1 bash"),
@@ -570,7 +570,7 @@ class InventoryTests(FixtureCase):
             files._env_interpreter(["-S", "python3", "-u"]), "python3"
         )
         self.assertEqual(
-            files._env_interpreter(["-u", "VAR", "python3"]), "VAR"
+            files._env_interpreter(["-u", "VAR", "python3"]), "python3"
         )
         self.assertEqual(files._env_interpreter(["VAR=1", "bash"]), "bash")
         self.assertIsNone(files._env_interpreter(["-i"]))

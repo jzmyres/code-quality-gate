@@ -10,7 +10,8 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path, PurePosixPath
@@ -344,15 +345,38 @@ def enumerate_files(root: Path) -> list[str]:
     return [entry.path for entry in enumerate_entries(root)]
 
 
-def _env_interpreter(arguments: list[str]) -> str | None:
-    for word in arguments:
-        if word.startswith("-") or "=" in word:
-            continue
-        return PurePosixPath(word).name
+def _consume_env_option(option: str, words: deque[str], path: Path | str) -> None:
+    if option in ("-i", "--ignore-environment", "-") or option.startswith(("--unset=", "--chdir=")):
+        return
+    if option in ("-S", "--split-string", "-u", "-C"):
+        argument = words.popleft() if words else ""
+        if option in ("-S", "--split-string"):
+            words.extendleft(reversed(argument.split()))
+        return
+    raise GateError(f"{path}: unsupported shebang env option {option!r}")
+
+
+def _env_operands(arguments: list[str], path: Path | str) -> Iterator[str]:
+    words = deque(arguments)
+    while words:
+        word = words.popleft()
+        if word == "--":
+            yield from words
+            return
+        if word.startswith("-"):
+            _consume_env_option(word, words, path)
+        else:
+            yield word
+
+
+def _env_interpreter(arguments: list[str], path: Path | str = "<shebang>") -> str | None:
+    for word in _env_operands(arguments, path):
+        if "=" not in word:
+            return PurePosixPath(word).name
     return None
 
 
-def _shebang_interpreter(first_line: str) -> str | None:
+def _shebang_interpreter(first_line: str, path: Path | str = "<shebang>") -> str | None:
     if not first_line.startswith("#!"):
         return None
     words = first_line[2:].strip().split()
@@ -361,7 +385,7 @@ def _shebang_interpreter(first_line: str) -> str | None:
     name = PurePosixPath(words[0]).name
     if name != _SHEBANG_ENV:
         return name
-    return _env_interpreter(words[1:])
+    return _env_interpreter(words[1:], path)
 
 
 def _type_name(mode: int) -> str | None:
@@ -381,7 +405,7 @@ def _shebang_line(path: Path) -> str:
 def _regular_interpreter(path: Path) -> str | None:
     if not stat.S_ISREG(path.lstat().st_mode):
         return None
-    return _shebang_interpreter(_shebang_line(path))
+    return _shebang_interpreter(_shebang_line(path), path)
 
 
 @dataclass(frozen=True)
@@ -396,7 +420,7 @@ def _matches_patterns(value: str, patterns: tuple[str, ...]) -> bool:
 
 
 def _configured_shebang_language(path: Path, patterns: tuple[str, ...]) -> str | None:
-    name = _shebang_interpreter(_shebang_line(path)) or ""
+    name = _shebang_interpreter(_shebang_line(path), path) or ""
     interpreter = _INTERPRETER_VERSION.sub("", name)
     if _matches_patterns(interpreter, patterns):
         return _INTERPRETER_LANGUAGE.get(interpreter)
