@@ -36,6 +36,60 @@ EXPECTED = {
 }
 
 
+class WorkerCountTests(unittest.TestCase):
+    def setUp(self):
+        self.cgroup_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.cgroup_membership = self.cgroup_root / "self-cgroup"
+        self.cgroup_membership.write_text("0::/user.slice/gate.scope\n", encoding="utf-8")
+        self.cpu_max = self.cgroup_root / "user.slice/gate.scope/cpu.max"
+        self.cpu_max.parent.mkdir(parents=True)
+        self.enterContext(mock.patch.object(shards.os, "sched_getaffinity", return_value=set(range(12))))
+
+    def _workers(self, *args):
+        return shards._options(
+            ["-s", "tests", *args], cgroup_root=self.cgroup_root, cgroup_membership=self.cgroup_membership,
+        ).workers
+
+    def test_default_workers_respect_quota_and_affinity(self):
+        for content, expected in (
+            ("300000 100000", 3), ("150000 100000", 2), ("max 100000", 12),
+            ("10000 100000", 1), ("1300000 100000", 12),
+        ):
+            with self.subTest(content=content):
+                self.cpu_max.write_text(content + "\n", encoding="utf-8")
+                self.assertEqual(self._workers(), expected)
+
+    def test_default_workers_without_cgroup_v2(self):
+        self.cgroup_membership.write_text("2:cpu:/user.slice/gate.scope\n", encoding="utf-8")
+        self.cpu_max.write_text("300000 100000\n", encoding="utf-8")
+        self.assertEqual(self._workers(), 12)
+
+    def test_default_workers_without_cpu_max(self):
+        self.assertEqual(self._workers(), 12)
+
+    def test_default_workers_reject_invalid_cpu_max(self):
+        for content in (b"invalid\n", b"300000 0\n", b"max nope\n", b"\xff 100000\n"):
+            with self.subTest(content=content):
+                self.cpu_max.write_bytes(content)
+                with self.assertRaises(shards.ShardError) as raised:
+                    self._workers()
+                self.assertIn(str(self.cpu_max), str(raised.exception))
+                self.assertIn(repr(content), str(raised.exception))
+
+    def test_default_workers_reject_unreadable_cpu_max(self):
+        self.cpu_max.write_text("300000 100000\n", encoding="utf-8")
+        with mock.patch.object(Path, "read_bytes", side_effect=PermissionError("permission denied")):
+            with self.assertRaises(shards.ShardError) as raised:
+                self._workers()
+        self.assertIn(str(self.cpu_max), str(raised.exception))
+        self.assertIn("content unavailable", str(raised.exception))
+        self.assertIn("permission denied", str(raised.exception))
+
+    def test_explicit_workers_are_not_capped(self):
+        self.cpu_max.write_text("300000 100000\n", encoding="utf-8")
+        self.assertEqual(self._workers("-j", "8"), 8)
+
+
 class ShardsTests(unittest.TestCase):
     maxDiff = None
 
@@ -216,8 +270,6 @@ class ShardsTests(unittest.TestCase):
     def test_shards_success_and_refusals(self):
         self.enterContext(mock.patch.dict(sys.modules))
         self.enterContext(mock.patch.object(sys, "path", sys.path.copy()))
-        with mock.patch.object(shards.os, "cpu_count", return_value=8):
-            self.assertEqual(shards._options(["-s", "tests"]).workers, 8)
         argv = ["-s", str(self.root / "tests"), "-p", "test_skips.py", "-j", "1"]
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shards.main(argv), 0)

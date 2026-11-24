@@ -355,14 +355,50 @@ def _summary(reports, elapsed):
     return int(failed)
 
 
-def _options(argv):
+def _cpu_max_cores(content):
+    quota, period = content.split()
+    if not period.isdigit() or not (period_us := int(period)):
+        raise ValueError
+    if quota == b"max":
+        return None
+    if not quota.isdigit():
+        raise ValueError
+    return (int(quota) + period_us - 1) // period_us
+
+
+def _cgroup_cpu_quota(root, membership):
+    for line in membership.read_text(encoding="utf-8").splitlines():
+        if line.startswith("0::"):
+            path = root / line[3:].lstrip("/") / "cpu.max"
+            break
+    else:
+        return None
+
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ShardError(f"{path}: expected readable CPU quota, content unavailable: {error}") from error
+    try:
+        return _cpu_max_cores(content)
+    except ValueError as error:
+        raise ShardError(f"{path}: expected a CPU quota and positive period, got {content!r}") from error
+
+
+def _options(argv, *, cgroup_root=Path("/sys/fs/cgroup"), cgroup_membership=Path("/proc/self/cgroup")):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-s", "--start-directory", dest="start", required=True)
     parser.add_argument("-p", "--pattern", default="test*.py")
-    parser.add_argument("-j", "--workers", type=int, default=os.cpu_count() or 1)
+    parser.add_argument("-j", "--workers", type=int)
     parser.add_argument("--worker", nargs=2, help=argparse.SUPPRESS)
     options = parser.parse_args(argv)
-    if options.workers < 1:
+    if options.workers is None:
+        if not options.worker:
+            affinity = len(os.sched_getaffinity(0))
+            quota = _cgroup_cpu_quota(cgroup_root, cgroup_membership)
+            options.workers = max(1, min(affinity, quota if quota is not None else affinity))
+    elif options.workers < 1:
         parser.error(f"--workers: expected an integer >= 1, got {options.workers}")
     return options
 
@@ -389,9 +425,9 @@ def _run(options):
 
 
 def main(argv=None):
-    options = _options(argv)
-    start = time.monotonic()
     try:
+        options = _options(argv)
+        start = time.monotonic()
         if options.worker:
             _worker(options)
             return 0
