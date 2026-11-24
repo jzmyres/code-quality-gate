@@ -786,7 +786,7 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.write_verification_baseline([executed_entry(1)])
         self.add_file(
             "program",
-            "#!/usr/bin/env python3\nimport os  # noqa: F401\nVALUE = 1\n",
+            "#!/usr/bin/env python3.13.1\nimport os  # noqa: F401\nVALUE = 1\n",
         )
         self.add_rule("program")
         result, _document, check = self.failed_verification()
@@ -834,6 +834,19 @@ class VerificationTests(FindingMixin, FixtureCase):
             output(result),
         )
 
+    def test_a_selected_shell_polyglot_with_a_python_suffix_is_not_scanned(self) -> None:
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        self.add_rule(shebangs='["sh", "python*"]')
+        self.add_file(
+            "pkg/polyglot.py",
+            '#!/bin/sh\n""":"\nexit 0\n":"""\nimport os  # noqa: F401\n',
+        )
+        result, _document, check = self.run_verification()
+        subjects = {item["subject"] for item in check["findings"]}
+        self.assertNotIn("exclusions:pkg/polyglot.py:noqa", subjects)
+        self.assertEqual(result.returncode, 0, output(result))
+
     def test_a_config_interpreter_is_not_a_python_program(self) -> None:
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])
@@ -863,17 +876,17 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.add_tests(1)
         self.write_verification_baseline([executed_entry(1)])
         program = self.add_file(
-            "program",
+            "pkg/unreadable.py",
             "#!/usr/bin/env python3.12\nVALUE = 1  # noqa: E501\n",
         )
         program.chmod(0o000)
         self.addCleanup(program.chmod, 0o644)
-        self.add_rule("program", shebangs="[]")
+        self.add_rule(shebangs="[]")
         result, _document, check = self.run_verification()
         self.assertEqual(result.returncode, 1, output(result))
         self.assertEqual(check["outcome"], "error")
-        self.assertIn("cannot read shebang of program", check["reason"])
-        self.assertIn("cannot read shebang of program", result.stderr)
+        self.assertIn("cannot read pkg/unreadable.py", check["reason"])
+        self.assertIn("cannot read pkg/unreadable.py", result.stderr)
 
     def test_added_noqa_comment_fails(self) -> None:
         self.add_tests(1)

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .files import _regular_interpreter
+from .files import _regular_interpreter, source_languages
 from .policy import CheckDef, Config, GateError, _string
 from .ratchet import Domain, Finding, Location
 from .runner import Diagnostics, mark_step
@@ -315,13 +315,6 @@ def _is_python_program(root: Path, relative: str) -> bool:
     )
 
 
-def _verification_files(root: Path, selected: list[str]) -> list[str]:
-    return [
-        relative for relative in selected
-        if _is_python_program(root, relative)
-    ]
-
-
 def _verification_domain(findings: list[Any]) -> Domain:
     return Domain.of_subjects(
         [finding.subject for finding in findings],
@@ -375,7 +368,8 @@ def _verification_measurement(
     selected, _names = _select_files(config, check, files, classes)
     mark_step("Python file selection")
     try:
-        python_files = _verification_files(root, selected)
+        languages = source_languages(root, selected, config, classes)
+        python_files = [path for path, language in languages.items() if language == "python"]
         no_cover = _CrapExclusions.measure(config, prior)
     except GateError as error:
         return _ratchet_error(check, start, prefix, error)
