@@ -135,7 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
     fetch = tool_commands.add_parser("fetch", help="install or verify pinned tools")
     fetch.add_argument("--lock", metavar="FILE", help="tool lock file")
     fetch.add_argument(
-        "--check", action="store_true", help="verify existing installs offline and read-only"
+        "--check",
+        action="store_true",
+        help="verify cached installs offline (use python3 -BI for no bytecode writes)",
     )
     path = tool_commands.add_parser("path", help="print a pinned tool's binary")
     path.add_argument("name", metavar="NAME")

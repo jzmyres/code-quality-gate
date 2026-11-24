@@ -9,12 +9,12 @@ import ctypes
 import fnmatch
 import hashlib
 import http.client
+import json
 import lzma
 import os
 import re
 import shutil
 import stat
-import struct
 import sys
 import tarfile
 import tempfile
@@ -92,6 +92,8 @@ def _tool_error(lock: Path, key: str, expected: str, actual: str) -> UsageError:
 
 
 def _safe_relative_binary(value: str) -> bool:
+    if "\0" in value or "\\" in value:
+        return False
     path = PurePosixPath(value)
     return bool(path.parts) and not path.is_absolute() and ".." not in path.parts
 
@@ -397,11 +399,9 @@ def _write_member(
         os.chmod(target, mode)
 
 
-def _extract_tar(
-    archive_path: Path, destination: Path, tool: Tool, *, mode: str = "r:*"
-) -> None:
+def _extract_tar(archive_path: Path, destination: Path, tool: Tool) -> None:
     try:
-        with tarfile.open(archive_path, mode) as archive:
+        with tarfile.open(archive_path, "r:*") as archive:
             members = archive.getmembers()
             records = []
             for member in members:
@@ -629,11 +629,6 @@ def _decompress_zstd(source: BinaryIO, target: BinaryIO) -> None:
 
 _CONDA_TARBALL = re.compile(r"(info|pkg)-([A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.zst)")
 _CONDA_LAYOUT = "expected exactly metadata.json and matching info- and pkg-*.tar.zst members"
-_ZIP_LOCAL_HEADER = struct.Struct("<4s5H3L2H")
-_ZIP_END = struct.Struct("<4s4H2LH")
-_ZIP64_LOCATOR = struct.Struct("<4sLQL")
-_ZIP64_END = struct.Struct("<4sQ2H2L4Q")
-_ZIP_SIZE_LIMIT = 0xffffffff
 
 
 def _conda_member_name(member: zipfile.ZipInfo) -> str:
@@ -679,155 +674,6 @@ def _conda_tarball_stems(names: set[str]) -> dict[str, str]:
     return tarballs
 
 
-def _conda_zip64_directory(stream: BinaryIO, end: int) -> tuple[int, int, int] | None:
-    locator_offset = end - _ZIP64_LOCATOR.size
-    stream.seek(locator_offset)
-    signature, disk, offset, disks = _ZIP64_LOCATOR.unpack(stream.read(_ZIP64_LOCATOR.size))
-    if signature != b"PK\x06\x07":
-        return None
-    if (disk, disks) != (0, 1) or offset + _ZIP64_END.size > locator_offset:
-        raise ValueError("invalid ZIP64 end locator")
-    stream.seek(offset)
-    signature, size, _, _, disk, start_disk, count, total, length, start = (
-        _ZIP64_END.unpack(stream.read(_ZIP64_END.size))
-    )
-    actual = (signature, offset + 12 + size, disk, start_disk, count, start + length)
-    if actual != (b"PK\x06\x06", locator_offset, 0, 0, total, offset):
-        raise ValueError("invalid ZIP64 central directory framing")
-    return start, length, count
-
-
-def _conda_zip_directory(stream: BinaryIO, comment: bytes) -> tuple[int, int, int]:
-    end = stream.seek(-(_ZIP_END.size + len(comment)), os.SEEK_END)
-    signature, disk, start_disk, count, total, length, start, comment_size = (
-        _ZIP_END.unpack(stream.read(_ZIP_END.size))
-    )
-    if (signature, comment_size) != (b"PK\x05\x06", len(comment)):
-        raise ValueError("invalid ZIP end record or trailing data")
-    if (disk, start_disk, count) != (0, 0, total):
-        raise ValueError("invalid ZIP central directory framing")
-    zip64 = _conda_zip64_directory(stream, end)
-    if zip64 is not None:
-        return zip64
-    if start + length != end:
-        raise ValueError("invalid ZIP central directory framing")
-    return start, length, count
-
-
-def _conda_zip_descriptor(member: zipfile.ZipInfo, data: bytes) -> bool:
-    short = struct.pack("<LLL", member.CRC, member.compress_size, member.file_size) if (
-        max(member.compress_size, member.file_size) <= _ZIP_SIZE_LIMIT
-    ) else None
-    long = struct.pack("<LQQ", member.CRC, member.compress_size, member.file_size)
-    if len(data) in (16, 24) and data.startswith(b"PK\x07\x08"):
-        data = data[4:]
-    return data in (short, long)
-
-
-def _conda_zip_local(stream: BinaryIO, member: zipfile.ZipInfo, boundary: int) -> None:
-    stream.seek(member.header_offset)
-    header = stream.read(_ZIP_LOCAL_HEADER.size)
-    if len(header) != _ZIP_LOCAL_HEADER.size:
-        raise ValueError(f"{member.filename}: truncated local ZIP header")
-    signature, _, flags, method, _, _, crc, packed, unpacked, name_size, extra_size = (
-        _ZIP_LOCAL_HEADER.unpack(header)
-    )
-    actual = (signature, flags, method, stream.read(name_size))
-    expected = (b"PK\x03\x04", member.flag_bits, member.compress_type, member.filename.encode("ascii"))
-    if actual != expected:
-        raise ValueError(f"{member.filename}: invalid local ZIP header")
-    extra = stream.read(extra_size)
-    _validate_conda_zip_local_sizes(member, (crc, packed, unpacked), extra)
-    end = stream.tell() + member.compress_size
-    if not _conda_zip_member_fits(stream, member, end, boundary):
-        raise ValueError(f"{member.filename}: invalid ZIP member boundaries")
-
-
-def _conda_zip_extra_fields(extra: bytes, name: str) -> dict[int, bytes]:
-    fields: dict[int, bytes] = {}
-    offset = 0
-    while offset < len(extra):
-        if len(extra) - offset < 4:
-            raise ValueError(f"{name}: truncated ZIP extra field")
-        kind, size = struct.unpack_from("<HH", extra, offset)
-        start = offset + 4
-        offset = start + size
-        if offset > len(extra):
-            raise ValueError(f"{name}: truncated ZIP extra field")
-        fields[kind] = extra[start:offset]
-    return fields
-
-
-def _validate_conda_zip_local_sizes(
-    member: zipfile.ZipInfo, local: tuple[int, int, int], extra: bytes
-) -> None:
-    fields = _conda_zip_extra_fields(extra, member.filename)
-    try:
-        local = _conda_zip_local_values(local, fields)
-    except (KeyError, struct.error) as error:
-        raise ValueError(f"{member.filename}: invalid local ZIP64 sizes") from error
-    expected = (member.CRC, member.compress_size, member.file_size)
-    if member.flag_bits & 8:
-        local = tuple(value or pinned for value, pinned in zip(local, expected, strict=True))
-    if local != expected:
-        raise ValueError(f"{member.filename}: local ZIP CRC or sizes disagree with central directory")
-
-
-def _conda_zip_local_values(
-    local: tuple[int, int, int], fields: dict[int, bytes]
-) -> tuple[int, int, int]:
-    crc, packed, unpacked = local
-    if _ZIP_SIZE_LIMIT not in (packed, unpacked):
-        return local
-    unpacked, packed = _conda_zip64_sizes(unpacked, packed, fields[1])
-    return crc, packed, unpacked
-
-
-def _conda_zip_member_sizes(member: zipfile.ZipInfo) -> None:
-    if member.compress_type != zipfile.ZIP_STORED:
-        raise ValueError(f"{member.filename}: conda v2 requires stored ZIP members")
-    if member.compress_size != member.file_size:
-        raise ValueError(f"{member.filename}: invalid sizes for a stored ZIP member")
-    _conda_zip_extra_fields(member.extra, member.filename)
-
-
-def _conda_zip64_sizes(unpacked: int, packed: int, extra: bytes) -> tuple[int, int]:
-    offset = 0
-    if unpacked == _ZIP_SIZE_LIMIT:
-        unpacked, = struct.unpack_from("<Q", extra)
-        offset = 8
-    if packed == _ZIP_SIZE_LIMIT:
-        packed, = struct.unpack_from("<Q", extra, offset)
-    return unpacked, packed
-
-
-def _conda_zip_member_fits(
-    stream: BinaryIO, member: zipfile.ZipInfo, end: int, boundary: int
-) -> bool:
-    if not member.flag_bits & 8:
-        return end == boundary
-    stream.seek(end)
-    size = boundary - end
-    return 12 <= size <= 24 and _conda_zip_descriptor(member, stream.read(size))
-
-
-def _validate_conda_zip(stream: BinaryIO, archive: zipfile.ZipFile) -> None:
-    """Account for container bytes outside the member streams checked by zipfile."""
-    members = sorted(archive.infolist(), key=lambda member: member.header_offset)
-    if members[0].header_offset != 0:
-        raise ValueError("unexpected data before first ZIP member")
-    start, length, count = _conda_zip_directory(stream, archive.comment)
-    directory_size = sum(
-        46 + len(member.filename) + len(member.extra) + len(member.comment) for member in members
-    )
-    if (count, length) != (len(members), directory_size):
-        raise ValueError("invalid ZIP central directory length or member count")
-    boundaries = [member.header_offset for member in members[1:]] + [start]
-    for member, boundary in zip(members, boundaries, strict=True):
-        _conda_zip_member_sizes(member)
-        _conda_zip_local(stream, member, boundary)
-
-
 def _validate_conda_metadata(archive: zipfile.ZipFile) -> None:
     metadata = load_json(archive.read("metadata.json").decode("utf-8"))
     version = metadata.get("conda_pkg_format_version") if isinstance(metadata, dict) else None
@@ -835,61 +681,7 @@ def _validate_conda_metadata(archive: zipfile.ZipFile) -> None:
         raise ValueError("expected conda_pkg_format_version 2")
 
 
-_TAR_BLOCK = tarfile.BLOCKSIZE
-_PAX_LENGTH = re.compile(rb"[1-9][0-9]* ")
-_PAX_RECORD = re.compile(rb"([^=\x00\n]+)=(.*)\n", re.DOTALL)
-_PAX_TYPES = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE)
-_GNU_NAME_TYPES = (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK)
 _CONDA_HOOKS = (".*-pre-link.*", ".*-post-link.*", ".*-pre-unlink.*")
-
-
-def _validate_conda_pax(data: bytes, offset: int) -> None:
-    position = 0
-    while position < len(data):
-        match = _PAX_LENGTH.match(data, position)
-        if match is None:
-            raise ValueError(f"invalid PAX record at offset {offset + position}")
-        end = position + int(match[0])
-        if end > len(data):
-            raise ValueError(f"invalid PAX record at offset {offset + position}")
-        _validate_conda_pax_record(data[match.end():end], offset + position)
-        position = end
-
-
-def _validate_conda_pax_record(record: bytes, offset: int) -> None:
-    match = _PAX_RECORD.fullmatch(record)
-    if match is None:
-        raise ValueError(f"invalid PAX record at offset {offset}")
-    if match[1] == b"size" and not match[2].isdigit():
-        raise ValueError(f"invalid PAX size at offset {offset}")
-
-
-def _conda_tar_padding(fd: int, start: int, end: int) -> None:
-    pad = os.pread(fd, end - start, start)
-    if len(pad) != end - start or any(pad):
-        raise ValueError(f"invalid tar member padding at offset {start}")
-
-
-def _conda_tar_extensions(archive: tarfile.TarFile, offset: int, limit: int) -> None:
-    fd = archive.fileobj.fileno()
-    while offset < limit:
-        header = tarfile.TarInfo.frombuf(
-            os.pread(fd, _TAR_BLOCK, offset), archive.encoding, archive.errors
-        )
-        start = offset + _TAR_BLOCK
-        end = start + header.size
-        offset = end + (-header.size % _TAR_BLOCK)
-        if header.size <= 0 or offset > limit:
-            raise ValueError(f"invalid tar extension size at offset {start - _TAR_BLOCK}")
-        _validate_conda_tar_extension(header.type, os.pread(fd, header.size, start), start)
-        _conda_tar_padding(fd, end, offset)
-
-
-def _validate_conda_tar_extension(kind: bytes, data: bytes, offset: int) -> None:
-    if kind in _PAX_TYPES:
-        _validate_conda_pax(data, offset)
-    elif kind not in _GNU_NAME_TYPES or data.find(b"\0") != len(data) - 1:
-        raise ValueError(f"invalid tar extension at offset {offset - _TAR_BLOCK}")
 
 
 def _conda_tar_path(member: tarfile.TarInfo, tool: Tool) -> PurePosixPath:
@@ -902,48 +694,15 @@ def _conda_tar_path(member: tarfile.TarInfo, tool: Tool) -> PurePosixPath:
     return path
 
 
-def _conda_tar_member_end(
-    archive: tarfile.TarFile, member: tarfile.TarInfo, header_offset: int
-) -> int:
-    end = member.offset_data + member.size
-    aligned = end + (-member.size % _TAR_BLOCK)
-    if member.size < 0 or aligned != archive.offset:
-        raise ValueError(f"invalid size for {member.name!r} at offset {header_offset}")
-    _conda_tar_padding(archive.fileobj.fileno(), end, aligned)
-    return aligned
-
-
-def _conda_tar_end(archive: tarfile.TarFile, offset: int) -> None:
-    """Distinguish a valid terminator from tarfile stopping at a malformed header."""
-    stream = archive.fileobj
-    stream.seek(offset)
-    blocks = stream.read(2 * _TAR_BLOCK)
-    if any(blocks[:_TAR_BLOCK]):
-        raise ValueError(f"invalid tar header at offset {offset}")
-    if blocks != bytes(2 * _TAR_BLOCK):
-        raise ValueError(f"expected two zero tar end blocks at offset {offset}")
-    for padding in iter(lambda: stream.read(128 * 1024), b""):
-        nonzero = padding.lstrip(b"\0")
-        if nonzero:
-            raise ValueError(f"nonzero data after tar end at offset {stream.tell() - len(nonzero)}")
-
-
 def _conda_tar_records(
     archive: tarfile.TarFile, tool: Tool
 ) -> dict[PurePosixPath, tarfile.TarInfo]:
     records: dict[PurePosixPath, tarfile.TarInfo] = {}
-    offset = 0
-    try:
-        for member in archive:
-            path = _conda_tar_path(member, tool)
-            if path in records:
-                raise ValueError(f"duplicate normalized tar path {path!s} from {member.name!r}")
-            records[path] = member
-            _conda_tar_extensions(archive, offset, member.offset_data - _TAR_BLOCK)
-            offset = _conda_tar_member_end(archive, member, offset)
-    except (tarfile.TarError, ValueError, OSError, OverflowError) as error:
-        raise ValueError(f"tar entry at offset {offset}: {error}") from error
-    _conda_tar_end(archive, offset)
+    for member in archive:
+        path = _conda_tar_path(member, tool)
+        if path in records:
+            raise ValueError(f"duplicate normalized tar path {path!s} from {member.name!r}")
+        records[path] = member
     return records
 
 
@@ -963,22 +722,10 @@ def _conda_hook(path: PurePosixPath) -> bool:
     )
 
 
-def _write_conda_payload(
-    archive: tarfile.TarFile,
-    records: dict[PurePosixPath, tarfile.TarInfo],
-    destination: Path,
-) -> None:
-    for path, member in records.items():
-        if member.isdir() or _conda_hook(path):
-            continue
-        target = destination.joinpath(*path.parts)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _write_member(
-            target,
-            archive.extractfile(member),
-            member.mode & 0o777,
-            f"cannot read tar entry {member.name!r}",
-        )
+_CONDA_READ_ERRORS = (
+    OSError, ValueError, zipfile.BadZipFile, RuntimeError, EOFError,
+    zlib.error, lzma.LZMAError, OverflowError, tarfile.TarError,
+)
 
 
 @contextlib.contextmanager
@@ -988,50 +735,45 @@ def _conda_tar(
     try:
         with archive.open(member) as source, tempfile.TemporaryFile(dir=staging) as tar:
             _decompress_zstd(source, tar)
-            end = tar.tell()
-            if end % _TAR_BLOCK:
-                raise ValueError(f"truncated tar block at offset {end - end % _TAR_BLOCK}")
-            tar.flush()
             tar.seek(0)
-            try:
-                parsed = tarfile.open(fileobj=tar, mode="r:")
-            except (tarfile.TarError, ValueError, OverflowError, RecursionError) as error:
-                raise ValueError(f"invalid tar header at offset 0: {error}") from error
-            with parsed:
+            with tarfile.open(fileobj=tar, mode="r:", errorlevel=2) as parsed:
                 yield parsed
-    except (
-        GateError, OSError, ValueError, zipfile.BadZipFile, RuntimeError, EOFError,
-        zlib.error, lzma.LZMAError, OverflowError,
-    ) as error:
+    except (GateError, *_CONDA_READ_ERRORS) as error:
         raise ValueError(f"{member}: {error}") from error
 
 
 def _extract_conda(archive_path: Path, destination: Path, tool: Tool) -> None:
     try:
-        with archive_path.open("rb") as stream, zipfile.ZipFile(stream) as archive:
+        with zipfile.ZipFile(archive_path) as archive:
             info, payload = _conda_tar_members(archive)
-            _validate_conda_zip(stream, archive)
             try:
                 _validate_conda_metadata(archive)
-            except (ValueError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error,
-                    lzma.LZMAError) as error:
+            except _CONDA_READ_ERRORS as error:
                 raise ValueError(f"metadata.json: {error}") from error
             with _conda_tar(archive, info, destination.parent) as tar:
                 _validate_conda_tar_parents(_conda_tar_records(tar, tool))
             with _conda_tar(archive, payload, destination.parent) as tar:
                 records = _conda_tar_records(tar, tool)
                 _validate_conda_tar_parents(records)
-                _write_conda_payload(tar, records, destination)
-    except (
-        zipfile.BadZipFile, tarfile.TarError, OSError, EOFError, ValueError, RuntimeError,
-        zlib.error, lzma.LZMAError, struct.error,
-    ) as error:
+                tar.extractall(
+                    destination,
+                    members=[
+                        member for path, member in records.items()
+                        if not any(_conda_hook(parent) for parent in (path, *path.parents))
+                    ],
+                    filter="data",
+                )
+    except _CONDA_READ_ERRORS as error:
         raise GateError(
             f"tools: {tool.name} {tool.version}: cannot extract conda archive: {error}"
         ) from error
 
 
-_ARCHIVE_EXTRACTORS = {"tar": _extract_tar, "wheel": _extract_wheel, "deb": _extract_deb}
+_ARCHIVE_EXTRACTORS = {
+    "tar": _extract_tar,
+    "wheel": _extract_wheel,
+    "deb": _extract_deb,
+}
 _CONDA_FORMAT = "conda"
 ARCHIVE_FORMATS = (*_ARCHIVE_EXTRACTORS, _CONDA_FORMAT)
 
@@ -1189,51 +931,121 @@ def _create_tools_root(tools_root: Path) -> None:
         raise GateError(f"tools: cannot create {tools_root}: {error}") from error
 
 
-def _check_payload_path(root: Path, path: Path, *, missing_ok: bool = False) -> None:
+@contextlib.contextmanager
+def _check_descriptor(
+    path: Path, flags: int, parent: int | None = None
+) -> Iterator[int]:
     try:
-        try:
-            resolved = path.resolve(strict=True)
-        except FileNotFoundError:
-            if not missing_ok:
-                raise
-            resolved = path.resolve()
-    except (OSError, RuntimeError) as error:
-        raise PayloadError(f"cannot resolve {path}: {error}") from error
-    if not resolved.is_relative_to(root):
-        raise PayloadError(f"{path} resolves outside the install directory {root}")
+        fd = os.open(path if parent is None else path.name, flags | os.O_NOFOLLOW, dir_fd=parent)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise PayloadError(f"cannot open {path} without following symbolic links: {error}") from error
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 
-def _check_tree_paths(root: Path, directory: Path) -> None:
-    pending = [directory]
-    while pending:
-        with os.scandir(pending.pop()) as children:
+def _check_file(path: Path, parent: int) -> tuple[str, str]:
+    try:
+        with _check_descriptor(path, os.O_RDONLY | os.O_NONBLOCK, parent) as fd:
+            mode = os.fstat(fd).st_mode
+            if not stat.S_ISREG(mode):
+                raise PayloadError(f"{path} is not a regular file")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                return "1" if mode & 0o111 else "0", hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError as error:
+        raise PayloadError(f"cannot read {path}: {error}") from error
+
+
+def _check_binary_digest(directory: Path, fd: int, binary: Path) -> str:
+    with contextlib.ExitStack() as stack:
+        for part in binary.relative_to(directory).parts[:-1]:
+            directory /= part
+            fd = stack.enter_context(_check_descriptor(directory, os.O_DIRECTORY, fd))
+        mode = os.lstat(binary.name, dir_fd=fd).st_mode
+        if stat.S_ISLNK(mode):
+            raise PayloadError(f"{binary} is a symbolic link")
+        if not stat.S_ISREG(mode):
+            raise PayloadError(f"{binary} is not a regular file")
+        return _check_file(binary, fd)[1]
+
+
+def _check_tree_record(path: Path, relative: str, fd: int, binary: Path) -> list[str]:
+    mode = os.lstat(path.name, dir_fd=fd).st_mode
+    if stat.S_ISLNK(mode):
+        if binary.is_relative_to(path):
+            raise PayloadError(f"{path} is a symbolic link")
+        return ["symlink", relative, os.readlink(path.name, dir_fd=fd)]
+    if stat.S_ISREG(mode):
+        executable, digest = _check_file(path, fd)
+        return ["file", relative, executable, digest]
+    if stat.S_ISDIR(mode):
+        return ["directory", relative]
+    raise PayloadError(f"{path} is not a regular file, directory or symlink")
+
+
+def _check_tree_records(
+    root: Path, directory: Path, fd: int, binary: Path, records: dict[str, list[str]]
+) -> None:
+    try:
+        with os.scandir(fd) as children:
             for entry in children:
-                path = Path(entry.path)
-                _check_payload_path(root, path)
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append(path)
+                path = directory / entry.name
+                relative = path.relative_to(root).as_posix()
+                record = _check_tree_record(path, relative, fd, binary)
+                records[relative] = record
+                if record[0] == "directory":
+                    with _check_descriptor(path, os.O_DIRECTORY, fd) as child:
+                        _check_tree_records(root, path, child, binary, records)
+    except OSError as error:
+        raise PayloadError(f"cannot read payload entries at {directory}: {error}") from error
 
 
-def _check_payload_paths(tool: Tool, directory: Path) -> None:
-    root = directory.resolve()
-    component = directory
-    for part in PurePosixPath(tool.binary).parts:
-        component /= part
-        _check_payload_path(root, component, missing_ok=True)
-    if tool.format != "deb":
-        _check_tree_paths(root, directory)
+def _check_tree_digest(directory: Path, fd: int, binary: Path) -> str:
+    records: dict[str, list[str]] = {}
+    _check_tree_records(directory, directory, fd, binary, records)
+    try:
+        binary_record = records[binary.relative_to(directory).as_posix()]
+    except KeyError:
+        raise FileNotFoundError(binary) from None
+    if binary_record[0] != "file":
+        raise PayloadError(f"{binary} is not a regular file")
+    digest = hashlib.sha256()
+    for relative in sorted(records):
+        line = json.dumps(records[relative], separators=(",", ":")) + "\n"
+        digest.update(line.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _check_tool(tool: Tool, tools_root: Path) -> None:
-    directory = _install_target(tool, tools_root)
+    directory = tools_root / f"{tool.name}-{tool.version}"
+    binary = directory / tool.binary
     try:
-        if directory.is_dir():
-            _check_payload_paths(tool, directory)
-    except (OSError, PayloadError, RuntimeError) as error:
+        with contextlib.ExitStack() as stack:
+            cache = tools_root.absolute()
+            prefix = Path(cache.anchor)
+            fd = stack.enter_context(_check_descriptor(prefix, os.O_DIRECTORY))
+            for part in cache.parts[1:]:
+                prefix /= part
+                fd = stack.enter_context(_check_descriptor(prefix, os.O_DIRECTORY, fd))
+            fd = stack.enter_context(_check_descriptor(directory, os.O_DIRECTORY, fd))
+            if tool.format == "deb":
+                actual = _check_binary_digest(directory, fd, binary)
+            else:
+                actual = _check_tree_digest(directory, fd, binary)
+    except FileNotFoundError:
+        raise UnsupportedError(
+            f"{tool.name} {tool.version} is not installed at {binary}; "
+            f"run '{TOOLS_FETCH}'"
+        ) from None
+    except (OSError, PayloadError, RecursionError) as error:
         raise UnsupportedError(
             f"{tool.name} {tool.version}: payload tree at {directory} is invalid: {error}"
         ) from error
-    _verify_tool_payload(tool, directory)
+    if actual != tool.payload_sha256:
+        raise _payload_mismatch(tool, directory, actual)
 
 
 def command_tools_fetch(lock: Path, *, check: bool = False) -> int:

@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -306,7 +307,7 @@ class ToolsTests(FixtureCase):
             )
         if archive_format is not None:
             lines.append(f'format = "{archive_format}"')
-        lines.append(f'binary = "{binary}"')
+        lines.append(f"binary = {json.dumps(binary)}")
         lock.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return lock
 
@@ -355,7 +356,7 @@ class ToolsTests(FixtureCase):
 
     def check_install(self, lock: Path, tools: Path) -> subprocess.CompletedProcess[str]:
         with mock.patch(
-            "quality_gate.tools.urllib.request.urlopen",
+            "urllib.request.urlopen",
             side_effect=AssertionError("offline check attempted a download"),
         ) as download:
             result = self.fetch(lock, tools, "--check")
@@ -909,14 +910,6 @@ class ToolsTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn(f"second {VERSION}: payload digest mismatch", result.stderr)
 
-    def test_fetch_reports_cache_creation_failure(self) -> None:
-        lock = self.write_lock("file:///unused", "0" * 64)
-        tools = self.base / "tools"
-        tools.touch()
-        result = self.fetch(lock, tools)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn(f"cannot create {tools}", result.stderr)
-
     def test_fetch_check_reports_missing_install_without_creating_cache(self) -> None:
         lock = self.write_lock("file:///unused", "0" * 64)
         tools = self.base / "tools"
@@ -924,6 +917,13 @@ class ToolsTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn(f"is not installed at {tools / f'jscpd-{VERSION}' / 'jscpd'}", result.stderr)
         self.assertFalse(tools.exists())
+
+        directory = self.seed_check_install(tools)
+        binary = directory / "jscpd"
+        binary.unlink()
+        result = self.check_install(lock, tools)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn(f"jscpd {VERSION} is not installed at {binary}", result.stderr)
 
     def test_fetch_check_reports_payload_mismatch(self) -> None:
         tools = self.base / "tools"
@@ -949,28 +949,32 @@ class ToolsTests(FixtureCase):
         self.assertIn(f"jscpd {VERSION}: payload tree at {directory} is invalid", result.stderr)
         self.assertIn("is not a regular file, directory or symlink", result.stderr)
 
-    def test_fetch_check_reports_unresolvable_install(self) -> None:
+        (directory / "pipe").unlink()
+        binary = directory / "jscpd"
+        binary.unlink()
+        binary.mkdir()
+        result = self.check_install(lock, tools)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn(f"jscpd {VERSION}: payload tree at {directory} is invalid", result.stderr)
+        self.assertIn(f"{binary} is not a regular file", result.stderr)
+
+    def test_fetch_check_reports_install_open_failure(self) -> None:
         tools = self.base / "tools"
         directory = self.seed_check_install(tools)
         lock = self.check_lock(directory)
-        resolve = Path.resolve
+        open_path = os.open
 
-        for failed_path in (directory, tools):
-            with self.subTest(failed_path=failed_path):
-                def unresolvable(
-                    path: Path, *args: object, failed: Path = failed_path, **kwargs: object
-                ) -> Path:
-                    if path == failed:
-                        raise OSError("cannot follow install path")
-                    return resolve(path, *args, **kwargs)
+        def denied(path, flags, *args, **kwargs):
+            if path == directory.name and kwargs.get("dir_fd") is not None:
+                raise PermissionError("install access denied")
+            return open_path(path, flags, *args, **kwargs)
 
-                with mock.patch.object(Path, "resolve", unresolvable):
-                    result = self.check_install(lock, tools)
-                self.assertEqual(result.returncode, 1, output(result))
-                self.assertIn(
-                    f"jscpd {VERSION}: cannot resolve install destination {directory}", result.stderr
-                )
-                self.assertIn("cannot follow install path", result.stderr)
+        with mock.patch.object(os, "open", side_effect=denied):
+            result = self.check_install(lock, tools)
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn(f"jscpd {VERSION}", result.stderr)
+        self.assertIn(f"cannot open {directory}", result.stderr)
+        self.assertIn("install access denied", result.stderr)
 
     def test_fetch_check_refuses_matching_tree_outside_cache(self) -> None:
         outside = self.seed_check_install(self.base / "outside")
@@ -979,65 +983,109 @@ class ToolsTests(FixtureCase):
         tools.mkdir()
         destination = tools / outside.name
         destination.symlink_to(outside)
-        with mock.patch("quality_gate.tools.payload_digest") as digest:
-            result = self.check_install(lock, tools)
-        digest.assert_not_called()
+        self.assert_check_refuses_symlink(lock, tools, destination)
+
+    def test_fetch_check_hashes_nonbinary_links_as_text(self) -> None:
+        tools = self.base / "tools"
+        directory = self.seed_check_install(tools)
+        external = self.base / "outside"
+        external.write_bytes(b"outside")
+        link = directory / "external"
+        link.symlink_to(external)
+        (directory / "loop").symlink_to("loop")
+        (directory / "dangling").symlink_to(self.base / "missing")
+        lock = self.check_lock(directory)
+
+        external.unlink()
+        external.mkdir()
+        result = self.check_install(lock, tools)
+        self.assertEqual(result.returncode, 0, output(result))
+
+        link.unlink()
+        link.symlink_to(self.base / "different")
+        result = self.check_install(lock, tools)
         self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn(f"{destination} resolves outside the tools directory", result.stderr)
+        self.assertIn(f"jscpd {VERSION}: payload digest mismatch at {directory}", result.stderr)
 
-    def test_fetch_check_refuses_matching_tree_with_outside_link(self) -> None:
-        for name in ("LICENSE", "jscpd"):
-            with self.subTest(name=name):
-                tools = self.base / name
-                directory = self.seed_check_install(tools)
-                outside = tools / "sibling"
-                outside.mkdir()
-                external = outside / "file"
-                external.write_bytes(b"same bytes")
-                path = directory / name
-                path.unlink()
-                path.symlink_to(outside if name == "LICENSE" else external)
-                self.assert_check_refuses_payload_path(
-                    self.check_lock(directory), tools, f"{path} resolves outside the install directory"
-                )
-
-    def test_fetch_check_refuses_debian_binary_outside_install(self) -> None:
-        for name in ("usr/bin/example", "usr/bin"):
-            with self.subTest(path=name):
-                tools = self.base / Path(name).name
+    def test_fetch_check_refuses_symlink_binary_components(self) -> None:
+        content = b"executable"
+        for archive_format, name in (
+            ("tar", "jscpd"),
+            ("tar", "usr/bin"),
+            ("deb", "usr/bin/example"),
+            ("deb", "usr/bin"),
+        ):
+            with self.subTest(archive_format=archive_format, path=name):
+                tools = self.base / f"{archive_format}-{Path(name).name}"
                 directory = tools / f"jscpd-{VERSION}"
                 outside = tools / "sibling"
                 outside.mkdir(parents=True)
-                content = b"executable"
                 external = outside / "example"
                 external.write_bytes(content)
                 path = directory / name
-                target = external if path.name == "example" else outside
                 path.parent.mkdir(parents=True)
-                path.symlink_to(target)
-                lock = self.package_lock(self.base / "absent.deb", content, digest="0" * 64)
-                self.assert_check_refuses_payload_path(
-                    lock, tools, f"{path} resolves outside the install directory", hasher="_content_sha256"
-                )
+                path.symlink_to(outside if path.name == "bin" else external)
+                if archive_format == "deb":
+                    lock = self.package_lock(self.base / "absent.deb", content, digest="0" * 64)
+                else:
+                    binary = "usr/bin/example" if path.name == "bin" else "jscpd"
+                    lock = self.write_lock(
+                        "file:///unused", "0" * 64, binary=binary, payload=payload_digest(directory)
+                    )
 
-    def test_fetch_check_reports_unresolvable_payload_path(self) -> None:
-        tools = self.base / "tools"
-        directory = self.seed_check_install(tools)
-        link = directory / "loop"
-        link.symlink_to(link.name)
-        self.assert_check_refuses_payload_path(
-            self.check_lock(directory), tools, f"cannot resolve {link}"
+                self.assert_check_refuses_symlink(lock, tools, path)
+
+    def assert_check_refuses_symlink(self, lock: Path, tools: Path, path: Path) -> None:
+        with mock.patch.object(hashlib, "file_digest", wraps=hashlib.file_digest) as digest:
+            result = self.check_install(lock, tools)
+        digest.assert_not_called()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertIn(f"jscpd {VERSION}", result.stderr)
+        self.assertIn(str(path), result.stderr)
+        self.assertIn("symbolic link", result.stderr)
+
+    def test_fetch_check_refuses_file_swapped_to_symlink_before_open(self) -> None:
+        external = self.base / "outside"
+        external.write_bytes(b"MIT\n")
+        self.assert_check_refuses_swapped_file(
+            lambda path: path.symlink_to(external), "without following symbolic links"
         )
 
-    def assert_check_refuses_payload_path(
-        self, lock: Path, tools: Path, diagnostic: str, *, hasher: str = "payload_digest"
+    def test_fetch_check_refuses_file_swapped_to_fifo_before_open(self) -> None:
+        self.assert_check_refuses_swapped_file(os.mkfifo, "is not a regular file")
+
+    def assert_check_refuses_swapped_file(
+        self, replace: Callable[[Path], None], diagnostic: str
     ) -> None:
-        with mock.patch.object(gate_tools, hasher) as digest:
+        tools = self.base / "tools"
+        directory = self.seed_check_install(tools)
+        path = directory / "LICENSE"
+        lock = self.check_lock(directory)
+        open_path = os.open
+
+        def replace_before_open(name, flags, *args, **kwargs):
+            if name == path.name and kwargs.get("dir_fd") is not None:
+                self.assertTrue(flags & os.O_NONBLOCK)
+                path.unlink()
+                replace(path)
+            return open_path(name, flags, *args, **kwargs)
+
+        with mock.patch.object(os, "open", side_effect=replace_before_open):
             result = self.check_install(lock, tools)
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn(f"jscpd {VERSION}", result.stderr)
+        self.assertIn(str(path), result.stderr)
         self.assertIn(diagnostic, result.stderr)
-        digest.assert_not_called()
+
+    def test_fetch_check_rejects_invalid_binary_lock_path(self) -> None:
+        tools = self.base / "tools"
+        for binary in ("bad\0name", "bin\\example", "/outside", "../outside"):
+            with self.subTest(binary=binary):
+                lock = self.write_lock("file:///unused", "0" * 64, binary=binary)
+                result = self.check_install(lock, tools)
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertIn(f"{lock}: jscpd.binary: expected a safe relative path", result.stderr)
+                self.assertFalse(tools.exists())
 
     def test_fetch_check_rejects_missing_or_malformed_lock(self) -> None:
         lock = self.base / "lock.toml"
@@ -1231,6 +1279,23 @@ class ToolsTests(FixtureCase):
         result = self.check_install(lock, tools)
         self.assertEqual(result.returncode, 0, output(result))
 
+    def test_fetch_conda_uses_data_filter_for_payload(self) -> None:
+        package = self.make_conda(self.conda_members())
+        tool = self.conda_tool(package)
+        destination = self.base / "destination"
+        destination.mkdir()
+        extractall = tarfile.TarFile.extractall
+        calls = []
+
+        def observe(archive, path, *, members, filter):
+            calls.append((path, [member.name for member in members], filter))
+            return extractall(archive, path, members=members, filter=filter)
+
+        with mock.patch.object(tarfile.TarFile, "extractall", observe):
+            gate_tools._extract_archive(package, destination, tool)
+        self.assertEqual(calls, [(destination, ["bin/example", "share/data"], "data")])
+        self.assertEqual(payload_digest(destination), tool.payload_sha256)
+
     def test_fetch_conda_rejects_invalid_container(self) -> None:
         members = self.conda_members()
         info = "info-example-1-0.tar.zst"
@@ -1265,16 +1330,15 @@ class ToolsTests(FixtureCase):
             ("metadata.json", b'{"conda_pkg_format_version": true}', "expected conda_pkg_format_version 2"),
             ("metadata.json", b'{"conda_pkg_format_version": 2.0}',
              "expected conda_pkg_format_version 2"),
-            ("metadata.json", b"{", "cannot extract conda archive"),
+            ("metadata.json", b"{", "Expecting property name"),
             (info, b"not zstd", "Unknown frame descriptor"),
             (payload, members[payload][:-1], "incomplete Zstandard frame"),
-            (info, self.conda_compress(b"x" * tarfile.BLOCKSIZE), "cannot extract conda archive"),
-            (payload, self.conda_compress(b"x" * tarfile.BLOCKSIZE), "invalid tar header at offset 0"),
-            (payload, self.conda_compress(bytes(tarfile.BLOCKSIZE - 1)), "truncated tar block"),
+            (info, self.conda_compress(b"not a tar archive"), "truncated header"),
+            (payload, self.conda_compress(b"not a tar archive"), "truncated header"),
         ):
             with self.subTest(name=name, diagnostic=diagnostic):
                 package = self.make_conda({**members, name: content})
-                self.assert_conda_refused(package, diagnostic)
+                self.assert_conda_refused(package, f"{name}: {diagnostic}")
         package.write_bytes(b"not zip")
         self.assert_conda_refused(package, "File is not a zip file")
 
@@ -1299,7 +1363,7 @@ class ToolsTests(FixtureCase):
         content = members["info-example-1-0.tar.zst"]
         damaged = bytes([content[0] ^ 1]) + content[1:]
         package.write_bytes(package.read_bytes().replace(content, damaged, 1))
-        self.assert_conda_refused(package, "Bad CRC-32")
+        self.assert_conda_refused(package, "info-example-1-0.tar.zst: Bad CRC-32")
 
     def test_fetch_conda_names_unexpected_and_duplicate_zip_members(self) -> None:
         members = self.conda_members()
@@ -1326,41 +1390,6 @@ class ToolsTests(FixtureCase):
             self.base / "example-1-0.conda", "ZIP member 'metadata.json' is not a regular file"
         )
 
-    def test_fetch_conda_rejects_invalid_zip_framing(self) -> None:
-        members = self.conda_members()
-        package = self.make_conda(members)
-        raw = package.read_bytes()
-        bad_count = bytearray(raw)
-        bad_count[-14:-12] = (4).to_bytes(2, "little")
-        bad_method = bytearray(raw)
-        bad_method[8:10] = (8).to_bytes(2, "little")
-        bad_crc = bytearray(raw)
-        bad_crc[14] ^= 1
-        bad_extra = bytearray(raw)
-        bad_extra[28] = 1
-        central = raw.index(b"PK\x01\x02")
-        bad_size = bytearray(raw)
-        bad_size[central + 20] ^= 1
-        bad_directory_size = bytearray(raw)
-        bad_directory_size[-14:-10] = b"\x04\x00\x04\x00"
-        for data, diagnostic in (
-            (raw + b"junk", "invalid ZIP end record or trailing data"),
-            (b"junk" + raw, "unexpected data before first ZIP member"),
-            (bad_count, "invalid ZIP central directory framing"),
-            (bad_directory_size, "invalid ZIP central directory length or member count"),
-            (bad_method, "metadata.json: invalid local ZIP header"),
-            (bad_crc, "metadata.json: local ZIP CRC or sizes disagree"),
-            (bad_extra, "metadata.json: truncated ZIP extra field"),
-            (bad_size, "metadata.json: invalid sizes for a stored ZIP member"),
-        ):
-            with self.subTest(diagnostic=diagnostic):
-                package.write_bytes(data)
-                self.assert_conda_refused(package, diagnostic)
-        with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for name, content in members.items():
-                archive.writestr(name, content)
-        self.assert_conda_refused(package, "metadata.json: conda v2 requires stored ZIP members")
-
     def test_fetch_conda_accepts_zip64_with_data_descriptors(self) -> None:
         class Unseekable(io.BytesIO):
             def seek(self, *args: int) -> int:
@@ -1379,17 +1408,6 @@ class ToolsTests(FixtureCase):
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(
             payload_digest(tools / f"jscpd-{VERSION}"), payload_digest(self.base / "expected")
-        )
-        descriptor = raw.index(b"PK\x07\x08")
-        package.write_bytes(raw[:descriptor + 4] + bytes([raw[descriptor + 4] ^ 1])
-                            + raw[descriptor + 5:])
-        self.assert_conda_refused(
-            package, "metadata.json: invalid ZIP member boundaries", tools=self.base / "broken-tools"
-        )
-        zip64_field = 30 + len("metadata.json")
-        package.write_bytes(raw[:zip64_field] + b"\x02" + raw[zip64_field + 1:])
-        self.assert_conda_refused(
-            package, "metadata.json: invalid local ZIP64 sizes", tools=self.base / "broken-tools"
         )
 
     def test_fetch_conda_rejects_duplicate_metadata_keys_and_non_json_constants(self) -> None:
@@ -1449,9 +1467,8 @@ class ToolsTests(FixtureCase):
         archive = self.make_conda(members)
         destination = self.base / "destination"
         destination.mkdir()
-        with lock_override(self.conda_lock(archive)):
-            _, tool = _pinned_tool("jscpd")
-        with self.assertRaisesRegex(GateError, "unsafe archive member"):
+        tool = self.conda_tool(archive)
+        with self.assertRaisesRegex(GateError, "pkg-example-1-0.tar.zst: .*unsafe archive member"):
             gate_tools._extract_archive(archive, destination, tool)
         self.assertEqual(list(destination.iterdir()), [])
         self.assertFalse((self.base / "conda-escape").exists())
@@ -1461,69 +1478,14 @@ class ToolsTests(FixtureCase):
     ) -> None:
         destination = self.base / "conda-destination"
         destination.mkdir(exist_ok=True)
-        tool = Tool("jscpd", VERSION, "file:///unused", "0" * 64, "0" * 64, "bin/example", "conda")
         for tarball in ("info-example-1-0.tar.zst", "pkg-example-1-0.tar.zst"):
             with self.subTest(tarball=tarball, diagnostic=diagnostic):
                 archive = self.make_conda({**members, tarball: self.conda_compress(raw)})
                 with self.assertRaises(GateError) as raised:
-                    gate_tools._extract_archive(archive, destination, tool)
+                    gate_tools._extract_archive(archive, destination, self.conda_tool(archive))
                 self.assertIn(tarball, str(raised.exception))
                 self.assertIn(diagnostic, str(raised.exception))
                 self.assertEqual(list(destination.iterdir()), [])
-
-    def test_extract_conda_rejects_bad_tar_framing_before_writing(self) -> None:
-        members = self.conda_members()
-        block = tarfile.BLOCKSIZE
-        raw = self.raw_tar({"bin/example": (b"fake", 0o755)})
-        end = 2 * block
-        for damaged, diagnostic in (
-            (raw[:end], f"expected two zero tar end blocks at offset {end}"),
-            (raw[:end + block], f"expected two zero tar end blocks at offset {end}"),
-            (raw[:end] + b"x" + raw[end + 1:], f"invalid tar header at offset {end}"),
-            (raw[:end + 2 * block] + b"x" + raw[end + 2 * block + 1:],
-             f"nonzero data after tar end at offset {end + 2 * block}"),
-            (raw[:block + 4] + b"x" + raw[block + 5:],
-             f"invalid tar member padding at offset {block + 4}"),
-        ):
-            self.assert_conda_tar_refused_before_write(members, damaged, diagnostic)
-
-    def test_extract_conda_validates_pax_records_before_writing(self) -> None:
-        members = self.conda_members()
-        extra = tarfile.TarInfo("entry")
-        extra.pax_headers["path"] = "share/" + "x" * 100
-        raw = self.raw_tar({}, extra)
-        destination = self.base / "pax-payload"
-        destination.mkdir()
-        pkg = "pkg-example-1-0.tar.zst"
-        archive = self.make_conda({**members, pkg: self.conda_compress(raw)})
-        tool = Tool("jscpd", VERSION, "file:///unused", "0" * 64, "0" * 64, "bin/example", "conda")
-        try:
-            gate_tools._extract_archive(archive, destination, tool)
-        except GateError as error:
-            self.fail(str(error))
-        self.assertTrue((destination / extra.pax_headers["path"]).is_file())
-        start = tarfile.BLOCKSIZE
-        end = raw.index(b"\n", start) + 1
-        damaged = raw[:start] + b"\0" + raw[start + 1:]
-        self.assert_conda_tar_refused_before_write(
-            members, damaged, f"invalid PAX record at offset {start}"
-        )
-        self.assert_conda_tar_refused_before_write(
-            members, raw[:end - 1] + b"?" + raw[end:], "offset"
-        )
-        extra.pax_headers["size"] = "not a size"
-        self.assert_conda_tar_refused_before_write(
-            members, self.raw_tar({}, extra), "invalid PAX size"
-        )
-
-    def test_extract_conda_rejects_bad_gnu_long_name_before_writing(self) -> None:
-        members = self.conda_members()
-        name = "share/" + "x" * 100
-        long_name = tarfile.TarInfo(name).tobuf(format=tarfile.GNU_FORMAT)
-        valid = long_name + bytes(2 * tarfile.BLOCKSIZE)
-        damaged = bytearray(valid)
-        damaged[tarfile.BLOCKSIZE + len(name)] = ord("x")
-        self.assert_conda_tar_refused_before_write(members, bytes(damaged), "invalid tar extension")
 
     def test_extract_conda_rejects_unsafe_tar_entries_before_writing(self) -> None:
         members = self.conda_members()
@@ -1547,11 +1509,11 @@ class ToolsTests(FixtureCase):
     def test_fetch_conda_reports_decoder_failure(self) -> None:
         package = self.make_conda(self.conda_members())
         with mock.patch(
-            "quality_gate.tools.ctypes.CDLL", side_effect=OSError("libzstd.so.1 unavailable"),
+            "ctypes.CDLL", side_effect=OSError("libzstd.so.1 unavailable"),
         ):
             self.assert_conda_refused(package, "libzstd.so.1 unavailable")
         library = ctypes.CDLL("libzstd.so.1")
-        with mock.patch("quality_gate.tools.ctypes.CDLL", return_value=library), mock.patch.object(
+        with mock.patch("ctypes.CDLL", return_value=library), mock.patch.object(
             library, "ZSTD_createDStream", return_value=None
         ):
             self.assert_conda_refused(package, "cannot allocate a Zstandard decoder")
@@ -1564,13 +1526,17 @@ class ToolsTests(FixtureCase):
     def test_fetch_conda_rejects_wrong_archive_digest(self) -> None:
         package = self.make_conda(self.conda_members())
         expected = "0" * 64
-        with mock.patch("quality_gate.tools._extract_archive") as extract:
+        with (
+            mock.patch.object(zipfile, "ZipFile") as read_zip,
+            mock.patch.object(tarfile, "open") as read_tar,
+        ):
             self.assert_conda_refused(
                 package, f"sha256 mismatch for {package.as_uri()}: "
                 f"expected {expected}, got {self.sha256(package)}",
                 digest=expected,
             )
-        extract.assert_not_called()
+        read_zip.assert_not_called()
+        read_tar.assert_not_called()
 
     def test_fetch_conda_rejects_wrong_payload_digest(self) -> None:
         package = self.make_conda(self.conda_members())
@@ -1578,15 +1544,26 @@ class ToolsTests(FixtureCase):
             package, "payload sha256 mismatch", payload="0" * 64,
         )
 
+    def conda_tool(
+        self, package: Path, *, digest: str | None = None, payload: str | None = None,
+    ) -> Tool:
+        return Tool(
+            "jscpd", VERSION, package.as_uri(), digest or self.sha256(package),
+            payload or payload_digest(self.base / "expected"), "bin/example", "conda",
+        )
+
     def assert_conda_refused(
-        self, package: Path, diagnostic: str, *, tools: Path | None = None, **overrides: str
+        self, package: Path, diagnostic: str, **overrides: str
     ) -> None:
-        lock = self.conda_lock(package, **overrides)
-        tools = tools or self.base / "tools"
-        result = self.fetch(lock, tools)
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn(f"jscpd {VERSION}", result.stderr)
-        self.assertIn(diagnostic, result.stderr)
+        tool = self.conda_tool(package, **overrides)
+        tools = self.base / "tools"
+        tools.mkdir(exist_ok=True)
+        with self.assertRaises(GateError) as raised:
+            gate_tools._fetch_tool(tool, tools)
+        error = raised.exception
+        self.assertEqual(error.exit_code, 1, str(error))
+        self.assertIn(f"jscpd {VERSION}", str(error))
+        self.assertIn(diagnostic, str(error))
         self.assertEqual(list(tools.iterdir()), [])
 
     def test_fetch_package_and_verify_its_binary(self) -> None:
