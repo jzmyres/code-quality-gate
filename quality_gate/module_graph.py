@@ -6,7 +6,6 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from importlib.machinery import PathFinder
-from os.path import normpath
 from pathlib import Path
 
 
@@ -94,10 +93,6 @@ def _import_edges(root: Path, modules: list[str]) -> set[Edge]:
     return {edge for module in sorted(modules) for edge in _source_edges(root, module, paths)}
 
 
-def _literal_target(root: Path, filename: str, paths: dict[str, str]) -> str | None:
-    return paths.get(normpath(root / f"{filename}.el")) or paths.get(normpath(root / filename))
-
-
 def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[str, dict]]:
     return (
         (source, row) for source in sorted(elisp) for row in elisp[source] if row["kind"] == kind
@@ -105,23 +100,26 @@ def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[st
 
 
 def _require_target(
-    root: Path, row: dict, paths: dict[str, str], providers: dict[str, set[str]],
+    row: dict, paths: set[str], providers: dict[str, set[str]],
 ) -> str | None:
     filename = row["filename"]
     if filename is not None:
-        return _literal_target(root, filename, paths)
+        with_suffix = f"{filename}.el"
+        if with_suffix in paths:
+            return with_suffix
+        return filename if filename in paths else None
     candidates = providers.get(row["feature"], ())
     return next(iter(candidates)) if len(candidates) == 1 else None
 
 
-def _require_edges(root: Path, elisp: dict[str, list[dict]], modules: list[str]) -> set[Edge]:
-    paths = {normpath(root / module): module for module in modules}
+def _require_edges(elisp: dict[str, list[dict]], modules: list[str]) -> set[Edge]:
+    paths = set(modules)
     providers: dict[str, set[str]] = defaultdict(set)
     for source, row in _elisp_records(elisp, "provide"):
         providers[row["feature"]].add(source)
     edges = set()
     for source, row in _elisp_records(elisp, "require"):
-        target = _require_target(root, row, paths, providers)
+        target = _require_target(row, paths, providers)
         if target is not None:
             edges.add(Edge(source, target, row["line"], "require"))
     return edges
@@ -254,7 +252,7 @@ def measure(
     root = root.absolute()
     elisp = elisp or {}
     modules = sorted([*python_modules, *elisp])
-    edges = sorted(_import_edges(root, python_modules) | _require_edges(root, elisp, modules))
+    edges = sorted(_import_edges(root, python_modules) | _require_edges(elisp, modules))
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [
         (component, _shortest_cycle(component, outgoing))

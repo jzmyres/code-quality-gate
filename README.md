@@ -328,15 +328,18 @@ The batch Emacs reader extracts `(require 'FEATURE)` at the top level or directl
 `eval-when-compile`. A top-level edge uses the line where the reader starts the form.
 A direct compile-time edge uses the line of the `require` symbol. The target is the
 unique measured file with a literal `(provide 'FEATURE)` at the top level or directly
-inside a top-level `progn`. For a literal filename in `(require 'FEATURE "FILE")`, the
-graph appends `.el` to the operand as written before resolving the path. For example,
-`"odd.name/"` first checks for a measured `odd.name/.el`, then checks the exact operand.
-If neither candidate is measured, the literal filename gives no edge. Relative filenames
-are matched from the repository root.
-A computed feature or filename is reported in `outside_extractor` with its file and line
-and gives no edge. Requires nested elsewhere, including in functions or quasiquote unquotes,
-give no edge. `load` and `load-file` also give no edge. An Emacs launch or reader failure, or a
-Python syntax error, produces a check error that names the affected file.
+inside a top-level `progn`. A literal filename in `(require 'FEATURE "FILE")` must be a
+canonical relative path. It must be nonempty, contain no `$`, and start with neither `/`
+nor `~`. Each slash-delimited component must be nonempty and must be neither `.` nor `..`,
+which also rules out a trailing slash. The graph matches `FILE.el` first, then `FILE`,
+exactly against the measured repository-relative paths. If neither candidate is measured,
+the literal filename gives no edge.
+
+Computed feature or filename operands and noncanonical literal filenames produce entries
+in `outside_extractor` with their file and line and give no edge. Requires nested elsewhere,
+including in functions or quasiquote unquotes, give no edge. `load` and `load-file` also
+give no edge. An Emacs launch or reader failure, or a Python syntax error, produces a
+check error that names the affected file.
 
 The graph reports one finding per strongly connected component with at least two modules
 and shows a shortest cycle with its edge locations. It also reports dependencies between

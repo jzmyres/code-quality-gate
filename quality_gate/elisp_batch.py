@@ -14,26 +14,38 @@ def batch_command(
 MODULE_GRAPH_READER = r"""
 (progn
   (require 'json)
+  (require 'seq)
 
   (defun qg-graph-quoted-symbol-p (form)
     (and (eq (proper-list-p form) 2)
          (eq (car form) 'quote)
          (symbolp (cadr form))))
 
-  (defun qg-graph-outside (line operand)
+  (defun qg-graph-outside (line description)
     (list (cons 'kind "outside") (cons 'line line)
-          (cons 'message (format "computed require %s is outside the extractor" operand))))
+          (cons 'message (format "%s is outside the extractor" description))))
+
+  (defun qg-graph-canonical-filename-p (filename)
+    (and (not (string-prefix-p "~" filename))
+         (not (string-search "$" filename))
+         (not (seq-some (lambda (part) (member part '("" "." "..")))
+                        (split-string filename "/" nil)))))
 
   (defun qg-graph-require (form &optional line)
     (when (and (eq (car-safe form) 'require) (proper-list-p form))
       (let* ((line (or line (line-number-at-pos (symbol-with-pos-pos (car form)))))
              (feature (cadr form))
              (filename (nth 2 form))
+             (filename-problem
+              (cond ((stringp filename)
+                     (unless (qg-graph-canonical-filename-p filename)
+                       "noncanonical require filename"))
+                    (filename "computed require filename")))
              (outside (delq nil
                             (list (unless (qg-graph-quoted-symbol-p feature)
-                                    (qg-graph-outside line "feature"))
-                                  (unless (or (null filename) (stringp filename))
-                                    (qg-graph-outside line "filename"))))))
+                                    (qg-graph-outside line "computed require feature"))
+                                  (when filename-problem
+                                    (qg-graph-outside line filename-problem))))))
         (or outside (list (list (cons 'kind "require") (cons 'line line)
                                 (cons 'feature (symbol-name (bare-symbol (cadr feature))))
                                 (cons 'filename filename)))))))

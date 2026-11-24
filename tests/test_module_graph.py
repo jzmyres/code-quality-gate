@@ -223,6 +223,15 @@ reason = "package measured by the graph"
         self.add_file("c.el", "(provide 'c)\n")
         self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "c.el", 1, "require")])
 
+    def test_module_graph_elisp_literal_filename_exact_fallback(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", '(require \'b "nested/target.el")\n(require \'b "missing")\n')
+        self.add_file("nested/target.el", "")
+        self.add_file("b.el", "(provide 'b)\n")
+        measurement = self.graph(0)["measurement"]
+        self.assertEqual(measurement["edges"], [edge("a.el", "nested/target.el", 1, "require")])
+        self.assertNotIn("outside_extractor", measurement)
+
     def test_module_graph_elisp_reader_label(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(defconst fixture '#1=(alpha beta))\n(require 'b)\n")
@@ -263,20 +272,33 @@ reason = "Python script measured by the graph"
         self.assertEqual(finding.location, "a.el:1")
         self.assertEqual(finding.measurement, {"edge": expected_edge})
 
-    def test_module_graph_elisp_literal_filename_preserves_trailing_slash(self) -> None:
+    def test_module_graph_elisp_noncanonical_literal_filenames(self) -> None:
         self.configure_graph(elisp=True)
-        self.add_file("a.el", '(require \'dotted-fixture "odd.name/")\n')
-        self.add_file("odd.name/.el", "(provide 'dotted-fixture)\n")
-        self.add_file("odd.name.el", "")
-        context = self.graph_context(["a.el", "odd.name/.el", "odd.name.el"], ("odd.name/.el",))
-        result = adapters._run_module_graph(context)
-        expected_edge = edge("a.el", "odd.name/.el", 1, "require")
-        self.assertEqual(result.measurement["edges"], [expected_edge])
-        self.assertEqual(result.outcome, "fail")
-        finding, = result.findings
-        self.assertIn("a.el -> odd.name/.el", finding.subject)
-        self.assertEqual(finding.location, "a.el:1")
-        self.assertEqual(finding.measurement, {"edge": expected_edge})
+        sep = chr(47)
+        absolute_operand = sep + "program"
+        operands = (
+            "", "odd.name" + sep, "program.el" + sep, "a" + sep * 2 + "program",
+            absolute_operand, sep.join(("dir", ".")), sep.join(("sub", "dir", "..")),
+            sep.join((".", "program")), sep.join(("~", "program")),
+            sep.join((chr(36) + "HOME", "program")), sep + ":" + absolute_operand,
+        )
+        program = "odd.name/.el"
+        self.add_file(program, "(provide 'dotted-fixture)\n")
+        targets = ["odd.name.el", "program.el", "a/program.el"]
+        for path in targets:
+            self.add_file(path, "")
+        context = self.graph_context(["a.el", program, *targets], (program,))
+        for operand in operands:
+            with self.subTest(operand=operand):
+                self.add_file("a.el", f'\n(require \'dotted-fixture "{operand}")\n')
+                result = adapters._run_module_graph(context)
+                self.assertEqual(result.measurement["edges"], [])
+                self.assertEqual(result.outcome, "pass")
+                self.assertEqual(result.findings, [])
+                self.assertEqual(result.measurement.get("outside_extractor"), [
+                    {"file": "a.el", "line": 2,
+                     "message": "noncanonical require filename is outside the extractor"},
+                ])
 
     def test_module_graph_elisp_top_level_progn_provider(self) -> None:
         self.configure_graph(elisp=True)
