@@ -175,7 +175,46 @@ reason = "package measured by the graph"
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(eval-when-compile\n  (\n   require 'b))\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 3, "require")])
+
+    def test_module_graph_elisp_compile_time_shared_reader_label(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", (
+            "(eval-when-compile\n"
+            "  '#1=(alpha beta)\n"
+            "  '#1#\n"
+            "  (require 'b))\n"
+        ))
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 4, "require")])
+
+    def test_module_graph_elisp_compile_time_bare_list_reader_label(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", (
+            "(eval-when-compile\n"
+            "  #1=(alpha beta)\n"
+            "  #1#\n"
+            "  (require 'b))\n"
+        ))
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 4, "require")])
+
+    def test_module_graph_elisp_compile_time_symbol_reader_label(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", (
+            "(eval-when-compile\n"
+            "  #1=alpha\n"
+            "  #1#\n"
+            "  (require 'b))\n"
+        ))
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 4, "require")])
+
+    def test_module_graph_elisp_compile_time_character_literal(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(eval-when-compile\n  ?)\n  (require 'b))\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 3, "require")])
 
     def test_module_graph_elisp_literal_filename(self) -> None:
         self.configure_graph(elisp=True)
@@ -190,12 +229,39 @@ reason = "package measured by the graph"
         self.add_file("b.el", "(provide 'b)\n")
         self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
 
+    def test_module_graph_elisp_top_level_labelled_require(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "\n#1=\n(require 'b)\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+
     def test_module_graph_elisp_dotted_literal_filename(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", '(require \'dotted-fixture "odd.name")\n')
         self.add_file("odd.name.el", "")
         self.add_file("other.el", "(provide 'dotted-fixture)\n")
         self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "odd.name.el", 1, "require")])
+
+    def test_module_graph_elisp_literal_filename_prefers_el_suffix(self) -> None:
+        self.configure_graph("""
+[[rule]]
+pattern = "odd.name"
+class = "python"
+reason = "Python script measured by the graph"
+""", elisp=True)
+        self.add_file("a.el", '(require \'dotted-fixture "odd.name")\n')
+        self.add_file("odd.name", "#!/usr/bin/env python3\n")
+        self.add_file("odd.name.el", "(provide 'dotted-fixture)\n")
+        context = self.graph_context(["a.el", "odd.name", "odd.name.el"], ("odd.name.el",))
+        result = adapters._run_module_graph(context)
+        expected_edge = edge("a.el", "odd.name.el", 1, "require")
+        self.assertEqual(result.measurement["edges"], [expected_edge])
+        self.assertIn("odd.name", result.measurement["modules"])
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        self.assertIn("a.el -> odd.name.el", finding.subject)
+        self.assertEqual(finding.location, "a.el:1")
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
 
     def test_module_graph_elisp_top_level_progn_provider(self) -> None:
         self.configure_graph(elisp=True)

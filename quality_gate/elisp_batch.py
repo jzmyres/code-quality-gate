@@ -24,9 +24,10 @@ MODULE_GRAPH_READER = r"""
     (list (cons 'kind "outside") (cons 'line line)
           (cons 'message (format "computed require %s is outside the extractor" operand))))
 
-  (defun qg-graph-require (form line)
+  (defun qg-graph-require (form &optional line)
     (when (and (eq (car-safe form) 'require) (proper-list-p form))
-      (let* ((feature (cadr form))
+      (let* ((line (or line (line-number-at-pos (symbol-with-pos-pos (car form)))))
+             (feature (cadr form))
              (filename (nth 2 form))
              (outside (delq nil
                             (list (unless (qg-graph-quoted-symbol-p feature)
@@ -34,42 +35,28 @@ MODULE_GRAPH_READER = r"""
                                   (unless (or (null filename) (stringp filename))
                                     (qg-graph-outside line "filename"))))))
         (or outside (list (list (cons 'kind "require") (cons 'line line)
-                                (cons 'feature (symbol-name (cadr feature)))
+                                (cons 'feature (symbol-name (bare-symbol (cadr feature))))
                                 (cons 'filename filename)))))))
-
-  (defun qg-graph-compile-requires (start end)
-    (save-excursion
-      (goto-char (1+ start))
-      (read (current-buffer))
-      (let (rows)
-        (while (progn (forward-comment (point-max)) (< (point) (1- end)))
-          (let ((line (line-number-at-pos))
-                (direct (eq (char-after) ?\())
-                (form (condition-case nil
-                          (read (current-buffer))
-                        (invalid-read-syntax (goto-char end) nil))))
-            (when direct
-              (dolist (row (qg-graph-require form line))
-                (push row rows)))))
-        (nreverse rows))))
 
   (defun qg-graph-provide (form)
     (when (and (eq (car-safe form) 'provide)
                (proper-list-p form)
                (qg-graph-quoted-symbol-p (cadr form)))
-      (list (cons 'kind "provide") (cons 'feature (symbol-name (cadadr form))))))
+      (list (cons 'kind "provide")
+            (cons 'feature (symbol-name (bare-symbol (cadadr form)))))))
 
-  (defun qg-graph-top-level (form start line)
-    (when (eq (char-after start) ?\()
-      (pcase (car-safe form)
-        ('provide
-         (let ((row (qg-graph-provide form)))
-           (when row (list row))))
-        ('progn
-         (when (proper-list-p form)
-           (delq nil (mapcar #'qg-graph-provide (cdr form)))))
-        ('require (qg-graph-require form line))
-        ('eval-when-compile (qg-graph-compile-requires start (point))))))
+  (defun qg-graph-top-level (form line)
+    (pcase (car-safe form)
+      ('provide
+       (let ((row (qg-graph-provide form)))
+         (when row (list row))))
+      ('progn
+       (when (proper-list-p form)
+         (delq nil (mapcar #'qg-graph-provide (cdr form)))))
+      ('require (qg-graph-require form line))
+      ('eval-when-compile
+       (when (proper-list-p form)
+         (apply #'append (mapcar #'qg-graph-require (cdr form)))))))
 
   (defun qg-graph-file (path)
     (with-temp-buffer
@@ -82,9 +69,9 @@ MODULE_GRAPH_READER = r"""
               (when (looking-at-p "#!") (forward-line 1))
               (while (progn (forward-comment (point-max)) (not (eobp)))
                 (setq line (line-number-at-pos))
-                (let* ((start (point))
-                       (form (read (current-buffer))))
-                  (dolist (row (qg-graph-top-level form start line))
+                (let* ((symbols-with-pos-enabled t)
+                       (form (read-positioning-symbols (current-buffer))))
+                  (dolist (row (qg-graph-top-level form line))
                     (push row rows))))
               (vconcat (nreverse rows)))
           (error (format "%s:%d: %s" path line (error-message-string failure)))))))
