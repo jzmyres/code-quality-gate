@@ -81,7 +81,6 @@ class PolicyTests(FixtureCase):
     def test_module_dirs_require_a_list_of_relative_directory_paths(self) -> None:
         for value, key in (
             ('"src"', "module_dirs"),
-            ("[1]", "module_dirs[0]"),
             ('[""]', "module_dirs[0]"),
             ('["."]', "module_dirs[0]"),
             ('["/src"]', "module_dirs[0]"),
@@ -91,6 +90,22 @@ class PolicyTests(FixtureCase):
         ):
             with self.subTest(value=value):
                 self.config_error(f"module_dirs = {value}\n" + BASE_CONFIG, key, "expected")
+
+    def test_module_dirs_wrong_types_name_the_offending_value(self) -> None:
+        for value, key, actual in (
+            ('{directory = "lib"}', "module_dirs", "{'directory': 'lib'}"),
+            ('[["lib"]]', "module_dirs[0]", "['lib']"),
+            ('["lib", 17]', "module_dirs[1]", "17"),
+        ):
+            with self.subTest(value=value):
+                self.config_error(f"module_dirs = {value}\n" + BASE_CONFIG, key, actual)
+
+    def test_duplicate_module_directory_names_the_value_and_index(self) -> None:
+        self.config_error(
+            'module_dirs = ["lib", "lib"]\n' + BASE_CONFIG,
+            "module_dirs[1]",
+            "duplicate 'lib'",
+        )
 
     def test_unknown_class_key(self) -> None:
         self.config_error(

@@ -229,12 +229,12 @@ For example, add this before the first TOML table.
 module_dirs = ["src", "tools/scripts"]
 ```
 
-Each entry is a literal repository-relative subdirectory path with slash-separated components and
-no leading or trailing slash, `.`, or `..` components. Inventory reports every code file outside
-the declared directories, including stageable code, and every declaration with no tracked or staged
-file under it. A tracked non-code file counts toward using a declaration, and non-code files can
-live anywhere. Omit `module_dirs` to disable placement enforcement. An empty list disallows all code
-files.
+Each entry must be a unique, literal repository-relative subdirectory path with slash-separated
+components and no leading or trailing slash, `.`, or `..` components. Inventory reports every code
+file outside the declared directories, including stageable code, and every declaration with no
+tracked or staged file under it. A tracked non-code file counts toward using a declaration, and
+non-code files can live anywhere. Omit `module_dirs` to disable placement enforcement. An empty
+list disallows all code files.
 
 ### hygiene
 

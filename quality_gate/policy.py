@@ -852,17 +852,25 @@ def _parse_protect(data: dict[str, Any], path: Path) -> tuple[str, ...]:
     return _optional_string_list(protect, "paths", path, "protect.paths")
 
 
+def _validate_module_directory(path: Path, key: str, directory: object) -> None:
+    if not isinstance(directory, str):
+        raise _config_error(path, key, "a string", repr(directory))
+    if {"", ".", ".."}.intersection(directory.split("/")) or "\x00" in directory:
+        raise _config_error(path, key, "a repository-relative directory path", repr(directory))
+
+
 def _parse_module_dirs(data: dict[str, Any], path: Path) -> tuple[str, ...] | None:
     if "module_dirs" not in data:
         return None
-    directories = _string_list(data, "module_dirs", path, "module_dirs")
+    directories = data["module_dirs"]
+    if not isinstance(directories, list):
+        raise _config_error(path, "module_dirs", "a list of strings", repr(directories))
+    seen: set[str] = set()
     for index, directory in enumerate(directories):
-        if {"", ".", ".."}.intersection(directory.split("/")) or "\x00" in directory:
-            raise _config_error(
-                path, f"module_dirs[{index}]", "a repository-relative directory path",
-                repr(directory),
-            )
-    return directories
+        key = f"module_dirs[{index}]"
+        _validate_module_directory(path, key, directory)
+        _unique(seen, directory, path, key, "a unique directory", f"duplicate {directory!r}", _config_error)
+    return tuple(directories)
 
 
 def _config_from_data(
