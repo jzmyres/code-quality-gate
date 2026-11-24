@@ -8,6 +8,7 @@ from collections import Counter
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import replace
 from io import StringIO
+from inspect import getsource
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -48,7 +49,10 @@ def shell_call(line: int, *words: str | tuple[str, list[dict]], script: str) -> 
 
 
 def shell_tree(*statements: dict) -> runner.RunResult:
-    tree = {"Type": "File", "Stmts": statements}
+    return shell_json({"Type": "File", "Stmts": statements})
+
+
+def shell_json(tree: dict) -> runner.RunResult:
     return runner.RunResult((), "completed", 0, stdout=json.dumps(tree).encode())
 
 
@@ -770,12 +774,14 @@ reason = "Shell option lookalike measured by the graph"
         word, operand = call["Args"]
         for args, detail in (
             (None, "missing field Args"),
+            ([None], "field Args must contain objects"),
             ([{}], "missing field Parts"),
             ([{**word, "Parts": ""}], "field Parts must be list"),
             ([{**word, "Parts": [{}]}], "missing field Type"),
             ([{**word, "Parts": [{"Type": 0}]}], "field Type must be str"),
             ([{**word, "Parts": [{"Type": "Lit"}]}], "missing field Value"),
             ([{**word, "Pos": {}}], "missing field Pos.Offset"),
+            ([{**word, "Pos": {"Offset": True}}], "field Pos.Offset must be int"),
             ([{**word, "End": {}}], "missing field End.Offset"),
             ([word, {**operand, "Parts": [shell_quote({})]}], "missing field Type"),
             ([word, {**operand, "Parts": [
@@ -790,16 +796,79 @@ reason = "Shell option lookalike measured by the graph"
                 self.assertEqual(result["outcome"], "error")
                 self.assertIn(f"broken.sh: shfmt JSON {detail}", result["reason"])
 
-    def test_module_graph_shell_schema_distinguishes_omitted_fields(self) -> None:
-        for node, fields in (
-            ({"Type": "CallExpr"}, {"Pos.Line": int, "Args": list}),
-            ({"Type": "CallExpr", "Assigns": [{}]}, {"Pos.Line": int, "Assigns": list}),
-            ({"Type": "CallExpr", "Assigns": [{}], "Args": [{}]}, {"Pos.Line": int, "Args": list}),
-            ({"Type": "ParamExp"}, {}),
-            ({"Type": "ParamExp", "Exp": {}}, {"Exp.Op": str}),
+    def test_module_graph_shell_requires_statement_fields(self) -> None:
+        self.configure_graph(shell=True)
+        script = "source ./sibling.sh\n"
+        self.add_file("main.sh", script)
+        self.add_file("sibling.sh", "")
+        for tree, detail in (
+            ({"Type": "File"}, "missing field Stmts"),
+            ({"Type": "File", "Stmts": [{}]}, "missing field Cmd"),
+            ({"Type": "File", "Stmts": [{"Cmd": {}}]}, "missing field Type"),
+            ({"Type": "File", "Stmts": [{"Cmd": [], "Redirs": []}]}, "field Cmd must be dict"),
+            ({"Type": "File", "Stmts": [{"Cmd": {"Type": "Unknown"}}]},
+             "unsupported field Type value 'Unknown'"),
         ):
-            with self.subTest(node=node):
-                self.assertEqual(module_graph._shell_fields(node), fields)
+            with self.subTest(detail=detail):
+                check = self.shell_graph(1, {"main.sh": shell_json(tree), "sibling.sh": shell_tree()})
+                self.assertEqual(check["outcome"], "error")
+                self.assertIn(f"main.sh: shfmt JSON {detail}", check["reason"])
+
+    def test_module_graph_shell_requires_nested_statement_fields(self) -> None:
+        self.configure_graph(shell=True)
+        script = "if true; then source ./sibling.sh; fi\n"
+        self.add_file("main.sh", script)
+        self.add_file("sibling.sh", "")
+        command = {
+            "Type": "IfClause", "Cond": [shell_call(1, "true", script=script)],
+            "Then": [shell_call(1, "source", "./sibling.sh", script=script)],
+        }
+        trees = {"main.sh": shell_tree({"Cmd": command}), "sibling.sh": shell_tree()}
+        measurement = self.shell_graph(0, trees)["measurement"]
+        self.assertEqual(measurement["edges"], [edge("main.sh", "sibling.sh", 1, "source")])
+        command.pop("Then")
+        trees["main.sh"] = shell_tree({"Cmd": command})
+        check = self.shell_graph(1, trees)
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("main.sh: shfmt JSON missing field Then", check["reason"])
+
+    def test_module_graph_shell_block_omission_requires_empty_body(self) -> None:
+        self.configure_graph(shell=True)
+        for body, exit_code in ((" ", 0), (" source ./sibling.sh; ", 1)):
+            with self.subTest(body=body):
+                script = "{" + body + "}\n"
+                self.add_file("main.sh", script)
+                block = {"Type": "Block", "Pos": {"Offset": 0}, "End": {"Offset": len(script) - 1}}
+                check = self.shell_graph(exit_code, {"main.sh": shell_tree({"Cmd": block})})
+                if exit_code:
+                    self.assertIn("main.sh: shfmt JSON missing field Stmts", check["reason"])
+                else:
+                    self.assertEqual(check["measurement"]["edges"], [])
+
+    def test_module_graph_shell_accepts_omitted_empty_fields(self) -> None:
+        self.configure_graph(shell=True)
+        self.add_file("blank.sh", " \n")
+        self.add_file("empty.sh", "")
+        self.add_file("header.sh", "#!/bin/bash\n")
+        script = ">out\nvalue=1\n"
+        self.add_file("main.sh", script)
+        out, = shell_call(1, "out", script=script)["Cmd"]["Args"]
+        end = {"Offset": len(script.rstrip())}
+        measurement = self.shell_graph(0, {
+            "blank.sh": shell_json({"Type": "File"}),
+            "empty.sh": shell_json({"Type": "File"}),
+            "header.sh": shell_json({"Type": "File"}),
+            "main.sh": shell_tree(
+                {"Redirs": [{"Word": out}]},
+                {"Cmd": {"Type": "CallExpr", "Pos": {"Line": 2}, "End": end, "Assigns": [{"End": end}]}},
+            ),
+        })["measurement"]
+        self.assertEqual(measurement["edges"], [])
+        self.assertNotIn("outside_extractor", measurement)
+
+    def test_module_graph_shell_uses_required_field_accessor(self) -> None:
+        source = getsource(module_graph).split("_SHELL_SCHEMA =", 1)[1].split("def _elisp_records(", 1)[0]
+        self.assertNotIn(".get(", source)
 
     def test_module_graph_measurement(self) -> None:
         self.configure_graph()

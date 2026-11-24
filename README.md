@@ -386,8 +386,10 @@ The graph reports other quoted, expanded, globbed, or unsupported targets as out
 It reports the same diagnostic for `source` and `.` with a first operand starting with
 `-` or `+` and for `bash` and `sh` with such an option before the script. These diagnostics appear in
 `outside_extractor` with the calling file and line. A literal path without a measured target
-is reported there as unresolved and includes the path. Shell syntax and shfmt schema errors
-fail the check and name the affected file. Schema errors also name the affected field.
+is reported there as unresolved and includes the path. The graph validates the shfmt fields it
+reads. Missing or mistyped fields fail the check and identify the file and field. Empty files,
+assignment-only commands, and redirect-only statements are valid. Shell syntax errors fail the
+check and identify the file.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends

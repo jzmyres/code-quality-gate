@@ -14,8 +14,7 @@ from inspect import signature
 from pathlib import Path
 from runpy import run_path
 from tokenize import open as open_source
-
-from .shell_syntax import _check_fields
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -361,29 +360,171 @@ def _python_edges(
         yield from _source_edges(root, module, paths, literal_paths, shadow_modules, outside)
 
 
-_SHELL_FIELDS = {"CallExpr": {"Pos.Line": int, "Args": list}, "Lit": {"Value": str}}
-_SHELL_WORD_FIELDS = {"Parts": list, "Pos.Offset": int, "End.Offset": int}
+_SHELL_SCHEMA = {
+    "File": {"Stmts": ["Stmt"]},
+    "Stmt": {"Cmd": "", "Redirs": ["Redirect"]},
+    "CallExpr": {"Assigns": ["Assign"], "Args": ["Word"]},
+    "Assign": {"Index": "", "Value": "Word", "Array": "ArrayExpr"},
+    "Redirect": {"Word": "Word", "Hdoc": "Word"},
+    "Block": {"Stmts": ["Stmt"]},
+    "Subshell": {"Stmts": ["Stmt"]},
+    "IfClause": {"Cond": ["Stmt"], "Then": ["Stmt"], "Else": "ElseClause"},
+    "ElseClause": {"Cond": ["Stmt"], "Then": ["Stmt"], "Else": "ElseClause"},
+    "WhileClause": {"Cond": ["Stmt"], "Do": ["Stmt"]},
+    "ForClause": {"Loop": "", "Do": ["Stmt"]},
+    "WordIter": {"Items": ["Word"]},
+    "CStyleLoop": {"Init": "", "Cond": "", "Post": ""},
+    "BinaryCmd": {"X": "Stmt", "Y": "Stmt"},
+    "FuncDecl": {"Body": "Stmt"},
+    "Word": {"Parts": [""]},
+    "DblQuoted": {"Parts": [""]},
+    "CmdSubst": {"Stmts": ["Stmt"]},
+    "ProcSubst": {"Stmts": ["Stmt"]},
+    "ParamExp": {"Index": "", "Slice": "Slice", "Repl": "Replace", "Exp": "Expansion"},
+    "Slice": {"Offset": "", "Length": ""},
+    "Replace": {"Orig": "Word", "With": "Word"},
+    "Expansion": {"Op": str, "Word": "Word"},
+    "ArithmExp": {"X": ""},
+    "ArithmCmd": {"X": ""},
+    "BinaryArithm": {"X": "", "Y": ""},
+    "UnaryArithm": {"X": ""},
+    "ParenArithm": {"X": ""},
+    "TestClause": {"X": ""},
+    "BinaryTest": {"X": "", "Y": ""},
+    "UnaryTest": {"X": ""},
+    "ParenTest": {"X": ""},
+    "CaseClause": {"Word": "Word", "Items": ["CaseItem"]},
+    "CaseItem": {"Patterns": ["Word"], "Stmts": ["Stmt"]},
+    "DeclClause": {"Args": ["Assign"]},
+    "ArrayExpr": {"Elems": ["ArrayElem"]},
+    "ArrayElem": {"Index": "", "Value": "Word"},
+    "TimeClause": {"Stmt": "Stmt"},
+    "CoprocClause": {"Name": "Word", "Stmt": "Stmt"},
+    "LetClause": {"Exprs": [""]},
+    "TestDecl": {"Description": "Word", "Body": "Stmt"},
+    "Lit": {"Value": str},
+    "SglQuoted": {},
+    "ExtGlob": {},
+}
+
+_SHELL_TRIVIA = re.compile(rb"(?:[ \t\r\n]|#[^\n]*(?=\n|\Z)|\\\r?\n)*")
 
 
-def _shell_fields(node: dict) -> dict[str, type]:
-    match node:
-        case {"Cmd": _}:
-            return {"Cmd.Type": str}
-        case {"Type": "CallExpr", "Assigns": _} if "Args" not in node:
-            return {"Pos.Line": int, "Assigns": list}
-        case {"Type": "ParamExp", "Exp": _}:
-            return {"Exp.Op": str}
-        case {"Type": str() as kind}:
-            return _SHELL_FIELDS.get(kind, {})
-        case {"Type": _}:
-            return {"Type": str}
-        case _:
-            return {}
+def _shell_assignment_only(fields: _ShellFields, node: dict) -> bool:
+    assigns = fields.read(node, "Assigns", list, "CallExpr")
+    return bool(assigns) and (
+        fields.read(node, "End.Offset", int) == fields.read(assigns[-1], "End.Offset", int)
+    )
+
+
+def _shell_allows_omission(fields: _ShellFields, node: dict, condition: str) -> bool:
+    match condition:
+        case "empty file":
+            return _SHELL_TRIVIA.fullmatch(fields.content) is not None
+        case "empty block":
+            start = fields.read(node, "Pos.Offset", int) + 1
+            end = fields.read(node, "End.Offset", int) - 1
+            return _SHELL_TRIVIA.fullmatch(fields.content, start, end) is not None
+        case "redirect only":
+            return bool(fields.read(node, "Redirs", list, "Stmt"))
+        case "assignment only":
+            return _shell_assignment_only(fields, node)
+    raise AssertionError(f"unsupported shfmt omission condition {condition!r}")
+
+
+_SHELL_OPTIONAL_FIELDS = {
+    ("File", "Stmts"): ([], "empty file"),
+    ("Stmt", "Cmd"): (None, "redirect only"),
+    ("Stmt", "Redirs"): ([], None),
+    ("CallExpr", "Assigns"): ([], None),
+    ("CallExpr", "Args"): ([], "assignment only"),
+    ("Assign", "Index"): (None, None),
+    ("Assign", "Value"): (None, None),
+    ("Assign", "Array"): (None, None),
+    ("Redirect", "Hdoc"): (None, None),
+    ("Block", "Stmts"): ([], "empty block"),
+    ("Subshell", "Stmts"): ([], "empty block"),
+    ("IfClause", "Else"): (None, None),
+    ("ElseClause", "Cond"): ([], None),
+    ("ElseClause", "Else"): (None, None),
+    ("WordIter", "Items"): ([], None),
+    ("CStyleLoop", "Init"): (None, None),
+    ("CStyleLoop", "Cond"): (None, None),
+    ("CStyleLoop", "Post"): (None, None),
+    ("DblQuoted", "Parts"): ([], None),
+    ("CmdSubst", "Stmts"): ([], None),
+    ("ProcSubst", "Stmts"): ([], None),
+    ("ParamExp", "Index"): (None, None),
+    ("ParamExp", "Slice"): (None, None),
+    ("ParamExp", "Repl"): (None, None),
+    ("ParamExp", "Exp"): (None, None),
+    ("Slice", "Offset"): (None, None),
+    ("Slice", "Length"): (None, None),
+    ("Replace", "Orig"): (None, None),
+    ("Replace", "With"): (None, None),
+    ("Expansion", "Word"): (None, None),
+    ("CaseClause", "Items"): ([], None),
+    ("CaseItem", "Stmts"): ([], None),
+    ("DeclClause", "Args"): ([], None),
+    ("ArrayExpr", "Elems"): ([], None),
+    ("ArrayElem", "Index"): (None, None),
+    ("ArrayElem", "Value"): (None, None),
+    ("TimeClause", "Stmt"): (None, None),
+    ("CoprocClause", "Name"): (None, None),
+}
+
+
+@dataclass(frozen=True)
+class _ShellFields:
+    source: str
+    content: bytes
+
+    def error(self, detail: str) -> ValueError:
+        return ValueError(f"{self.source}: shfmt JSON {detail}")
+
+    def missing(self, node: dict, field: str, kind: str) -> Any:
+        key = kind, field
+        if key in _SHELL_OPTIONAL_FIELDS:
+            empty, condition = _SHELL_OPTIONAL_FIELDS[key]
+            if condition is None or _shell_allows_omission(self, node, condition):
+                return empty
+        raise self.error(f"missing field {field}")
+
+    def read(self, node: dict, field: str, expected: type, kind: str = "") -> Any:
+        parent, _, key = field.rpartition(".")
+        if parent:
+            node = self.read(node, parent, dict)
+        try:
+            value = node[key]
+        except KeyError:
+            return self.missing(node, field, kind)
+        return self.checked(value, field, expected)
+
+    def checked(self, value: Any, field: str, expected: type) -> Any:
+        if type(value) is not expected:
+            raise self.error(f"field {field} must be {expected.__name__}")
+        if expected is list and any(type(child) is not dict for child in value):
+            raise self.error(f"field {field} must contain objects")
+        return value
+
+
+_SHELL_PATH_CHARS = rb"[A-Za-z0-9._/+-]+"
+_SHELL_PATH = re.compile(rb"(?!-)" + _SHELL_PATH_CHARS)
+_SHELL_POSSIBLE_RUN = re.compile(rb"[/{}*?\[]|^~|=~")
+_SHELL_DIRECTORY_PREFIXES = {
+    b'"$(dirname "$0")"': ("CmdSubst", None),
+    b'"${BASH_SOURCE%/*}"': ("ParamExp", "%"),
+}
+_SHELL_DIRECTORY_PATH = re.compile(
+    rb"(" + rb"|".join(map(re.escape, _SHELL_DIRECTORY_PREFIXES)) + rb")(/" + _SHELL_PATH_CHARS + rb")"
+)
+_SHELL_ARGUMENT_COMMANDS = {b"source": "source", b".": "source", b"bash": "execute", b"sh": "execute"}
+_ShellWord = tuple[list[dict], bytes]
 
 
 def _read_shell(
-    root: Path, sources: Sequence[str], parse_shell: Callable[..., dict] | None,
-) -> dict[str, tuple[bytes, dict]]:
+    root: Path, sources: Sequence[str], parse_shell: Callable[[bytes, str], dict] | None,
+) -> dict[str, tuple[_ShellFields, dict]]:
     scripts = {}
     for source in sources:
         if parse_shell is None:
@@ -392,120 +533,118 @@ def _read_shell(
             content = (root / source).read_bytes()
         except OSError as error:
             raise ValueError(f"cannot read {source}: {error}") from error
-        scripts[source] = content, parse_shell(content, source, _shell_fields)
+        scripts[source] = _ShellFields(source, content), parse_shell(content, source)
     return scripts
 
 
-def _check_shell_parts(node: dict, source: str) -> None:
-    for part in _check_fields(node, {"Parts": list}, source)["Parts"]:
-        _check_fields(part, {"Type": str}, source)
+def _shell_word(word: dict, fields: _ShellFields) -> _ShellWord:
+    parts = fields.read(word, "Parts", list)
+    start = fields.read(word, "Pos.Offset", int)
+    end = fields.read(word, "End.Offset", int)
+    spelling = fields.content[start:end] if 0 <= start < end <= len(fields.content) else b""
+    return parts, spelling
 
 
-def _shell_args(call: dict, source: str) -> Sequence[dict]:
-    if "Args" not in call and (assigns := call.get("Assigns")):
-        end = _check_fields(call, {"End.Offset": int}, source)["End"]["Offset"]
-        assignment_end = _check_fields(assigns[-1], {"End.Offset": int}, source)["End"]["Offset"]
-        if end == assignment_end:
-            return ()
-    return _check_fields(call, {"Args": list}, source)["Args"]
+def _shell_literal(part: dict, spelling: bytes, fields: _ShellFields) -> bool:
+    return fields.read(part, "Type", str) == "Lit" and spelling == fields.read(part, "Value", str).encode()
 
 
-def _shell_calls(tree: dict, source: str) -> Iterator[dict]:
-    pending = [tree]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, list):
-            pending.extend(reversed(node))
-        if isinstance(node, dict):
-            if "Parts" in node:
-                _check_shell_parts(node, source)
-            if node.get("Type") == "CallExpr":
-                yield node
-            pending.extend(reversed(node.values()))
+def _shell_plain_word(word: _ShellWord, fields: _ShellFields) -> bool:
+    parts, spelling = word
+    return len(parts) == 1 and _shell_literal(parts[0], spelling, fields)
 
 
-_SHELL_PATH_CHARS = rb"[A-Za-z0-9._/+-]+"
-_SHELL_PATH = re.compile(rb"(?!-)" + _SHELL_PATH_CHARS)
-_SHELL_POSSIBLE_RUN = re.compile(rb"[/{}*?\[]|^~|=~")
-_SHELL_DIRNAME = b'"$(dirname "$0")"'
-_SHELL_BASH_SOURCE = b'"${BASH_SOURCE%/*}"'
-_SHELL_DIRECTORY_PATH = re.compile(
-    rb"(" + re.escape(_SHELL_DIRNAME) + rb"|" + re.escape(_SHELL_BASH_SOURCE)
-    + rb")(/" + _SHELL_PATH_CHARS + rb")"
-)
-_SHELL_ARGUMENT_COMMANDS = {b"source": "source", b".": "source", b"bash": "execute", b"sh": "execute"}
+def _shell_directory_part(quote: dict, prefix: bytes, fields: _ShellFields) -> bool:
+    parts = fields.read(quote, "Parts", list)
+    if len(parts) != 1:
+        return False
+    part, = parts
+    kind, operator = _SHELL_DIRECTORY_PREFIXES[prefix]
+    return fields.read(part, "Type", str) == kind and (
+        operator is None or fields.read(part, "Exp.Op", str) == operator
+    )
 
 
-def _shell_spelling(word: dict, content: bytes) -> bytes:
-    start, end = word["Pos"]["Offset"], word["End"]["Offset"]
-    return content[start:end] if 0 <= start < end <= len(content) else b""
-
-
-def _shell_literal(word: dict, spelling: bytes) -> bool:
-    match word["Parts"]:
-        case [{"Type": "Lit", "Value": value}]:
-            return bool(spelling) and spelling == value.encode()
-        case _:
-            return False
-
-
-def _shell_directory_part(quote: dict, prefix: bytes, source: str) -> bool:
-    _check_shell_parts(quote, source)
-    match quote["Parts"]:
-        case [{"Type": "CmdSubst"}]:
-            return prefix == _SHELL_DIRNAME
-        case [{"Type": "ParamExp"} as part] if prefix == _SHELL_BASH_SOURCE:
-            _check_fields(part, {"Exp": dict, "Exp.Op": str}, source)
-            return part["Exp"]["Op"] == "%"
-        case _:
-            return False
-
-
-def _shell_directory_target(word: dict, prefix: bytes, tail: bytes, source: str) -> str | None:
-    match word["Parts"]:
-        case [{"Type": "DblQuoted"} as quote, {"Type": "Lit", "Value": value}]:
-            if _shell_directory_part(quote, prefix, source) and value.encode() == tail:
-                return "." + tail.decode("ascii")
+def _shell_directory_target(
+    parts: list[dict], prefix: bytes, tail: bytes, fields: _ShellFields,
+) -> str | None:
+    if len(parts) != 2:
+        return None
+    quote, literal = parts
+    if fields.read(quote, "Type", str) == "DblQuoted" and _shell_directory_part(quote, prefix, fields):
+        if _shell_literal(literal, tail, fields):
+            return "." + tail.decode("ascii")
     return None
 
 
-def _shell_target(word: dict, spelling: bytes, source: str) -> str | None:
-    if _SHELL_PATH.fullmatch(spelling) and _shell_literal(word, spelling):
+def _shell_target(word: _ShellWord, fields: _ShellFields) -> str | None:
+    parts, spelling = word
+    if _SHELL_PATH.fullmatch(spelling) and _shell_plain_word(word, fields):
         return spelling.decode("ascii")
     if directory := _SHELL_DIRECTORY_PATH.fullmatch(spelling):
         prefix, tail = directory.groups()
-        return _shell_directory_target(word, prefix, tail, source)
+        return _shell_directory_target(parts, prefix, tail, fields)
     return None
 
 
-def _shell_dependency(args: Sequence[dict], content: bytes, source: str) -> tuple[str, str | None] | None:
-    if not args:
+def _shell_argument_target(word: _ShellWord, fields: _ShellFields) -> str | None:
+    if word[1].startswith((b"-", b"+")):
         return None
-    head = _shell_spelling(args[0], content)
-    if not _shell_literal(args[0], head):
-        return "execute", _shell_target(args[0], head, source)
-    match _SHELL_ARGUMENT_COMMANDS.get(head):
-        case str() as kind if len(args) > 1:
-            operand = _shell_spelling(args[1], content)
-            return kind, None if operand.startswith((b"-", b"+")) else _shell_target(args[1], operand, source)
-        case None if _SHELL_POSSIBLE_RUN.search(head):
-            return "execute", _shell_target(args[0], head, source)
+    return _shell_target(word, fields)
+
+
+def _shell_dependency(words: list[_ShellWord], fields: _ShellFields) -> tuple[str, str | None] | None:
+    if not words:
+        return None
+    head = words[0][1]
+    if not _shell_plain_word(words[0], fields) or _SHELL_POSSIBLE_RUN.search(head):
+        return "execute", _shell_target(words[0], fields)
+    if len(words) > 1 and head in _SHELL_ARGUMENT_COMMANDS:
+        return _SHELL_ARGUMENT_COMMANDS[head], _shell_argument_target(words[1], fields)
     return None
 
 
-def _shell_dependencies(shell: dict[str, tuple[bytes, dict]]) -> Iterator[tuple[str, int, str, str | None]]:
-    for source, (content, tree) in shell.items():
-        for call in _shell_calls(tree, source):
-            args = _shell_args(call, source)
-            for word in args:
-                _check_fields(word, _SHELL_WORD_FIELDS, source)
-            dependency = _shell_dependency(args, content, source)
-            if dependency is not None:
-                yield source, call["Pos"]["Line"], *dependency
+def _shell_children(
+    node: dict, kind: str, schema: dict[str, list[str] | str | type], fields: _ShellFields,
+) -> Iterator[tuple[dict, str]]:
+    for name, role in schema.items():
+        if isinstance(role, list):
+            yield from ((child, role[0]) for child in fields.read(node, name, list, kind))
+        elif isinstance(role, type):
+            fields.read(node, name, role, kind)
+        elif (child := fields.read(node, name, dict, kind)) is not None:
+            yield child, role
+
+
+def _shell_call(node: dict, fields: _ShellFields) -> Iterator[tuple[str, int, str, str | None]]:
+    line = fields.read(node, "Pos.Line", int)
+    args = fields.read(node, "Args", list, "CallExpr")
+    if dependency := _shell_dependency([_shell_word(word, fields) for word in args], fields):
+        yield fields.source, line, *dependency
+
+
+def _shell_nodes(tree: dict, fields: _ShellFields) -> Iterator[tuple[dict, str]]:
+    pending = [(tree, "")]
+    while pending:
+        node, kind = pending.pop()
+        kind = kind or fields.read(node, "Type", str)
+        if kind not in _SHELL_SCHEMA:
+            raise fields.error(f"unsupported field Type value {kind!r}")
+        yield node, kind
+        pending.extend(reversed(list(_shell_children(node, kind, _SHELL_SCHEMA[kind], fields))))
+
+
+def _shell_dependencies(
+    shell: dict[str, tuple[_ShellFields, dict]],
+) -> Iterator[tuple[str, int, str, str | None]]:
+    for fields, tree in shell.values():
+        for node, kind in _shell_nodes(tree, fields):
+            if kind == "CallExpr":
+                yield from _shell_call(node, fields)
 
 
 def _shell_edges(
-    root: Path, shell: dict[str, tuple[bytes, dict]], paths: dict[str, str], outside: list[dict],
+    root: Path, shell: dict[str, tuple[_ShellFields, dict]], paths: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
     for source, line, kind, operand in _shell_dependencies(shell):
         target = _measured_path(root, source, paths, operand) if operand else None
@@ -524,7 +663,7 @@ def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[st
 
 def _graph_edges(
     root: Path, modules: list[str], python_modules: list[str],
-    elisp: dict[str, list[dict]], shell: dict[str, tuple[bytes, dict]], outside: list[dict],
+    elisp: dict[str, list[dict]], shell: dict[str, tuple[_ShellFields, dict]], outside: list[dict],
 ) -> list[Edge]:
     resolved_root = root.resolve()
     paths = {str(resolved_root / module): module for module in modules}
@@ -658,7 +797,7 @@ def _graph_report(
 def measure(
     root: Path, python_modules: list[str], spec: GraphSpec, *,
     elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
-    parse_shell: Callable[..., dict] | None = None,
+    parse_shell: Callable[[bytes, str], dict] | None = None,
     test_sources: frozenset[str] = frozenset(),
 ) -> tuple[dict, list[Cycle], list[Edge], list[Edge]]:
     root = root.absolute()

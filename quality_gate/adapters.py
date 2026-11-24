@@ -11,6 +11,7 @@ import json
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable
@@ -265,7 +266,7 @@ def _run_module_graph(context: AdapterContext) -> Any:
         elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}
         measurement, cycles, suite_edges, program_edges = module_graph.measure(
             context.root, python_modules, check.spec, elisp=elisp, shell_modules=shell_modules,
-            parse_shell=_parse_shell, test_sources=test_sources,
+            parse_shell=partial(_parse_shell, required_fields=lambda _node: {}), test_sources=test_sources,
         )
     except (GateError, ValueError) as error:
         return _ratchet_error(check, start, context.prefix, error)
