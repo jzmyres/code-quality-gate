@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -97,44 +97,6 @@ def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[st
     return (
         (source, row) for source in sorted(elisp) for row in elisp[source] if row["kind"] == kind
     )
-
-
-def _require_target(
-    row: dict, paths: set[str], providers: dict[str, set[str]],
-) -> tuple[str | None, str | None]:
-    filename = row["filename"]
-    if filename is not None:
-        candidates = paths.intersection((f"{filename}.el", filename))
-        if not candidates:
-            return None, f"require filename {filename!r} has no measured target"
-        if len(candidates) > 1:
-            return None, f"require filename {filename!r} matches multiple measured files"
-    else:
-        feature = row["feature"]
-        candidates = providers.get(feature, set())
-        if len(candidates) > 1:
-            return None, f"require feature {feature!r} has multiple measured providers"
-    return next(iter(candidates), None), None
-
-
-def _require_edges(elisp: dict[str, list[dict]], modules: list[str]) -> tuple[set[Edge], list[dict]]:
-    paths = set(modules)
-    providers: dict[str, set[str]] = defaultdict(set)
-    for source, row in _elisp_records(elisp, "provide"):
-        providers[row["feature"]].add(source)
-    edges = set()
-    outside = []
-    for source, row in _elisp_records(elisp, "require"):
-        target, problem = _require_target(row, paths, providers)
-        if target is not None:
-            edges.add(Edge(source, target, row["line"], "require"))
-        elif problem is not None:
-            outside.append({
-                "file": source,
-                "line": row["line"],
-                "message": f"{problem} and is outside the extractor",
-            })
-    return edges, outside
 
 
 Outgoing = dict[str, dict[str, Edge]]
@@ -260,11 +222,14 @@ def measure(
     root = root.absolute()
     elisp = elisp or {}
     modules = sorted([*python_modules, *elisp])
-    require_edges, outside = _require_edges(elisp, modules)
-    outside.extend(
+    require_edges = {
+        Edge(source, row["target"], row["line"], "require")
+        for source, row in _elisp_records(elisp, "require")
+    }
+    outside = [
         {"file": source, "line": row["line"], "message": row["message"]}
         for source, row in _elisp_records(elisp, "outside")
-    )
+    ]
     edges = sorted(_import_edges(root, python_modules) | require_edges)
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [

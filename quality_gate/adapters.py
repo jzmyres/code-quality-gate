@@ -233,12 +233,15 @@ def _graph_elisp_report(report: Path, files: list[str]) -> dict[str, list[dict]]
     return {path: _graph_elisp_records(document[path]) for path in files}
 
 
-def _read_graph_elisp(context: AdapterContext, files: list[str]) -> dict[str, list[dict]]:
+def _read_graph_elisp(
+    context: AdapterContext, files: list[str], modules: list[str],
+) -> dict[str, list[dict]]:
     try:
         with TemporaryDirectory(prefix="qg-module-graph-", dir=context.evidence_dir) as directory:
             manifest = Path(directory) / "files.json"
             report = Path(directory) / "result.json"
-            manifest.write_text(json.dumps(files, ensure_ascii=False), encoding="utf-8")
+            inputs = {"sources": files, "modules": modules}
+            manifest.write_text(json.dumps(inputs, ensure_ascii=False), encoding="utf-8")
             mark_step("Emacs module graph")
             command = elisp_batch.batch_command("emacs", None, elisp_batch.MODULE_GRAPH_READER)
             child = run([*command, str(manifest), str(report)], cwd=context.root,
@@ -258,9 +261,9 @@ def _run_module_graph(context: AdapterContext) -> Any:
     check = context.check
     try:
         python_modules, elisp_modules = _graph_modules(context, check.spec)
-        test_sources = frozenset(path for path in (*python_modules, *elisp_modules)
-                                 if python_shape._is_test_path(path))
-        elisp = _read_graph_elisp(context, elisp_modules) if elisp_modules else {}
+        modules = [*python_modules, *elisp_modules]
+        test_sources = frozenset(path for path in modules if python_shape._is_test_path(path))
+        elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}
         measurement, cycles, suite_edges, program_edges = module_graph.measure(
             context.root, python_modules, check.spec, elisp=elisp, test_sources=test_sources,
         )

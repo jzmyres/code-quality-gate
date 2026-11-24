@@ -315,6 +315,42 @@ reason = "package measured by the graph"
         self.assertEqual(finding.location, "a.el:1")
         self.assertEqual(finding.measurement, {"edge": expected_edge})
 
+    def test_module_graph_elisp_feature_identity_survives_serialization(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", r"(require 'fixture\\351)" + "\n")
+        self.add_file("fixture.el", r"(provide 'fixture\\351)" + "\n")
+        self.add_file("decoy.el", b"; -*- coding: raw-text -*-\n(provide 'fixture\xe9)\n")
+        context = self.graph_context(["a.el", "fixture.el", "decoy.el"], ("fixture.el",))
+        result = adapters._run_module_graph(context)
+        expected_edge = edge("a.el", "fixture.el", 1, "require")
+        self.assert_elisp_outcomes(result.measurement, [expected_edge])
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        self.assertIn("a.el -> fixture.el", finding.subject)
+        self.assertEqual(finding.location, "a.el:1")
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
+
+    def assert_requires_on_consecutive_lines(self, separator: str) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", f"(require 'fixture){separator}\n(require 'fixture)\n")
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        context = self.graph_context(["a.el", "fixture.el"], ("fixture.el",))
+        result = adapters._run_module_graph(context)
+        expected_edges = [edge("a.el", "fixture.el", line, "require") for line in (1, 2)]
+        self.assert_elisp_outcomes(result.measurement, expected_edges)
+        self.assertEqual(result.outcome, "fail")
+        self.assertEqual([finding.location for finding in result.findings], ["a.el:1", "a.el:2"])
+        self.assertEqual(
+            [finding.measurement for finding in result.findings],
+            [{"edge": expected_edge} for expected_edge in expected_edges],
+        )
+
+    def test_module_graph_elisp_require_after_reader_comment(self) -> None:
+        self.assert_requires_on_consecutive_lines(" #! ignored")
+
+    def test_module_graph_elisp_require_after_vertical_tab(self) -> None:
+        self.assert_requires_on_consecutive_lines("\v")
+
     def test_module_graph_elisp_trailing_mixed_line_endings(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", b"(require 'fixture-f)\n\r\n")
@@ -388,7 +424,7 @@ reason = "package measured by the graph"
         self.configure_graph(elisp=True)
         self.add_file("a.el", "\n#1=\n(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 2, "require")])
+        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 3, "require")])
 
     def test_module_graph_elisp_dotted_literal_filename(self) -> None:
         self.configure_graph(elisp=True)
@@ -476,7 +512,7 @@ reason = "Python script measured by the graph"
         self.add_file("fixture.el", "(provide 'fixture)\n")
         context = self.graph_context(["a.el", "fixture.el", "decoy.el"], ("fixture.el",))
         expected_edge = edge("a.el", "fixture.el", 2, "require")
-        for source, line in (("\n(\n provide '#:fixture)\n", 2),
+        for source, line in (("\n(\n provide '#:fixture)\n", 3),
                              ("(progn\n  (\n   provide '#:fixture))\n", 3)):
             with self.subTest(source=source):
                 self.add_file("decoy.el", source)

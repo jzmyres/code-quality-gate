@@ -325,28 +325,28 @@ Python imports anywhere in a file count, including function bodies and `TYPE_CHE
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
-file-local `read-symbol-shorthands`. It extracts `(require 'FEATURE)` at the top level or
-directly inside a top-level `eval-when-compile`. A top-level edge uses the line where the
-reader starts the form after skipping whitespace and comments. A direct compile-time
-edge uses the line of the `require` symbol. An omitted filename
-or an explicit `nil` uses feature lookup. The target is the unique measured file with
-a literal `(provide 'FEATURE)` at the top level or directly inside a top-level
+file-local `read-symbol-shorthands`. It reads each top-level form once in sequence and
+extracts `(require 'FEATURE)` at the top level or directly inside a top-level
+`eval-when-compile`. Locations use the positions of the `require` and `provide` head
+symbols from that read. With an omitted filename or explicit `nil`, Emacs matches
+interned feature symbols by identity. The target is the unique measured file with a
+matching literal `(provide 'FEATURE)` at the top level or directly inside a top-level
 `progn`. With no measured provider, the feature is treated as external and produces
-neither an edge nor a report entry. Feature names in requires and providers must be
-interned symbols.
+neither an edge nor a report entry.
 
 In `(require 'FEATURE "FILE")`, every slash-delimited component of `FILE` must be
 nonempty, differ from `.` and `..`, and contain only ASCII letters, digits, `.`, `_`,
 `+`, and `-`. The graph compares `FILE.el` and `FILE` exactly against the measured
-repository-relative paths. Exactly one match produces an edge.
+repository-relative paths. One match produces an edge. Zero or two matches produce
+one `outside_extractor` entry with the require's file and line.
 
-A missing or ambiguous literal filename target, an ambiguous feature provider,
-computed require operands, or a literal filename outside the allowlist produces
-one `outside_extractor` entry with the require's file and line in place of an edge.
-Uninterned features in requires or providers are reported there as well. Requires
-nested elsewhere, including in functions or quasiquote unquotes, give no edge.
-`load` and `load-file` also give no edge. An Emacs launch or reader failure, or a
-Python syntax error, produces a check error that names the affected file.
+Multiple measured providers, computed require operands, and literal filenames
+outside the allowlist also produce one located `outside_extractor` entry per require.
+Uninterned features in requires or providers are reported there as well.
+Requires nested elsewhere, including in functions or quasiquote unquotes, give no edge.
+`load` and `load-file` also give no edge. An Emacs launch failure, a reader error
+other than its end-of-input signal, or a Python syntax error produces a check error
+that names the affected file.
 
 The graph reports one finding per strongly connected component with at least two modules
 and shows a shortest cycle with its edge locations. It also reports dependencies between

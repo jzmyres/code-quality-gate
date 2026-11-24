@@ -13,6 +13,7 @@ def batch_command(
 
 MODULE_GRAPH_READER = r"""
 (progn
+  (require 'cl-lib)
   (require 'json)
   (require 'seq)
 
@@ -20,11 +21,6 @@ MODULE_GRAPH_READER = r"""
     (and (eq (proper-list-p form) 2)
          (eq (car form) 'quote)
          (symbolp (cadr form))))
-
-  (defun qg-graph-interned-name (symbol)
-    (let* ((symbol (bare-symbol symbol))
-           (name (symbol-name symbol)))
-      (when (eq symbol (intern-soft name)) name)))
 
   (defun qg-graph-outside (line description)
     (list (cons 'kind "outside") (cons 'line line)
@@ -39,14 +35,17 @@ MODULE_GRAPH_READER = r"""
                            part)))
                    (split-string filename "/" nil))))
 
-  (defun qg-graph-require (form &optional line)
+  (defun qg-graph-head-line (form)
+    (line-number-at-pos (symbol-with-pos-pos (car form))))
+
+  (defun qg-graph-require (form)
     (when (and (eq (car-safe form) 'require) (proper-list-p form))
-      (let* ((line (or line (line-number-at-pos (symbol-with-pos-pos (car form)))))
+      (let* ((line (qg-graph-head-line form))
              (quoted-feature (qg-graph-quoted-symbol-p (cadr form)))
-             (feature (and quoted-feature (qg-graph-interned-name (cadadr form))))
+             (feature (and quoted-feature (bare-symbol (cadadr form))))
              (feature-problem
               (cond ((not quoted-feature) "computed")
-                    ((not feature) "uninterned")))
+                    ((not (eq feature (intern-soft feature))) "uninterned")))
              (filename (nth 2 form))
              (filename-problem
               (cond ((stringp filename)
@@ -60,65 +59,100 @@ MODULE_GRAPH_READER = r"""
                     (feature-problem (format "%s require feature" feature-problem))
                     (filename-problem (format "%s require filename" filename-problem)))))
         (if problem
-            (qg-graph-outside line problem)
-          (list (cons 'kind "require") (cons 'line line)
-                (cons 'feature feature) (cons 'filename filename))))))
+            (list 'outside line problem)
+          (list 'require line feature filename)))))
 
-  (defun qg-graph-provide (form &optional line)
+  (defun qg-graph-provide (form)
     (when (and (eq (car-safe form) 'provide)
                (proper-list-p form)
                (qg-graph-quoted-symbol-p (cadr form)))
-      (let ((feature (qg-graph-interned-name (cadadr form))))
-        (if feature
-            (list (cons 'kind "provide") (cons 'feature feature))
-          (qg-graph-outside (or line (line-number-at-pos (symbol-with-pos-pos (car form))))
-                            "uninterned provide feature")))))
+      (let ((line (qg-graph-head-line form))
+            (feature (bare-symbol (cadadr form))))
+        (if (eq feature (intern-soft feature))
+            (list 'provide line feature)
+          (list 'outside line "uninterned provide feature")))))
 
-  (defun qg-graph-top-level (form line)
+  (defun qg-graph-top-level (form)
     (pcase (car-safe form)
       ('provide
-       (let ((row (qg-graph-provide form line)))
+       (let ((row (qg-graph-provide form)))
          (when row (list row))))
       ('progn
        (when (proper-list-p form)
          (delq nil (mapcar #'qg-graph-provide (cdr form)))))
       ('require
-       (let ((row (qg-graph-require form line)))
+       (let ((row (qg-graph-require form)))
          (when row (list row))))
       ('eval-when-compile
        (when (proper-list-p form)
          (delq nil (mapcar #'qg-graph-require (cdr form)))))))
 
   (defun qg-graph-file (path)
-    (let ((absolute-path (expand-file-name path)) (source-line 1))
-      (condition-case failure
-          (catch 'qg-graph-records
-            (load-with-code-conversion
-             absolute-path path nil t
-             (lambda (buffer _filename)
-               (with-current-buffer buffer
-                 (let ((syntax (copy-syntax-table emacs-lisp-mode-syntax-table)) rows)
-                   (modify-syntax-entry ?\r " " syntax)
-                   (set-syntax-table syntax)
-                   (goto-char (point-min))
-                   (when (looking-at-p "#!") (forward-line 1))
-                   (while (progn (forward-comment (point-max)) (not (eobp)))
-                     (setq source-line (line-number-at-pos))
-                     (let* ((symbols-with-pos-enabled t)
-                            (form (read-positioning-symbols (current-buffer))))
-                       (dolist (row (qg-graph-top-level form source-line))
-                         (push row rows))))
-                   (throw 'qg-graph-records (vconcat (nreverse rows))))))))
-        (error (format "%s:%d: %s" path source-line (error-message-string failure))))))
+    (condition-case failure
+        (catch 'qg-graph-records
+          (load-with-code-conversion
+           (expand-file-name path) path nil t
+           (lambda (buffer _filename)
+             (with-current-buffer buffer
+               (goto-char (point-min))
+               (let ((symbols-with-pos-enabled t) rows)
+                 (while t
+                   (let ((form (condition-case nil
+                                   (read-positioning-symbols buffer)
+                                 (end-of-file
+                                  (throw 'qg-graph-records (nreverse rows))))))
+                     (dolist (row (qg-graph-top-level form))
+                       (push row rows)))))))))
+      (error (format "%s: %s" path (error-message-string failure)))))
+
+  (defun qg-graph-resolve (row modules providers)
+    (pcase row
+      (`(outside ,line ,description)
+       (qg-graph-outside line description))
+      (`(require ,line ,feature ,filename)
+       (let ((candidates (if filename
+                             (delq nil (list (gethash (concat filename ".el") modules)
+                                             (gethash filename modules)))
+                           (gethash feature providers))))
+         (pcase candidates
+           (`(,target)
+            (list (cons 'kind "require") (cons 'line line) (cons 'target target)))
+           ('nil
+            (when filename
+              (qg-graph-outside
+               line (format "require filename '%s' has no measured target and" filename))))
+           (_
+            (qg-graph-outside
+             line (if filename
+                      (format "require filename '%s' matches multiple measured files and" filename)
+                    (format "require feature '%S' has multiple measured providers and" feature)))))))))
 
   (let* ((manifest (pop command-line-args-left))
          (report (pop command-line-args-left))
-         (paths (with-temp-buffer
-                  (insert-file-contents manifest)
-                  (json-parse-buffer :array-type 'list)))
+         (inputs (with-temp-buffer
+                   (insert-file-contents manifest)
+                   (json-parse-buffer :object-type 'alist :array-type 'list)))
+         (paths (alist-get 'sources inputs))
+         (modules (make-hash-table :test 'equal))
+         (providers (make-hash-table :test 'eq))
          (results (make-hash-table :test 'equal)))
+    (dolist (path (alist-get 'modules inputs))
+      (puthash path path modules))
     (dolist (path paths)
-      (puthash path (qg-graph-file path) results))
+      (let ((rows (qg-graph-file path)))
+        (puthash path rows results)
+        (unless (stringp rows)
+          (dolist (row rows)
+            (pcase row
+              (`(provide ,_ ,feature)
+               (cl-pushnew path (gethash feature providers) :test #'equal)))))))
+    (dolist (path paths)
+      (let ((rows (gethash path results)))
+        (unless (stringp rows)
+          (puthash path
+                   (vconcat (delq nil (mapcar (lambda (row) (qg-graph-resolve row modules providers))
+                                              rows)))
+                   results))))
     (let ((coding-system-for-write 'utf-8-unix))
       (with-temp-file report
         (insert (json-encode results))))))
