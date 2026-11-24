@@ -325,7 +325,8 @@ Python imports anywhere in a file count, including function bodies and `TYPE_CHE
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
-file-local `read-symbol-shorthands`. It reads each top-level form once in sequence and
+file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
+cleanly. The extractor reads each top-level form once in sequence and
 extracts `(require 'FEATURE)` at the top level or directly inside a top-level
 `eval-when-compile`. Locations use the positions of the `require` and `provide` head
 symbols from that read. With an omitted filename or explicit `nil`, Emacs matches
@@ -344,9 +345,11 @@ Multiple measured providers, computed require operands, and literal filenames
 outside the allowlist also produce one located `outside_extractor` entry per require.
 Uninterned features in requires or providers are reported there as well.
 The Emacs reader refuses reader labels (`#N=` and `#N#`) so each positioned head
-identifies a single source occurrence. A reader refusal produces one
-`outside_extractor` entry at the reader's error location. The refused file
-contributes no outgoing edges or feature providers.
+identifies a single source occurrence. An error in coding or file-local variable
+processing, a reader label, or any other reader error, including EOF inside a form,
+refuses the whole file. The graph reports one `outside_extractor` entry with the file
+and error line, discards the file's outgoing edges and feature providers, and continues
+measuring the other files.
 Requires nested elsewhere, including in functions or quasiquote unquotes, give no edge.
 `load` and `load-file` also give no edge. An Emacs launch failure or a Python
 syntax error produces a check error that names the affected file.

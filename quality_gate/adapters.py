@@ -219,8 +219,6 @@ def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> tup
 
 
 def _graph_elisp_records(records: Any) -> list[dict]:
-    if isinstance(records, str):
-        raise ValueError(records)
     if not isinstance(records, list):
         raise ValueError("expected a list of Emacs reader records")
     return records

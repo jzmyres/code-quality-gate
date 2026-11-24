@@ -88,27 +88,52 @@ MODULE_GRAPH_READER = r"""
          (delq nil (mapcar #'qg-graph-require (cdr form)))))))
 
   (defun qg-graph-file (path)
-    (condition-case failure
-        (catch 'qg-graph-records
-          (load-with-code-conversion
-           (expand-file-name path) path nil t
-           (lambda (buffer _filename)
-             (with-current-buffer buffer
-               (goto-char (point-min))
-               (let ((read-circle nil) (symbols-with-pos-enabled t) rows)
-                 (while t
-                   (let ((form (condition-case read-error
-                                   (read-positioning-symbols buffer)
-                                 (end-of-file
-                                  (throw 'qg-graph-records (nreverse rows)))
-                                 (error
-                                  (throw 'qg-graph-records
-                                         (list (list 'outside (line-number-at-pos)
-                                                     (format "Emacs Lisp source with a reader error (%s)"
-                                                             (error-message-string read-error)))))))))
-                     (dolist (row (qg-graph-top-level form))
-                       (push row rows)))))))))
-      (error (format "%s: %s" path (error-message-string failure)))))
+    (let ((read-circle nil)
+          (error-line 1)
+          (error-stage "preparation")
+          (read-shorthands hack-read-symbol-shorthands-function)
+          rows)
+      (condition-case failure
+          (let ((hack-read-symbol-shorthands-function
+                 (when read-shorthands
+                   (lambda ()
+                     (let ((source-buffer (current-buffer)))
+                       (handler-bind
+                           ((error
+                             (lambda (_failure)
+                               (let ((line (line-number-at-pos)))
+                                 (setq error-line
+                                       (if (eq (current-buffer) source-buffer)
+                                           line
+                                         (+ line (with-current-buffer source-buffer
+                                                   (line-number-at-pos)) -1)))))))
+                         (funcall read-shorthands)))))))
+            (load-with-code-conversion
+             (expand-file-name path) path nil t
+             (lambda (buffer _filename)
+               (setq error-stage "reader")
+               (with-current-buffer buffer
+                 (goto-char (point-min))
+                 (let ((load-read-function
+                        (lambda (stream)
+                          (let ((load-read-function nil)
+                                (read-start (point))
+                                (symbols-with-pos-enabled t))
+                            (handler-bind
+                                ((error
+                                  (lambda (failure)
+                                    (setq error-line
+                                          (line-number-at-pos
+                                           (if (eq (car failure) 'end-of-file) read-start (point)))))))
+                              (dolist (row (qg-graph-top-level (read-positioning-symbols stream)))
+                                (push row rows))))
+                          nil)))
+                   (eval-buffer buffer)))))
+            (nreverse rows))
+        (error
+         (list (list 'outside error-line
+                     (format "Emacs Lisp source with a %s error (%s)"
+                             error-stage (error-message-string failure))))))))
 
   (defun qg-graph-resolve (row modules providers)
     (pcase row
@@ -146,18 +171,16 @@ MODULE_GRAPH_READER = r"""
     (dolist (path paths)
       (let ((rows (qg-graph-file path)))
         (puthash path rows results)
-        (unless (stringp rows)
-          (dolist (row rows)
-            (pcase row
-              (`(provide ,_ ,feature)
-               (cl-pushnew path (gethash feature providers) :test #'equal)))))))
+        (dolist (row rows)
+          (pcase row
+            (`(provide ,_ ,feature)
+             (cl-pushnew path (gethash feature providers) :test #'equal))))))
     (dolist (path paths)
       (let ((rows (gethash path results)))
-        (unless (stringp rows)
-          (puthash path
-                   (vconcat (delq nil (mapcar (lambda (row) (qg-graph-resolve row modules providers))
-                                              rows)))
-                   results))))
+        (puthash path
+                 (vconcat (delq nil (mapcar (lambda (row) (qg-graph-resolve row modules providers))
+                                            rows)))
+                 results)))
     (let ((coding-system-for-write 'utf-8-unix))
       (with-temp-file report
         (insert (json-encode results))))))

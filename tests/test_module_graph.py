@@ -461,6 +461,44 @@ reason = "package measured by the graph"
             {"file": source, "line": line, "message": message},
         ])
 
+    def test_module_graph_elisp_file_local_metadata_label_refuses_file(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", (
+            "(require 'fixture)\n"
+            "(provide 'a)\n"
+            ";; Local Variables:\n"
+            ';; read-symbol-shorthands: #1=(("f-" . "fixture-"))\n'
+            ";; End:\n"
+        ))
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        self.add_file("consumer.el", "(require 'a)\n(require 'fixture)\n")
+        context = self.graph_context(["a.el", "consumer.el", "fixture.el"], ("fixture.el",))
+        result = adapters._run_module_graph(context)
+        self.assertEqual(result.outcome, "fail", result.diagnostics.error)
+        expected_edge = edge("consumer.el", "fixture.el", 2, "require")
+        self.assert_reader_label_refused(result.measurement, "a.el", 4, [expected_edge])
+        finding, = result.findings
+        self.assertIn("consumer.el -> fixture.el", finding.subject)
+        self.assertEqual(finding.location, "consumer.el:2")
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
+
+    def test_module_graph_elisp_truncated_form_refuses_file(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(require 'fixture)\n(provide 'a)\n(")
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        self.add_file("consumer.el", "(require 'a)\n")
+        context = self.graph_context(["a.el", "consumer.el", "fixture.el"], ("fixture.el",))
+        result = adapters._run_module_graph(context)
+        self.assertEqual(result.measurement["edges"], [])
+        outside, = result.measurement["outside_extractor"]
+        self.assertIn("End of file during parsing", outside["message"])
+        self.assertTrue(outside["message"].endswith("is outside the extractor"))
+        self.assert_elisp_outcomes(result.measurement, [], [{
+            "file": "a.el", "line": 3, "message": outside["message"],
+        }])
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.findings, [])
+
     def test_module_graph_elisp_reader_label(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(defconst fixture '#1=(alpha beta))\n(require 'b)\n")
