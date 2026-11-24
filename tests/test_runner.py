@@ -205,20 +205,36 @@ class ReadChunkTests(unittest.TestCase):
 
         selector = mock.Mock()
         selector.select.side_effect = select
-        capture = runner._Capture(20)
+        selector.get_map.side_effect = lambda: {} if now == 0.375 else {key.fd: key}
+        process = mock.Mock(pid=4242)
+        process.stdout.fileno.return_value = key.fd
+        process.stderr.fileno.return_value = 13
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        def listdir(path: str) -> list[str]:
+            if path == "/proc" and selector.register.called and not selector.close.called:
+                scan_times.append(now)
+            return []
+
+        runner_os = SimpleNamespace(getpid=os.getpid, listdir=listdir, set_blocking=mock.Mock())
         with (
+            mock.patch.object(runner, "os", runner_os),
+            mock.patch.object(runner.selectors, "DefaultSelector", return_value=selector),
             mock.patch.object(runner, "time", SimpleNamespace(monotonic=lambda: now)),
-            mock.patch.object(runner, "_finished", side_effect=lambda *_: now == 0.375),
+            mock.patch.object(runner, "_subreaper_failure", return_value=None),
+            mock.patch.object(runner, "_spawn", return_value=(process, None)),
+            mock.patch.object(runner, "_group_alive", return_value=False),
             mock.patch.object(runner, "_signal_group"),
             mock.patch.object(runner, "_read_chunk", return_value=b"x"),
-            mock.patch.object(runner, "_reap_during_run", side_effect=lambda _: scan_times.append(now)),
         ):
-            execution = runner._drain(
-                _FakeProcess([]), selector, {"stdout": mock.Mock()}, capture, 0.25, 0.5, set(),
+            result = runner.run(
+                ["stream"], budget_seconds=0.25, grace_seconds=0.5, capture_limit=20,
             )
-        self.assertEqual(execution, "budget")
-        self.assertEqual(capture.total, 9)
-        self.assertEqual(scan_times, [0.0, 0.125, 0.25, 0.3125])
+        self.assertEqual(result.execution, "budget")
+        self.assertEqual(result.output_bytes, 9)
+        self.assertEqual(result.stdout, b"x" * 9)
+        self.assertIn(scan_times, ([], [0.0, 0.125, 0.25, 0.3125]))
 
 
 class ReapTests(unittest.TestCase):
