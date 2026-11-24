@@ -777,7 +777,7 @@ class PolicyTrustTests(TrustCase):
         lock = (
             '[legacy]\nversion = "1"\nurl = "file:///unused"\n'
             f'sha256 = "{"0" * 64}"\npayload_sha256 = "{"0" * 64}"\n'
-            'format = "deb"\nbinary = "usr/bin/legacy"\n'
+            'format = "conda"\nbinary = "bin/legacy"\n'
         )
         self.add_file("tools.lock.toml", lock)
         revision = self.directory_revision()

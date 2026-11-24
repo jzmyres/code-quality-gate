@@ -29,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 from .json_input import load_json
-from .payload import PayloadError, _content_sha256, payload_digest
+from .payload import PayloadError, payload_digest
 from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
@@ -94,8 +94,7 @@ def _tool_error(lock: Path, key: str, expected: str, actual: str) -> UsageError:
 def _safe_relative_binary(value: str) -> bool:
     if "\0" in value or "\\" in value:
         return False
-    path = PurePosixPath(value)
-    return bool(path.parts) and not path.is_absolute() and ".." not in path.parts
+    return all(part not in ("", ".", "..") for part in value.split("/"))
 
 
 def _lock_version(lock: Path, name: str, raw: dict[str, Any]) -> str:
@@ -191,7 +190,7 @@ def load_tools(lock: Path) -> dict[str, Tool]:
         raise UsageError(
             f"{lock}: expected a readable tool lock file, got {error}"
         ) from error
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+    except (ValueError, RecursionError) as error:
         raise UsageError(f"{lock}: expected valid TOML, got {error}") from error
 
     tools: dict[str, Tool] = {}
@@ -229,14 +228,8 @@ def _payload_mismatch(
     )
 
 
-def _tool_payload_digest(tool: Tool, directory: Path) -> str:
-    """The digest the lock pins for this archive format.
-
-    A debian package's payload is the declared binary itself, so its digest
-    is the binary's content hash; other formats digest the whole install tree.
-    """
-    if tool.format == "deb":
-        return _content_sha256(directory / tool.binary)
+def _tool_payload_digest(_tool: Tool, directory: Path) -> str:
+    """Return the full-tree digest used by the fetcher and trusted runs."""
     return payload_digest(directory)
 
 
@@ -473,95 +466,6 @@ def _extract_wheel(archive_path: Path, destination: Path, tool: Tool) -> None:
         ) from error
 
 
-def _ar_header(
-    data: bytes, offset: int, tool: Tool
-) -> tuple[str, int]:
-    header = data[offset : offset + 60]
-    if len(header) < 60:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: truncated ar header; "
-            "nothing installed"
-        )
-    if header[58:60] != b"`\n":
-        raise GateError(f"tools: {tool.name} {tool.version}: invalid ar header; nothing installed")
-    try:
-        name = header[:16].decode("ascii").strip().rstrip("/")
-        size = int(header[48:58].decode("ascii").strip())
-    except (UnicodeDecodeError, ValueError) as error:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: invalid ar header: "
-            f"{error}; nothing installed"
-        ) from error
-    return name, size
-
-
-def _ar_members(
-    data: bytes, tool: Tool
-) -> list[tuple[str, bytes]]:
-    if not data.startswith(b"!<arch>\n"):
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: not an ar archive; "
-            "nothing installed"
-        )
-    members: list[tuple[str, bytes]] = []
-    offset = 8
-    while offset < len(data):
-        name, size = _ar_header(data, offset, tool)
-        offset += 60
-        if size < 0 or offset + size > len(data):
-            raise GateError(
-                f"tools: {tool.name} {tool.version}: truncated ar member "
-                f"{name!r}; nothing installed"
-            )
-        members.append((name, data[offset : offset + size]))
-        offset += size + (size & 1)
-    return members
-
-
-def _debian_version(members: list[tuple[str, bytes]], tool: Tool) -> None:
-    version = [raw for name, raw in members if name == "debian-binary"]
-    if version != [b"2.0\n"]:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: expected debian-binary 2.0; "
-            "nothing installed"
-        )
-
-
-def _debian_data(members: list[tuple[str, bytes]], tool: Tool) -> bytes:
-    _debian_version(members, tool)
-    data = [raw for name, raw in members if name.startswith("data.tar.")]
-    if len(data) != 1:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: expected one data.tar member, "
-            f"got {len(data)}; nothing installed"
-        )
-    return data[0]
-
-
-def _extract_deb(archive_path: Path, destination: Path, tool: Tool) -> None:
-    try:
-        members = _ar_members(archive_path.read_bytes(), tool)
-        data = _debian_data(members, tool)
-    except OSError as error:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: cannot read archive: {error}"
-        ) from error
-    temporary = tempfile.NamedTemporaryFile(
-        prefix=".qg-data-", dir=destination.parent, delete=False
-    )
-    path = Path(temporary.name)
-    try:
-        with temporary:
-            temporary.write(data)
-        _extract_tar(path, destination, tool)
-    except OSError as error:
-        raise GateError(
-            f"tools: {tool.name} {tool.version}: cannot extract archive: {error}"
-        ) from error
-    finally:
-        path.unlink(missing_ok=True)
-
-
 class _ZstdBuffer(ctypes.Structure):
     _fields_ = [
         ("data", ctypes.c_void_p),
@@ -627,15 +531,17 @@ def _decompress_zstd(source: BinaryIO, target: BinaryIO) -> None:
         library.ZSTD_freeDStream(context)
 
 
-_CONDA_TARBALL = re.compile(r"(info|pkg)-([A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.zst)")
+_CONDA_TARBALL = re.compile(r"(info|pkg)-([A-Za-z0-9_][A-Za-z0-9._+-]*\.tar\.zst)")
 _CONDA_LAYOUT = "expected exactly metadata.json and matching info- and pkg-*.tar.zst members"
+_DOS_VOLUME_LABEL = 0x08
+_DOS_DIRECTORY = 0x10
 
 
 def _conda_member_name(member: zipfile.ZipInfo) -> str:
     if member.orig_filename != member.filename:
         raise ValueError(f"invalid ZIP member name {member.orig_filename!r}")
     if (
-        member.external_attr & 0x10
+        member.external_attr & (_DOS_VOLUME_LABEL | _DOS_DIRECTORY)
         or _member_kind(member, _WHEEL_MEMBER_KINDS) != _MEMBER_RULES["regular"]
     ):
         raise ValueError(f"ZIP member {member.filename!r} is not a regular file")
@@ -685,6 +591,10 @@ _CONDA_HOOKS = (".*-pre-link.*", ".*-post-link.*", ".*-pre-unlink.*")
 
 
 def _conda_tar_path(member: tarfile.TarInfo, tool: Tool) -> PurePosixPath:
+    """Validate the PAX path even when GNU.sparse.name overrides it."""
+    pax_path = member.pax_headers.get("path", "")
+    if "\0" in pax_path:
+        raise ValueError(f"unsafe archive member {pax_path!r}")
     if not member.name or "\0" in member.name:
         raise ValueError(f"unsafe archive member {member.name!r}")
     path = _member_path(member.name, tool, root=member.isdir())
@@ -772,18 +682,13 @@ def _extract_conda(archive_path: Path, destination: Path, tool: Tool) -> None:
 _ARCHIVE_EXTRACTORS = {
     "tar": _extract_tar,
     "wheel": _extract_wheel,
-    "deb": _extract_deb,
+    "conda": _extract_conda,
 }
-_CONDA_FORMAT = "conda"
-ARCHIVE_FORMATS = (*_ARCHIVE_EXTRACTORS, _CONDA_FORMAT)
+ARCHIVE_FORMATS = tuple(_ARCHIVE_EXTRACTORS)
 
 
 def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
-    if tool.format == _CONDA_FORMAT:
-        _extract_conda(archive_path, destination, tool)
-        return
-    extractor = _ARCHIVE_EXTRACTORS.get(tool.format, _extract_tar)
-    extractor(archive_path, destination, tool)
+    _ARCHIVE_EXTRACTORS[tool.format](archive_path, destination, tool)
 
 
 def _install_target(tool: Tool, tools_root: Path) -> Path:
@@ -947,6 +852,29 @@ def _check_descriptor(
         os.close(fd)
 
 
+@contextlib.contextmanager
+def _check_search_path(root: Path, path: Path, parent: int) -> Iterator[int]:
+    """Open each component without following links or retaining its ancestors."""
+    parts = path.relative_to(root).parts
+    fd = os.dup(parent)
+    try:
+        for index, part in enumerate(parts):
+            try:
+                child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as error:
+                prefix = root.joinpath(*parts[:index + 1])
+                raise PayloadError(
+                    f"cannot open {prefix} without following symbolic links: {error}"
+                ) from error
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def _check_file(path: Path, parent: int) -> tuple[str, str]:
     try:
         with _check_descriptor(path, os.O_RDONLY | os.O_NONBLOCK, parent) as fd:
@@ -957,19 +885,6 @@ def _check_file(path: Path, parent: int) -> tuple[str, str]:
                 return "1" if mode & 0o111 else "0", hashlib.file_digest(stream, "sha256").hexdigest()
     except OSError as error:
         raise PayloadError(f"cannot read {path}: {error}") from error
-
-
-def _check_binary_digest(directory: Path, fd: int, binary: Path) -> str:
-    with contextlib.ExitStack() as stack:
-        for part in binary.relative_to(directory).parts[:-1]:
-            directory /= part
-            fd = stack.enter_context(_check_descriptor(directory, os.O_DIRECTORY, fd))
-        mode = os.lstat(binary.name, dir_fd=fd).st_mode
-        if stat.S_ISLNK(mode):
-            raise PayloadError(f"{binary} is a symbolic link")
-        if not stat.S_ISREG(mode):
-            raise PayloadError(f"{binary} is not a regular file")
-        return _check_file(binary, fd)[1]
 
 
 def _check_tree_record(path: Path, relative: str, fd: int, binary: Path) -> list[str]:
@@ -986,9 +901,10 @@ def _check_tree_record(path: Path, relative: str, fd: int, binary: Path) -> list
     raise PayloadError(f"{path} is not a regular file, directory or symlink")
 
 
-def _check_tree_records(
+def _check_directory_records(
     root: Path, directory: Path, fd: int, binary: Path, records: dict[str, list[str]]
-) -> None:
+) -> list[Path]:
+    directories = []
     try:
         with os.scandir(fd) as children:
             for entry in children:
@@ -997,15 +913,28 @@ def _check_tree_records(
                 record = _check_tree_record(path, relative, fd, binary)
                 records[relative] = record
                 if record[0] == "directory":
-                    with _check_descriptor(path, os.O_DIRECTORY, fd) as child:
-                        _check_tree_records(root, path, child, binary, records)
+                    directories.append(path)
     except OSError as error:
         raise PayloadError(f"cannot read payload entries at {directory}: {error}") from error
+    return directories
+
+
+def _check_tree_records(directory: Path, fd: int, binary: Path) -> dict[str, list[str]]:
+    """Reopen parents from the install root to keep descriptor use independent of depth."""
+    records: dict[str, list[str]] = {}
+    pending = _check_directory_records(directory, directory, fd, binary, records)
+    while pending:
+        path = pending.pop()
+        with (
+            _check_search_path(directory, path.parent, fd) as parent,
+            _check_descriptor(path, os.O_DIRECTORY, parent) as child,
+        ):
+            pending.extend(_check_directory_records(directory, path, child, binary, records))
+    return records
 
 
 def _check_tree_digest(directory: Path, fd: int, binary: Path) -> str:
-    records: dict[str, list[str]] = {}
-    _check_tree_records(directory, directory, fd, binary, records)
+    records = _check_tree_records(directory, fd, binary)
     try:
         binary_record = records[binary.relative_to(directory).as_posix()]
     except KeyError:
@@ -1023,18 +952,14 @@ def _check_tool(tool: Tool, tools_root: Path) -> None:
     directory = tools_root / f"{tool.name}-{tool.version}"
     binary = directory / tool.binary
     try:
-        with contextlib.ExitStack() as stack:
-            cache = tools_root.absolute()
-            prefix = Path(cache.anchor)
-            fd = stack.enter_context(_check_descriptor(prefix, os.O_DIRECTORY))
-            for part in cache.parts[1:]:
-                prefix /= part
-                fd = stack.enter_context(_check_descriptor(prefix, os.O_DIRECTORY, fd))
-            fd = stack.enter_context(_check_descriptor(directory, os.O_DIRECTORY, fd))
-            if tool.format == "deb":
-                actual = _check_binary_digest(directory, fd, binary)
-            else:
-                actual = _check_tree_digest(directory, fd, binary)
+        cache = tools_root.absolute()
+        anchor = Path(cache.anchor)
+        with (
+            _check_descriptor(anchor, os.O_PATH | os.O_DIRECTORY) as root,
+            _check_search_path(anchor, cache, root) as parent,
+            _check_descriptor(directory, os.O_DIRECTORY, parent) as fd,
+        ):
+            actual = _check_tree_digest(directory, fd, binary)
     except FileNotFoundError:
         raise UnsupportedError(
             f"{tool.name} {tool.version} is not installed at {binary}; "

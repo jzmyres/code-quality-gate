@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import random
+import resource
 import shutil
 import stat
 import subprocess
@@ -68,19 +69,22 @@ def child_permissions(base: Path) -> dict[str, object]:
 
 
 class ToolsTests(FixtureCase):
-    def test_repository_lock_pins_shfmt_deb(self) -> None:
+    def test_repository_lock_pins_shfmt_conda_artifact(self) -> None:
         with lock_override(GATE / "tools.lock.toml"):
             _, tool = _pinned_tool("shfmt")
 
-        self.assertEqual(tool.version, "3.8.0-1+b8")
-        self.assertEqual(tool.format, "deb")
-        self.assertEqual(tool.binary, "usr/bin/shfmt")
+        self.assertEqual(tool.version, "3.14.1")
+        self.assertEqual(tool.format, "conda")
+        self.assertEqual(tool.binary, "bin/shfmt")
         self.assertEqual(
-            tool.sha256, "7f5ba49c0bb38584cb8d2b6571306189ddbfd56e3371e5b877001f3e5b02501f"
+            tool.url, "https://conda.anaconda.org/conda-forge/linux-64/go-shfmt-3.14.1-hfc2019e_0.conda"
+        )
+        self.assertEqual(
+            tool.sha256, "0cc0a5c62bba143b540a5f266fc3bc826ce784bc244be957f3a5af77c65d2011"
         )
         self.assertEqual(
             tool.payload_sha256,
-            "d36a64424d379a28ef1d47be26f7ff081bfbc4a9e25a3262db5883e97d3055ad",
+            "25a74fe433754f10a50a4ee05aec3ccf96c09545b08f94d2595a895f8e36711e",
         )
 
     def make_tarball(
@@ -170,31 +174,6 @@ class ToolsTests(FixtureCase):
                 info.external_attr = (stat.S_IFLNK | 0o777) << 16
                 archive.writestr(info, target)
         return path
-
-    def make_package(self) -> tuple[Path, bytes]:
-        binary = b"#!/bin/sh\necho fake\n"
-        data = io.BytesIO()
-        with tarfile.open(fileobj=data, mode="w:gz") as archive:
-            member = tarfile.TarInfo("usr/bin/example")
-            member.mode, member.size = 0o755, len(binary)
-            archive.addfile(member, io.BytesIO(binary))
-        contents = bytearray(b"!<arch>\n")
-        for name, payload in (("debian-binary", b"2.0\n"), ("data.tar.gz", data.getvalue())):
-            header = f"{name + '/':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{len(payload):<10}`\n"
-            contents.extend(header.encode("ascii") + payload)
-            if len(payload) % 2:
-                contents.extend(b"\n")
-        package = self.base / "tool.deb"
-        package.write_bytes(contents)
-        return package, binary
-
-    def package_lock(self, package: Path, binary: bytes, *, digest: str | None = None,
-                     payload: str | None = None) -> Path:
-        return self.write_lock(
-            package.as_uri(), digest or self.sha256(package),
-            binary="usr/bin/example", archive_format="deb",
-            payload=payload or hashlib.sha256(binary).hexdigest(),
-        )
 
     def conda_members(self) -> dict[str, bytes]:
         script = f"#!/bin/sh\ntouch '{self.base / 'script-ran'}'\n".encode()
@@ -910,6 +889,51 @@ class ToolsTests(FixtureCase):
         self.assertEqual(result.returncode, 1, output(result))
         self.assertIn(f"second {VERSION}: payload digest mismatch", result.stderr)
 
+    def test_fetch_check_traverses_search_only_cache_ancestor(self) -> None:
+        ancestor = self.base / "search-only"
+        tools = ancestor / "tools"
+        lock = self.check_lock(self.seed_check_install(tools))
+        open_path = os.open
+
+        def search_only(path, flags, *args, **kwargs):
+            if path == ancestor.name and os.geteuid() == 0 and not flags & os.O_PATH:
+                raise PermissionError("search-only directory")
+            return open_path(path, flags, *args, **kwargs)
+
+        ancestor.chmod(0o100)
+        try:
+            with mock.patch.object(os, "open", new=search_only):
+                result = self.check_install(lock, tools)
+            self.assertEqual(result.returncode, 0, output(result))
+        finally:
+            ancestor.chmod(0o700)
+
+    def test_fetch_check_verifies_a_thousand_levels_with_limited_descriptors(self) -> None:
+        tools = self.base / "tools"
+        directory = self.seed_check_install(tools)
+        branches = []
+        leaf = directory
+        try:
+            for _ in range(1000):
+                leaf /= "d"
+                leaf.mkdir()
+                branches.append(leaf)
+            (leaf / "data").write_bytes(b"deep payload\n")
+            lock = self.check_lock(directory)
+            limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+            soft, hard = limits
+            limit = 64 if soft == resource.RLIM_INFINITY else min(soft, 64)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+            try:
+                result = self.check_install(lock, tools)
+            finally:
+                resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+            self.assertEqual(result.returncode, 0, output(result))
+        finally:
+            (leaf / "data").unlink(missing_ok=True)
+            for branch in reversed(branches):
+                branch.rmdir()
+
     def test_fetch_check_reports_missing_install_without_creating_cache(self) -> None:
         lock = self.write_lock("file:///unused", "0" * 64)
         tools = self.base / "tools"
@@ -1009,14 +1033,9 @@ class ToolsTests(FixtureCase):
 
     def test_fetch_check_refuses_symlink_binary_components(self) -> None:
         content = b"executable"
-        for archive_format, name in (
-            ("tar", "jscpd"),
-            ("tar", "usr/bin"),
-            ("deb", "usr/bin/example"),
-            ("deb", "usr/bin"),
-        ):
-            with self.subTest(archive_format=archive_format, path=name):
-                tools = self.base / f"{archive_format}-{Path(name).name}"
+        for name in ("jscpd", "usr/bin"):
+            with self.subTest(path=name):
+                tools = self.base / Path(name).name
                 directory = tools / f"jscpd-{VERSION}"
                 outside = tools / "sibling"
                 outside.mkdir(parents=True)
@@ -1025,13 +1044,10 @@ class ToolsTests(FixtureCase):
                 path = directory / name
                 path.parent.mkdir(parents=True)
                 path.symlink_to(outside if path.name == "bin" else external)
-                if archive_format == "deb":
-                    lock = self.package_lock(self.base / "absent.deb", content, digest="0" * 64)
-                else:
-                    binary = "usr/bin/example" if path.name == "bin" else "jscpd"
-                    lock = self.write_lock(
-                        "file:///unused", "0" * 64, binary=binary, payload=payload_digest(directory)
-                    )
+                binary = "usr/bin/example" if path.name == "bin" else "jscpd"
+                lock = self.write_lock(
+                    "file:///unused", "0" * 64, binary=binary, payload=payload_digest(directory)
+                )
 
                 self.assert_check_refuses_symlink(lock, tools, path)
 
@@ -1079,7 +1095,10 @@ class ToolsTests(FixtureCase):
 
     def test_fetch_check_rejects_invalid_binary_lock_path(self) -> None:
         tools = self.base / "tools"
-        for binary in ("bad\0name", "bin\\example", "/outside", "../outside"):
+        for binary in (
+            "bad\0name", "bin\\example", "/outside", "../outside",
+            "bin//example", "bin/./example", "bin/../example", "bin/example/",
+        ):
             with self.subTest(binary=binary):
                 lock = self.write_lock("file:///unused", "0" * 64, binary=binary)
                 result = self.check_install(lock, tools)
@@ -1094,6 +1113,7 @@ class ToolsTests(FixtureCase):
             (None, "expected a tool lock file, got missing"),
             (b"[jscpd\n", "expected valid TOML"),
             (b"\xff", "expected valid TOML"),
+            (b"value = " + b"9" * 5000, "expected valid TOML"),
             (b'[jscpd]\nversion = "9.9.9"\n', "jscpd.url: expected"),
         ):
             with self.subTest(diagnostic=diagnostic):
@@ -1109,6 +1129,18 @@ class ToolsTests(FixtureCase):
         result = self.check_install(lock, tools)
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn(f"{lock}: expected a readable tool lock file", result.stderr)
+        self.assertFalse(tools.exists())
+
+    def test_fetch_check_rejects_excessive_toml_nesting(self) -> None:
+        """Run parser stack exhaustion in a child to preserve the suite's tracer."""
+        lock = self.base / "lock.toml"
+        lock.write_bytes(b"value = " + b"[" * 2000 + b"0" + b"]" * 2000)
+        tools = self.base / "tools"
+        result = self.run_qg_process(
+            "tools", "fetch", "--lock", str(lock), "--check", env={"QG_TOOLS_DIR": str(tools)}
+        )
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(f"{lock}: expected valid TOML", result.stderr)
         self.assertFalse(tools.exists())
 
     def test_fetch_check_leaves_fresh_checkout_and_cache_unchanged(self) -> None:
@@ -1296,6 +1328,17 @@ class ToolsTests(FixtureCase):
         self.assertEqual(calls, [(destination, ["bin/example", "share/data"], "data")])
         self.assertEqual(payload_digest(destination), tool.payload_sha256)
 
+    def test_fetch_conda_accepts_matching_stems_with_leading_underscore(self) -> None:
+        members = {
+            name.replace("-example", "-_example"): content
+            for name, content in self.conda_members().items()
+        }
+        package = self.make_conda(members)
+        tools = self.base / "tools"
+        result = self.fetch(self.conda_lock(package), tools)
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue((tools / f"jscpd-{VERSION}" / "bin/example").is_file())
+
     def test_fetch_conda_rejects_invalid_container(self) -> None:
         members = self.conda_members()
         info = "info-example-1-0.tar.zst"
@@ -1377,18 +1420,21 @@ class ToolsTests(FixtureCase):
             self.make_conda(members, "extra/"), "ZIP member 'extra/' is not a regular file"
         )
 
-    def test_fetch_conda_rejects_dos_directory_members(self) -> None:
+    def test_fetch_conda_rejects_dos_directory_and_volume_label_members(self) -> None:
         members = self.conda_members()
-        entry = zipfile.ZipInfo("metadata.json")
-        entry.create_system = 0
-        entry.external_attr = 0x10
-        with zipfile.ZipFile(self.make_conda({}), "w") as archive:
-            archive.writestr(entry, members.pop("metadata.json"))
-            for name, content in members.items():
-                archive.writestr(name, content)
-        self.assert_conda_refused(
-            self.base / "example-1-0.conda", "ZIP member 'metadata.json' is not a regular file"
-        )
+        name = "metadata.json"
+        metadata = members.pop(name)
+        for attribute in (0x10, 0x08):
+            with self.subTest(attribute=attribute):
+                entry = zipfile.ZipInfo(name)
+                entry.create_system = 0
+                entry.external_attr = attribute
+                package = self.make_conda({})
+                with zipfile.ZipFile(package, "w") as archive:
+                    archive.writestr(entry, metadata)
+                    for member, content in members.items():
+                        archive.writestr(member, content)
+                self.assert_conda_refused(package, f"ZIP member {name!r} is not a regular file")
 
     def test_fetch_conda_accepts_zip64_with_data_descriptors(self) -> None:
         class Unseekable(io.BytesIO):
@@ -1506,6 +1552,14 @@ class ToolsTests(FixtureCase):
         ):
             self.assert_conda_tar_refused_before_write(members, raw, diagnostic)
 
+    def test_extract_conda_rejects_pax_path_with_nul_before_writing(self) -> None:
+        member = tarfile.TarInfo("extra")
+        member.pax_headers = {"path": "extra\0hidden", "GNU.sparse.name": "extra"}
+        raw = self.raw_tar({"bin/example": (b"fake", 0o755)}, member)
+        self.assert_conda_tar_refused_before_write(
+            self.conda_members(), raw, "unsafe archive member 'extra\\x00hidden'"
+        )
+
     def test_fetch_conda_reports_decoder_failure(self) -> None:
         package = self.make_conda(self.conda_members())
         with mock.patch(
@@ -1565,51 +1619,6 @@ class ToolsTests(FixtureCase):
         self.assertIn(f"jscpd {VERSION}", str(error))
         self.assertIn(diagnostic, str(error))
         self.assertEqual(list(tools.iterdir()), [])
-
-    def test_fetch_package_and_verify_its_binary(self) -> None:
-        package, binary = self.make_package()
-        lock = self.package_lock(package, binary)
-        tools = self.base / "tools"
-        result = self.fetch(lock, tools)
-        self.assertEqual(result.returncode, 0, output(result))
-        directory = tools / f"jscpd-{VERSION}"
-        installed = directory / "usr/bin/example"
-        self.assertEqual(installed.read_bytes(), binary)
-        package.unlink()
-        result = self.check_install(lock, tools)
-        self.assertEqual(result.returncode, 0, output(result))
-        with lock_override(lock):
-            self.assertEqual(verify_tool_directory("jscpd", directory), directory)
-            restore_owner_write(directory)
-            installed.write_bytes(b"changed")
-            with self.assertRaisesRegex(UnsupportedError, "payload digest mismatch"):
-                verify_tool_directory("jscpd", directory)
-
-    def test_fetch_package_rejects_invalid_container(self) -> None:
-        package, binary = self.make_package()
-        data = bytearray(package.read_bytes())
-        data[66] = 0
-        package.write_bytes(data)
-        result = self.fetch(self.package_lock(package, binary), self.base / "tools")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("invalid ar header", output(result))
-        self.assert_not_installed(self.base / "tools")
-
-    def test_fetch_package_rejects_wrong_archive_digest(self) -> None:
-        package, binary = self.make_package()
-        lock = self.package_lock(package, binary, digest="0" * 64)
-        result = self.fetch(lock, self.base / "tools")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("sha256 mismatch", output(result))
-        self.assert_not_installed(self.base / "tools")
-
-    def test_fetch_package_rejects_wrong_payload_digest(self) -> None:
-        package, binary = self.make_package()
-        lock = self.package_lock(package, binary, payload="0" * 64)
-        result = self.fetch(lock, self.base / "tools")
-        self.assertEqual(result.returncode, 1, output(result))
-        self.assertIn("payload sha256 mismatch", output(result))
-        self.assert_not_installed(self.base / "tools")
 
     def test_fetch_wheel_with_wrong_hash_installs_nothing(self) -> None:
         wheel = self.make_wheel()
@@ -1796,7 +1805,7 @@ class ToolsTests(FixtureCase):
         text = output(result)
         self.assertEqual(result.returncode, 2, text)
         self.assertIn("jscpd.format", text)
-        self.assertIn("one of tar, wheel", text)
+        self.assertIn("one of tar, wheel, conda", text)
 
     def test_tools_path_prints_the_default_path(self) -> None:
         tools = self.base / "tools"
