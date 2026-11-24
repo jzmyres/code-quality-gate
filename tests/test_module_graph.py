@@ -263,6 +263,21 @@ reason = "Python script measured by the graph"
         self.assertEqual(finding.location, "a.el:1")
         self.assertEqual(finding.measurement, {"edge": expected_edge})
 
+    def test_module_graph_elisp_literal_filename_preserves_trailing_slash(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", '(require \'dotted-fixture "odd.name/")\n')
+        self.add_file("odd.name/.el", "(provide 'dotted-fixture)\n")
+        self.add_file("odd.name.el", "")
+        context = self.graph_context(["a.el", "odd.name/.el", "odd.name.el"], ("odd.name/.el",))
+        result = adapters._run_module_graph(context)
+        expected_edge = edge("a.el", "odd.name/.el", 1, "require")
+        self.assertEqual(result.measurement["edges"], [expected_edge])
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        self.assertIn("a.el -> odd.name/.el", finding.subject)
+        self.assertEqual(finding.location, "a.el:1")
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
+
     def test_module_graph_elisp_top_level_progn_provider(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(require 'b)\n")

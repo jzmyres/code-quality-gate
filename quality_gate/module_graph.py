@@ -95,8 +95,7 @@ def _import_edges(root: Path, modules: list[str]) -> set[Edge]:
 
 
 def _literal_target(root: Path, filename: str, paths: dict[str, str]) -> str | None:
-    name = normpath(root / filename)
-    return paths.get(f"{name}.el") or paths.get(name)
+    return paths.get(normpath(root / f"{filename}.el")) or paths.get(normpath(root / filename))
 
 
 def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[str, dict]]:
