@@ -768,10 +768,13 @@ class VerificationTests(FindingMixin, FixtureCase):
         self,
         *patterns: str,
         class_name: str = "python",
+        code_patterns: str = '["*.py"]',
         shebangs: str = '["python*"]',
     ) -> None:
         self.write_config(
             verification_config().replace(
+                'patterns = ["*.py"]', f"patterns = {code_patterns}"
+            ).replace(
                 'shebangs = ["python*"]', f"shebangs = {shebangs}"
             )
             + "".join(
@@ -887,6 +890,23 @@ class VerificationTests(FindingMixin, FixtureCase):
         self.assertEqual(check["outcome"], "error")
         self.assertIn("cannot read pkg/unreadable.py", check["reason"])
         self.assertIn("cannot read pkg/unreadable.py", result.stderr)
+
+    def test_an_unreadable_selected_symlink_target_is_a_shebang_error(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads any file, so a mode cannot make one unreadable")
+        self.add_tests(1)
+        self.write_verification_baseline([executed_entry(1)])
+        target = self.base / "target"
+        target.write_text("#!/usr/bin/env python3\nVALUE = 1\n", encoding="utf-8")
+        target.chmod(0o000)
+        self.addCleanup(target.chmod, 0o644)
+        (self.repo / "program").symlink_to(target)
+        self.add_rule("program", code_patterns='["*.py", "program"]')
+        result, _document, check = self.run_verification()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(check["outcome"], "error")
+        self.assertIn("cannot read shebang of program", check["reason"])
+        self.assertIn("cannot read shebang of program", result.stderr)
 
     def test_added_noqa_comment_fails(self) -> None:
         self.add_tests(1)
