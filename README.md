@@ -326,20 +326,23 @@ Files with a Python shebang are read as Python even when their names end in `.el
 
 The batch Emacs reader extracts `(require 'FEATURE)` at the top level or directly inside a top-level
 `eval-when-compile`. A top-level edge uses the line where the reader starts the form.
-A direct compile-time edge uses the line of the `require` symbol. The target is the
-unique measured file with a literal `(provide 'FEATURE)` at the top level or directly
-inside a top-level `progn`. A literal filename in `(require 'FEATURE "FILE")` must be a
-canonical relative path. It must be nonempty, contain no `$`, and start with neither `/`
-nor `~`. Each slash-delimited component must be nonempty and must be neither `.` nor `..`,
-which also rules out a trailing slash. The graph matches `FILE.el` first, then `FILE`,
-exactly against the measured repository-relative paths. If neither candidate is measured,
-the literal filename gives no edge.
+A direct compile-time edge uses the line of the `require` symbol. A require without a
+filename targets the unique measured file with a literal `(provide 'FEATURE)` at the top
+level or directly inside a top-level `progn`. Feature names in requires and providers
+must be interned symbols.
 
-Computed feature or filename operands and noncanonical literal filenames produce entries
-in `outside_extractor` with their file and line and give no edge. Requires nested elsewhere,
-including in functions or quasiquote unquotes, give no edge. `load` and `load-file` also
-give no edge. An Emacs launch or reader failure, or a Python syntax error, produces a
-check error that names the affected file.
+In `(require 'FEATURE "FILE")`, every slash-delimited component of `FILE` must be
+nonempty, differ from `.` and `..`, and contain only ASCII letters, digits, `.`, `_`,
+`+`, and `-`. The graph matches `FILE.el` first, then `FILE`, exactly against the
+measured repository-relative paths. If neither candidate is measured, the literal
+filename gives no edge.
+
+Computed require operands, literal filenames outside the allowlist, and uninterned
+features in requires or providers produce entries in `outside_extractor` with their
+file and line. Those operands take no part in edge resolution. Requires nested
+elsewhere, including in functions or quasiquote unquotes, give no edge. `load` and
+`load-file` also give no edge. An Emacs launch or reader failure, or a Python syntax
+error, produces a check error that names the affected file.
 
 The graph reports one finding per strongly connected component with at least two modules
 and shows a shortest cycle with its edge locations. It also reports dependencies between

@@ -21,20 +21,32 @@ MODULE_GRAPH_READER = r"""
          (eq (car form) 'quote)
          (symbolp (cadr form))))
 
+  (defun qg-graph-interned-name (symbol)
+    (let* ((symbol (bare-symbol symbol))
+           (name (symbol-name symbol)))
+      (when (eq symbol (intern-soft name)) name)))
+
   (defun qg-graph-outside (line description)
     (list (cons 'kind "outside") (cons 'line line)
           (cons 'message (format "%s is outside the extractor" description))))
 
   (defun qg-graph-canonical-filename-p (filename)
-    (and (not (string-prefix-p "~" filename))
-         (not (string-search "$" filename))
-         (not (seq-some (lambda (part) (member part '("" "." "..")))
-                        (split-string filename "/" nil)))))
+    (let ((case-fold-search nil))
+      (seq-every-p (lambda (part)
+                     (and (not (member part '("." "..")))
+                          (string-match-p
+                           (rx string-start (+ (any "A-Za-z0-9._+-")) string-end)
+                           part)))
+                   (split-string filename "/" nil))))
 
   (defun qg-graph-require (form &optional line)
     (when (and (eq (car-safe form) 'require) (proper-list-p form))
       (let* ((line (or line (line-number-at-pos (symbol-with-pos-pos (car form)))))
-             (feature (cadr form))
+             (quoted-feature (qg-graph-quoted-symbol-p (cadr form)))
+             (feature (and quoted-feature (qg-graph-interned-name (cadadr form))))
+             (feature-problem
+              (cond ((not quoted-feature) "computed require feature")
+                    ((not feature) "uninterned require feature")))
              (filename (nth 2 form))
              (filename-problem
               (cond ((stringp filename)
@@ -42,25 +54,28 @@ MODULE_GRAPH_READER = r"""
                        "noncanonical require filename"))
                     (filename "computed require filename")))
              (outside (delq nil
-                            (list (unless (qg-graph-quoted-symbol-p feature)
-                                    (qg-graph-outside line "computed require feature"))
+                            (list (when feature-problem
+                                    (qg-graph-outside line feature-problem))
                                   (when filename-problem
                                     (qg-graph-outside line filename-problem))))))
         (or outside (list (list (cons 'kind "require") (cons 'line line)
-                                (cons 'feature (symbol-name (bare-symbol (cadr feature))))
+                                (cons 'feature feature)
                                 (cons 'filename filename)))))))
 
-  (defun qg-graph-provide (form)
+  (defun qg-graph-provide (form &optional line)
     (when (and (eq (car-safe form) 'provide)
                (proper-list-p form)
                (qg-graph-quoted-symbol-p (cadr form)))
-      (list (cons 'kind "provide")
-            (cons 'feature (symbol-name (bare-symbol (cadadr form)))))))
+      (let ((feature (qg-graph-interned-name (cadadr form))))
+        (if feature
+            (list (cons 'kind "provide") (cons 'feature feature))
+          (qg-graph-outside (or line (line-number-at-pos (symbol-with-pos-pos (car form))))
+                            "uninterned provide feature")))))
 
   (defun qg-graph-top-level (form line)
     (pcase (car-safe form)
       ('provide
-       (let ((row (qg-graph-provide form)))
+       (let ((row (qg-graph-provide form line)))
          (when row (list row))))
       ('progn
        (when (proper-list-p form)
