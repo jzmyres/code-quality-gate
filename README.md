@@ -186,9 +186,9 @@ rule that then matches no file still fails as stale. A tracked path whose worktr
 by something else (for example a directory) is not deleted and keeps its usual handling. Only staged
 records carry a git mode; mode `160000` identifies a gitlink, which matches exactly one rule like any
 other enumerated path but is never opened or measured as a file. Every other entry is inspected with
-`lstat`: a symlink is recorded as a symlink and never followed or read, while FIFOs, sockets and
-devices are rejected with a message. Shebang inspection reads at most 4096 bytes and only from a
-regular file.
+`lstat`. FIFOs, sockets and devices are rejected with a message. Code detection by shebang
+reads at most 4096 bytes and is limited to regular files. For language dispatch, a symlink
+selected by its inventory class can still use the Python shebang of its regular target.
 
 ### inventory
 
@@ -297,14 +297,16 @@ The `measurement.findings` array includes allowed accesses. See the
 ### Source comments
 
 Use the `comments` check to reject comments in all files of the classes that
-list it. Python's tokenizer reads `.py` files and Python shebang scripts. Batch
-Emacs reads `.el` files. The shell driver reads names ending in `.sh` or `.bash`.
-It uses inventory's shebang reader and gives `sh` and `bash` shebangs priority
-over filename suffixes. The shared `quality_gate/shell_syntax.py` module sends
-source bytes to the pinned shfmt from the gate's tools directory under the
-check's remaining deadline. Parser errors, timeouts, and missing drivers fail
-the check and name the file. The failure reason lists findings and file errors
-in path and line order, with file errors at line 0.
+list it. The check uses the language recorded by inventory. A regular file
+whose shebang matches `[code].shebangs` and names `sh` or a `bash` interpreter
+goes to the shell driver regardless of its suffix. Inventory also recognizes
+`.sh` and `.bash` by suffix. Python's tokenizer reads Python files, and
+batch Emacs reads Emacs Lisp files. The shared `quality_gate/shell_syntax.py`
+module sends source bytes to the pinned shfmt from the gate's tools directory
+and validates the caller's JSON fields within the remaining check deadline.
+Parser errors, timeouts, and missing drivers fail the check and name the file.
+The failure reason lists findings and file errors in path and line order, with
+file errors at line 0.
 
 The check matches each exception against the whole physical line. `NAME.el`
 must be the file's own base name, and `SUMMARY` is the library summary.

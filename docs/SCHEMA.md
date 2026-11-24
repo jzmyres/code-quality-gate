@@ -263,15 +263,19 @@ tier = 1
 enforcement = "enforced"
 ```
 
-The check reads `.py`, Python shebang scripts, `.el`, and names ending in `.sh` or
-`.bash`. It uses inventory's shebang reader and gives `sh` and `bash` shebangs
-priority over suffixes. For shell files, the shared `quality_gate/shell_syntax.py`
-module feeds the file's bytes to the pinned shfmt from the tools directory on
-stdin with `--to-json` and `--filename` in Bash mode. The gate runner enforces the
-remaining check deadline. The shared parser validates the JSON fields declared
-by its caller. The comments driver reads `Hash.Line` and `Text` from every object
-with a `Hash` key and treats omitted `Text` as an empty comment body. The shell
-exception applies to a line-1 shebang that matches the allowed form.
+The check dispatches using the language recorded by inventory. For regular
+files, an interpreter named `sh` or starting with `bash` that matches
+`[code].shebangs` takes precedence over the filename suffix. The `.sh` and
+`.bash` suffixes also select Bash. A selected extensionless symlink to a
+Python shebang script uses the Python driver.
+
+The shared `quality_gate/shell_syntax.py` module feeds source bytes to the
+pinned shfmt from the tools directory on stdin with `--to-json` and
+`--filename` in Bash mode. It validates the caller's declared JSON fields and
+checks the remaining deadline before launch and after decoding. The comments
+driver reads `Hash.Line` and `Text` from every object with a `Hash` key and
+treats omitted `Text` as an empty comment body. The shell exception applies to
+a line-1 shebang that matches the allowed form.
 
 Any forbidden comment, parser error, timeout, or selected file without a driver produces
 an outcome of `fail`. The reason includes each finding and each file error,

@@ -7,15 +7,13 @@ import json
 import re
 import subprocess
 import tokenize
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from . import shell_syntax
 from .elisp_batch import batch_command
-from .files import source_language
 
 
 @dataclass(frozen=True)
@@ -247,9 +245,11 @@ def _shell_comment_nodes(tree: dict[str, Any]) -> Iterator[dict[str, Any]]:
             pending.extend(reversed(node.values()))
 
 
-def _shell_findings(source: Path, path: str, budget: int) -> list[Finding]:
+def _shell_findings(
+    source: Path, path: str, parse_shell: Callable[..., dict[str, Any]],
+) -> list[Finding]:
     content = source.read_bytes()
-    tree = shell_syntax.parse(content, path, _shell_comment_fields, budget=budget)
+    tree = parse_shell(content, path, _shell_comment_fields)
     findings = []
     for node in _shell_comment_nodes(tree):
         line = node["Hash"]["Line"]
@@ -260,18 +260,21 @@ def _shell_findings(source: Path, path: str, budget: int) -> list[Finding]:
 
 
 def _read_source(
-    root: Path, path: str, budget: int, elisp: list[str],
+    root: Path, path: str, language: str | None, elisp: list[str],
+    parse_shell: Callable[..., dict[str, Any]], remaining_budget: Callable[[float], float],
 ) -> tuple[list[Finding], list[ReadError]]:
     source = root / path
     try:
-        language = source_language(source)
         if language == "lisp":
             elisp.append(path)
             return [], []
         if language == "python":
             return _python_findings(source, path), []
         if language == "bash":
-            return _shell_findings(source, path, budget), []
+            findings = _shell_findings(source, path, parse_shell)
+            if remaining_budget(float("inf")) <= 0:
+                raise ValueError("shfmt deadline exceeded")
+            return findings, []
     except (OSError, SyntaxError, tokenize.TokenError, ValueError) as error:
         detail = str(error).removeprefix(f"{path}: ")
         return [], [ReadError(path, f"cannot read {path}: {detail}")]
@@ -279,12 +282,16 @@ def _read_source(
 
 
 def measure(
-    root: Path, files: list[str], emacs: str = "emacs", budget: int = 30,
+    root: Path, files: list[str], languages: Mapping[str, str | None],
+    parse_shell: Callable[..., dict[str, Any]], remaining_budget: Callable[[float], float],
+    emacs: str = "emacs", budget: int = 30,
 ) -> tuple[list[Finding], list[ReadError]]:
     """Report forbidden comments and files that could not be analyzed."""
     elisp, findings, errors = [], [], []
     for path in sorted(set(files)):
-        rows, failures = _read_source(root, path, budget, elisp)
+        rows, failures = _read_source(
+            root, path, languages.get(path), elisp, parse_shell, remaining_budget,
+        )
         findings.extend(rows)
         errors.extend(failures)
     if elisp:

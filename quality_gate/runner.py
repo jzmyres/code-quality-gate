@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from tempfile import TemporaryFile
 from typing import Any
 
 from .policy import UsageError
@@ -647,10 +648,21 @@ def _spawn(
     cwd: os.PathLike[str] | str | None,
     env: dict[str, str] | None,
     started: float,
-    stdin: int,
+    stdin: bytes | None,
+    budget_seconds: float,
 ) -> tuple[subprocess.Popen[bytes] | None, RunResult | None]:
     try:
-        return _popen(argv, cwd, env, stdin), None
+        if stdin is None:
+            return _popen(argv, cwd, env, subprocess.DEVNULL), None
+        with TemporaryFile() as stream:
+            stream.write(stdin)
+            stream.seek(0)
+            if time.monotonic() >= started + budget_seconds:
+                return None, RunResult(
+                    argv, "budget", None, timed_out=True,
+                    duration_seconds=time.monotonic() - started,
+                )
+            return _popen(argv, cwd, env, stream.fileno()), None
     except (OSError, subprocess.SubprocessError) as error:
         return None, _empty(
             argv,
@@ -684,12 +696,12 @@ def run(
     *,
     cwd: os.PathLike[str] | str | None = None,
     env: dict[str, str] | None = None,
-    stdin: int = subprocess.DEVNULL,
+    stdin: bytes | None = None,
     budget_seconds: float,
     capture_limit: int | None = CAPTURE_LIMIT,
     grace_seconds: float = GRACE_SECONDS,
 ) -> RunResult:
-    """Run ARGV in its own process group with an optional stdin descriptor."""
+    """Run ARGV in its own process group with optional bytes on stdin."""
     argv_tuple = tuple(argv)
     started = time.monotonic()
     subreaper_failure = _subreaper_failure()
@@ -714,7 +726,7 @@ def run(
         )
     budget_seconds, grace_seconds = _run_budget(budget_seconds, grace_seconds)
     deadline = started + max(0.0, budget_seconds)
-    process, failure = _spawn(argv_tuple, cwd, env, started, stdin)
+    process, failure = _spawn(argv_tuple, cwd, env, started, stdin, budget_seconds)
     if failure is not None:
         return failure
     assert process is not None

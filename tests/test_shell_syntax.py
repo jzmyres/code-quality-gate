@@ -1,5 +1,4 @@
 """Exercise shfmt invocation and validation of caller-declared JSON fields."""
-import os
 import sys
 import time
 from pathlib import Path
@@ -8,26 +7,24 @@ from unittest import TestCase, mock
 
 import support
 
-from quality_gate import files, runner
+from quality_gate import adapters, runner
 from quality_gate.policy import UnsupportedError
 
 
 class ShellSyntaxTests(TestCase):
     def setUp(self):
-        from quality_gate import shell_syntax
-
-        self.parse = shell_syntax.parse
+        self.parse = adapters._parse_shell
         self.binary = support.GATE / "tools" / "bin" / "shfmt"
         self.lookup = self.enterContext(
-            mock.patch.object(shell_syntax, "tool_binary", return_value=self.binary),
+            mock.patch.object(adapters, "tool_binary", return_value=self.binary),
         )
-        self.run = self.enterContext(mock.patch.object(shell_syntax, "run"))
+        self.run = self.enterContext(mock.patch.object(adapters, "run"))
 
     def test_passes_filename_and_unmodified_bytes_to_pinned_shfmt(self):
         content = b"printf '\xc3\xa9'\r\n"
 
         def read_stdin(argv, *, stdin, budget_seconds, capture_limit):
-            self.assertEqual(os.read(stdin, len(content) + 1), content)
+            self.assertEqual(stdin, content)
             self.assertEqual(argv, [
                 str(self.binary), "--to-json", "-ln=bash", "--filename", "my script.sh",
             ])
@@ -86,6 +83,12 @@ class ShellSyntaxTests(TestCase):
         self.lookup.assert_not_called()
         self.run.assert_not_called()
 
+    def test_lookup_spends_deadline_before_launch(self):
+        with mock.patch.object(adapters, "remaining_budget", side_effect=[1, 0]):
+            with self.assertRaisesRegex(ValueError, r"late\.sh: shfmt deadline exceeded"):
+                self.parse(b"true\n", "late.sh", lambda node: {})
+        self.run.assert_not_called()
+
     def test_missing_pinned_tool_fails_before_invocation(self):
         self.lookup.side_effect = UnsupportedError("pinned shfmt is missing")
         with self.assertRaisesRegex(ValueError, r"script\.sh: cannot run shfmt: pinned shfmt is missing"):
@@ -98,14 +101,6 @@ class ShellSyntaxTests(TestCase):
                 self.run.return_value = runner.RunResult((), "completed", 0, stdout=payload)
                 with self.assertRaisesRegex(ValueError, rf"script\.sh: .*{detail}"):
                     self.parse(b"true\n", "script.sh", lambda node: {})
-
-
-class SourceLanguageTests(TestCase):
-    def test_shell_shebang_takes_priority_over_suffix(self):
-        with TemporaryDirectory() as directory:
-            source = Path(directory) / "sample.py"
-            source.write_bytes(b"#!/usr/bin/env -S bash -e\n")
-            self.assertEqual(files.source_language(source), "bash")
 
 
 class ShellCommentSchemaTests(TestCase):

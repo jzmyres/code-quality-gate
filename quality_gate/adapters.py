@@ -17,10 +17,10 @@ from typing import Any, Callable
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, python_crap, python_mutation,
+    module_graph, python_crap, python_mutation, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .files import DiffBaseOverride
+from .files import DiffBaseOverride, InventoryClasses, source_language
 from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -34,7 +34,8 @@ from .policy import (
     _string,
     _string_list,
 )
-from .runner import execution_outcome, mark_step, run
+from .runner import execution_outcome, mark_step, remaining_budget, run
+from .tools import tool_binary
 
 
 def _default_budget(_spec: Any) -> int:
@@ -355,11 +356,34 @@ def _comments_problems(findings: list[comments.Finding], errors: list[comments.R
     return [text for _, _, text in ordered]
 
 
+def _parse_shell(content: bytes, filename: str, required_fields: Callable) -> dict[str, Any]:
+    mark_step(f"shfmt parsing {filename}")
+    try:
+        return shell_syntax.parse(
+            content, filename, required_fields,
+            tool_binary=tool_binary, run=run, execution_outcome=execution_outcome,
+            remaining_budget=remaining_budget,
+        )
+    except (GateError, OSError) as error:
+        raise ValueError(f"{filename}: cannot run shfmt: {error}") from error
+
+
+def _source_languages(context: AdapterContext, selected: list[str]) -> dict[str, str | None]:
+    if isinstance(context.classes, InventoryClasses):
+        return context.classes.languages
+    return {
+        path: source_language(context.root / path, path, context.config, selected=True).language
+        for path in selected
+    }
+
+
 def _run_comments(context: AdapterContext) -> Any:
     from .checks import _adapter_selection, _check_result
 
     _spec, start, selected, _classes = _adapter_selection(context)
-    findings, errors = comments.measure(context.root, selected)
+    findings, errors = comments.measure(
+        context.root, selected, _source_languages(context, selected), _parse_shell, remaining_budget,
+    )
     problems = _comments_problems(findings, errors)
     for problem in problems:
         print(f"{context.prefix}: {problem}", file=sys.stderr)

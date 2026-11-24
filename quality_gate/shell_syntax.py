@@ -3,12 +3,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from tempfile import TemporaryFile
+from pathlib import Path
 from typing import Any
-
-from .policy import GateError
-from .runner import RunResult, execution_outcome, mark_step, remaining_budget, run
-from .tools import tool_binary
 
 
 def _check_fields(node: dict[str, Any], fields: dict[str, type], filename: str) -> dict[str, Any]:
@@ -22,23 +18,6 @@ def _check_fields(node: dict[str, Any], fields: dict[str, type], filename: str) 
         if type(value) is not expected:
             raise ValueError(f"{filename}: shfmt JSON field {field} must be {expected.__name__}")
     return node
-
-
-def _run_shfmt(content: bytes, filename: str, budget: int) -> RunResult:
-    mark_step(f"shfmt parsing {filename}")
-    if remaining_budget(budget) <= 0:
-        raise ValueError(f"{filename}: shfmt deadline exceeded")
-    try:
-        binary = tool_binary("shfmt").absolute()
-        with TemporaryFile() as stdin:
-            stdin.write(content)
-            stdin.seek(0)
-            return run(
-                [str(binary), "--to-json", "-ln=bash", "--filename", filename],
-                stdin=stdin.fileno(), budget_seconds=budget, capture_limit=None,
-            )
-    except (GateError, OSError) as error:
-        raise ValueError(f"{filename}: cannot run shfmt: {error}") from error
 
 
 def _decode_tree(
@@ -55,18 +34,38 @@ def _decode_tree(
     return tree
 
 
-def parse(
-    content: bytes, filename: str, required_fields: Callable[[dict[str, Any]], dict[str, type]],
-    *, budget: int = 30,
-) -> dict[str, Any]:
-    """Parse bytes and validate the caller's required dotted fields for each object."""
-    result = _run_shfmt(content, filename, budget)
+def _require_time(filename: str, remaining: float) -> None:
+    if remaining <= 0:
+        raise ValueError(f"{filename}: shfmt deadline exceeded")
+
+
+def _output(result: Any, filename: str, execution_outcome: Callable[[str], Any]) -> bytes:
     outcome = execution_outcome(result.execution)
     if outcome.budget:
-        raise ValueError(f"{filename}: shfmt deadline exceeded")
+        _require_time(filename, 0)
     if outcome.error:
         raise ValueError(f"{filename}: cannot run shfmt: {result.error}")
-    if result.returncode != 0:
-        detail = result.stderr_text.strip() or f"exit {result.returncode}"
+    if not outcome.completed or result.returncode != 0:
+        detail = result.stderr_text.strip() or f"{result.execution}, exit {result.returncode}"
         raise ValueError(f"{filename}: shfmt parse failed: {detail}")
-    return _decode_tree(result.stdout, filename, required_fields)
+    return result.stdout
+
+
+def parse(
+    content: bytes, filename: str, required_fields: Callable[[dict[str, Any]], dict[str, type]],
+    *, tool_binary: Callable[[str], Path], run: Callable[..., Any],
+    execution_outcome: Callable[[str], Any], remaining_budget: Callable[[float], float],
+    budget: int = 30,
+) -> dict[str, Any]:
+    """Parse bytes and validate the caller's required dotted fields for each object."""
+    _require_time(filename, remaining_budget(budget))
+    binary = tool_binary("shfmt").absolute()
+    _require_time(filename, remaining_budget(budget))
+    result = run(
+        [str(binary), "--to-json", "-ln=bash", "--filename", filename],
+        stdin=content, budget_seconds=budget, capture_limit=None,
+    )
+    _require_time(filename, remaining_budget(budget))
+    tree = _decode_tree(_output(result, filename, execution_outcome), filename, required_fields)
+    _require_time(filename, remaining_budget(budget))
+    return tree

@@ -9,6 +9,7 @@ from unittest import mock
 from support import BASE_CONFIG, GATE, FixtureCase, output
 
 from quality_gate import adapters, comments, policy, runner
+from quality_gate import files as inventory
 
 
 FIXTURES = GATE / "tests" / "fixtures" / "comments"
@@ -22,7 +23,7 @@ class CommentsTests(FixtureCase):
     def setUp(self):
         super().setUp()
         config = BASE_CONFIG.replace('checks = ["smoke"]', 'checks = ["comments"]')
-        config = config.replace('pattern = "*.py"', 'pattern = "[asz]*"')
+        config = config.replace('pattern = "*.py"', 'pattern = "[apsz]*"')
         self.write_config(config + '''
 [checks.comments]
 adapter = "comments"
@@ -57,7 +58,10 @@ enforcement = "enforced"
 
     def test_comments_none_unavailable_emacs_names_selected_file(self):
         self.add_file("sample.el", "(message \"ok\")\n")
-        rows, errors = comments.measure(self.repo, ["sample.el"], emacs=str(self.repo / "missing-emacs"))
+        rows, errors = comments.measure(
+            self.repo, ["sample.el"], {"sample.el": "lisp"}, adapters._parse_shell,
+            runner.remaining_budget, emacs=str(self.repo / "missing-emacs"),
+        )
         self.assertEqual(rows, [])
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0].path, "sample.el")
@@ -166,12 +170,15 @@ enforcement = "enforced"
             "{path}:{line}: {text}".format(**row) for row in check["measurement"]["findings"]
         ])
 
-    def shell_check(self, path, source, tree, *, elapsed=0):
+    def shell_check(self, path, source, tree, *, elapsed=0, decode_budget=30, scan_expires=False):
         self.add_file(path, source)
         config = policy.load_config(self.repo)
         check = config.checks["comments"]
+        paths, classes, violations = inventory.validate_inventory(self.repo, config)
+        self.assertEqual(violations, [])
+        self.assertIn(path, paths)
         context = adapters.AdapterContext(
-            self.repo, config, check, [path], {path: "python"}, "check", {}, self.repo,
+            self.repo, config, check, [path], classes, "check", {}, self.repo,
         )
         try:
             shell_syntax = import_module("quality_gate.shell_syntax")
@@ -180,12 +187,34 @@ enforcement = "enforced"
                 raise
             return adapters._run_comments(context)
         result = runner.RunResult((), "completed", 0, stdout=json.dumps(tree).encode())
+        decode_tree = shell_syntax._decode_tree
+        comment_nodes = comments._shell_comment_nodes
+
+        def decode(*args):
+            parsed = decode_tree(*args)
+            deadline.seconds = decode_budget
+            return parsed
+
+        def scan(parsed):
+            yield from comment_nodes(parsed)
+            if scan_expires:
+                deadline.seconds = 0
+
         with (
-            mock.patch.object(shell_syntax, "tool_binary", return_value=self.base / "shfmt"),
-            mock.patch.object(shell_syntax, "run", return_value=result),
-            runner.check_deadline("comments", time.monotonic() - elapsed, 30),
+            mock.patch.object(adapters, "tool_binary", return_value=self.base / "shfmt"),
+            mock.patch.object(adapters, "run", return_value=result) as run,
+            mock.patch.object(shell_syntax, "_decode_tree", side_effect=decode),
+            mock.patch.object(comments, "_shell_comment_nodes", side_effect=scan),
+            runner.check_deadline("comments", time.monotonic() - elapsed, 30) as deadline,
         ):
-            return adapters._run_comments(context)
+            checked = adapters._run_comments(context)
+        if elapsed < 30:
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][-1], path)
+            self.assertEqual(run.call_args.kwargs["stdin"], source.encode())
+        else:
+            run.assert_not_called()
+        return checked
 
     def test_comments_none_shell_findings(self):
         source = "# full line\ntrue  # inline\n# shellcheck disable=SC2086\ntrue\n#\n#!/bin/sh\n"
@@ -226,28 +255,58 @@ enforcement = "enforced"
         ])
 
     def test_comments_none_shell_dispatch_uses_inventory_detection(self):
-        cases = (
-            (".sh", "", []),
-            ("script", "#!./bash\n", [{"path": "script", "line": 1, "text": "#!./bash"}]),
-            ("polyglot.py", "#!/bin/sh\n", []),
-            ("polyglot.el", "#!/bin/sh\n", []),
-        )
-        for path, shebang, preceding in cases:
+        for path, shebang, line in (("sample.sh", "", 1), ("script", "#!./bash\n", 2)):
             with self.subTest(path=path):
-                line = 2 if shebang else 1
                 rows = [{"Hash": {"Line": line}, "Text": " shell comment"}]
                 if shebang:
-                    rows.insert(0, {"Hash": {"Line": 1}, "Text": shebang[1:].rstrip("\n")})
-                result = self.shell_check(path, shebang + "# shell comment\necho hello\n", {"Last": rows})
-                self.assertEqual(result.measurement["findings"], [
-                    *preceding, {"path": path, "line": line, "text": "# shell comment"},
-                ], result.reason)
+                    rows.insert(0, {"Hash": {"Line": 1}, "Text": "!./bash"})
+                result = self.shell_check(path, shebang + "# shell comment\ntrue\n", {"Last": rows})
+                expected = [{"path": path, "line": line, "text": "# shell comment"}]
+                if shebang:
+                    expected.insert(0, {"path": path, "line": 1, "text": "#!./bash"})
+                self.assertEqual(result.measurement["findings"], expected)
+
+    def test_comments_none_polyglot_uses_inventory_shell_language(self):
+        config = self.read_file("quality-gate.toml").replace(
+            'shebangs = ["sh", "bash", "python*"]', 'shebangs = ["sh", "bash*", "python*"]',
+        )
+        self.write_config(config)
+        for shebang in ("#!/bin/sh", "#!/usr/bin/env bash5"):
+            with self.subTest(shebang=shebang):
+                source = f'{shebang}\n""":"\n# shell-only comment\ntrue\n":"""\n'
+                tree = {"Stmts": [{"Comments": [
+                    {"Hash": {"Line": 1}, "Text": shebang[1:]},
+                    {"Hash": {"Line": 3}, "Text": " shell-only comment"},
+                ]}]}
+                result = self.shell_check("polyglot.py", source, tree)
                 self.assertEqual(result.outcome, "fail")
+                self.assertEqual(result.measurement["findings"], [
+                    {"path": "polyglot.py", "line": 3, "text": "# shell-only comment"},
+                ])
+
+    def test_comments_none_selected_extensionless_python_symlink(self):
+        self.add_file("source.py", fixture_source("python"))
+        (self.repo / "sample").symlink_to("source.py")
+        self.assertEqual(self.check_comments_none(0)["measurement"]["findings"], [])
 
     def test_comments_none_shell_deadline_already_spent(self):
         result = self.shell_check("sample.sh", "true\n", {}, elapsed=31)
         self.assertEqual(result.outcome, "fail")
         self.assertIn("cannot read sample.sh: shfmt deadline exceeded", result.reason)
+
+    def test_comments_none_shell_deadline_spent_during_decoding(self):
+        tree = {"Last": [{"Hash": {"Line": 1}, "Text": " late"}]}
+        result = self.shell_check("sample.sh", "# late\n", tree, decode_budget=0)
+        self.assertEqual(result.outcome, "fail")
+        self.assertIn("cannot read sample.sh: shfmt deadline exceeded", result.reason)
+        self.assertEqual(result.measurement["findings"], [])
+
+    def test_comments_none_shell_deadline_spent_during_scan(self):
+        tree = {"Last": [{"Hash": {"Line": 1}, "Text": " late"}]}
+        result = self.shell_check("sample.sh", "# late\n", tree, scan_expires=True)
+        self.assertEqual(result.outcome, "fail")
+        self.assertIn("cannot read sample.sh: shfmt deadline exceeded", result.reason)
+        self.assertEqual(result.measurement["findings"], [])
 
     def test_comments_none_shell_schema_error(self):
         tree = {"Last": [{"Hash": {}, "Text": " missing position"}]}
@@ -262,6 +321,13 @@ enforcement = "enforced"
             path.relative_to(GATE).as_posix()
             for path in (GATE / "quality_gate").rglob("*") if path.suffix in {".py", ".el"}
         ]
-        findings, errors = comments.measure(GATE, files)
+        config = policy.load_config(GATE)
+        languages = {
+            path: inventory.source_language(GATE / path, path, config, selected=True).language
+            for path in files
+        }
+        findings, errors = comments.measure(
+            GATE, files, languages, adapters._parse_shell, runner.remaining_budget,
+        )
         self.assertEqual(errors, [])
         self.assertEqual(findings, [])

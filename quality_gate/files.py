@@ -11,7 +11,7 @@ import re
 import stat
 import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path, PurePosixPath
 
@@ -26,7 +26,7 @@ SOURCE_LANGUAGE_BY_SUFFIX = {
     ".bash": "bash",
     ".el": "lisp",
 }
-_SHELL_INTERPRETERS = {"sh", "bash"}
+_BASH_INTERPRETER = re.compile(r"sh$|bash")
 _PYTHON_INTERPRETER = re.compile(r"python(?:[23](?:\.[0-9]+)?)?")
 DIFF_BASE_ENV = "QG_DIFF_BASE"
 BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
@@ -346,35 +346,61 @@ def _regular_interpreter(path: Path) -> str | None:
     return _shebang_interpreter(_shebang_line(path))
 
 
-def source_language(path: Path) -> str | None:
-    """Choose a driver using inventory's shebang reader and the source suffix."""
-    interpreter = _regular_interpreter(path)
-    if interpreter in _SHELL_INTERPRETERS:
+@dataclass(frozen=True)
+class SourceClassification:
+    code: bool
+    language: str | None
+
+
+def _eligible_python_link(path: Path, mode: int, inspect_link: bool) -> bool:
+    return inspect_link and stat.S_ISLNK(mode) and path.is_file()
+
+
+def _source_interpreter(path: Path, inspect_link: bool) -> tuple[bool, str]:
+    mode = path.lstat().st_mode
+    regular = stat.S_ISREG(mode)
+    if regular or _eligible_python_link(path, mode, inspect_link):
+        return regular, _shebang_interpreter(_shebang_line(path)) or ""
+    return False, ""
+
+
+def _matches_patterns(value: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns)
+
+
+def _code_shebang(regular: bool, interpreter: str, config: Config) -> bool:
+    return regular and bool(interpreter) and _matches_patterns(interpreter, config.code_shebangs)
+
+
+def _driver(suffix: str | None, interpreter: str, code_by_shebang: bool) -> str | None:
+    if code_by_shebang and _BASH_INTERPRETER.match(interpreter):
         return "bash"
+    if suffix is not None:
+        return suffix
+    return "python" if _PYTHON_INTERPRETER.fullmatch(interpreter) else None
+
+
+def source_language(
+    path: Path, relative: str, config: Config, *, selected: bool,
+) -> SourceClassification:
+    """Classify a file for inventory validation and language dispatch."""
+    code_by_path = _matches_patterns(relative, config.code_patterns)
     _, dot, extension = path.name.rpartition(".")
-    suffix_language = SOURCE_LANGUAGE_BY_SUFFIX.get(dot + extension)
-    if suffix_language is not None:
-        return suffix_language
-    if _PYTHON_INTERPRETER.fullmatch(interpreter or ""):
-        return "python"
-    return None
+    suffix = SOURCE_LANGUAGE_BY_SUFFIX.get(dot + extension)
+    if not selected and (code_by_path or not config.code_shebangs):
+        return SourceClassification(code_by_path, suffix)
+    regular, interpreter = _source_interpreter(path, selected and suffix is None)
+    code_by_shebang = _code_shebang(regular, interpreter, config)
+    language = _driver(suffix, interpreter, code_by_shebang)
+    return SourceClassification(code_by_path or code_by_shebang, language)
 
 
-def _is_code(path: Path, relative: str, config: Config) -> bool:
-    if any(
-        fnmatch.fnmatchcase(relative, pattern)
-        for pattern in config.code_patterns
-    ):
-        return True
-    if not config.code_shebangs:
-        return False
-    interpreter = _regular_interpreter(path)
-    if interpreter is None:
-        return False
-    return any(
-        fnmatch.fnmatchcase(interpreter, pattern)
-        for pattern in config.code_shebangs
-    )
+class InventoryClasses(dict[str, str]):
+    """Inventory classes and the source languages decided alongside them."""
+
+    def __init__(self, classes: dict[str, str], languages: dict[str, str | None]) -> None:
+        super().__init__(classes)
+        self.languages = languages
 
 
 def _reject_special_files(
@@ -459,6 +485,8 @@ class _InventoryValidator:
     matched: list[int]
     classes: dict[str, str]
     gitlinks: set[str]
+    languages: dict[str, str | None] = field(default_factory=dict)
+    language_checks: set[str] = field(default_factory=set)
 
     def validate(self) -> tuple[list[str], dict[str, str], list[str]]:
         files = [entry.path for entry in self.entries]
@@ -473,7 +501,7 @@ class _InventoryValidator:
             for invalid, message in _STALE_RULE_CHECKS:
                 if invalid(self.matched[index]):
                     self.violations.append(message.format(**values))
-        return files, self.classes, self.violations
+        return files, InventoryClasses(self.classes, self.languages), self.violations
 
     def _check_classes(self) -> None:
         known = _known_names(self.config.checks)
@@ -537,13 +565,17 @@ class _InventoryValidator:
         if relative in self.gitlinks:
             return
         try:
-            code = _is_code(self.root / relative, relative, self.config)
+            selected = not self.language_checks.isdisjoint(class_def.checks)
+            source = source_language(
+                self.root / relative, relative, self.config, selected=selected,
+            )
         except OSError as error:
             self.violations.append(
                 f"{relative}: cannot read shebang: {error}"
             )
             return
-        message = _FILE_CLASS_MESSAGES.get((code, class_def.code))
+        self.languages[relative] = source.language
+        message = _FILE_CLASS_MESSAGES.get((source.code, class_def.code))
         if message is not None:
             self.violations.append(
                 message.format(
@@ -568,6 +600,9 @@ def validate_inventory(
         [0] * len(config.rules),
         {},
         {entry.path for entry in entries if entry.gitlink},
+        language_checks={
+            check.id for check in config.checks.values() if check.adapter == "comments"
+        },
     ).validate()
 
 
