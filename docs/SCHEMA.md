@@ -263,10 +263,17 @@ tier = 1
 enforcement = "enforced"
 ```
 
-The check reads `.py`, Python shebang scripts, and `.el` files. Any forbidden
-comment, parser error, or selected file without a driver produces an outcome
-of `fail`. The reason includes each finding and each file error, sorted by
-repository-relative path and line. File errors sort at line 0.
+The check reads `.py`, Python shebang scripts, `.el`, `.sh`, `.bash`, and
+scripts with `sh` or `bash` shebangs. For shell files, `quality_gate/shell_syntax.py`
+feeds the file's bytes to the pinned shfmt from the tools directory with
+`--to-json` and `--filename` in Bash mode. The shared parser validates the JSON
+fields declared by its caller. The comments driver uses `Hash.Line` and `Text`
+from objects with a `Hash` key and treats omitted `Text` as an empty comment body.
+Only a shebang on the first line is exempt for shell files.
+
+Any forbidden comment, parser error, or selected file without a driver produces
+an outcome of `fail`. The reason includes each finding and each file error,
+sorted by repository-relative path and line. File errors sort at line 0.
 A complete scan with zero findings passes.
 
 ### Evidence and obligations

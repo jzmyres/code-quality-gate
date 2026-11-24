@@ -19,6 +19,11 @@ from .runner import execution_outcome, run
 
 
 SHEBANG_LIMIT = 4096
+SCRIPT_LANGUAGE_BY_SUFFIX = {
+    ".py": "python",
+    ".sh": "bash",
+    ".bash": "bash",
+}
 DIFF_BASE_ENV = "QG_DIFF_BASE"
 BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
 _SHEBANG_ENV = "env"

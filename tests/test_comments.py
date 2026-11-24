@@ -1,9 +1,13 @@
-"""Exercise the comments gate with both language parsers."""
+"""Exercise the comments gate across its language drivers."""
 from __future__ import annotations
+
+import json
+from subprocess import CompletedProcess
+from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase, output
 
-from quality_gate import adapters, comments, policy
+from quality_gate import adapters, comments, policy, shell_syntax
 
 
 FIXTURES = GATE / "tests" / "fixtures" / "comments"
@@ -149,17 +153,87 @@ enforcement = "enforced"
         self.assertIn("cannot read sample.el", self.check_comments_none(1)["reason"])
 
     def test_comments_none_reason_orders_errors_and_findings(self):
-        self.add_file("a.sh", "#!/bin/sh\ntrue\n")
+        self.add_file("a.unknown", "unknown source\n")
         self.add_file("a.py", "# first\n# second\n")
         self.add_file("z.py", "x = 1  # c\n")
         check = self.check_comments_none(1)
         reason = check["reason"].splitlines()
         self.assertEqual(reason, [
-            "a.py:1: # first", "a.py:2: # second", "a.sh: no comments driver", "z.py:1: # c",
+            "a.py:1: # first", "a.py:2: # second", "a.unknown: no comments driver", "z.py:1: # c",
         ])
         self.assertEqual([*reason[:2], reason[-1]], [
             "{path}:{line}: {text}".format(**row) for row in check["measurement"]["findings"]
         ])
+
+    def shell_check(self, path, source, tree):
+        self.add_file(path, source)
+        config = policy.load_config(self.repo)
+        check = config.checks["comments"]
+        context = adapters.AdapterContext(
+            self.repo, config, check, [path], {path: "python"}, "check", {}, self.repo,
+        )
+        result = CompletedProcess([], 0, json.dumps(tree).encode(), b"")
+        with (
+            mock.patch.object(shell_syntax, "tool_binary", return_value=self.base / "shfmt"),
+            mock.patch.object(shell_syntax, "run", return_value=result) as run,
+        ):
+            checked = adapters._run_comments(context)
+        self.assertEqual(run.call_args.kwargs["input"], source.encode())
+        self.assertEqual(run.call_args.args[0][-2:], ["--filename", path])
+        return checked
+
+    def test_comments_none_shell_findings(self):
+        source = "# full line\ntrue  # inline\n# shellcheck disable=SC2086\ntrue\n#\n#!/bin/sh\n"
+        tree = {
+            "Stmts": [
+                {"Comments": [{"Hash": {"Line": 1}, "Text": " full line"},
+                              {"Hash": {"Line": 2}, "Text": " inline"}]},
+                {"Comments": [{"Hash": {"Line": 3}, "Text": " shellcheck disable=SC2086"}]},
+            ],
+            "Last": [{"Hash": {"Line": 5}}, {"Hash": {"Line": 6}, "Text": "!/bin/sh"}],
+        }
+        result = self.shell_check("sample.sh", source, tree)
+        self.assertEqual(result.outcome, "fail")
+        self.assertEqual(result.measurement["findings"], [
+            {"path": "sample.sh", "line": 1, "text": "# full line"},
+            {"path": "sample.sh", "line": 2, "text": "# inline"},
+            {"path": "sample.sh", "line": 3, "text": "# shellcheck disable=SC2086"},
+            {"path": "sample.sh", "line": 5, "text": "#"},
+            {"path": "sample.sh", "line": 6, "text": "#!/bin/sh"},
+        ])
+
+    def test_comments_none_shell_shebang_and_literals(self):
+        tree = {"Stmts": [
+            {"Comments": [{"Hash": {"Line": 1}, "Text": "!/usr/bin/env bash"}],
+             "Cmd": {"Args": [{"Parts": [{"Value": "# inside a string"}]}]}},
+            {"Redirs": [{"Hdoc": {"Parts": [{"Value": "# inside a heredoc\n"}]}}]},
+        ]}
+        result = self.shell_check("sample", fixture_source("shell"), tree)
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.measurement["findings"], [])
+
+    def test_comments_none_shell_indented_shebang(self):
+        tree = {"Last": [{"Hash": {"Line": 1}, "Text": "!/bin/sh"}]}
+        result = self.shell_check("sample.bash", "  #!/bin/sh\n", tree)
+        self.assertEqual(result.outcome, "fail")
+        self.assertEqual(result.measurement["findings"], [
+            {"path": "sample.bash", "line": 1, "text": "#!/bin/sh"},
+        ])
+
+    def test_comments_none_shell_schema_error(self):
+        tree = {"Last": [{"Hash": {}, "Text": " missing position"}]}
+        result = self.shell_check("sample.sh", "# missing position\n", tree)
+        self.assertEqual(result.outcome, "fail")
+        self.assertIn("cannot read sample.sh", result.reason)
+        self.assertIn("missing field Hash.Line", result.reason)
+        self.assertEqual(result.measurement["findings"], [])
+
+    def test_shell_comment_fields_require_position_and_allow_omitted_text(self):
+        self.assertEqual(comments._shell_comment_fields({"Hash": {}}), {"Hash.Line": int})
+        self.assertEqual(comments._shell_comment_fields({"Hash": {}, "Text": " hi"}), {
+            "Hash.Line": int, "Text": str,
+        })
+        self.assertEqual(comments._shell_comment_fields({"Text": " hi"}), {})
 
     def test_comments_none_measures_gate_package_directly(self):
         files = [

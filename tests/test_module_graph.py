@@ -1143,7 +1143,9 @@ reason = "Python script measured by the graph"
         ]
         measurement, cycles, suite_edges, program_edges = module_graph.measure(GATE, modules, spec)
         (component, _), = cycles
-        self.assertEqual(len(component), 23)
+        self.assertEqual(len(component), 25)
+        self.assertIn("quality_gate/comments.py", component)
+        self.assertIn("quality_gate/shell_syntax.py", component)
         self.assertTrue(all(path.startswith("quality_gate/") for path in component))
         self.assertEqual(len(suite_edges), 16)
         self.assertEqual(program_edges, [])

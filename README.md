@@ -298,9 +298,12 @@ The `measurement.findings` array includes allowed accesses. See the
 
 Use the `comments` check to reject comments in all files of the classes that
 list it. Python's tokenizer reads `.py` files and Python shebang scripts. Batch
-Emacs reads `.el` files. A parser error or a selected file without a driver fails
-the check and names the file. The failure reason lists findings and file
-errors in path and line order, with file errors at line 0.
+Emacs reads `.el` files. The shell driver reads `.sh`, `.bash`, and scripts with
+`sh` or `bash` shebangs. It uses the shared `quality_gate/shell_syntax.py` module
+to parse source bytes with the pinned shfmt from the gate's tools directory.
+A parser error or a selected file without a driver fails the check and names
+the file. The failure reason lists findings and file errors in path and line
+order, with file errors at line 0.
 
 The check matches each exception against the whole physical line. `NAME.el`
 must be the file's own base name, and `SUMMARY` is the library summary.
@@ -308,6 +311,7 @@ must be the file's own base name, and `SUMMARY` is the library summary.
 | Language | Position | Exact form | Authority |
 | --- | --- | --- | --- |
 | Python | Line 1 | `#!` followed by an interpreter path and optional arguments | Kernel shebang |
+| Shell | Line 1 | `#!` followed by an interpreter path and optional arguments | Kernel shebang |
 | Emacs Lisp | Line 1 | Shebang naming `emacs` directly or as the first argument to `env` | Kernel shebang |
 | Emacs Lisp | Line 1, or line 2 after an allowed shebang | `;;; NAME.el --- SUMMARY  -*- lexical-binding: t; -*-` | Emacs library header and file-local cookie |
 | Emacs Lisp | Header block | `;;; Commentary:` | `lm-commentary-start` |

@@ -7,11 +7,15 @@ import json
 import re
 import subprocess
 import tokenize
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
+from . import shell_syntax
 from .elisp_batch import batch_command
+from .files import SCRIPT_LANGUAGE_BY_SUFFIX
 
 
 @dataclass(frozen=True)
@@ -53,16 +57,16 @@ def _shebang_words(line: str) -> list[str]:
     return line[2:].split() if _allowed("shebang", line) else []
 
 
-def _python_script(first_line: bytes) -> bool:
+def _script_interpreter(first_line: bytes) -> str:
     line = first_line.decode("utf-8", errors="replace").rstrip("\r\n")
     words = _shebang_words(line)
     if not words:
-        return False
+        return ""
     interpreter, *arguments = words
     name = Path(interpreter).name
     if name == "env":
         name = Path(_env_command(arguments)).name
-    return _PYTHON_INTERPRETER.fullmatch(name) is not None
+    return name
 
 
 def _python_findings(source: Path, path: str) -> list[Finding]:
@@ -242,21 +246,63 @@ def _elisp_findings(
     return findings, errors
 
 
-def _python_source(source: Path) -> bool:
-    if source.suffix == ".py":
-        return True
+def _shell_comment_fields(node: dict[str, Any]) -> dict[str, type]:
+    if "Hash" not in node:
+        return {}
+    fields = {"Hash.Line": int}
+    if "Text" in node:
+        fields["Text"] = str
+    return fields
+
+
+def _shell_comment_nodes(tree: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(reversed(node))
+        if isinstance(node, dict):
+            if "Hash" in node:
+                yield node
+            pending.extend(reversed(node.values()))
+
+
+def _shell_findings(source: Path, path: str, budget: int) -> list[Finding]:
+    content = source.read_bytes()
+    tree = shell_syntax.parse(content, path, _shell_comment_fields, budget=budget)
+    findings = []
+    for node in _shell_comment_nodes(tree):
+        line = node["Hash"]["Line"]
+        text = "#" + node.get("Text", "")
+        if not (line == 1 and content.startswith(b"#!") and _allowed("shebang", text)):
+            findings.append(Finding(path, line, text[:60]))
+    return findings
+
+
+def _script_findings(source: Path, path: str, budget: int) -> list[Finding] | None:
+    language = SCRIPT_LANGUAGE_BY_SUFFIX.get(source.suffix)
+    if language == "python":
+        return _python_findings(source, path)
+    if language == "bash":
+        return _shell_findings(source, path, budget)
     with source.open("rb") as stream:
-        return _python_script(stream.readline(4096))
+        interpreter = _script_interpreter(stream.readline(4096))
+    if interpreter in {"sh", "bash"}:
+        return _shell_findings(source, path, budget)
+    if _PYTHON_INTERPRETER.fullmatch(interpreter):
+        return _python_findings(source, path)
+    return None
 
 
-def _read_python(root: Path, path: str) -> tuple[list[Finding], list[ReadError]]:
-    source = root / path
+def _read_script(root: Path, path: str, budget: int) -> tuple[list[Finding], list[ReadError]]:
     try:
-        if _python_source(source):
-            return _python_findings(source, path), []
+        findings = _script_findings(root / path, path, budget)
     except (OSError, SyntaxError, tokenize.TokenError, ValueError) as error:
-        return [], [ReadError(path, f"cannot read {path}: {error}")]
-    return [], [ReadError(path, f"{path}: no comments driver")]
+        detail = str(error).removeprefix(f"{path}: ")
+        return [], [ReadError(path, f"cannot read {path}: {detail}")]
+    if findings is None:
+        return [], [ReadError(path, f"{path}: no comments driver")]
+    return findings, []
 
 
 def measure(
@@ -268,7 +314,7 @@ def measure(
     findings, errors = _elisp_findings(root, elisp, emacs, budget) if elisp else ([], [])
     for path in paths:
         if not path.endswith(".el"):
-            rows, failures = _read_python(root, path)
+            rows, failures = _read_script(root, path, budget)
             findings.extend(rows)
             errors.extend(failures)
     findings.sort(key=lambda row: (row.path, row.line))
