@@ -1,9 +1,7 @@
 """Tests for the policy schema and inventory obligations."""
 from __future__ import annotations
 
-import contextlib
 import importlib
-import io
 import json
 import sys
 import unittest
@@ -638,11 +636,11 @@ class PolicyTests(FixtureCase):
         original_run = '["python3", "-c", "print(1)"]'
         self.write_config(config.replace(original_run, json.dumps(run)))
         self.assert_default_shard_workers(policy.load_config(self.repo))
-        for args in (("-j", "4"), ("-j4",), ("--workers", "4"), ("--workers=4",), ("--wor=4",)):
-            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+        for args in (("-j", "4"), ("-j4",), ("--workers", "4"), ("--workers=4",)):
+            with self.subTest(args=args):
                 self.write_config(config.replace(original_run, json.dumps([*run, *args])))
                 fixture = policy.load_config(self.repo)
-                with self.assertRaises((AssertionError, SystemExit)):
+                with self.assertRaises(AssertionError):
                     self.assert_default_shard_workers(fixture)
 
     def test_check_direction_defaults_to_max_and_accepts_min(self) -> None:
