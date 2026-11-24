@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tomllib
 from collections import Counter
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import replace
 from io import StringIO
 from types import SimpleNamespace
@@ -76,24 +76,17 @@ reason = "Shell measured by the graph"
         self.assertEqual(result.returncode, exit_code, result.stderr)
         return self.check_by_id(document, "module-graph")
 
-    def shell_graph(self, exit_code: int, trees: dict[str, runner.RunResult]) -> dict[str, Any]:
-        binary = self.repo / "shfmt"
-        parsed = []
-
-        def parse(argv, *, stdin, budget_seconds, capture_limit):
-            path = argv[-1]
-            parsed.append(path)
-            self.assertEqual(argv, [str(binary), "--to-json", "-ln=bash", "--filename", path])
-            self.assertEqual(stdin, (self.repo / path).read_bytes())
-            return trees[path]
-
+    @contextmanager
+    def mock_shell_parser(self, trees: dict[str, runner.RunResult]):
         with (
-            mock.patch.object(adapters, "tool_binary", return_value=binary),
-            mock.patch.object(adapters, "run", side_effect=parse),
+            mock.patch.object(adapters, "tool_binary", return_value=self.repo / "shfmt"),
+            mock.patch.object(adapters, "run", side_effect=lambda argv, **_: trees[argv[-1]]) as run,
         ):
-            check = self.graph(exit_code)
-        self.assertEqual(parsed, sorted(trees))
-        return check
+            yield run
+
+    def shell_graph(self, exit_code: int, trees: dict[str, runner.RunResult]) -> dict[str, Any]:
+        with self.mock_shell_parser(trees):
+            return self.graph(exit_code)
 
     def assert_elisp_outcomes(
         self,
@@ -550,7 +543,7 @@ bash ./sibling.sh
 if true; then sh "./sibling.sh"; fi
 ./sibling.sh
 source './with space.sh'
-source ./literal\*.sh
+source './literal*.sh'
 source ./"sibling".sh
 "${BASH_SOURCE%/*}"/sibling.sh
 bash -c true
@@ -582,7 +575,7 @@ sh
                          "Then": [shell_call(6, "sh", [shell_quote("./sibling.sh")])]}},
                 shell_call(7, "./sibling.sh"),
                 shell_call(8, "source", [{"Type": "SglQuoted", "Value": "./with space.sh"}]),
-                shell_call(9, "source", r"./literal\*.sh"),
+                shell_call(9, "source", [{"Type": "SglQuoted", "Value": "./literal*.sh"}]),
                 shell_call(10, "source", [shell_literal("./"), shell_quote("sibling"), shell_literal(".sh")]),
                 shell_call(11, [shell_quote(bash_source), shell_literal("/sibling.sh")]),
                 shell_call(12, "bash", "-c", "true"),
@@ -610,7 +603,27 @@ sh
                 ("scripts/with space.sh", 8, "source"),
             )
         ])
-        self.assertNotIn("outside_extractor", measurement)
+        self.assertEqual(measurement["outside_extractor"], [
+            {"file": "scripts/main.sh", "line": 12, "message": "shell execute: target is outside the parser"},
+        ])
+
+    def test_module_graph_shell_uses_shared_parser_for_inventory_shell_files(self) -> None:
+        self.configure_graph(shell=True)
+        content = "#!/bin/sh\ntrue\n"
+        self.add_file("script.py", content)
+        self.add_file("sibling.sh", "")
+        trees = {"script.py": shell_tree(shell_call(2, "true")), "sibling.sh": shell_tree()}
+        with self.mock_shell_parser(trees) as run:
+            check = self.graph(0)
+        self.assertEqual(check["measurement"]["modules"], ["a.py", "script.py", "sibling.sh"])
+        self.assertEqual(check["measurement"]["edges"], [])
+        self.assertEqual(run.call_args_list, [
+            mock.call(
+                [str(self.repo / "shfmt"), "--to-json", "-ln=bash", "--filename", path],
+                stdin=data, budget_seconds=30, capture_limit=None,
+            )
+            for path, data in (("script.py", content.encode()), ("sibling.sh", b""))
+        ])
 
     def test_module_graph_shell_reports_computed_and_missing_paths(self) -> None:
         self.configure_graph(shell=True)
@@ -620,8 +633,12 @@ bash ./sib*.sh
 ./$name
 source ../README.md
 source ./absent.sh
+source ./foo{a,{b}}.sh
+bash -e "$dir/sibling.sh"
+sh -- ./sibling.sh
 """)
         self.add_file("scripts/sibling.sh", "")
+        self.add_file("scripts/foo{a,{b}}.sh", "")
         directory = {"Type": "ParamExp", "Short": True, "Param": {"Value": "dir"}}
         substitution = {"Type": "CmdSubst", "Stmts": [shell_call(2, "printf", ".")]}
         name = {"Type": "ParamExp", "Short": True, "Param": {"Value": "name"}}
@@ -633,17 +650,21 @@ source ./absent.sh
                 shell_call(4, [shell_literal("./"), name]),
                 shell_call(5, "source", "../README.md"),
                 shell_call(6, "source", "./absent.sh"),
+                shell_call(7, "source", "./foo{a,{b}}.sh"),
+                shell_call(8, "bash", "-e", [shell_quote(directory, "/sibling.sh")]),
+                shell_call(9, "sh", "--", "./sibling.sh"),
             ),
             "scripts/sibling.sh": shell_tree(),
+            "scripts/foo{a,{b}}.sh": shell_tree(),
         })["measurement"]
         self.assertEqual(measurement["edges"], [])
         diagnostics = measurement["outside_extractor"]
         self.assertEqual([(row["file"], row["line"]) for row in diagnostics], [
-            ("scripts/main.sh", line) for line in range(1, 7)
+            ("scripts/main.sh", line) for line in range(1, 10)
         ])
-        for row in diagnostics[:4]:
+        for row in (*diagnostics[:4], *diagnostics[6:]):
             self.assertIn("outside the parser", row["message"])
-        for row, target in zip(diagnostics[4:], ("../README.md", "./absent.sh"), strict=True):
+        for row, target in zip(diagnostics[4:6], ("../README.md", "./absent.sh"), strict=True):
             self.assertIn("unresolved", row["message"])
             self.assertIn(target, row["message"])
 
@@ -666,6 +687,11 @@ source ./absent.sh
             ({**call, "Args": [{"Parts": ""}]}, "field Parts must be list"),
             ({**call, "Args": [{"Parts": [{}]}]}, "missing word part field Type"),
             ({**call, "Args": [{"Parts": [{"Type": "Lit"}]}]}, "missing field Value"),
+            (shell_call(1, "source", [shell_quote({})]), "missing word part field Type"),
+            (shell_call(1, "source", [shell_quote({
+                "Type": "ParamExp", "Param": {"Value": "BASH_SOURCE"},
+                "Exp": {"Word": {"Parts": [shell_literal("/*")]}},
+            }, "/sibling.sh")]), "missing field Exp.Op"),
         ):
             with self.subTest(detail=detail):
                 result = self.shell_graph(1, {"broken.sh": shell_tree(tree)})
@@ -675,8 +701,9 @@ source ./absent.sh
     def test_module_graph_shell_schema_accepts_omitted_empty_fields(self) -> None:
         for node, fields in (
             ({"Type": "CallExpr"}, {"Pos.Line": int, "Args": list}),
-            ({"Type": "CallExpr", "Assigns": [{}]}, {"Pos.Line": int}),
-            ({"Type": "CallExpr", "Assigns": [{}], "Args": [{}]}, {"Pos.Line": int, "Args": list}),
+            ({"Type": "CallExpr", "Assigns": [{}]}, {"Pos.Line": int, "Assigns": list}),
+            ({"Type": "CallExpr", "Assigns": [{}], "Args": [{}]},
+             {"Pos.Line": int, "Assigns": list, "Args": list}),
             ({"Type": "DblQuoted"}, {}),
             ({"Type": "DblQuoted", "Parts": [{}]}, {"Parts": list}),
             ({"Type": "SglQuoted"}, {}),

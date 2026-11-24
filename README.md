@@ -380,10 +380,12 @@ module in any language. The reader also recognizes a `$(dirname "$0")` or
 `${BASH_SOURCE%/*}` prefix, including `${BASH_SOURCE[0]%/*}`, followed by a
 slash and a literal name.
 
-Targets with other expansions, substitutions, or globs are reported as outside the parser
+A literal target consists of unquoted parts free of `{`, `}`, `*`, `?`, and `[`, or quoted
+parts free of expansions and substitutions. Targets with other expansions, substitutions,
+or globs and `bash` or `sh` calls with a leading option are reported as outside the parser
 in `outside_extractor` with the calling file and line. A literal path without a measured
-target is reported there as unresolved and includes the path. A shell syntax error
-or shfmt schema error fails the check and names the affected file.
+target is reported there as unresolved and includes the path. Shell syntax and shfmt schema
+errors fail the check and name the affected file. Schema errors also name the affected field.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
