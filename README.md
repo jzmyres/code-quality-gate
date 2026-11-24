@@ -343,6 +343,12 @@ one `outside_extractor` entry with the require's file and line.
 Multiple measured providers, computed require operands, and literal filenames
 outside the allowlist also produce one located `outside_extractor` entry per require.
 Uninterned features in requires or providers are reported there as well.
+If a reader label shares a `require` or `provide` head anywhere in the form as read,
+each affected call produces an `outside_extractor` entry at the shared head's line.
+A require whose feature or filename operand passes through a shared reader object
+also produces one entry at its head's line. A rejected `provide` contributes no
+provider. Emacs's read result can erase label syntax, for example when a label
+reference returns `nil`. The extractor can only detect sharing present in that result.
 Requires nested elsewhere, including in functions or quasiquote unquotes, give no edge.
 `load` and `load-file` also give no edge. An Emacs launch failure, a reader error
 other than its end-of-input signal, or a Python syntax error produces a check error
