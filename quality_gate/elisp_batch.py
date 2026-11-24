@@ -38,50 +38,7 @@ MODULE_GRAPH_READER = r"""
   (defun qg-graph-head-line (form)
     (line-number-at-pos (symbol-with-pos-pos (car form))))
 
-  (defun qg-graph-char-table-children (table)
-    (let* ((parent (char-table-parent table))
-           (children (list parent (char-table-range table nil)))
-           (index 0))
-      (condition-case nil
-          (while t
-            (push (char-table-extra-slot table index) children)
-            (setq index (1+ index)))
-        (args-out-of-range nil))
-      (when parent
-        (setq table (copy-sequence table))
-        (set-char-table-parent table nil))
-      (map-char-table (lambda (_key value) (push value children)) table)
-      children))
-
-  (defun qg-graph-object-children (object)
-    (cond ((consp object) (list (car object) (cdr object)))
-          ((or (vectorp object) (recordp object) (closurep object))
-           (cl-loop for index below (length object) collect (aref object index)))
-          ((hash-table-p object)
-           (let (children)
-             (maphash (lambda (key value) (push key children) (push value children)) object)
-             children))
-          ((stringp object) (mapcar #'caddr (object-intervals object)))
-          ((char-table-p object) (qg-graph-char-table-children object))))
-
-  (defun qg-graph-occurrences (form)
-    (let ((symbols-with-pos-enabled nil)
-          (counts (make-hash-table :test 'eq))
-          (pending (list form)))
-      (while pending
-        (let* ((object (pop pending))
-               (count (gethash object counts 0)))
-          (when (< count 2)
-            (puthash object (1+ count) counts)
-            (setq pending (nconc (qg-graph-object-children object) pending)))))
-      counts))
-
-  (defun qg-graph-shared-p (object occurrences)
-    (let ((symbols-with-pos-enabled nil))
-      (and (or (consp object) (symbol-with-pos-p object) (stringp object))
-           (eq (gethash object occurrences) 2))))
-
-  (defun qg-graph-require (form occurrences)
+  (defun qg-graph-require (form)
     (when (and (eq (car-safe form) 'require) (proper-list-p form))
       (let* ((line (qg-graph-head-line form))
              (feature-operand (cadr form))
@@ -89,22 +46,14 @@ MODULE_GRAPH_READER = r"""
              (feature (and quoted-feature (bare-symbol (cadr feature-operand))))
              (feature-problem
               (cond ((not quoted-feature) "computed")
-                    ((seq-some (lambda (object) (qg-graph-shared-p object occurrences))
-                               (list (cdr form) feature-operand (car feature-operand)
-                                     (cdr feature-operand) (cadr feature-operand)))
-                     "shared")
                     ((not (eq feature (intern-soft feature))) "uninterned")))
              (filename (nth 2 form))
              (filename-problem
               (cond ((and (stringp filename) (not (qg-graph-canonical-filename-p filename)))
                      "noncanonical")
-                    ((or (qg-graph-shared-p (cddr form) occurrences)
-                         (and (stringp filename) (qg-graph-shared-p filename occurrences)))
-                     "shared")
                     ((not (or (stringp filename) (null filename))) "computed")))
              (problem
-              (cond ((qg-graph-shared-p (car form) occurrences) "shared require head")
-                    ((and feature-problem filename-problem)
+              (cond ((and feature-problem filename-problem)
                      (format "require with a %s feature and a %s filename"
                              feature-problem filename-problem))
                     (feature-problem (format "%s require feature" feature-problem))
@@ -113,32 +62,30 @@ MODULE_GRAPH_READER = r"""
             (list 'outside line problem)
           (list 'require line feature filename)))))
 
-  (defun qg-graph-provide (form occurrences)
+  (defun qg-graph-provide (form)
     (when (and (eq (car-safe form) 'provide)
-               (proper-list-p form))
-      (cond ((qg-graph-shared-p (car form) occurrences)
-             (list 'outside (qg-graph-head-line form) "shared provide head"))
-            ((qg-graph-quoted-symbol-p (cadr form))
-             (let ((line (qg-graph-head-line form))
-                   (feature (bare-symbol (cadadr form))))
-               (if (eq feature (intern-soft feature))
-                   (list 'provide line feature)
-                 (list 'outside line "uninterned provide feature")))))))
+               (proper-list-p form)
+               (qg-graph-quoted-symbol-p (cadr form)))
+      (let ((line (qg-graph-head-line form))
+            (feature (bare-symbol (cadadr form))))
+        (if (eq feature (intern-soft feature))
+            (list 'provide line feature)
+          (list 'outside line "uninterned provide feature")))))
 
-  (defun qg-graph-top-level (form occurrences)
+  (defun qg-graph-top-level (form)
     (pcase (car-safe form)
       ('provide
-       (let ((row (qg-graph-provide form occurrences)))
+       (let ((row (qg-graph-provide form)))
          (when row (list row))))
       ('progn
        (when (proper-list-p form)
-         (delq nil (mapcar (lambda (child) (qg-graph-provide child occurrences)) (cdr form)))))
+         (delq nil (mapcar #'qg-graph-provide (cdr form)))))
       ('require
-       (let ((row (qg-graph-require form occurrences)))
+       (let ((row (qg-graph-require form)))
          (when row (list row))))
       ('eval-when-compile
        (when (proper-list-p form)
-         (delq nil (mapcar (lambda (child) (qg-graph-require child occurrences)) (cdr form)))))))
+         (delq nil (mapcar #'qg-graph-require (cdr form)))))))
 
   (defun qg-graph-file (path)
     (condition-case failure
@@ -148,13 +95,18 @@ MODULE_GRAPH_READER = r"""
            (lambda (buffer _filename)
              (with-current-buffer buffer
                (goto-char (point-min))
-               (let ((symbols-with-pos-enabled t) rows)
+               (let ((read-circle nil) (symbols-with-pos-enabled t) rows)
                  (while t
-                   (let ((form (condition-case nil
+                   (let ((form (condition-case read-error
                                    (read-positioning-symbols buffer)
                                  (end-of-file
-                                  (throw 'qg-graph-records (nreverse rows))))))
-                     (dolist (row (qg-graph-top-level form (qg-graph-occurrences form)))
+                                  (throw 'qg-graph-records (nreverse rows)))
+                                 (error
+                                  (throw 'qg-graph-records
+                                         (list (list 'outside (line-number-at-pos)
+                                                     (format "Emacs Lisp source with a reader error (%s)"
+                                                             (error-message-string read-error)))))))))
+                     (dolist (row (qg-graph-top-level form))
                        (push row rows)))))))))
       (error (format "%s: %s" path (error-message-string failure)))))
 

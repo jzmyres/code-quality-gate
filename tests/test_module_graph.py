@@ -207,29 +207,18 @@ reason = "package measured by the graph"
             "  (require 'b))\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 4, "require")])
+        self.assert_reader_label_refused(self.graph(0)["measurement"], "a.el", 2, [])
 
     def test_module_graph_elisp_shared_require_head(self) -> None:
-        self.configure_graph(elisp=True)
-        self.add_file("a.el", (
+        self.assert_labelled_require_refused(
             "(eval-when-compile\n"
             "  '#1=require\n"
             "  (#1# 'fixture)\n"
             "  (#1# 'fixture))\n"
-        ))
-        self.add_file("fixture.el", "(provide 'fixture)\n")
-        context = self.graph_context(["a.el", "fixture.el"], ("fixture.el",))
-        result = adapters._run_module_graph(context)
-        self.assert_elisp_outcomes(result.measurement, [], [
-            {"file": "a.el", "line": 2, "message": "shared require head is outside the extractor"}
-            for _ in range(2)
-        ])
-        self.assertEqual(result.outcome, "pass")
-        self.assertEqual(result.findings, [])
+        )
 
     def test_module_graph_elisp_shared_require_operands(self) -> None:
-        self.configure_graph(elisp=True)
-        self.add_file("a.el", (
+        self.assert_labelled_require_refused(
             "(eval-when-compile\n"
             "  '#1=fixture\n"
             '  \'#2="fixture"\n'
@@ -241,25 +230,17 @@ reason = "package measured by the graph"
             "  '#5=(require 'fixture)\n"
             "  #5#\n"
             '  (require \'fixture "fixture"))\n'
-        ))
+        )
+
+    def assert_labelled_require_refused(self, source: str) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", source)
         self.add_file("fixture.el", "(provide 'fixture)\n")
         context = self.graph_context(["a.el", "fixture.el"], ("fixture.el",))
         result = adapters._run_module_graph(context)
-        expected_edge = edge("a.el", "fixture.el", 11, "require")
-        self.assert_elisp_outcomes(result.measurement, [expected_edge], [
-            {"file": "a.el", "line": line, "message": f"{problem} is outside the extractor"}
-            for line, problem in (
-                (5, "shared require feature"),
-                (6, "shared require filename"),
-                (7, "shared require feature"),
-                (9, "shared require head"),
-            )
-        ])
-        self.assertEqual(result.outcome, "fail")
-        finding, = result.findings
-        self.assertIn("a.el -> fixture.el", finding.subject)
-        self.assertEqual(finding.location, "a.el:11")
-        self.assertEqual(finding.measurement, {"edge": expected_edge})
+        self.assert_reader_label_refused(result.measurement, "a.el", 2, [])
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.findings, [])
 
     def test_module_graph_elisp_compile_time_bare_list_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -270,7 +251,7 @@ reason = "package measured by the graph"
             "  (require 'b))\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 4, "require")])
+        self.assert_reader_label_refused(self.graph(0)["measurement"], "a.el", 2, [])
 
     def test_module_graph_elisp_compile_time_symbol_reader_label(self) -> None:
         self.configure_graph(elisp=True)
@@ -281,7 +262,7 @@ reason = "package measured by the graph"
             "  (require 'b))\n"
         ))
         self.add_file("b.el", "(provide 'b)\n")
-        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 4, "require")])
+        self.assert_reader_label_refused(self.graph(0)["measurement"], "a.el", 2, [])
 
     def test_module_graph_elisp_compile_time_character_literal(self) -> None:
         self.configure_graph(elisp=True)
@@ -369,10 +350,10 @@ reason = "package measured by the graph"
 
     def test_module_graph_elisp_feature_identity_survives_serialization(self) -> None:
         self.configure_graph(elisp=True)
-        provider = r"fixture\351.el"
-        self.add_file("a.el", r"(require 'fixture\\351)" + "\n")
-        self.add_file(provider, r"(provide 'fixture\\351)" + "\n")
-        self.add_file("decoy.el", b"; -*- coding: raw-text -*-\n(provide 'fixture\xe9)\n")
+        provider = r"caf\351.el"
+        self.add_file("a.el", r"(require 'caf\\351)" + "\n")
+        self.add_file(provider, r"(provide 'caf\\351)" + "\n")
+        self.add_file("decoy.el", b"; -*- coding: raw-text -*-\n(provide 'caf\xe9)\n")
         context = self.graph_context(["a.el", provider, "decoy.el"], (provider,))
         result = adapters._run_module_graph(context)
         expected_edge = edge("a.el", provider, 1, "require")
@@ -467,17 +448,55 @@ reason = "package measured by the graph"
                 expected_edges, expected_outside,
             )
 
+    def assert_reader_label_refused(
+        self, measurement: dict[str, Any], source: str, line: int,
+        expected_edges: list[dict[str, Any]],
+    ) -> None:
+        outside = measurement.get("outside_extractor", [])
+        self.assertEqual(len(outside), 1, outside)
+        message = outside[0]["message"]
+        self.assertIn('Invalid read syntax: "#1="', message)
+        self.assertTrue(message.endswith("is outside the extractor"), message)
+        self.assert_elisp_outcomes(measurement, expected_edges, [
+            {"file": source, "line": line, "message": message},
+        ])
+
     def test_module_graph_elisp_reader_label(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "(defconst fixture '#1=(alpha beta))\n(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 2, "require")])
+        self.assert_reader_label_refused(self.graph(0)["measurement"], "a.el", 1, [])
 
     def test_module_graph_elisp_top_level_labelled_require(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", "\n#1=\n(require 'b)\n")
         self.add_file("b.el", "(provide 'b)\n")
-        self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 3, "require")])
+        self.assert_reader_label_refused(self.graph(0)["measurement"], "a.el", 2, [])
+
+    def test_module_graph_elisp_reader_label_in_char_table(self) -> None:
+        self.add_file("other.el", "(provide 'other)\n")
+        table = "#^[#1=alpha nil nil" + " nil" * 65 + "]"
+        self.assert_labelled_provider_refused(
+            f"(require 'other)\n(provide 'fixture)\n'{table}\n", 3, ("other.el",),
+        )
+
+    def assert_labelled_provider_refused(
+        self, decoy_source: str, label_line: int, other_files: tuple[str, ...] = (),
+    ) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(require 'fixture)\n")
+        self.add_file("fixture.el", "(provide 'fixture)\n")
+        self.add_file("decoy.el", decoy_source)
+        files = ["a.el", "fixture.el", "decoy.el", *other_files]
+        context = self.graph_context(files, ("fixture.el",))
+        result = adapters._run_module_graph(context)
+        expected_edge = edge("a.el", "fixture.el", 1, "require")
+        self.assert_reader_label_refused(result.measurement, "decoy.el", label_line, [expected_edge])
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        self.assertIn("a.el -> fixture.el", finding.subject)
+        self.assertEqual(finding.location, "a.el:1")
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
 
     def test_module_graph_elisp_dotted_literal_filename(self) -> None:
         self.configure_graph(elisp=True)
@@ -560,21 +579,7 @@ reason = "Python script measured by the graph"
         self.assert_elisp_outcomes(self.graph(0)["measurement"], [edge("a.el", "b.el", 1, "require")])
 
     def test_module_graph_elisp_shared_provide_head(self) -> None:
-        self.configure_graph(elisp=True)
-        self.add_file("a.el", "(require 'fixture)\n")
-        self.add_file("fixture.el", "(provide 'fixture)\n")
-        self.add_file("decoy.el", "(progn\n  [#1=provide]\n  (#1# 'fixture))\n")
-        context = self.graph_context(["a.el", "fixture.el", "decoy.el"], ("fixture.el",))
-        result = adapters._run_module_graph(context)
-        expected_edge = edge("a.el", "fixture.el", 1, "require")
-        self.assert_elisp_outcomes(result.measurement, [expected_edge], [
-            {"file": "decoy.el", "line": 2, "message": "shared provide head is outside the extractor"},
-        ])
-        self.assertEqual(result.outcome, "fail")
-        finding, = result.findings
-        self.assertIn("a.el -> fixture.el", finding.subject)
-        self.assertEqual(finding.location, "a.el:1")
-        self.assertEqual(finding.measurement, {"edge": expected_edge})
+        self.assert_labelled_provider_refused("(progn\n  [#1=provide]\n  (#1# 'fixture))\n", 2)
 
     def test_module_graph_elisp_uninterned_provider_does_not_hide_edge(self) -> None:
         self.configure_graph(elisp=True)
