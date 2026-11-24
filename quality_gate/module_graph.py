@@ -96,8 +96,8 @@ def _import_edges(root: Path, modules: list[str]) -> set[Edge]:
 
 def _literal_target(root: Path, filename: str, paths: dict[str, str]) -> str | None:
     name = normpath(root / filename)
-    if name in paths or Path(filename).suffix:
-        return paths.get(name)
+    if name in paths:
+        return paths[name]
     return paths.get(f"{name}.el")
 
 

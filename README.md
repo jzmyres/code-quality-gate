@@ -326,9 +326,10 @@ Files with a Python shebang are read as Python even when their names end in `.el
 
 The batch Emacs reader extracts `(require 'FEATURE)` at the top level or directly inside a top-level
 `eval-when-compile`. The edge starts at the require form's opening line and targets the
-unique measured file with a top-level `(provide 'FEATURE)`. A literal filename in
-`(require 'FEATURE "FILE")` selects only the measured path it names, with `.el` tried when
-the filename has no suffix. Relative filenames are matched from the repository root.
+unique measured file with a literal `(provide 'FEATURE)` at the top level or directly
+inside a top-level `progn`. A literal filename in `(require 'FEATURE "FILE")` matches
+the exact measured path first, then the same path with `.el` appended, even for a dotted
+basename. Relative filenames are matched from the repository root.
 A computed feature or filename is reported in `outside_extractor` with its file and line
 and gives no edge. Requires nested elsewhere, including in functions or quasiquote unquotes,
 give no edge. `load` and `load-file` also give no edge. An Emacs launch or reader failure, or a

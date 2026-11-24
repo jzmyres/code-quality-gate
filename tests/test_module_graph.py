@@ -184,6 +184,26 @@ reason = "package measured by the graph"
         self.add_file("c.el", "(provide 'c)\n")
         self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "c.el", 1, "require")])
 
+    def test_module_graph_elisp_reader_label(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(defconst fixture '#1=(alpha beta))\n(require 'b)\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+
+    def test_module_graph_elisp_dotted_literal_filename(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", '(require \'dotted-fixture "odd.name")\n')
+        self.add_file("odd.name.el", "")
+        self.add_file("other.el", "(provide 'dotted-fixture)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "odd.name.el", 1, "require")])
+
+    def test_module_graph_elisp_top_level_progn_provider(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(require 'b)\n")
+        self.add_file("b.el", "(progn (provide 'b) (require 'c))\n")
+        self.add_file("c.el", "(provide 'c)\n(progn (progn (provide 'b)))\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 1, "require")])
+
     def test_module_graph_elisp_computed_operands(self) -> None:
         self.configure_graph(elisp=True)
         self.add_file("a.el", '(require (intern "b"))\n(require \'b (concat "b" ".el"))\n')

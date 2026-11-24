@@ -53,18 +53,27 @@ MODULE_GRAPH_READER = r"""
                 (push row rows)))))
         (nreverse rows))))
 
+  (defun qg-graph-provide (form)
+    (when (and (eq (car-safe form) 'provide)
+               (proper-list-p form)
+               (qg-graph-quoted-symbol-p (cadr form)))
+      (list (cons 'kind "provide") (cons 'feature (symbol-name (cadadr form))))))
+
   (defun qg-graph-top-level (form start line)
     (when (eq (char-after start) ?\()
       (pcase (car-safe form)
         ('provide
-         (when (and (proper-list-p form) (qg-graph-quoted-symbol-p (cadr form)))
-           (list (list (cons 'kind "provide") (cons 'feature (symbol-name (cadadr form)))))))
+         (let ((row (qg-graph-provide form)))
+           (when row (list row))))
+        ('progn
+         (when (proper-list-p form)
+           (delq nil (mapcar #'qg-graph-provide (cdr form)))))
         ('require (qg-graph-require form line))
         ('eval-when-compile (qg-graph-compile-requires start (point))))))
 
   (defun qg-graph-file (path)
     (with-temp-buffer
-      (let ((line 1) (read-circle nil) rows)
+      (let ((line 1) rows)
         (condition-case failure
             (progn
               (insert-file-contents path)
