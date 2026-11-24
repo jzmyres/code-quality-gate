@@ -1,26 +1,37 @@
 from __future__ import annotations
 
 import tomllib
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase
 
 from quality_gate import adapters, module_graph, policy
 
 
-def edge(source: str, target: str, line: int) -> dict[str, str | int]:
-    return {"source": source, "target": target, "line": line}
+def edge(source: str, target: str, line: int, kind: str = "import") -> dict[str, str | int]:
+    return {"source": source, "target": target, "line": line, "kind": kind}
 
 
 class ModuleGraphTests(FixtureCase):
-    def configure_graph(self, suites: str = "") -> None:
-        self.write_config(BASE_CONFIG + """
+    def configure_graph(self, options: str = "", *, elisp: bool = False) -> None:
+        config = BASE_CONFIG + """
 [checks.module-graph]
 adapter = "module_graph"
 tier = 1
 enforcement = "enforced"
 classes = ["python"]
-""" + suites)
+""" + options
+        if elisp:
+            config += """
+[[rule]]
+pattern = "*.el"
+class = "python"
+reason = "Elisp measured by the graph"
+"""
+        self.write_config(config)
 
     def graph(self, exit_code: int) -> dict[str, Any]:
         result, document = self.run_json("--only", "module-graph")
@@ -154,6 +165,129 @@ reason = "package measured by the graph"
             "threshold": 0,
         })
 
+    def test_module_graph_elisp_top_level_require(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "\n(require 'b)\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+
+    def test_module_graph_elisp_compile_time_require(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(eval-when-compile\n  (\n   require 'b))\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 2, "require")])
+
+    def test_module_graph_elisp_literal_filename(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", '(require \'b "c")\n')
+        self.add_file("b.el", "(provide 'b)\n")
+        self.add_file("c.el", "(provide 'c)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "c.el", 1, "require")])
+
+    def test_module_graph_elisp_computed_operands(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", '(require (intern "b"))\n(require \'b (concat "b" ".el"))\n')
+        self.add_file("b.el", "(provide 'b)\n")
+        measurement = self.graph(0)["measurement"]
+        self.assertEqual(measurement["edges"], [])
+        self.assertEqual(measurement.get("outside_extractor"), [
+            {"file": "a.el", "line": 1, "message": "computed require feature is outside the extractor"},
+            {"file": "a.el", "line": 2, "message": "computed require filename is outside the extractor"},
+        ])
+
+    def test_module_graph_elisp_ignores_nested_requires_and_loads(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", (
+            "(defun later () (require 'b))\n"
+            "`(outer ,(require 'b))\n"
+            "(eval-when-compile (progn (require 'b)))\n"
+            '(load "b")\n'
+            '(load-file "b.el")\n'
+            "(require 'b)\n"
+        ))
+        self.add_file("b.el", "(provide 'b)\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [edge("a.el", "b.el", 6, "require")])
+
+    def test_module_graph_python_shebang_precedes_elisp_suffix(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("caller.el", "#!/usr/bin/env python3\nimport dep\n")
+        self.add_file("dep.py", "")
+        self.add_file("reader.el", "(require 'b)\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        python_edge, *require_edges = self.graph(0)["measurement"]["edges"]
+        self.assertEqual(
+            (python_edge["source"], python_edge["target"], python_edge["line"]),
+            ("caller.el", "dep.py", 2),
+        )
+        self.assertEqual(require_edges, [edge("reader.el", "b.el", 1, "require")])
+        self.assertEqual(python_edge["kind"], "import")
+
+    def graph_context(self, files: list[str], programs: tuple[str, ...] = ()) -> adapters.AdapterContext:
+        config = policy.load_config(self.repo)
+        check = config.checks["module-graph"]
+        if programs:
+            spec = SimpleNamespace(classes=check.spec.classes, suites=check.spec.suites, programs=programs)
+            check = replace(check, spec=spec)
+        classes = dict.fromkeys(files, "python")
+        return adapters.AdapterContext(self.repo, config, check, files, classes, "check", {}, self.base)
+
+    def test_module_graph_program_dependency(self) -> None:
+        self.configure_graph()
+        self.add_file("library.py", "import guarded\nimport program_cli\n")
+        self.add_file("guarded.py", 'if __name__ == "__main__":\n    pass\n')
+        self.add_file("program_cli.py", "")
+        self.add_file("test_library.py", "import program_cli\n")
+        files = ["library.py", "guarded.py", "program_cli.py", "test_library.py"]
+        context = self.graph_context(files, ("program_*.py",))
+        result = adapters._run_module_graph(context)
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        self.assertIn("library.py -> program_cli.py", finding.subject)
+        self.assertEqual(finding.location, "library.py:2")
+        self.assertEqual(finding.measurement, {"edge": edge("library.py", "program_cli.py", 2)})
+
+        self.add_file("library.py", "import guarded\n")
+        result = adapters._run_module_graph(context)
+        self.assertEqual(result.outcome, "pass")
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.measurement["edges"], [
+            edge("library.py", "guarded.py", 1), edge("test_library.py", "program_cli.py", 1),
+        ])
+
+    def test_module_graph_programs_policy(self) -> None:
+        self.configure_graph('programs = ["tools/*.py", "cli.py"]\n')
+        spec = policy.load_config(self.repo).checks["module-graph"].spec
+        self.assertEqual(spec.programs, ("tools/*.py", "cli.py"))
+        self.configure_graph('programs = ["cli.py", 1]\n')
+        with self.assertRaisesRegex(policy.ConfigError, r"checks\.module-graph\.programs.*expected"):
+            policy.load_config(self.repo)
+
+    def test_module_graph_duplicate_require_to_program(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(require 'b) (require 'b)\n")
+        self.add_file("b.el", "(provide 'b)\n")
+        context = self.graph_context(["a.el", "b.el"], ("b.el",))
+        result = adapters._run_module_graph(context)
+        self.assertEqual(result.outcome, "fail")
+        finding, = result.findings
+        expected_edge = edge("a.el", "b.el", 1, "require")
+        self.assertEqual(result.measurement["edges"], [expected_edge])
+        self.assertEqual(result.measurement["value"], 1)
+        self.assertEqual(finding.measurement, {"edge": expected_edge})
+        self.assertEqual(finding.location, "a.el:1")
+
+    def test_module_graph_elisp_launch_failure(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("a.el", "(provide 'a)\n")
+        context = self.graph_context(["a.el"])
+        with mock.patch("quality_gate.runner.subprocess.Popen",
+                        side_effect=FileNotFoundError("fixture cannot start Emacs")):
+            result = adapters._run_module_graph(context)
+        self.assertEqual(result.outcome, "error")
+        self.assertEqual(result.diagnostics.error, (
+            "cannot read Emacs Lisp module graph for a.el: cannot run command: fixture cannot start Emacs"
+        ))
+
     def test_module_graph_empty_scope(self) -> None:
         self.configure_graph()
         config = policy.load_config(self.repo)
@@ -161,9 +295,10 @@ reason = "package measured by the graph"
         context = adapters.AdapterContext(self.repo, config, check, [], {}, "check", {}, self.base)
         result = adapters._run_module_graph(context)
         self.assertEqual(result.outcome, "pass")
-        measurement, cycles, suite_edges = module_graph.measure(self.repo, [], check.spec)
+        measurement, cycles, suite_edges, program_edges = module_graph.measure(self.repo, [], check.spec)
         self.assertEqual(result.measurement, measurement)
         self.assertEqual((measurement["modules"], cycles, suite_edges), ([], [], []))
+        self.assertEqual(program_edges, [])
 
     def test_module_graph_classes_list_is_required(self) -> None:
         key = "checks.module-graph"
@@ -185,11 +320,12 @@ reason = "package measured by the graph"
             for directory in ("quality_gate", "tests")
             for path in (GATE / directory).glob("*.py")
         ]
-        measurement, cycles, suite_edges = module_graph.measure(GATE, modules, spec)
+        measurement, cycles, suite_edges, program_edges = module_graph.measure(GATE, modules, spec)
         (component, _), = cycles
         self.assertEqual(len(component), 23)
         self.assertTrue(all(path.startswith("quality_gate/") for path in component))
         self.assertEqual(len(suite_edges), 16)
+        self.assertEqual(program_edges, [])
         self.assertIn(
             module_graph.Edge("tests/test_adapters.py", "tests/test_python_tests.py", 17),
             suite_edges,

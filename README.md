@@ -318,29 +318,57 @@ Use a docstring for usage and the README or commit message for rationale and
 history. See the [policy schema](docs/SCHEMA.md#source-comments-policy) for the
 check configuration and result.
 
-### Python module graph
+### Module graph
 
-The `module_graph` adapter reads Python files in the named inventory classes. It reports one
-finding per strongly connected component with at least two modules and shows a shortest cycle
-with its import lines. It also reports each import from one test suite into another. Suite
-patterns match repository-relative paths, so suites can share support modules outside those
-patterns. Imports anywhere in a file count, including function bodies and `TYPE_CHECKING`
-blocks. A syntax error produces a check error with the file and parser diagnostic.
+The `module_graph` adapter measures Python and Emacs Lisp files in the named inventory classes.
+Python imports anywhere in a file count, including function bodies and `TYPE_CHECKING` blocks.
+Files with a Python shebang are read as Python even when their names end in `.el`.
 
-For a repository with `python` and `test` inventory classes, add this check and list
-`module-graph` in both classes' `checks` arrays.
+The batch Emacs reader extracts `(require 'FEATURE)` at the top level or directly inside a top-level
+`eval-when-compile`. The edge starts at the require form's opening line and targets the
+unique measured file with a top-level `(provide 'FEATURE)`. A literal filename in
+`(require 'FEATURE "FILE")` selects only the measured path it names, with `.el` tried when
+the filename has no suffix. Relative filenames are matched from the repository root.
+A computed feature or filename is reported in `outside_extractor` with its file and line
+and gives no edge. Requires nested elsewhere, including in functions or quasiquote unquotes,
+give no edge. `load` and `load-file` also give no edge. An Emacs launch or reader failure, or a
+Python syntax error, produces a check error that names the affected file.
+
+The graph reports one finding per strongly connected component with at least two modules
+and shows a shortest cycle with its edge locations. It also reports dependencies between
+distinct test suites. Suite patterns match repository-relative paths, so suites can share
+support modules outside those patterns.
+
+Rule 3 reports each dependency from a non-program module to a policy-declared program.
+Each finding names both modules and gives the source file and line of the edge.
+The optional `programs` list uses the same repository-relative path matching as `suites`.
+Only matching modules are programs. Test files are exempt as sources for this rule.
+
+For a repository with `python`, `test`, and `elisp` inventory classes, add this check and list
+`module-graph` in those classes' `checks` arrays.
 
 ```toml
 [checks.module-graph]
 adapter = "module_graph"
 tier = 1
 enforcement = "enforced"
-classes = ["python", "test"]
+classes = ["python", "test", "elisp"]
 suites = ["tests/test_*.py"]
+programs = ["tools/*.py"]
+```
+
+Run the configured check with
+
+```sh
+python3 -I qg.py check --only module-graph
 ```
 
 The check allows zero findings, so any finding fails the gate under this policy.
-The JSON result includes the sorted modules and import edges, plus fan-in and fan-out for each module.
+The JSON result includes the sorted modules and edges, each edge's kind (`import` or `require`),
+and fan-in and fan-out for each module.
+
+Follow-ups cover path-based loads (`GATE-MODULE-GRAPH-PATHLOAD`), subprocess dependencies
+(`GATE-MODULE-GRAPH-SUBPROCESS`), and Shell dependency extraction (`GATE-MODULE-GRAPH-SHELL`).
 
 ### Source-character checks
 

@@ -7,18 +7,21 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable
 
 from . import (
-    clones, command, comments, elisp_crap, elisp_lint, elisp_tests, env_surface,
+    clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
     module_graph, python_crap, python_mutation,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import DiffBaseOverride
+from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -31,6 +34,7 @@ from .policy import (
     _string,
     _string_list,
 )
+from .runner import execution_outcome, mark_step, run
 
 
 def _default_budget(_spec: Any) -> int:
@@ -155,7 +159,9 @@ def _module_graph_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -
     if not classes:
         raise _config_error(path, f"{key}.classes", "at least one inventory class", "an empty list")
     suites = _optional_string_list(raw, "suites", path, f"{key}.suites")
-    return ParsedSpec(module_graph.GraphSpec(classes, suites), "module-graph/1", ("static",), threshold=0)
+    programs = _optional_string_list(raw, "programs", path, f"{key}.programs")
+    spec = module_graph.GraphSpec(classes, suites, programs)
+    return ParsedSpec(spec, "module-graph/1", ("static",), threshold=0)
 
 
 def _graph_finding(subject: str, edges: tuple[module_graph.Edge, ...], **measurement: Any) -> ratchet.Finding:
@@ -163,37 +169,86 @@ def _graph_finding(subject: str, edges: tuple[module_graph.Edge, ...], **measure
     return ratchet.Finding(subject, 1, ", ".join(map(str, locations)), measurement, locations)
 
 
+def _graph_cycle_finding(component: list[str], cycle: tuple[module_graph.Edge, ...]) -> ratchet.Finding:
+    route = " -> ".join([*(edge.source for edge in cycle), cycle[0].source])
+    kinds = {edge.kind for edge in cycle}
+    kind = cycle[0].kind if len(kinds) == 1 else "dependency"
+    return _graph_finding(
+        f"Cyclic {kind} ({route}), component [{', '.join(component)}]", cycle,
+        component=component, cycle=[edge.to_json() for edge in cycle],
+    )
+
+
 def _graph_findings(
-    cycles: list[module_graph.Cycle], suite_edges: list[module_graph.Edge]
+    cycles: list[module_graph.Cycle], suite_edges: list[module_graph.Edge],
+    program_edges: list[module_graph.Edge],
 ) -> list[ratchet.Finding]:
-    findings = []
-    for component, cycle in cycles:
-        route = " -> ".join([*(edge.source for edge in cycle), cycle[0].source])
-        findings.append(_graph_finding(
-            f"Cyclic import ({route}), component [{', '.join(component)}]", cycle,
-            component=component, cycle=[edge.to_json() for edge in cycle],
-        ))
+    findings = [_graph_cycle_finding(component, cycle) for component, cycle in cycles]
     findings.extend(
         _graph_finding(
-            f"Suite import ({edge.source} -> {edge.target}) at line {edge.line}",
+            f"Suite {edge.kind} ({edge.source} -> {edge.target}) at line {edge.line}",
             (edge,), edge=edge.to_json(),
         )
         for edge in suite_edges
     )
+    findings.extend(
+        _graph_finding(
+            f"Dependency on program ({edge.source} -> {edge.target}) at line {edge.line}",
+            (edge,), edge=edge.to_json(),
+        )
+        for edge in program_edges
+    )
     return findings
 
 
-def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> list[str]:
+def _graph_modules(context: AdapterContext, spec: module_graph.GraphSpec) -> tuple[list[str], list[str]]:
     unknown = sorted(set(spec.classes) - context.config.classes.keys())
     if unknown:
         key = f"checks.{context.check.id}.classes"
         known = ", ".join(sorted(context.config.classes))
         raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
-    return sorted(
-        path for path in context.files
-        if context.classes.get(path) in spec.classes
-        and verification._is_python_program(context.root, path)
-    )
+    python_modules, elisp_modules = [], []
+    for path in sorted(context.files):
+        if context.classes.get(path) not in spec.classes:
+            continue
+        if verification._is_python_program(context.root, path):
+            python_modules.append(path)
+        elif path.endswith(".el"):
+            elisp_modules.append(path)
+    return python_modules, elisp_modules
+
+
+def _graph_elisp_records(records: Any) -> list[dict]:
+    if isinstance(records, str):
+        raise ValueError(records)
+    if not isinstance(records, list):
+        raise ValueError("expected a list of Emacs reader records")
+    return records
+
+
+def _graph_elisp_report(report: Path, files: list[str]) -> dict[str, list[dict]]:
+    document = load_json(report.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.keys() != set(files):
+        raise ValueError("expected an Emacs reader report for each selected file")
+    return {path: _graph_elisp_records(document[path]) for path in files}
+
+
+def _read_graph_elisp(context: AdapterContext, files: list[str]) -> dict[str, list[dict]]:
+    try:
+        with TemporaryDirectory(prefix="qg-module-graph-", dir=context.evidence_dir) as directory:
+            manifest = Path(directory) / "files.json"
+            report = Path(directory) / "result.json"
+            manifest.write_text(json.dumps(files, ensure_ascii=False), encoding="utf-8")
+            mark_step("Emacs module graph")
+            command = elisp_batch.batch_command("emacs", None, elisp_batch.MODULE_GRAPH_READER)
+            child = run([*command, str(manifest), str(report)], cwd=context.root,
+                        budget_seconds=_default_budget(context.check.spec))
+            if not execution_outcome(child.execution).completed or child.returncode != 0:
+                status = f"Emacs execution {child.execution}, exit code {child.returncode}"
+                raise ValueError(child.error or child.stderr_text.strip() or status)
+            return _graph_elisp_report(report, files)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read Emacs Lisp module graph for {', '.join(files)}: {error}") from error
 
 
 def _run_module_graph(context: AdapterContext) -> Any:
@@ -202,14 +257,21 @@ def _run_module_graph(context: AdapterContext) -> Any:
     start = time.monotonic()
     check = context.check
     try:
-        modules = _graph_modules(context, check.spec)
-        measurement, cycles, suite_edges = module_graph.measure(context.root, modules, check.spec)
+        python_modules, elisp_modules = _graph_modules(context, check.spec)
+        test_sources = frozenset(path for path in (*python_modules, *elisp_modules)
+                                 if python_shape._is_test_path(path))
+        elisp = _read_graph_elisp(context, elisp_modules) if elisp_modules else {}
+        measurement, cycles, suite_edges, program_edges = module_graph.measure(
+            context.root, python_modules, check.spec, elisp=elisp, test_sources=test_sources,
+        )
     except (GateError, ValueError) as error:
         return _ratchet_error(check, start, context.prefix, error)
-    findings = _graph_findings(cycles, suite_edges)
+    for row in measurement.get("outside_extractor", ()):
+        print(f"{context.prefix}: {row['file']}:{row['line']}: {row['message']}", file=sys.stderr)
+    findings = _graph_findings(cycles, suite_edges, program_edges)
     return _finish_ratchet(
         check, findings, [], context.prefix, start, ratchet.Domain.all(),
-        f"{len(modules)} Python modules measured", measurement=measurement,
+        f"{len(measurement['modules'])} modules measured", measurement=measurement,
     )
 
 
@@ -459,7 +521,7 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "module_graph",
-    ("classes", "suites"),
+    ("classes", "suites", "programs"),
     _module_graph_spec,
     _run_module_graph,
     location_coverage="complete",
