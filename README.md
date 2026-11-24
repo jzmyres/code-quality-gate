@@ -324,6 +324,19 @@ The `module_graph` adapter measures Python and Emacs Lisp files in the named inv
 Python imports anywhere in a file count, including function bodies and `TYPE_CHECKING` blocks.
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
+Python calls to `runpy.run_path` and `importlib.util.spec_from_file_location` add
+`path-load` edges when the compiler's symbol tables and a unique, unconditional
+module-level import identify the loader. Import aliases are supported. The path must
+be a string literal passed positionally or as `path_name=` or `location=`, respectively.
+Relative paths are resolved from the calling file's directory and must identify a
+measured Python file.
+
+Recognized loader call spellings with unprovable bindings, including shadowed names,
+rebindings, and conditional, star, or relative imports, are reported as unresolved.
+Computed paths, unpacked arguments, and paths outside the measured Python files are also
+unresolved. Each unresolved call produces an `outside_extractor` entry with its file,
+line, and reason.
+
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
 cleanly. The extractor reads each top-level form once in sequence and
@@ -384,11 +397,11 @@ python3 -I qg.py check --only module-graph
 ```
 
 The check allows zero findings, so any finding fails the gate under this policy.
-The JSON result includes the sorted modules and edges, each edge's kind (`import` or `require`),
+The JSON result includes the sorted modules and edges, each edge's kind (`import`, `path-load`, or `require`),
 and fan-in and fan-out for each module.
 
-Follow-ups cover path-based loads (`GATE-MODULE-GRAPH-PATHLOAD`), subprocess dependencies
-(`GATE-MODULE-GRAPH-SUBPROCESS`), and Shell dependency extraction (`GATE-MODULE-GRAPH-SHELL`).
+Follow-ups cover subprocess dependencies (`GATE-MODULE-GRAPH-SUBPROCESS`) and
+Shell dependency extraction (`GATE-MODULE-GRAPH-SHELL`).
 
 ### Source-character checks
 
