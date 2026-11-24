@@ -241,7 +241,6 @@ reason = "package measured by the graph"
             "dotted_alias": (
                 "import importlib.util as ilu\nilu.spec_from_file_location('n', 'target.py')", 2, "canonical",
             ),
-            "from_import": ("from runpy import run_path\nrun_path('target.py')", 2, "canonical"),
             "parent_only": (
                 "import importlib\nimportlib.util.spec_from_file_location('n', 'target.py')",
                 2, "top-level import importlib.util",
@@ -277,17 +276,8 @@ reason = "package measured by the graph"
                 "import importlib.util\nimportlib.util.spec_from_file_location(location='qg.py')",
                 2, "argument",
             ),
-            "from_spec_without_name": (
-                "from importlib.util import spec_from_file_location\n"
-                "spec_from_file_location(location='target.py')",
-                2, "canonical",
-            ),
             "destructured": (
                 "import runpy\nload, = (runpy.run_path,)\nload('target.py')", 2, "not called directly",
-            ),
-            "chained": (
-                "from runpy import run_path\nrp = run_path\na = rp; b = a\nb('target.py')",
-                2, "not called directly",
             ),
             "chained_assignment": (
                 "import runpy\nload = other = runpy.run_path\nload('target.py')", 2, "not called directly",
@@ -311,10 +301,68 @@ reason = "package measured by the graph"
                 self.assertEqual(measurement["edges"], [])
                 self.assert_unresolved_path_loads(measurement, (line,), reason)
 
+    def test_module_graph_reports_loader_imports(self) -> None:
+        self.configure_graph()
+        self.add_file("qg.py", "")
+        context = self.graph_context(["caller.py", "qg.py"])
+        fixtures = {
+            "class_body": (
+                "from runpy import run_path as __module__\nclass C:\n __module__('qg.py')\n",
+                ((1, "run_path: a from import"),),
+            ),
+            "destructured": (
+                "from runpy import run_path as rp\na, = (rp,)\na('qg.py')\n",
+                ((1, "run_path: a from import"),),
+            ),
+            "chained_alias": (
+                "from runpy import run_path as rp\na = rp; b = a\nb('qg.py')\n",
+                ((1, "run_path: a from import"),),
+            ),
+            "direct_call": (
+                "from runpy import run_path\nrun_path('qg.py')\n",
+                ((1, "run_path: a from import"), (2, "canonical")),
+            ),
+            "spec_without_name": (
+                "from importlib.util import spec_from_file_location\n"
+                "spec_from_file_location(location='qg.py')\n",
+                ((1, "spec_from_file_location: a from import"), (2, "canonical")),
+            ),
+            "spelled_assignment": (
+                "from runpy import run_path\nrp = run_path\na = rp; b = a\nb('qg.py')\n",
+                ((1, "run_path: a from import"), (2, "not called directly")),
+            ),
+            "multiple_imports": (
+                "from other import run_path as rp, spec_from_file_location, something as run_path\n",
+                ((1, "run_path: a from import"), (1, "spec_from_file_location: a from import")),
+            ),
+        }
+        for name, (source, expected) in fixtures.items():
+            with self.subTest(name=name):
+                self.add_file("caller.py", source)
+                measurement = adapters._run_module_graph(context).measurement
+                self.assertEqual(measurement["edges"], [])
+                lines = tuple(line for line, _ in expected)
+                self.assert_unresolved_path_loads(measurement, lines, "unresolved path load")
+                for row, (_, reason) in zip(measurement["outside_extractor"], expected, strict=True):
+                    self.assertIn(reason, row["message"])
+
+    def test_module_graph_reports_postponed_parameter_annotation(self) -> None:
+        self.configure_graph()
+        self.add_file("qg.py", "")
+        self.add_file("caller.py", (
+            "from __future__ import annotations\n"
+            "import runpy\n"
+            "value: runpy.run_path('qg.py')\n"
+            "def f(x: runpy.run_path('qg.py')): pass\n"
+        ))
+        measurement = adapters._run_module_graph(self.graph_context(["caller.py", "qg.py"])).measurement
+        self.assertEqual(measurement["edges"], [])
+        self.assert_unresolved_path_loads(measurement, (3, 4), "annotation")
+
     def test_module_graph_reports_loader_references_in_annotations(self) -> None:
         self.configure_graph()
         fixtures = {
-            "postponed": (
+            "postponed_return": (
                 "from __future__ import annotations\n"
                 "import runpy\n"
                 "value: runpy.run_path('qg.py')\n"
@@ -422,6 +470,14 @@ reason = "package measured by the graph"
         self.assertEqual(check["measurement"]["edges"], [expected, expected])
         finding, = check["findings"]
         self.assertEqual(finding["measurement"], {"edge": expected})
+
+    def test_module_graph_python_path_load_reaches_elisp_module(self) -> None:
+        self.configure_graph(elisp=True)
+        self.add_file("caller.py", "import runpy\nrunpy.run_path('target.el')\n")
+        self.add_file("target.el", "")
+        measurement = self.graph(0)["measurement"]
+        self.assertEqual(measurement["edges"], [edge("caller.py", "target.el", 2, "path-load")])
+        self.assertNotIn("outside_extractor", measurement)
 
     def test_module_graph_syntax_error(self) -> None:
         self.configure_graph()

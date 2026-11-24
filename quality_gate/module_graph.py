@@ -219,7 +219,7 @@ def _resolve_path_load(
         return None, "the path argument must be an unambiguous string literal"
     module = _measured_path(root, source, paths, value.value)
     if module is None:
-        return None, f"path {value.value!r} does not resolve to a measured Python file"
+        return None, f"path {value.value!r} does not resolve to a measured module"
     return module, None
 
 
@@ -319,6 +319,18 @@ def _parse_source(root: Path, source: str) -> tuple[ast.Module, symtable.SymbolT
     return tree, table
 
 
+def _from_loader_diagnostics(source: str, imports: list[ast.Import | ast.ImportFrom]) -> Iterator[dict]:
+    return (
+        {
+            "file": source,
+            "line": node.lineno,
+            "message": f"unresolved path load {alias.name}: a from import does not bind the loader module",
+        }
+        for node in imports if isinstance(node, ast.ImportFrom)
+        for alias in node.names if alias.name in _LOADER_NAMES
+    )
+
+
 def _source_edges(
     root: Path, source: str, paths: dict[str, str], literal_paths: dict[str, str],
     shadow_modules: dict[str, str], outside: list[dict],
@@ -332,17 +344,19 @@ def _source_edges(
         for origin in _import_origins(root, source, node, paths)
         if origin in paths
     }
+    outside.extend(_from_loader_diagnostics(source, imports))
     binding_refusals = _loader_binding_refusals(table, nodes, imports)
     yield from _path_loads(root, source, literal_paths, tree, binding_refusals, shadow_modules, outside)
 
 
 def _python_edges(
-    root: Path, modules: list[str], shadow_modules: dict[str, str], outside: list[dict],
+    root: Path, python_modules: list[str], modules: list[str], outside: list[dict],
 ) -> Iterator[Edge]:
-    paths = {str(root / module): module for module in modules}
+    paths = {str(root / module): module for module in python_modules}
     resolved_root = root.resolve()
     literal_paths = {str(resolved_root / module): module for module in modules}
-    for module in sorted(modules):
+    shadow_modules = _measured_loader_shadows(modules)
+    for module in sorted(python_modules):
         yield from _source_edges(root, module, paths, literal_paths, shadow_modules, outside)
 
 
@@ -483,8 +497,7 @@ def measure(
         {"file": source, "line": row["line"], "message": row["message"]}
         for source, row in _elisp_records(elisp, "outside")
     ]
-    shadows = _measured_loader_shadows(modules)
-    edges = sorted([*_python_edges(root, python_modules, shadows, outside), *require_edges])
+    edges = sorted([*_python_edges(root, python_modules, modules, outside), *require_edges])
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [
         (component, _shortest_cycle(component, outgoing))

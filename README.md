@@ -335,17 +335,18 @@ The exact import must appear directly in the module body before the call's enclo
 top-level statement. The whole file must have a single binding for the loader's head
 name. A star import or a repository module or package that provides the head name also
 makes the loader unresolved. Arguments must match the loader's signature and use no
-unpacking. Relative paths are resolved from the calling file's directory and must
-identify a measured Python file.
+unpacking. Relative paths are resolved from the calling Python file's directory and
+can identify a measured module in any language.
 
 Every other name or attribute reference ending in `run_path` or
 `spec_from_file_location` produces one unresolved diagnostic in `outside_extractor`,
-with the file, the line where the loader is spelled, and the reason. This includes
-references in variable, parameter, and return annotations, type aliases, and type
-parameter bounds and defaults, regardless of when Python evaluates them. When code
-assigns or destructures a loader into an alias, the diagnostic points to the original
-loader spelling. Later references using only the alias and dynamic namespace writes
-are outside the static analysis.
+with the file, the line where the loader is spelled, and the reason. Each
+`from ... import` of either name also produces one diagnostic at the import statement,
+with or without an alias. References in variable, parameter, and return annotations,
+type aliases, and type parameter bounds and defaults are always unresolved. When
+code assigns or destructures a loader into an alias, the diagnostic points to the
+original loader spelling. Later references using only the alias and dynamic namespace
+writes are outside the static analysis.
 
 The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
 file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
