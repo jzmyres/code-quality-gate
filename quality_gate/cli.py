@@ -132,8 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     tool_commands = tools.add_subparsers(
         dest="tools_command", required=True, parser_class=_Parser
     )
-    fetch = tool_commands.add_parser("fetch", help="download and verify pinned tools")
+    fetch = tool_commands.add_parser("fetch", help="install or verify pinned tools")
     fetch.add_argument("--lock", metavar="FILE", help="tool lock file")
+    fetch.add_argument(
+        "--check", action="store_true", help="verify installed tools offline"
+    )
     path = tool_commands.add_parser("path", help="print a pinned tool's binary")
     path.add_argument("name", metavar="NAME")
     check = commands.add_parser("check", help="run every configured check")
@@ -250,7 +253,7 @@ def _run_tools(args: Any) -> int:
         else _default_lock_path()
     )
     if args.tools_command == "fetch":
-        return command_tools_fetch(lock)
+        return command_tools_fetch(lock, check=args.check)
     return command_tools_path(lock, args.name)
 
 

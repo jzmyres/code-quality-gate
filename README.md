@@ -1137,18 +1137,27 @@ entries and `--prune` follow the same ratchet rules as Python CRAP.
 
     python3 -I qg.py tools fetch
     python3 -I qg.py tools fetch --lock /path/to/tools.lock.toml
+    python3 -BI qg.py tools fetch --check
     python3 -I qg.py tools path ruff
 
 `tools fetch` reads the gate's `tools.lock.toml` (or `--lock FILE`) and installs every pinned tool under
 `QG_TOOLS_DIR`, which defaults to `~/.local/share/code-quality-gate/tools`, as `NAME-VERSION/`. It
 downloads with `urllib`, verifies the archive SHA-256, extracts into a temporary directory inside the
-tools directory, and computes the install tree's payload digest before moving it into place. It refuses
+tools directory, and computes the pinned format's payload digest before moving it into place. It refuses
 an archive hash or payload digest mismatch, or an unsafe archive member (absolute path, `..`, link, or
 non-regular file), without installing anything. Tool names and versions must match
 `[A-Za-z0-9][A-Za-z0-9._+-]*`, the install destination must resolve inside the tools directory, and a
 lock table accepts only `version`, `url`, `sha256`, `payload_sha256`, `binary` and `format`;
 other keys are configuration errors and a missing `payload_sha256` is a lock error. An existing install
 is kept only when its payload digest matches the lock; otherwise `tools fetch` replaces it.
+
+`python3 -BI qg.py tools fetch --check` verifies every installed payload against the lock offline.
+It accepts the same `--lock FILE` option and checks that each install directory resolves inside
+the tools cache before hashing its payload. It reads the lock and existing installs without
+downloading archives, writing files, changing modes, or running tools. Python's `-B` flag
+prevents bytecode cache writes in the gate checkout. It exits 0 if all installs match, 1 for a
+missing, unsafe, unreadable, or changed install, and 2 for a missing, unreadable, or invalid lock.
+Failures identify the affected tool and install path or the lock file.
 
 Once a payload matches its pinned digest, `tools fetch` removes every write bit from every directory and
 file in the tree and installs it read-only, and a matching existing install is made read-only the same
@@ -1179,10 +1188,15 @@ An archive without `format` is a tar archive. `format = "wheel"` marks a Python 
 it is extracted with `zipfile` under the same safety rules. The wheel's install directory is what the
 Python adapters put on `sys.path`; for coverage that is `coverage-7.16.2/`, and its `binary` entry
 `coverage/__init__.py` is looked up inside the verified tree.
-`format = "deb"` marks a Debian package: the standard library reads the `ar` container, extracts its
-single `data.tar.*` member and unpacks that with the same tar safety rules. A debian package's payload
-digest is the declared binary's content hash; the other formats digest the whole install tree. This
-format also supports locks in trusted historical revisions.
+`format = "conda"` marks a conda v2 artifact. The gate checks the archive SHA-256 before opening
+the ZIP. It requires a `metadata.json` marker with `conda_pkg_format_version` set to the integer 2,
+and matching `info-<stem>.tar.zst` and `pkg-<stem>.tar.zst` tarballs. The gate uses the host
+`libzstd.so.1` runtime to decompress both tarballs. It applies the tar safety rules to the payload
+and extracts it into the user-owned tools cache. It discards the info tarball and runs no installer
+or package scripts. The payload digest covers the full installed tree.
+`format = "deb"` marks a Debian package. The gate reads the `ar` container and unpacks its single
+`data.tar.*` member under the same tar safety rules. Both fetch and check use the declared binary's
+content hash as the payload digest for this format, including the current shfmt pin.
 
 `tools path NAME` prints the expected binary path, whether or not the tool is installed, so scripts can
 locate the cache. An unknown tool name exits 2.
@@ -1831,10 +1845,12 @@ tests use a fake jscpd in a temporary
 not installed. Command-check tests use the real command; the real ruff test runs only when the pinned
 ruff binary exists and proves enforcement: an unused import is rejected with F401, then the repaired
 fixture is accepted, including files whose names contain a space and begin with `-`. `tools fetch`
-tests use fixture tarballs and wheels with `file://` URLs, including wrong hashes, unknown keys, unsafe
-archive members, payload mismatches and destinations outside the tools directory, and prove that a
-tampered Ruff or coverage install is `unsupported` before it runs and that a full run leaves the coverage
-install unchanged. Contract tests cover result typing,
+tests build local tarballs, wheels, Debian packages, and conda archives and fetch them via `file://`
+URLs. They cover wrong hashes, unknown keys, unsafe archive members, payload mismatches, and
+destinations outside the tools directory. Offline check tests seed local installs and exercise
+the write-free CLI invocation from a fresh copy of the gate.
+Tool-use tests prove that a tampered Ruff or coverage install is `unsupported` before it runs
+and that a full run leaves the coverage install unchanged. Contract tests cover result typing,
 obligations and exemptions, diagnostics, baseline identity and domain rules, prune reporting and
 round-trips, the bounded runner's group kill and output cap, JSON usage errors, and the trust root's
 baseline, policy, protected-path, prune and identity rules.

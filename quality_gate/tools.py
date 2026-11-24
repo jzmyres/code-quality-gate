@@ -5,8 +5,11 @@ The lock validator and extraction dispatch share the archive format table.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import http.client
+import json
+import lzma
 import os
 import re
 import shutil
@@ -18,16 +21,18 @@ import tomllib
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from .payload import PayloadError, _content_sha256, payload_digest
 from .policy import GateError, UnsupportedError, UsageError, _describe, _string
 
 TOOLS_FETCH = "python3 -I qg.py tools fetch"
 TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
-ARCHIVE_FORMATS = ("tar", "wheel", "deb")
+ARCHIVE_FORMATS = ("tar", "wheel", "deb", "conda")
 LOCK_KEYS = (
     "version",
     "url",
@@ -296,7 +301,7 @@ def _verify_sha256(tool: Tool, archive: Path) -> None:
     actual = digest.hexdigest()
     if actual != tool.sha256:
         raise GateError(
-            f"tools: {tool.name} {tool.version}: sha256 mismatch: "
+            f"tools: {tool.name} {tool.version}: sha256 mismatch for {tool.url}: "
             f"expected {tool.sha256}, got {actual}; nothing installed"
         )
 
@@ -391,9 +396,11 @@ def _write_member(
         os.chmod(target, mode)
 
 
-def _extract_tar(archive_path: Path, destination: Path, tool: Tool) -> None:
+def _extract_tar(
+    archive_path: Path, destination: Path, tool: Tool, *, mode: str = "r:*"
+) -> None:
     try:
-        with tarfile.open(archive_path, "r:*") as archive:
+        with tarfile.open(archive_path, mode) as archive:
             members = archive.getmembers()
             records = []
             for member in members:
@@ -554,8 +561,134 @@ def _extract_deb(archive_path: Path, destination: Path, tool: Tool) -> None:
         path.unlink(missing_ok=True)
 
 
+class _ZstdBuffer(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("size", ctypes.c_size_t),
+        ("position", ctypes.c_size_t),
+    ]
+
+
+def _zstd_library() -> ctypes.CDLL:
+    library = ctypes.CDLL("libzstd.so.1")
+    buffer_pointer = ctypes.POINTER(_ZstdBuffer)
+    signatures = (
+        (library.ZSTD_createDStream, ctypes.c_void_p, []),
+        (library.ZSTD_freeDStream, ctypes.c_size_t, [ctypes.c_void_p]),
+        (
+            library.ZSTD_decompressStream,
+            ctypes.c_size_t,
+            [ctypes.c_void_p, buffer_pointer, buffer_pointer],
+        ),
+        (library.ZSTD_isError, ctypes.c_uint, [ctypes.c_size_t]),
+        (library.ZSTD_getErrorName, ctypes.c_char_p, [ctypes.c_size_t]),
+    )
+    for function, result, arguments in signatures:
+        function.restype = result
+        function.argtypes = arguments
+    return library
+
+
+def _zstd_chunk(
+    library: ctypes.CDLL, context: int, chunk: bytes, target: BinaryIO,
+    buffer: ctypes.Array,
+) -> int:
+    source = ctypes.create_string_buffer(chunk)
+    incoming = _ZstdBuffer(ctypes.addressof(source), len(chunk), 0)
+    outgoing = _ZstdBuffer(ctypes.addressof(buffer), len(buffer), 0)
+    while True:
+        outgoing.position = 0
+        remaining = library.ZSTD_decompressStream(
+            context, ctypes.byref(outgoing), ctypes.byref(incoming),
+        )
+        if library.ZSTD_isError(remaining):
+            raise ValueError(library.ZSTD_getErrorName(remaining).decode("ascii"))
+        target.write(buffer[:outgoing.position])
+        if incoming.position == incoming.size and (
+            remaining == 0 or outgoing.position < outgoing.size
+        ):
+            return remaining
+
+
+def _decompress_zstd(source: BinaryIO, target: BinaryIO) -> None:
+    library = _zstd_library()
+    context = library.ZSTD_createDStream()
+    if not context:
+        raise ValueError("cannot allocate a Zstandard decoder")
+    try:
+        buffer = ctypes.create_string_buffer(128 * 1024)
+        remaining = 1
+        for chunk in iter(lambda: source.read(128 * 1024), b""):
+            remaining = _zstd_chunk(library, context, chunk, target, buffer)
+        if remaining:
+            raise ValueError("incomplete Zstandard frame")
+    finally:
+        library.ZSTD_freeDStream(context)
+
+
+_CONDA_PAYLOAD = re.compile(r"pkg-([A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.zst)")
+
+
+def _conda_member_name(member: zipfile.ZipInfo) -> str:
+    if member.orig_filename != member.filename:
+        raise ValueError(f"invalid ZIP member name {member.orig_filename!r}")
+    if _member_kind(member, _WHEEL_MEMBER_KINDS) != _MEMBER_RULES["regular"]:
+        raise ValueError(f"ZIP member {member.filename!r} is not a regular file")
+    return member.filename
+
+
+def _conda_tar_members(archive: zipfile.ZipFile) -> tuple[str, str]:
+    names = sorted(_conda_member_name(member) for member in archive.infolist())
+    expected = "expected exactly metadata.json and matching info- and pkg-*.tar.zst members"
+    if len(names) != 3:
+        raise ValueError(expected)
+    info, marker, payload = names
+    match = _CONDA_PAYLOAD.fullmatch(payload)
+    if match is None or info != f"info-{match[1]}" or marker != "metadata.json":
+        raise ValueError(expected)
+    return info, payload
+
+
+def _validate_conda_metadata(archive: zipfile.ZipFile) -> None:
+    with archive.open("metadata.json") as stream:
+        metadata = json.load(stream)
+    version = metadata.get("conda_pkg_format_version") if isinstance(metadata, dict) else None
+    if type(version) is not int or version != 2:
+        raise ValueError("expected conda_pkg_format_version 2")
+
+
+@contextlib.contextmanager
+def _conda_tar(archive: zipfile.ZipFile, member: str, staging: Path) -> Iterator[Path]:
+    with archive.open(member) as source, tempfile.NamedTemporaryFile(
+        prefix=".qg-conda-", dir=staging
+    ) as tar:
+        _decompress_zstd(source, tar)
+        if tar.tell() % tarfile.BLOCKSIZE:
+            raise ValueError(f"{member}: truncated tar block")
+        tar.flush()
+        yield Path(tar.name)
+
+
+def _extract_conda(archive_path: Path, destination: Path, tool: Tool) -> None:
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            info, payload = _conda_tar_members(archive)
+            _validate_conda_metadata(archive)
+            with _conda_tar(archive, info, destination.parent) as path, tarfile.open(path, "r:") as tar:
+                tar.getmembers()
+            with _conda_tar(archive, payload, destination.parent) as path:
+                _extract_tar(path, destination, tool, mode="r:")
+    except (
+        zipfile.BadZipFile, tarfile.TarError, OSError, EOFError, ValueError, RuntimeError,
+        zlib.error, lzma.LZMAError,
+    ) as error:
+        raise GateError(
+            f"tools: {tool.name} {tool.version}: cannot extract conda archive: {error}"
+        ) from error
+
+
 _ARCHIVE_EXTRACTORS = dict(zip(
-    ARCHIVE_FORMATS, (_extract_tar, _extract_wheel, _extract_deb),
+    ARCHIVE_FORMATS, (_extract_tar, _extract_wheel, _extract_deb, _extract_conda),
     strict=True,
 ))
 
@@ -567,8 +700,8 @@ def _extract_archive(archive_path: Path, destination: Path, tool: Tool) -> None:
 
 def _install_target(tool: Tool, tools_root: Path) -> Path:
     destination = tools_root / f"{tool.name}-{tool.version}"
-    root = tools_root.resolve()
     try:
+        root = tools_root.resolve()
         resolved = destination.resolve()
     except (OSError, RuntimeError) as error:
         raise GateError(
@@ -703,24 +836,32 @@ def _fetch_tool(tool: Tool, tools_root: Path) -> None:
     print(f"tools: installed {tool.name} {tool.version} at {binary}")
 
 
-def command_tools_fetch(lock: Path) -> int:
-    try:
-        tools = load_tools(lock)
-    except UsageError as error:
-        print(error, file=sys.stderr)
-        return 2
-    tools_root = _tools_dir()
+def _create_tools_root(tools_root: Path) -> None:
     try:
         tools_root.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        print(f"tools: cannot create {tools_root}: {error}", file=sys.stderr)
-        return 1
-    for name in sorted(tools):
-        try:
-            _fetch_tool(tools[name], tools_root)
-        except GateError as error:
-            print(error, file=sys.stderr)
-            return error.exit_code
+        raise GateError(f"tools: cannot create {tools_root}: {error}") from error
+
+
+def _check_tool(tool: Tool, tools_root: Path) -> None:
+    directory = _install_target(tool, tools_root)
+    _verify_tool_payload(tool, directory)
+
+
+def command_tools_fetch(lock: Path, *, check: bool = False) -> int:
+    try:
+        tools = load_tools(lock)
+        tools_root = _tools_dir()
+        if not check:
+            _create_tools_root(tools_root)
+        for name in sorted(tools):
+            if check:
+                _check_tool(tools[name], tools_root)
+            else:
+                _fetch_tool(tools[name], tools_root)
+    except GateError as error:
+        print(error, file=sys.stderr)
+        return error.exit_code
     return 0
 
 
