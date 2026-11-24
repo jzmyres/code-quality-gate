@@ -8,6 +8,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import shlex
 import stat
 import sys
 from collections import deque
@@ -345,31 +346,51 @@ def enumerate_files(root: Path) -> list[str]:
     return [entry.path for entry in enumerate_entries(root)]
 
 
-def _consume_env_option(option: str, words: deque[str], path: Path | str) -> None:
-    if option in ("-i", "--ignore-environment", "-") or option.startswith(("--unset=", "--chdir=")):
-        return
-    if option in ("-S", "--split-string", "-u", "-C"):
-        argument = words.popleft() if words else ""
-        if option in ("-S", "--split-string"):
-            words.extendleft(reversed(argument.split()))
-        return
-    raise GateError(f"{path}: unsupported shebang env option {option!r}")
+class _EnvArguments:
+    def __init__(self, arguments: str | list[str]) -> None:
+        self.raw = arguments.lstrip() if isinstance(arguments, str) else ""
+        self.pending = deque(arguments if isinstance(arguments, list) else ())
+
+    def read_word(self, *, split_string: bool = False) -> str | None:
+        if self.raw:
+            if split_string:
+                payload, self.raw = self.raw, ""
+                return payload
+            word, *remaining = self.raw.split(maxsplit=1)
+            self.raw = remaining[0] if remaining else ""
+            return word
+        return self.pending.popleft() if self.pending else None
 
 
-def _env_operands(arguments: list[str], path: Path | str) -> Iterator[str]:
-    words = deque(arguments)
-    while words:
-        word = words.popleft()
+def _consume_env_option(option: str, words: _EnvArguments, path: Path | str) -> None:
+    if option in ("-u", "-C"):
+        words.read_word()
+    elif option in ("-S", "--split-string"):
+        payload = words.read_word(split_string=True) or ""
+        try:
+            words.pending.extendleft(reversed(shlex.split(payload)))
+        except ValueError as error:
+            raise GateError(f"{path}: invalid shebang env {option!r} argument: {error}") from error
+    else:
+        raise GateError(f"{path}: unsupported shebang env option {option!r}")
+
+
+def _env_operands(arguments: str | list[str], path: Path | str) -> Iterator[str]:
+    words = _EnvArguments(arguments)
+    while (word := words.read_word()) is not None:
         if word == "--":
-            yield from words
+            yield from iter(words.read_word, None)
             return
+        name, separator, _ = word.partition("=")
+        if name + separator in ("-i", "--ignore-environment", "-", "--unset=", "--chdir="):
+            continue
         if word.startswith("-"):
             _consume_env_option(word, words, path)
         else:
             yield word
 
 
-def _env_interpreter(arguments: list[str], path: Path | str = "<shebang>") -> str | None:
+def _env_interpreter(arguments: str | list[str], path: Path | str = "<shebang>") -> str | None:
     for word in _env_operands(arguments, path):
         if "=" not in word:
             return PurePosixPath(word).name
@@ -379,13 +400,13 @@ def _env_interpreter(arguments: list[str], path: Path | str = "<shebang>") -> st
 def _shebang_interpreter(first_line: str, path: Path | str = "<shebang>") -> str | None:
     if not first_line.startswith("#!"):
         return None
-    words = first_line[2:].strip().split()
+    words = first_line[2:].split(maxsplit=1)
     if not words:
         return None
     name = PurePosixPath(words[0]).name
     if name != _SHEBANG_ENV:
         return name
-    return _env_interpreter(words[1:], path)
+    return _env_interpreter(words[1] if len(words) == 2 else "", path)
 
 
 def _type_name(mode: int) -> str | None:

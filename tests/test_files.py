@@ -25,8 +25,19 @@ class ShebangParserTests(unittest.TestCase):
             "NAME=VALUE bash",
             "-- bash",
             "-- NAME=VALUE bash",
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    files._shebang_interpreter(f"#!/usr/bin/env {arguments}"),
+                    "bash",
+                )
+
+    def test_env_parses_options_in_the_split_string(self) -> None:
+        for arguments in (
             "-S -u NAME bash",
             "--split-string -C /some/dir bash",
+            "-S -C 'some dir' bash",
+            '-S --chdir="some dir" bash',
         ):
             with self.subTest(arguments=arguments):
                 self.assertEqual(
@@ -36,6 +47,7 @@ class ShebangParserTests(unittest.TestCase):
 
     def test_env_splits_whitespace_inside_an_argument(self) -> None:
         self.assertEqual(files._env_interpreter(["-S", "-u\tNAME  bash"]), "bash")
+        self.assertEqual(files._env_interpreter(["--split-string", "-C 'some dir' bash"]), "bash")
 
     def test_env_option_terminator_allows_a_command_starting_with_dash(self) -> None:
         self.assertEqual(files._shebang_interpreter("#!/usr/bin/env -- -bash"), "-bash")
