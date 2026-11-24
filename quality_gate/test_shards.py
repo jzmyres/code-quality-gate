@@ -427,13 +427,18 @@ def _cgroup_cpu_quota(root, membership):
     return min(quotas, default=None)
 
 
-def _options(argv):
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-s", "--start-directory", dest="start", required=True)
     parser.add_argument("-p", "--pattern", default="test*.py")
     parser.add_argument("-j", "--workers", type=int)
     parser.add_argument("--failed-report", type=Path, metavar="PATH")
     parser.add_argument("--worker", nargs=2, help=argparse.SUPPRESS)
+    return parser
+
+
+def _options(argv):
+    parser = build_parser()
     options = parser.parse_args(argv)
     if options.workers is None:
         if not options.worker:

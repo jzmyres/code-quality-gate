@@ -1,7 +1,10 @@
 """Tests for the policy schema and inventory obligations."""
 from __future__ import annotations
 
+import contextlib
 import importlib
+import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -10,6 +13,7 @@ from support import BASE_CONFIG, GATE, FixtureCase, output, with_clones
 
 sys.path.insert(0, str(GATE))
 policy = importlib.import_module("quality_gate.policy")
+shards = importlib.import_module("quality_gate.test_shards")
 
 
 class PolicyTests(FixtureCase):
@@ -613,14 +617,33 @@ class PolicyTests(FixtureCase):
             with self.subTest(check=identifier):
                 self.assertIsNone(config.checks[identifier].baseline)
 
-    def test_this_repository_policy_uses_default_shard_workers(self) -> None:
-        config = policy.load_config(GATE)
+    def assert_default_shard_workers(self, config: policy.Config) -> None:
+        parser = shards.build_parser()
         for identifier, check in config.checks.items():
             run = getattr(check.spec, "run", ())
-            if any(Path(arg).parts[-2:] == ("quality_gate", "test_shards.py") for arg in run):
-                with self.subTest(check=identifier):
-                    self.assertNotIn("-j", run)
-                    self.assertNotIn("--workers", run)
+            for position, arg in enumerate(run):
+                if Path(arg).parts[-2:] == ("quality_gate", "test_shards.py"):
+                    options = parser.parse_args(run[position + 1:])
+                    self.assertEqual(options.workers, parser.get_default("workers"), identifier)
+                    break
+
+    def test_this_repository_policy_uses_default_shard_workers(self) -> None:
+        self.assert_default_shard_workers(policy.load_config(GATE))
+
+    def test_shard_worker_policy_rejects_fixed_counts(self) -> None:
+        config = BASE_CONFIG.replace('"smoke"', '"tests"').replace(
+            '[checks.smoke]\nadapter = "command"', '[checks.tests]\nadapter = "python_tests"',
+        )
+        run = ["{python}", "-I", "quality_gate/test_shards.py", "-s", "tests"]
+        original_run = '["python3", "-c", "print(1)"]'
+        self.write_config(config.replace(original_run, json.dumps(run)))
+        self.assert_default_shard_workers(policy.load_config(self.repo))
+        for args in (("-j", "4"), ("-j4",), ("--workers", "4"), ("--workers=4",), ("--wor=4",)):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                self.write_config(config.replace(original_run, json.dumps([*run, *args])))
+                fixture = policy.load_config(self.repo)
+                with self.assertRaises((AssertionError, SystemExit)):
+                    self.assert_default_shard_workers(fixture)
 
     def test_check_direction_defaults_to_max_and_accepts_min(self) -> None:
         self.write_config(BASE_CONFIG)
