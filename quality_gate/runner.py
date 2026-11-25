@@ -202,13 +202,14 @@ class RunResult:
         if exit_code is not None and exit_code < 0:
             signal_number = -exit_code
             exit_code = None
+        tail_bytes = self.output_tail[-TAIL_LIMIT:]
         return Diagnostics(
             argv=list(self.argv),
             exit_code=exit_code,
             signal=signal_number,
             output_bytes=self.output_bytes,
-            output_tail=self._text(self.output_tail[-TAIL_LIMIT:]),
-            output_truncated=self.output_truncated,
+            output_tail=self._text(tail_bytes),
+            output_truncated=self.output_bytes > len(tail_bytes),
             error=self.error,
         )
 

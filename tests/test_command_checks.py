@@ -320,10 +320,11 @@ class CommandCheckTests(FixtureCase):
         diagnostics = check["diagnostics"]
         self.assertEqual(diagnostics["exit_code"], 7)
         self.assertIsNone(diagnostics["signal"])
-        self.assertIn("bad output", diagnostics["output_tail"])
+        self.assertEqual(diagnostics["output_tail"], "bad output\n")
         self.assertIn("-c", diagnostics["argv"])
         self.assertIn("bad output", diagnostics["argv"][-1])
-        self.assertGreater(diagnostics["output_bytes"], 0)
+        self.assertEqual(diagnostics["output_bytes"], len(b"bad output\n"))
+        self.assertFalse(diagnostics["output_truncated"])
 
     def test_missing_executable_is_an_execution_error(self) -> None:
         self.write_config(
@@ -457,6 +458,20 @@ class CommandCheckTests(FixtureCase):
         self.assertGreater(diagnostics["output_bytes"], 1024 * 1024)
         self.assertTrue(diagnostics["output_truncated"])
         self.assertLessEqual(len(diagnostics["output_tail"].encode()), 4096)
+
+    def test_output_tail_truncation_is_reported_below_capture_limit(self) -> None:
+        stdout = b"start" + b"x" * 7407 + b"end"
+        run = json.dumps(
+            ["python3", "-c", f"import sys; sys.stdout.buffer.write({stdout!r})"]
+        )
+        self.write_config(with_command(run))
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 0, output(result))
+        diagnostics = self.check_by_id(document, "lint")["diagnostics"]
+        self.assertEqual(diagnostics["output_bytes"], 7415)
+        self.assertEqual(diagnostics["output_tail"], stdout[-4096:].decode("ascii"))
+        self.assertTrue(diagnostics["output_truncated"])
+
 
 class RegexRunnerTests(unittest.TestCase):
     def test_ambiguous_or_non_json_matching_results_are_refused(self) -> None:

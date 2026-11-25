@@ -448,7 +448,9 @@ baseline = "crap.toml"
         wrapper, log = self.version_probe("9" * 45000)
         text = wrapper.read_text(encoding="utf-8")
         wrapper.write_text(text.replace(";;", "; exit 7;;", 1), encoding="utf-8")
-        self.assert_probe_refused(wrapper, log, "9" * 128 + "...", exit_code=7)
+        self.assert_probe_refused(
+            wrapper, log, "9" * 128 + "...", truncated=True, exit_code=7
+        )
 
     def test_invalid_emacs_version_probe_is_unsupported(self) -> None:
         wrapper = self.base / "emacs"
