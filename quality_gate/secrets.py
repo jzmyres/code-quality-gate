@@ -53,8 +53,9 @@ def scan(
             [*argv, *targets], cwd=directory, env={},
             budget_seconds=budget, capture_limit=None,
         )
-        sys.stderr.write(child.stdout_text)
-        sys.stderr.write(child.stderr_text)
+        sys.stderr.buffer.write(child.stdout)
+        sys.stderr.buffer.write(child.stderr)
+        sys.stderr.buffer.flush()
         if child.execution != "completed":
             return child
         if child.returncode:

@@ -76,8 +76,13 @@ class SecretsTests(FixtureCase):
         return tools.tool_binary("betterleaks").resolve()
 
     def _check(self, root: Path | None = None):
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        result, stdout, stderr = self._check_bytes(root)
+        return result, stdout, stderr.decode("utf-8")
+
+    def _check_bytes(self, root: Path | None = None):
+        stdout, stderr = io.StringIO(), io.BytesIO()
+        stream = io.TextIOWrapper(stderr, encoding="utf-8", write_through=True)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stream):
             result = checks.run_check(
                 root or self.repo, self.config, self.config.checks["secrets"], [], {},
                 prefix="check: secrets", evidence_dir=self.evidence,
@@ -106,9 +111,6 @@ class SecretsTests(FixtureCase):
 
     def test_stageable_credential_fails_with_candidate_controls_disabled(self) -> None:
         self._require_scanner()
-        marker = self.base / "candidate-imported"
-        self.add_file("quality_gate/__init__.py", f"open({str(marker)!r}, 'w').close()\n")
-        self.add_file("quality_gate/secrets.py", f"open({str(marker)!r}, 'w').close()\n")
         self.add_file(".betterleaksignore", "new.txt:github-pat:2\n")
         self.add_file(".betterleaks.toml", "invalid scanner config\n")
         self._plant("new.txt", " # betterleaks:allow")
@@ -117,6 +119,20 @@ class SecretsTests(FixtureCase):
         result, _, stderr = self._check()
         self.assertEqual(result.outcome, "fail", stderr)
         self.assertIn("path: new.txt", stderr)
+
+    def test_fresh_gate_process_does_not_import_the_candidate_package(self) -> None:
+        binary = self._require_scanner()
+        marker = self.base / "candidate-imported"
+        self.add_file("quality_gate/__init__.py", f"open({str(marker)!r}, 'w').close()\n")
+        self.add_file("quality_gate/secrets.py", f"open({str(marker)!r}, 'w').close()\n")
+        self._plant("new.md")
+
+        completed = self.run_qg_process(
+            "check", "--only", "secrets", "--json",
+            cwd=self.repo, env={"QG_TOOLS_DIR": str(binary.parent.parent)},
+        )
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("path: new.md", completed.stderr)
         self.assertFalse(marker.exists())
 
     def test_gitignored_file_is_not_scanned_in_clean_tree(self) -> None:
@@ -189,6 +205,25 @@ class SecretsTests(FixtureCase):
         self.assertIn("github-pat", stderr)
         self.assertEqual(stderr, "".join(forwarded))
 
+    def test_invalid_utf8_filename_in_scanner_output_is_forwarded_byte_for_byte(self) -> None:
+        self._require_scanner()
+        filename = b"nested/settings-\xff.txt"
+        self._plant(os.fsdecode(filename))
+
+        forwarded = []
+
+        def run_scanner(argv, **options):
+            child = runner.run(argv, **options)
+            forwarded.extend((child.stdout, child.stderr))
+            return child
+
+        with mock.patch.object(adapters, "run", side_effect=run_scanner):
+            result, _, stderr = self._check_bytes()
+        expected = b"".join(forwarded)
+        self.assertEqual(result.outcome, "fail", stderr)
+        self.assertIn(b"path: " + filename, expected)
+        self.assertEqual(stderr, expected)
+
     def test_budget_termination_removes_copied_input(self) -> None:
         self.add_file("nested/settings.txt", "ordinary text\n")
         copied = self.base / "copied"
@@ -236,15 +271,17 @@ class SecretsTests(FixtureCase):
         selected = [f"source-{index:02}.txt" for index in range(secrets._MAX_FILES_PER_INVOCATION + 1)]
         for path in selected:
             self.add_file(path, "ordinary text\n")
-        first = runner.RunResult((), "completed", 1, stdout=b"redacted finding\n")
+        first = runner.RunResult(
+            (), "completed", 1, stdout=b"redacted finding\n", stderr=b"scanned source-\xff.txt\n",
+        )
         second = runner.RunResult((), "completed", 0)
         launch = mock.Mock(side_effect=[first, second])
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        stderr = io.BytesIO()
+        with contextlib.redirect_stderr(io.TextIOWrapper(stderr, encoding="utf-8")):
             result = secrets.scan(
                 Path(sys.executable), self.repo, self.evidence, selected, 600, run=launch,
             )
+            self.assertEqual(stderr.getvalue(), first.stdout + first.stderr)
         self.assertIs(result, first)
-        self.assertEqual(stderr.getvalue(), "redacted finding\n")
         targets = [call.args[0][call.args[0].index("--") + 1:] for call in launch.call_args_list]
         self.assertEqual(targets, [selected[:-1], selected[-1:]])
