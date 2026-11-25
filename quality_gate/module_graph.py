@@ -860,6 +860,14 @@ def _graph_report(
     return report
 
 
+def elisp_reader_errors(elisp: dict[str, list[dict]]) -> list[dict]:
+    return [
+        {"file": source, "line": row["line"], "message": row["message"], "kind": "reader-error",
+         "stage": row["stage"]}
+        for source, row in _elisp_records(elisp, "reader-error")
+    ]
+
+
 def dependencies(
     root: Path, python_modules: list[str], *,
     elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
@@ -873,11 +881,7 @@ def dependencies(
         {"file": source, "line": row["line"], "message": row["message"]}
         for source, row in _elisp_records(elisp, "outside")
     ]
-    outside.extend(
-        {"file": source, "line": row["line"], "message": row["message"], "kind": "reader-error",
-         "stage": row["stage"]}
-        for source, row in _elisp_records(elisp, "reader-error")
-    )
+    outside.extend(elisp_reader_errors(elisp))
     edges = _graph_edges(root, modules, python_modules, elisp, shell, outside)
     return modules, edges, outside
 

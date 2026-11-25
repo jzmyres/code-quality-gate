@@ -1058,12 +1058,13 @@ def _extract_module_contracts(
         try:
             mark_step("module graph inputs")
             _require_contract_budget()
-            graph = extract_contract_graph(root, config, owners, classes, evidence_dir)
+            graph = extract_contract_graph(root, config, owners, classes, evidence_dir, findings)
             _require_contract_budget()
+            reader_failed = bool(findings)
             mark_step("module interface evaluation")
             findings.extend(module_contract_findings(config, owners, graph))
             _require_contract_budget()
-            return (None if graph.reader_errors else graph), "completed"
+            return (None if reader_failed else graph), "completed"
         except RunTimeout:
             raise
         except (GateError, ValueError, TimeoutError, RecursionError) as error:

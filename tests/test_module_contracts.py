@@ -125,8 +125,9 @@ class ModuleContractTests(FixtureCase):
             "library/private.py": "library",
             "library/z.py": "library",
         })
-        graph = adapters.extract_contract_graph(self.repo, config, owners, classes, self.base)
+        graph = adapters.extract_contract_graph(self.repo, config, owners, classes, self.base, findings)
         self.assertEqual(graph.modules, sorted(owners))
+        self.assertEqual(findings, [])
         self.assertEqual(adapters.module_contract_findings(config, owners, graph), [])
 
     def test_edge_kind_is_part_of_deduplication_and_ordering(self) -> None:
@@ -186,7 +187,10 @@ class ModuleContractTests(FixtureCase):
     def test_staged_code_outside_modules_fails_independently_of_inventory(self) -> None:
         self.add_file("orphan.py", "value = 0\n")
         result, findings = self.assert_map_failure()
-        self.assertIn("orphan.py: no declared module owner", result.stderr)
+        self.assertIn(
+            "module-contracts: uncovered-file: orphan.py: no declared module owner",
+            result.stderr.splitlines(),
+        )
         finding, = findings
         self.assertEqual((finding["rule"], finding["file"]), ("uncovered-file", "orphan.py"))
 
@@ -194,7 +198,10 @@ class ModuleContractTests(FixtureCase):
         self.add_file("orphan.py", "value = 0\n")
         self.assertEqual(self.git("ls-files", "orphan.py").stdout, "")
         result, findings = self.assert_map_failure(stage=False)
-        self.assertIn("orphan.py: no declared module owner", result.stderr)
+        self.assertIn(
+            "module-contracts: uncovered-file: orphan.py: no declared module owner",
+            result.stderr.splitlines(),
+        )
         self.assertEqual(findings[0]["file"], "orphan.py")
 
     def test_uncovered_non_utf8_path_is_retained_in_the_finding(self) -> None:
@@ -226,7 +233,11 @@ class ModuleContractTests(FixtureCase):
         result, findings = self.assert_map_failure()
         for index, pattern in enumerate(("README.md", "APP/*.py"), 1):
             key = f"modules.app.files[{index}]"
-            self.assertIn(f"{key}: pattern {pattern!r} matches no inventoried code file", result.stderr)
+            self.assertIn(
+                f"module-contracts: unused-pattern: {key}: pattern {pattern!r}"
+                " matches no inventoried code file",
+                result.stderr.splitlines(),
+            )
             self.assertEqual(findings[index - 1]["key"], key)
             self.assertEqual(findings[index - 1]["module"], "app")
 
@@ -398,10 +409,12 @@ reason = "Lisp source"
         self.assertIn("app/use.el:1 -> library/fixture.el (require)", result.stderr)
 
     def test_elisp_reader_and_preparation_errors_block(self) -> None:
-        for stage, line, source in (
-            ("reader", 3, "(require 'fixture)\n(provide 'use)\n("),
+        for stage, line, source, detail in (
+            ("reader", 3, "(require 'fixture)\n(provide 'use)\n(",
+             f"End of file during parsing: {self.repo / 'app/use.el'}"),
             ("preparation", 4, "(require 'fixture)\n(provide 'use)\n;; Local Variables:\n"
-             ';; read-symbol-shorthands: #1=(("f-" . "fixture-"))\n;; End:\n'),
+             ';; read-symbol-shorthands: #1=(("f-" . "fixture-"))\n;; End:\n',
+             'Invalid read syntax: "#1=", 1, 27'),
         ):
             with self.subTest(stage=stage):
                 self.configure_elisp(source)
@@ -411,7 +424,34 @@ reason = "Lisp source"
                 self.assertEqual(
                     (finding["file"], finding["line"], finding["stage"]), ("app/use.el", line, stage),
                 )
-                self.assertIn(f"app/use.el:{line}: Emacs Lisp source with a {stage} error", result.stderr)
+                message = f"Emacs Lisp source with a {stage} error ({detail}) is outside the extractor"
+                self.assertEqual(finding["message"], message)
+                self.assertIn(
+                    f"module-contracts: module-extraction: app/use.el:{line}: {message}",
+                    result.stderr.splitlines(),
+                )
+
+    def test_elisp_reader_finding_survives_python_extraction_failure(self) -> None:
+        self.configure_elisp("(provide 'use)\n(")
+        self.add_file("app/main.py", "import (\n")
+        result, _, check = self.contract(1)
+        reader_message = (
+            f"Emacs Lisp source with a reader error (End of file during parsing: {self.repo / 'app/use.el'})"
+            " is outside the extractor"
+        )
+        python_message = (
+            "app/main.py: expected readable, valid Python source, got invalid syntax (main.py, line 1)"
+        )
+        self.assertEqual(check["findings"], [
+            {"rule": "module-extraction", "file": "app/use.el", "line": 2, "kind": "reader-error",
+             "stage": "reader", "message": reader_message},
+            {"rule": "module-extraction", "stage": "module graph dependencies", "message": python_message},
+        ])
+        self.assertIn(
+            f"module-contracts: module-extraction: app/use.el:2: {reader_message}",
+            result.stderr.splitlines(),
+        )
+        self.assertIn(f"module-contracts: module-extraction: {python_message}", result.stderr.splitlines())
 
     def test_elisp_outside_record_is_nonblocking(self) -> None:
         self.configure_elisp("(require (intern \"fixture\"))\n")

@@ -1401,12 +1401,12 @@ The summary line `check: failed (...)` names the roots in the usual order. When 
 `check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry is spelled as the
 summary spells it and `CAUSE` is a root check id. A consequence still rejects and still exits 1.
 
-`check --only CHECK [CHECK ...]` runs inventory, hygiene and module contracts, then those checks and the checks
-they require, in policy order. Nothing else runs. An unknown or repeated check id is a usage error
-(exit 2) naming it, before any check runs. A partial run never prunes and never runs under a trusted
-directory: `--only` with `--prune` or with `--policy-from` is a usage error (exit 2) naming both
-options, before any check runs. A partial run is never a verdict on the tree; use the full `check` for
-that.
+`check --only CHECK [CHECK ...]` runs inventory, hygiene and module contracts if enabled, then the
+selected checks and their requirements in policy order. Nothing else runs. An unknown or repeated
+check id is a usage error (exit 2) naming it, before any check runs. A partial run never prunes and
+never runs under a trusted directory: `--only` with `--prune` or with `--policy-from` is a usage
+error (exit 2) naming both options, before any check runs. A partial run is never a verdict on the
+tree; use the full `check` for that.
 
 `QG_AGENT=1` marks an agent sandbox. `check` selects the whole policy by default, or the
 `--only` check IDs and their requirements. If any selected adapter declares `runs_suite`,

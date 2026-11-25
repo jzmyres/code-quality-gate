@@ -288,20 +288,24 @@ class GraphExtraction:
     inputs: GraphInputs
     modules: list[str]
     edges: list[module_graph.Edge]
-    reader_errors: list[dict]
 
 
-def _extract_graph(context: AdapterContext, inputs: GraphInputs) -> GraphExtraction:
+def _extract_graph(
+    context: AdapterContext, inputs: GraphInputs, reader_findings: list[dict] | None = None,
+) -> GraphExtraction:
     python, lisp, shell = inputs
     elisp = _read_graph_elisp(context, lisp, [*python, *lisp, *shell]) if lisp else {}
+    if reader_findings is not None:
+        reader_findings.extend(
+            {"rule": "module-extraction", **row} for row in module_graph.elisp_reader_errors(elisp)
+        )
     mark_step("module graph dependencies")
     if remaining_budget(_default_budget(None)) <= 0:
         raise ValueError("module graph dependency extraction deadline exceeded")
-    modules, edges, outside = module_graph.dependencies(
+    modules, edges, _ = module_graph.dependencies(
         context.root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
     )
-    reader_errors = [row for row in outside if row.get("kind") == "reader-error"]
-    return GraphExtraction(inputs, modules, edges, reader_errors)
+    return GraphExtraction(inputs, modules, edges)
 
 
 def module_ownership(
@@ -312,14 +316,15 @@ def module_ownership(
 
 def extract_contract_graph(
     root: Path, config: Any, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
+    reader_findings: list[dict],
 ) -> GraphExtraction:
     context = AdapterContext(root, config, None, list(owners), classes, "module-contracts", {}, evidence_dir)
-    return _extract_graph(context, _graph_modules(context, module_graph.GraphSpec(tuple(config.classes), ())))
+    inputs = _graph_modules(context, module_graph.GraphSpec(tuple(config.classes), ()))
+    return _extract_graph(context, inputs, reader_findings)
 
 
 def module_contract_findings(config: Any, owners: dict[str, str], graph: GraphExtraction) -> list[dict]:
-    reader_errors = [{"rule": "module-extraction", **row} for row in graph.reader_errors]
-    return reader_errors + module_graph.interface_findings(config.modules, owners, graph.edges)
+    return module_graph.interface_findings(config.modules, owners, graph.edges)
 
 
 def affected_graph(
