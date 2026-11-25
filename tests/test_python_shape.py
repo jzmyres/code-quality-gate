@@ -2003,17 +2003,22 @@ class HelperInputTests(ShapeCase):
 
 SHIPPED_POLICY = (GATE / "quality-gate.toml").read_text(encoding="utf-8")
 SHIPPED_FIXTURE_MODULES = """\
-[modules.fixture]
-files = ["*"]
-entry_points = []
+[modules.gate]
+files = ["qg.py", "quality_gate/mod.py", "quality_gate/elisp/helper.el"]
+entry_points = ["quality_gate/elisp/helper.el"]
 allowed_dependencies = []
+
+[modules.tests]
+files = ["tests/test_mod.py", "tests/elisp/qg-elisp-tests.el"]
+entry_points = []
+allowed_dependencies = ["gate"]
 
 """
 
 SHIPPED_FILES = {
     "qg.py": "VALUE = 1\n",
     "quality_gate/mod.py": "def build(value):\n    return value\n",
-    "quality_gate/elisp/helper.el": "(defun helper ()\n  nil)\n",
+    "quality_gate/elisp/helper.el": "(defun helper ()\n  nil)\n(provide 'helper)\n",
     "tests/test_mod.py": (
         "import unittest\n"
         "\n"
@@ -2022,7 +2027,7 @@ SHIPPED_FILES = {
         "    def test_nothing(self):\n"
         "        self.assertTrue(True)\n"
     ),
-    "tests/elisp/qg-elisp-tests.el": "(require 'ert)\n",
+    "tests/elisp/qg-elisp-tests.el": "(require 'ert)\n(require 'helper)\n",
     "quality-gate-crap.toml": baseline_text(
         [], check="crap", metric_version="python-lines/1"
     ),
@@ -2071,6 +2076,7 @@ class ShippedPolicyTests(FixtureCase):
         document = self.parse_json(result)
         contract = self.check_by_id(document, "module-contracts")
         self.assertEqual(contract["outcome"], "pass", output(result))
+        self.assertIsNotNone(contract["budget_seconds"])
         return result, document, self.check_by_id(document, "shape")
 
     def add_wrapper(self) -> str:
