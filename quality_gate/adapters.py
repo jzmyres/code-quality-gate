@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, python_crap, python_mutation, shell_syntax,
+    module_graph, output_patterns, python_crap, python_mutation, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .coverage_tool import _coverage_config_problem
@@ -608,19 +608,38 @@ def _unittest_module_index(argv: tuple[str, ...]) -> int | None:
     return index if argv[index:index + 2] == ("-m", "unittest") else None
 
 
+def _match_affected_output(context: AdapterContext, child: Any, result: Any, start: float) -> None:
+    spec = context.check.spec
+    if spec.must_match is None or result.outcome != "pass":
+        return
+    matches, evaluation = output_patterns._pattern_matches(
+        {"must_match": spec.must_match}, child.combined_text,
+        max(0.0, start + spec.budget_seconds - time.monotonic()),
+    )
+    if matches is None:
+        failure = command._pattern_failure(
+            context.check, spec, start, context.prefix, result.diagnostics, evaluation,
+        )
+        result.outcome, result.execution, result.reason = failure.outcome, failure.execution, failure.reason
+    elif not matches["must_match"]:
+        result.outcome = "fail"
+        result.reason = f"output did not match must_match {spec.must_match!r}"
+
+
 def _affected_command_tests(context: AdapterContext) -> Any:
     from .checks import _finish_test_result
 
     spec = context.check.spec
     argv = spec.run
     module = _unittest_module_index(argv)
-    if module is None or spec.must_match is not None or "{files}" in argv:
+    if module is None or "{files}" in argv:
         return _affected_opaque_tests(context, command._run_command)
     start = time.monotonic()
     plan = _affected_test_plan(context, argv[module + 2:])
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     child, temporary_reason = _affected_test_child(context, plan, list(argv[:module]), environment, start)
     result = _affected_test_report(context, plan.with_suffix(".result.json"), child, start)
+    _match_affected_output(context, child, result, start)
     return _finish_test_result(result, temporary_reason, context.prefix, child.combined_text)
 
 

@@ -82,6 +82,16 @@ requires = "tests"
 threshold = 6
 """
 
+SHAPE_CONFIG = CONFIG.replace('"lint", "tests", "chars"', '"lint", "tests", "chars", "shape"') + CRAP + """\
+[checks.shape]
+adapter = "python_shape"
+tier = 1
+enforcement = "enforced"
+scope = "changed"
+base = "HEAD"
+crap_check = "crap"
+"""
+
 VERIFICATION = """\
 [checks.verification]
 adapter = "verification"
@@ -113,7 +123,9 @@ class AffectedScopeTests(FixtureCase):
         )
 
     def run_gate(self, *args):
-        return self.run_json(*args, env=self.default_tool_env())
+        environment = self.default_tool_env()
+        environment["QG_AGENT"] = "0"
+        return self.run_json(*args, env=environment)
 
     def affected(self, *args):
         result, document = self.run_gate("--base", "HEAD", *args)
@@ -222,10 +234,11 @@ class AffectedScopeTests(FixtureCase):
         _, document = self.affected()
         self.assertIn("unplaced file pkg/b.py", self.checked(document)["selection"]["reason"])
         lint = self.checked(document, "lint")
-        self.assertEqual(lint["selection"]["selected"], {"pkg/renamed.py": "changed"})
+        self.assertEqual(lint["diagnostics"]["argv"][-3:], ["pkg/__init__.py", "pkg/a.py", "pkg/renamed.py"])
+        self.assertIn("unplaced file pkg/b.py", lint["selection"]["reason"])
 
     def test_committed_and_staged_changes_survive_unstaged_reverts(self):
-        from quality_gate.files import affected_changes
+        from quality_gate.files import affected_diff
 
         self.commit_all()
         self.add_file("pkg/a.py", "value = 2\n")
@@ -233,7 +246,9 @@ class AffectedScopeTests(FixtureCase):
         self.add_file("pkg/b.py", "import pkg.a\nvalue = 2\n")
         self.git("add", "pkg/b.py")
         self.add_file("pkg/b.py", "import pkg.a\n")
-        self.assertEqual(affected_changes(self.repo, "HEAD^"), {"pkg/a.py", "pkg/b.py"})
+        base, changed = affected_diff(self.repo, "HEAD^")
+        self.assertEqual(base.commit, self.git("rev-parse", "HEAD^").stdout.strip())
+        self.assertEqual(changed, {"pkg/a.py", "pkg/b.py"})
         result, document = self.run_gate("--base", "HEAD^")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(self.checked(document, "lint")["selection"]["selected"],
@@ -251,6 +266,25 @@ class AffectedScopeTests(FixtureCase):
         self.assertEqual(lint["outcome"], "fail")
         self.assertIn("ruff.toml", lint["selection"]["selected"]["pkg/b.py"])
         self.assertIn("F401", lint["diagnostics"]["output_tail"])
+
+    def test_extended_lint_configuration_runs_all_per_file_checks(self):
+        self.write_config(CONFIG.replace(
+            '["python3", "-c", "import sys; print(sys.argv[1:])", "{files}"]',
+            '["{tool:ruff}", "check", "--no-cache", "--config", "ruff.toml", "{files}"]',
+        ))
+        self.add_file("ruff.toml", 'extend = "lint-options.toml"\n')
+        self.add_file("lint-options.toml", "[lint]\nselect = []\n")
+        self.change("lint-options.toml", '[lint]\nselect = ["F401"]\n')
+        _, document = self.affected()
+        lint = self.checked(document, "lint")
+        self.assertEqual(lint["outcome"], "fail")
+        self.assertIn("F401", lint["diagnostics"]["output_tail"])
+        for name in ("lint", "chars"):
+            self.assertEqual(
+                self.checked(document, name)["selection"]["selected"],
+                dict.fromkeys(("pkg/__init__.py", "pkg/a.py", "pkg/b.py"),
+                              "full run: unplaced file lint-options.toml"),
+            )
 
     def test_tool_pin_change_runs_full_file_class(self):
         self.write_config(CONFIG.replace(
@@ -342,6 +376,32 @@ class AffectedScopeTests(FixtureCase):
         self.assertIn(skipped, report["selection"]["selected"])
         self.assertEqual(report["skipped"], [skipped])
 
+    def test_hook_discovery_records_each_occurrence_of_the_same_case(self):
+        self.add_file("tests/test_hook.py", """\
+import unittest
+
+class Repeated(unittest.TestCase):
+    def test_repeated(self):
+        if not hasattr(self, "invoked"):
+            self.invoked = True
+            self.skipTest("first occurrence")
+
+def load_tests(loader, suite, pattern):
+    case = Repeated("test_repeated")
+    return unittest.TestSuite([case, case])
+""")
+        self.commit_all()
+        result, document = self.affected()
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document)
+        first = "test_hook.Repeated.test_repeated (discovery occurrence 1)"
+        second = "test_hook.Repeated.test_repeated (discovery occurrence 2)"
+        self.assertIn(first, suite["selection"]["selected"])
+        self.assertIn(second, suite["selection"]["selected"])
+        self.assertIn(first, suite["skipped"])
+        self.assertIn(second, suite["executed"])
+        self.assertEqual(suite["not_executed"], {})
+
     def test_only_selected_test_skipped_with_or_without_policy_pattern(self):
         self.commit_all()
         self.write_test("other", decorator="    @unittest.skip('disabled')\n")
@@ -389,6 +449,28 @@ class AffectedScopeTests(FixtureCase):
         self.assertEqual(suite["skipped"], [OTHER])
         self.assertIn(IMPORTING, suite["selection"]["left_out"])
 
+    def test_unittest_with_must_match_records_a_case_with_mixed_subtests(self):
+        config = CONFIG.replace('adapter = "python_tests"', 'adapter = "command"').replace(
+            '"{python}", "-m"', '"python3", "-I", "-m"',
+        )
+        self.write_config(config + 'must_match = "captured marker"\n')
+        self.commit_all()
+        for marker, outcome in (("captured marker", "pass"), ("different marker", "fail")):
+            with self.subTest(outcome=outcome):
+                self.write_test("other", body=f"        print({marker!r})\n"
+                                             "        with self.subTest('passes'):\n"
+                                             "            self.assertTrue(True)\n"
+                                             "        with self.subTest('skips'):\n"
+                                             "            self.skipTest('disabled')\n")
+                _, document = self.affected()
+                suite = self.checked(document)
+                self.assertEqual(suite["outcome"], outcome)
+                self.assertEqual(suite["measurement"], {"tests": 1})
+                self.assertEqual(suite["executed"], [OTHER])
+                self.assertEqual(suite["skipped"], [])
+                if outcome == "fail":
+                    self.assertIn("must_match", suite["reason"])
+
     def test_staged_initializer_deletion_expands_package_and_dependents(self):
         self.write_config(CONFIG + """
 [[rule]]
@@ -405,7 +487,7 @@ reason = "External package consumer"
         lint = self.checked(document, "lint")
         self.assertIn("pkg/__init__.py", lint["selection"]["selected"]["pkg/b.py"])
         self.assertIn("consumer.py", lint["diagnostics"]["argv"])
-        self.assertIn("depends on pkg/b.py", lint["selection"]["selected"]["consumer.py"])
+        self.assertIn("unplaced file pkg/__init__.py", lint["selection"]["selected"]["consumer.py"])
         self.assertEqual(self.checked(document)["executed"], [IMPORTING, OTHER])
 
     def test_shell_source_dependents_reach_file_command(self):
@@ -527,3 +609,93 @@ suite = "tests/ert.el"
         suite = self.checked(document, "elisp")
         self.assertEqual(suite["outcome"], "not_run")
         self.assertIn("tests/ert.el", suite["selection"]["left_out"])
+
+    def test_changed_elisp_suite_is_selected_with_a_dot_prefix(self):
+        self.write_elisp_config()
+        self.add_file("lisp/calc.el", "(defun calc (a) a)\n(provide 'calc)\n")
+        self.add_file("tests/suite.el", "(require 'ert)\n(ert-run-tests-batch-and-exit)\n")
+        self.change(
+            "tests/suite.el",
+            "(require 'ert)\n(ert-deftest selected () (should t))\n(ert-run-tests-batch-and-exit)\n",
+        )
+        result, document = self.affected("--only", "elisp")
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document, "elisp")
+        self.assertEqual(suite["selection"]["selected"], {"tests/suite.el": "changed"})
+        self.assertEqual(suite["measurement"], {"tests": 1})
+
+    def test_empty_ert_suite_supplies_crap_coverage(self):
+        self.write_elisp_config()
+        self.add_file("tests/suite.el", "(require 'ert)\n(ert-run-tests-batch-and-exit)\n")
+        self.add_file("lisp/calc.el", "(defun calc (a) a)\n(provide 'calc)\n")
+        self.change("lisp/calc.el", "(defun calc (a) (if a 1 2))\n(provide 'calc)\n")
+        _, document = self.affected("--only", "elisp_crap")
+        suite = self.checked(document, "elisp")
+        self.assertEqual(suite["outcome"], "fail")
+        self.assertEqual(suite["measurement"], {"tests": 0})
+        self.assertIn("coverage required", suite["selection"]["reason"])
+        crap = self.checked(document, "elisp_crap")
+        self.assertEqual(crap["selection"]["selected"], {"lisp/calc.el": "changed"})
+        self.assertGreater(crap["measurement"]["functions"], 0)
+
+    def write_elisp_config(self):
+        self.write_config(CONFIG.replace('"*.py", "*.sh"', '"*.py", "*.sh", "*.el"') + """
+[classes.elisp]
+code = true
+description = "Measured Elisp sources"
+checks = ["elisp", "elisp_crap"]
+
+[classes.ert]
+code = true
+description = "ERT suites"
+checks = ["lint"]
+
+[[rule]]
+pattern = "lisp/*.el"
+class = "elisp"
+reason = "Elisp sources"
+
+[[rule]]
+pattern = "tests/*.el"
+class = "ert"
+reason = "ERT suite"
+
+[checks.elisp]
+adapter = "elisp_tests"
+tier = 1
+enforcement = "enforced"
+suite = "./tests/suite.el"
+
+[checks.elisp_crap]
+adapter = "elisp_crap"
+tier = 1
+enforcement = "enforced"
+requires = "elisp"
+threshold = 6
+""")
+
+    def test_python_shape_uses_requested_diff_and_reports_measured_files(self):
+        self.write_config(SHAPE_CONFIG)
+        self.commit_all()
+        self.add_file("pkg/a.py", "def new_function():\n    return 1\n")
+        self.commit_all("Branch change")
+        result, document = self.run_gate("--base", "HEAD^", "--only", "shape")
+        shape = self.checked(document, "shape")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(shape["measurement"]["base"], {
+            "commit": self.git("rev-parse", "HEAD^").stdout.strip(), "source": "--base",
+        })
+        self.assertEqual(shape["measurement"]["functions"], 1)
+        self.assertEqual(shape["selection"]["selected"], {"pkg/a.py": "in the requested diff"})
+        self.assertIn("pkg/b.py", shape["selection"]["left_out"])
+
+    def test_python_shape_is_not_run_with_no_measured_files(self):
+        self.write_config(SHAPE_CONFIG)
+        self.commit_all()
+        result, document = self.affected("--only", "shape")
+        self.assertEqual(result.returncode, 0, output(result))
+        shape = self.checked(document, "shape")
+        self.assertEqual(shape["outcome"], "not_run")
+        self.assertEqual(shape["reason"], "no files in the shape measurement")
+        self.assertEqual(shape["selection"]["selected"], {})
+        self.assertIn("pkg/a.py", shape["selection"]["left_out"])

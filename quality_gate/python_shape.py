@@ -172,6 +172,7 @@ class ShapeInput:
     tests: frozenset[str]
     spec: ShapeSpec
     limit: float
+    paths: tuple[str, ...] = ()
 
 
 def _is_test_path(relative: str) -> bool:
@@ -344,7 +345,7 @@ def _hunks(raw: bytes) -> tuple[set[str], dict[str, set[int]]]:
     return paths, added
 
 
-def _diff_lines(root: Path, base: str) -> Diff:
+def _diff_lines(root: Path, base: str, *, tracked_only: bool = False) -> Diff:
     """The added line numbers of every changed path, and new whole files."""
     raw = _git(
         root,
@@ -357,7 +358,7 @@ def _diff_lines(root: Path, base: str) -> Diff:
         "python-shape diff",
     )
     paths, added = _hunks(raw)
-    untracked = frozenset(
+    untracked = frozenset() if tracked_only else frozenset(
         _untracked_files(root, "python-shape untracked-file selection")
     )
     return Diff(
@@ -550,7 +551,7 @@ def _shape_input(
     The CRAP-payoff rule compares against the before tree for files
     touched by the diff. The other rules use the after tree alone.
     """
-    diff = _diff_lines(context.root, base.commit)
+    diff = _diff_lines(context.root, base.commit, tracked_only=base.source == "--base")
     scoped = _measured_paths(context, spec, diff)
     indexes = {
         path: _file_index(path, _read_source(context.root, path))
@@ -572,7 +573,7 @@ def _shape_input(
     parsed = [*indexes.values(), *scanned.values()]
     calls, tests = _uses(parsed, names)
     return ShapeInput(
-        functions, before, added, candidates, calls, tests, spec, limit
+        functions, before, added, candidates, calls, tests, spec, limit, tuple(scoped),
     )
 
 
@@ -1052,7 +1053,7 @@ def _findings(data: ShapeInput) -> list[Finding]:
 
 
 def _run_python_shape(context: Any) -> Any:
-    from .checks import _evaluate_ratchet, _ratchet_result
+    from .checks import _check_result, _configuration_error, _finish_ratchet
 
     check = context.check
     start = time.monotonic()
@@ -1065,28 +1066,28 @@ def _run_python_shape(context: Any) -> Any:
         mark_step("python-shape analysis")
         data = _shape_input(context, check.spec, limit, base)
     except GateError as error:
-        from .checks import _ratchet_error
-
-        result = _ratchet_error(check, start, context.prefix, error)
-        result.configuration_error = True
-        return result
+        return _configuration_error(check, start, context.prefix, error)
+    selection = context.selection
+    if selection is not None:
+        candidates = selection.selected
+        reason = "in the requested diff" if check.spec.scope == "changed" else selection.reason
+        selection.selected = dict.fromkeys(data.paths, reason)
+        selection.left_out = dict.fromkeys(
+            sorted(candidates.keys() - selection.selected.keys()), "outside the shape measurement",
+        )
+        if not data.paths:
+            selection.reason = "no files in the shape measurement"
+            return _check_result(
+                check, start, "not_run", execution="not_run", satisfied=True, reason=selection.reason,
+            )
     mark_step("python-shape rules")
     measured = Domain.of_files(
         sorted({function.path for function in data.functions}),
         "the measured production files",
     )
-    ratchet, failure = _evaluate_ratchet(
-        _findings(data), [], check, context.prefix, measured
-    )
-    if ratchet is None:
-        return _ratchet_result(check, start, failure, reason=failure)
-    if ratchet.satisfied:
-        print(
-            f"{context.prefix}: {len(data.functions)} functions measured",
-            flush=True,
-        )
-    return _ratchet_result(
-        check, start, ratchet.outcome, ratchet=ratchet,
+    return _finish_ratchet(
+        check, _findings(data), [], context.prefix, start, measured,
+        f"{len(data.functions)} functions measured",
         measurement={
             "functions": len(data.functions),
             "added": len(data.added),

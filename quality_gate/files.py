@@ -295,20 +295,22 @@ def _split_nul(raw: bytes) -> list[str]:
     ]
 
 
-def affected_changes(root: Path, revision: str) -> set[str]:
+def affected_diff(root: Path, revision: str) -> tuple[DiffBase, set[str]]:
     commit, problem = _verified_commit(root, revision)
     if commit is None:
         raise UsageError(f"check: --base {revision!r}: expected an existing commit, {problem}")
     names = set()
     try:
+        operation = f"check: --base {revision!r}: changed-file selection"
+        merge_base = _git(root, ["merge-base", commit, "HEAD"], operation).decode().strip()
         for comparison in ([f"{commit}...HEAD"], ["--cached"], []):
             names.update(_split_nul(_git(
                 root, ["diff", "--name-only", "--no-renames", "-z", *comparison, "--"],
-                f"check: --base {revision!r}: changed-file selection",
+                operation,
             )))
     except GateError as error:
         raise UsageError(str(error)) from error
-    return names
+    return DiffBase(merge_base, "--base"), names
 
 
 def _untracked_files(

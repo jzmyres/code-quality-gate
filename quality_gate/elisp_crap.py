@@ -247,12 +247,20 @@ def _complexity(context: Any, selected: list[str], start: float) -> tuple[Any, A
         return _complexity_document(context, selected, start, child, result)
 
 
+def _usable_evidence(context: Any, required: Any) -> bool:
+    return required.outcome == "pass" or (
+        context.selection is not None
+        and required.tests_ran == 0
+        and required.evidence_path is not None
+    )
+
+
 def _required(context: Any, start: float) -> tuple[Any, Any]:
     from .checks import _ratchet_result
 
     name = context.check.spec.requires
     required = context.prior.get(name)
-    if required is None or required.outcome != "pass":
+    if required is None or not _usable_evidence(context, required):
         reason = f"coverage unreliable: {name} did not pass"
     elif required.adapter_data is None:
         reason = f"coverage unreliable: {name} produced no Edebug evidence"

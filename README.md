@@ -1306,8 +1306,8 @@ any check starts.
 staged and unstaged tracked changes, including deletions and both sides of renames. Inventory and
 hygiene run in full. Per-file checks use the changed inputs, and lint and compilation also receive
 their transitive module graph dependents. A changed or deleted package initializer affects its
-package modules. Changes to policy, tool pins, and check configuration can expand a check to its
-full input class.
+package modules. Any changed tracked path outside the module graph expands every per-file
+check to its full input class, including changes to configuration, tool pins, data, and documentation.
 
 Unittest discovery selects changed test files and tests that reach changed modules through the
 graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.

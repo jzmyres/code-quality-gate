@@ -23,8 +23,9 @@ from . import gate_result
 from .adapters import AdapterContext, adapter_for, affected_graph, run_affected_check
 from .files import (
     BUILTIN_RESULT_KINDS,
+    DiffBase,
     DiffBaseOverride,
-    affected_changes,
+    affected_diff,
     git_argv,
     hygiene_result,
     resolve_diff_base,
@@ -839,10 +840,6 @@ DEPENDENT_FILE_ADAPTERS = frozenset({"elisp_compile", "elisp_checkdoc"})
 CRAP_ADAPTERS = frozenset({"python_crap", "elisp_crap"})
 CHANGED_FILE_ADAPTERS = CRAP_ADAPTERS | {"source_chars", "comments"}
 OUTSIDE_SCOPE = "no changed file affects this input"
-TOOL_CONFIG_FILES = {
-    "ruff": {"ruff.toml", ".ruff.toml", "pyproject.toml"},
-    "shellcheck": {"shellcheckrc", ".shellcheckrc"},
-}
 
 
 def _per_file(check: CheckDef) -> bool:
@@ -860,48 +857,19 @@ def _global_input(config: Config, classes: dict[str, str], changed: set[str]) ->
     return None
 
 
-def _relative_input(root: Path, value: str | Path) -> str | None:
-    path = Path(os.path.normpath(root / value))
-    return path.relative_to(root).as_posix() if path.is_relative_to(root) else None
-
-
-def _explicit_inputs(root: Path, check: CheckDef) -> set[str]:
-    argv = getattr(check.spec, "run", ())
-    inputs = {_relative_input(root, argument.split("=", 1)[-1]) for argument in argv}
-    if check.baseline is not None:
-        inputs.add(_relative_input(root, check.baseline))
-    return inputs - {None}
-
-
-def _implicit_inputs(check: CheckDef, changed: set[str]) -> set[str]:
-    argv = getattr(check.spec, "run", ())
-    if not argv:
-        return set()
-    tool = Path(argv[0].removeprefix("{tool:").removesuffix("}")).name
-    names = TOOL_CONFIG_FILES.get(tool, ())
-    return {path for path in changed if Path(path).name in names}
-
-
-def _check_input(root: Path, check: CheckDef, changed: set[str]) -> str | None:
-    matched = sorted((changed & _explicit_inputs(root, check)) | _implicit_inputs(check, changed))
-    return f"full run: check input {matched[0]} changed" if matched else None
-
-
 def _selection_inputs(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str],
-) -> tuple[dict[str, str], str | None, str | None]:
+) -> tuple[dict[str, str], str | None]:
     full = _global_input(config, classes, changed)
     if full or not changed:
-        return {}, full, full
+        return {}, full
     try:
         nodes, affected = affected_graph(root, config, files, classes, evidence_dir, changed)
     except (GateError, ValueError) as error:
-        full = f"full run: module graph unavailable ({error})"
-        return {}, full, full
+        return {}, f"full run: module graph unavailable ({error})"
     unplaced = sorted(changed - nodes)
-    full_suite = f"full run: unplaced file {unplaced[0]}" if unplaced else None
-    return affected, None, full_suite
+    return affected, f"full run: unplaced file {unplaced[0]}" if unplaced else None
 
 
 def _forced_inputs(config: Config, selected: list[CheckDef]) -> dict[str, str]:
@@ -944,14 +912,13 @@ def _elisp_suite_scope(path: str, reason: str | None) -> CheckSelection:
 
 def _check_selection(
     check: CheckDef, inputs: list[str], changed: set[str], affected: dict[str, str],
-    full: str | None, suite_reason: str | None,
+    full: str | None,
 ) -> CheckSelection:
-    suite_full = full or suite_reason
     if check.adapter == "elisp_tests":
-        path = check.spec.suite
-        return _elisp_suite_scope(path, suite_full or affected.get(path))
+        path = Path(check.spec.suite).as_posix()
+        return _elisp_suite_scope(path, full or affected.get(path))
     if "tests" in check.evidence:
-        return CheckSelection({}, {}, suite_full or "full run", test_paths=affected, full_suite=suite_full)
+        return CheckSelection({}, {}, full or "full run", test_paths=affected, full_suite=full)
     return _file_scope(check, inputs, changed, affected, full)
 
 
@@ -963,7 +930,7 @@ def _require_coverage(
     suite = check.spec.requires
     if selections[suite].skip:
         reason = f"full run: coverage required by {check.id}"
-        selections[suite] = _elisp_suite_scope(config.checks[suite].spec.suite, reason)
+        selections[suite] = _elisp_suite_scope(Path(config.checks[suite].spec.suite).as_posix(), reason)
     selections[suite].coverage = True
 
 
@@ -971,15 +938,16 @@ def _affected_selection(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str], checks: list[CheckDef],
 ) -> dict[str, CheckSelection]:
-    affected, global_reason, suite_reason = _selection_inputs(
+    affected, full = _selection_inputs(
         root, config, files, classes, evidence_dir, changed,
     )
     forced = _forced_inputs(config, checks)
     selections = {}
     for check in checks:
-        full = global_reason or _check_input(root, check, changed) or forced.get(check.id)
         inputs = _select_files(config, check, files, classes)[0]
-        selections[check.id] = _check_selection(check, inputs, changed, affected, full, suite_reason)
+        selections[check.id] = _check_selection(
+            check, inputs, changed, affected, full or forced.get(check.id),
+        )
     for check in checks:
         _require_coverage(check, config, selections)
     return selections
@@ -1013,12 +981,16 @@ def _run_selected_check(
 def _scope_plan(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str] | None, checks: list[CheckDef], inventory_code: int,
-) -> dict[str, CheckSelection]:
+    affected_base: DiffBase | None,
+) -> tuple[DiffBaseOverride, dict[str, CheckSelection]]:
     if changed is None:
-        return {}
+        return resolve_diff_base(root), {}
+    base_override = DiffBaseOverride(base=affected_base)
     if inventory_code != 0:
-        return {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
-    return _affected_selection(root, config, files, classes, evidence_dir, changed, checks)
+        selections = {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
+    else:
+        selections = _affected_selection(root, config, files, classes, evidence_dir, changed, checks)
+    return base_override, selections
 
 
 def _run_inventory_blocked_check(check: CheckDef, selection: CheckSelection | None) -> CheckResult:
@@ -1037,6 +1009,7 @@ def _run_policy_checks(
     inventory_code: int,
     selected_ids: list[str] | None = None,
     changed: set[str] | None = None,
+    affected_base: DiffBase | None = None,
 ) -> list[CheckResult]:
     selected = list(config.checks) if selected_ids is None else selected_ids
     selected_checks = [config.checks[identifier] for identifier in selected]
@@ -1045,11 +1018,11 @@ def _run_policy_checks(
     run_directory = tempfile.TemporaryDirectory(prefix="qg-run-")
     previous = _arm_run_limit(_run_limit(selected_checks))
     try:
-        base_override = resolve_diff_base(root)
         try:
             directory = Path(run_directory.name)
-            selections = _scope_plan(
+            base_override, selections = _scope_plan(
                 root, config, files, classes, directory, changed, selected_checks, inventory_code,
+                affected_base,
             )
             for check in selected_checks:
                 selection = selections.get(check.id)
@@ -1447,7 +1420,7 @@ def _check_command(
     if problem is not None:
         return _prune_option_error(root, config, prune_ids, problem)
     selected = _selected_check_ids(config, only_ids)
-    changed = affected_changes(root, affected_base) if affected_base is not None else None
+    base, changed = (None, None) if affected_base is None else affected_diff(root, affected_base)
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
     if changed is not None:
@@ -1456,7 +1429,7 @@ def _check_command(
                 dict.fromkeys(files, "full run"), {}, "full run",
             ).report()
     results.extend(
-        _run_policy_checks(root, config, files, classes, code, selected, changed)
+        _run_policy_checks(root, config, files, classes, code, selected, changed, base)
     )
     return _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
 

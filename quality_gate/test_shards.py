@@ -143,8 +143,9 @@ def _discovery_path(module):
 
 
 class AffectedResult(unittest.TextTestResult):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, occurrences, **kwargs):
         super().__init__(*args, **kwargs)
+        self.occurrences = occurrences
         self.executed = []
         self.skipped_cases = []
         self.skipped_invocation = False
@@ -175,25 +176,31 @@ class AffectedResult(unittest.TextTestResult):
         if not isinstance(test, unittest.loader._FailedTest):
             skipped = self.skipped_invocation and not self.has_result
             recorded = self.skipped_cases if skipped else self.executed
-            recorded.append(test)
+            names = self.occurrences.get(id(test))
+            recorded.append(names.popleft() if names else test.id())
         super().stopTest(test)
 
 
 class AffectedRunner(unittest.TextTestRunner):
-    resultclass = AffectedResult
+    def __init__(self, *, occurrences, **kwargs):
+        super().__init__(resultclass=functools.partial(AffectedResult, occurrences=occurrences), **kwargs)
 
 
 def _case_names(cases):
     names = [test.id() for test in cases]
     counts = Counter(names)
-    return {
-        id(test): f"{name} (discovery occurrence {index})" if counts[name] > 1 else name
-        for index, (test, name) in enumerate(zip(cases, names, strict=True), 1)
-    }
+    return [
+        f"{name} (discovery occurrence {index})" if counts[name] > 1 else name
+        for index, name in enumerate(names, 1)
+    ]
 
 
-def _case_reasons(names, discovered, paths):
-    return {name: paths.get(discovered.get(identity)) for identity, name in names.items()}
+def _case_occurrences(cases, names, selected):
+    occurrences = {}
+    for test, name in zip(cases, names, strict=True):
+        if name in selected:
+            occurrences.setdefault(id(test), deque()).append(name)
+    return occurrences
 
 
 def _suite_reason(full, loader, cases):
@@ -213,8 +220,11 @@ def _real_cases(tests):
 def _affected_cases(cases, names, loader, plan):
     full = _suite_reason(plan["full"], loader, cases)
     if full is not None:
-        return dict.fromkeys(names.values(), full), full
-    reasons = _case_reasons(names, loader.paths, plan["paths"])
+        return dict.fromkeys(names, full), full
+    reasons = {
+        name: plan["paths"].get(loader.paths[id(test)])
+        for test, name in zip(cases, names, strict=True)
+    }
     if plan["coverage"] and not any(reasons.values()):
         full = "full run: coverage required for changed inputs"
         return dict.fromkeys(reasons, full), full
@@ -231,14 +241,11 @@ def _selection_report(reasons, full):
 
 
 def _selected_suite(tests, names, selected):
+    remaining = iter(names)
     return unittest.TestSuite(
         test for test in tests
-        if isinstance(test, unittest.loader._FailedTest) or names[id(test)] in selected
+        if isinstance(test, unittest.loader._FailedTest) or next(remaining) in selected
     )
-
-
-def _recorded_cases(tests, names):
-    return [names[id(test)] if id(test) in names else test.id() for test in tests]
 
 
 class AffectedProgram(unittest.TestProgram):
@@ -246,7 +253,7 @@ class AffectedProgram(unittest.TestProgram):
         self.plan = plan
         super().__init__(
             module=None, argv=["unittest", *argv], testLoader=AffectedLoader(),
-            testRunner=AffectedRunner, exit=False,
+            exit=False,
         )
 
     def runTests(self):
@@ -257,11 +264,16 @@ class AffectedProgram(unittest.TestProgram):
         selection = _selection_report(reasons, full)
         if full is None:
             self.test = _selected_suite(tests, names, selection["selected"])
+        occurrences = _case_occurrences(cases, names, selection["selected"])
+        self.testRunner = AffectedRunner(
+            occurrences=occurrences, verbosity=self.verbosity, failfast=self.failfast,
+            buffer=self.buffer, warnings=self.warnings,
+        )
         super().runTests()
         self.report = {
             "selection": selection,
-            "executed": _recorded_cases(self.result.executed, names),
-            "skipped": _recorded_cases(self.result.skipped_cases, names),
+            "executed": self.result.executed,
+            "skipped": self.result.skipped_cases,
             "discovery_errors": self.testLoader.errors,
             "omitted": not (full or selection["selected"] or self.testLoader.errors or self.result.errors),
         }
