@@ -525,30 +525,17 @@ enabled check runs after inventory and hygiene and before the other configured c
 `--only` and `--base` runs, including an empty diff.
 With successful inventory and a valid map declaring at least two modules, it extracts the full
 owned-code graph using the existing Python, Emacs Lisp and shell extractors. Required extraction
-failures, including Emacs preparation and reader errors, reject with exit 1, as do ownership
-and call violations. Ordinary outside-extractor records are nonblocking. A valid zero- or
+failures, including Emacs preparation and reader errors, reject with exit 1, as do ownership,
+interface and capability violations. Ordinary outside-extractor records are nonblocking. A valid zero- or
 one-module map requires no extraction. `worklist` omits the built-in.
 
 Only the declared owner can invoke a capability entry point. The `capability-owner` rule matches
 the exact resolved target on `path-load` edges from Python `runpy.run_path` and
 `importlib.util.spec_from_file_location`, `require` edges from Emacs Lisp, and `source` and
-`execute` edges from the shell. Python `import` edges follow the module interface rule. Capability
+`execute` edges from the shell. Python `import` edges follow the module interface rule. The rule
+uses only resolved graph edges, so an unresolved operand produces no capability finding. Capability
 violations are checked across the full graph, regardless of the diff, `shared_base`, allowed
 dependencies or module entry points. A call can violate both the interface and capability rules.
-
-Upgrade the trusted gate to a version that accepts `[capabilities]` before adding declarations
-to an authorized policy. The gate's own CLI and isolated coverage driver can then be declared
-in `quality-gate.toml` as follows.
-
-```toml
-[capabilities.run-quality-gate]
-owner = "core"
-entry_points = ["qg.py"]
-
-[capabilities.run-coverage-driver]
-owner = "python"
-entry_points = ["quality_gate/covrun.py"]
-```
 
 With `shared_base` enabled, `--base` takes precedence and supplies its affected-scope diff
 from the merge base. Otherwise, the check compares the run's resolved `QG_DIFF_BASE` commit

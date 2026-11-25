@@ -302,27 +302,6 @@ class ModuleContractTests(FixtureCase):
                 for row in findings
             ], expected)
 
-    def test_gate_capability_declarations_match_the_owned_inventory_paths(self) -> None:
-        policy = (self.gate / "quality-gate.toml").read_text(encoding="utf-8")
-        self.write_config(
-            policy + capability("qg.py", name="run-quality-gate", owner="core")
-            + capability("quality_gate/covrun.py", name="run-coverage-driver", owner="python"),
-        )
-        baseline = "quality-gate-verification.toml"
-        self.add_file(baseline, (self.gate / baseline).read_bytes())
-        config = load_config(self.repo, candidate_root=self.gate)
-        self.assertEqual({name: (declaration.owner, declaration.entry_points)
-                          for name, declaration in config.capabilities.items()}, {
-            "run-quality-gate": ("core", ("qg.py",)),
-            "run-coverage-driver": ("python", ("quality_gate/covrun.py",)),
-        })
-        files, classes, violations = validate_inventory(self.gate, config)
-        self.assertEqual(violations, [])
-        owners, findings = adapters.module_ownership(config, files, classes)
-        self.assertEqual(findings, [])
-        self.assertEqual(owners["qg.py"], "core")
-        self.assertEqual(owners["quality_gate/covrun.py"], "python")
-
     def test_rejects_an_allowed_dependency_on_a_private_file(self) -> None:
         self.add_file("app/main.py", "import app.helper\nimport library.private\n")
         result, _, check = self.contract(1)
@@ -613,7 +592,7 @@ reason = "Shell source"
             ("sh ../library/private.sh", "execute"),
         ):
             with self.subTest(command=command):
-                self.configure_shell(f"# Call the capability\n{command}\n")
+                self.configure_shell(f"\n{command}\n")
                 target = "library/private.sh"
                 self.allow_library_target(target)
                 result, _, check = self.contract(1, env=self.default_tool_env())
@@ -643,7 +622,7 @@ reason = "Lisp source"
         self.assertIn("app/use.el:1 -> library/fixture.el (require)", result.stderr)
 
     def test_resolved_elisp_require_enforces_capability_ownership(self) -> None:
-        self.configure_elisp(";; Call the capability\n(require 'fixture)\n")
+        self.configure_elisp("\n(require 'fixture)\n")
         target = "library/fixture.el"
         self.allow_library_target(target)
         result, _, check = self.contract(1)
