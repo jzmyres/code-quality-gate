@@ -10,8 +10,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
-import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -22,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, output_patterns, python_crap, python_mutation, shell_syntax,
+    module_graph, python_crap, python_mutation, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .coverage_tool import _coverage_config_problem
@@ -471,15 +469,32 @@ def _affected_test_child(
 
 
 def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | None]:
-    if report["omitted"]:
-        return "not_run", report["selection"]["reason"]
     if report["discovery_errors"]:
         return "fail", report["discovery_errors"][0].splitlines()[0]
     if returncode:
         return "fail", f"command exited {returncode}"
+    if report["omitted"]:
+        return "not_run", report["selection"]["reason"]
     if not report["executed"]:
         return "fail", "no test executed"
     return "pass", None
+
+
+def _read_affected_report(path: Path) -> dict:
+    with path.open(encoding="utf-8") as journal:
+        report = load_json(journal.readline())
+        records = {event: [] for event in ("started", "executed", "skipped", "failed")}
+        for line in journal:
+            if line.endswith("\n"):
+                event, name = load_json(line)
+                records[event].append(name)
+    started = set(records.pop("started"))
+    missed = report["selection"]["selected"].keys() - set(records["executed"]) - set(records["skipped"])
+    report["not_executed"] = {
+        name: "invocation interrupted" if name in started else "the run did not invoke this selected test"
+        for name in sorted(missed)
+    }
+    return {**report, **records}
 
 
 def _affected_test_report(context: AdapterContext, path: Path, child: Any, start: float) -> Any:
@@ -490,34 +505,34 @@ def _affected_test_report(context: AdapterContext, path: Path, child: Any, start
     failure = python_tests._tests_execution_failure(
         check, spec, child, diagnostics, child.combined_text, prefix, start,
     )
-    if failure is not None:
-        return failure
     try:
-        report = load_json(path.read_text(encoding="utf-8"))
+        report = _read_affected_report(path)
     except (OSError, ValueError) as error:
+        if failure is not None:
+            return failure
         return _tests_result(
             check, spec, start, prefix, f"unittest produced no discovery and execution report: {error}",
             diagnostics=diagnostics, report=False,
         )
-    return _affected_test_check(check, start, child, report)
+    return _affected_test_check(check, start, child, report, failure)
 
 
-def _affected_test_check(check: Any, start: float, child: Any, report: dict) -> Any:
+def _affected_test_check(check: Any, start: float, child: Any, report: dict, failure: Any) -> Any:
     from .checks import _check_result
 
-    outcome, reason = _affected_test_verdict(report, child.returncode)
+    outcome, reason = (failure.outcome, failure.reason) if failure else _affected_test_verdict(
+        report, child.returncode,
+    )
     executed, skipped = len(report["executed"]), len(report["skipped"])
-    missed = report["selection"]["selected"].keys() - set(report["executed"]) - set(report["skipped"])
-    report["not_executed"] = dict.fromkeys(sorted(missed), "the run did not invoke this selected test")
     report.pop("omitted")
-    findings = _unittest_findings(report.pop("failed"))
+    findings = _unittest_findings(sorted(set(report.pop("failed"))))
     fields = {
         "reason": reason, "diagnostics": child.diagnostics(), "budget_seconds": check.spec.budget_seconds,
         "report_fields": report, "findings": findings,
     }
     if outcome == "not_run":
         return _check_result(check, start, outcome, execution="not_run", satisfied=True, **fields)
-    return _check_result(check, start, outcome, measurement={"tests": executed},
+    return _check_result(check, start, outcome, execution=child.execution, measurement={"tests": executed},
                          tests_ran=executed + skipped, tests_skipped=skipped, **fields)
 
 
@@ -555,7 +570,7 @@ def _affected_unittest(context: AdapterContext, argv: tuple[str, ...], *, shards
     child, temporary_reason = _affected_test_child(
         context, plan, command, python_tests._test_environment(command), start,
     )
-    result = _affected_test_report(context, plan.with_suffix(".result.json"), child, start)
+    result = _affected_test_report(context, plan.with_suffix(".result.jsonl"), child, start)
     return _finish_affected_unittest(context, result, data_dir, start, temporary_reason, child)
 
 
@@ -571,16 +586,16 @@ def _finish_affected_unittest(context: AdapterContext, result: Any, data_dir: Pa
         )
         evidence.report_fields = result.report_fields
         return evidence
-    if context.selection.coverage and "executed" in result.report_fields:
+    if child.execution == "completed" and context.selection.coverage and "executed" in result.report_fields:
         _affected_coverage(context, result, data_dir, start)
     return _finish_test_result(result, temporary_reason, prefix, child.combined_text)
 
 
-def _affected_opaque_tests(context: AdapterContext, execute: Callable) -> Any:
+def _affected_opaque_python_tests(context: AdapterContext) -> Any:
     if context.check.spec.skipped_pattern is not None:
-        return execute(context)
+        return python_tests._run_python_tests(context)
     with contextlib.redirect_stdout(io.StringIO()):
-        result = execute(context)
+        result = python_tests._run_python_tests(context)
     result.measurement = result.tests_ran = result.tests_skipped = None
     if result.outcome == "pass":
         result.outcome = "unsupported"
@@ -589,77 +604,23 @@ def _affected_opaque_tests(context: AdapterContext, execute: Callable) -> Any:
     return result
 
 
-def _affected_python_tests(context: AdapterContext) -> Any:
+def _run_python_tests(context: AdapterContext) -> Any:
+    if context.selection is None:
+        return python_tests._run_python_tests(context)
     argv = context.check.spec.run
     if python_tests._uses_shard_runner(context.root, argv):
         return _affected_unittest(context, argv[2:], shards=True)
     if argv[:3] == ("{python}", "-m", "unittest"):
         return _affected_unittest(context, argv[3:])
-    return _affected_opaque_tests(context, python_tests._run_python_tests)
+    return _affected_opaque_python_tests(context)
 
 
-def _unittest_module_index(argv: tuple[str, ...]) -> int | None:
-    executable = Path(argv[0]).name
-    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
-        return None
-    index = 1
-    while index < len(argv) and re.fullmatch(r"-[BEIsSu]+", argv[index]):
-        index += 1
-    return index if argv[index:index + 2] == ("-m", "unittest") else None
-
-
-def _match_affected_output(context: AdapterContext, child: Any, result: Any, start: float) -> None:
-    spec = context.check.spec
-    if spec.must_match is None or result.outcome != "pass":
-        return
-    matches, evaluation = output_patterns._pattern_matches(
-        {"must_match": spec.must_match}, child.combined_text,
-        max(0.0, start + spec.budget_seconds - time.monotonic()),
-    )
-    if matches is None:
-        failure = command._pattern_failure(
-            context.check, spec, start, context.prefix, result.diagnostics, evaluation,
-        )
-        result.outcome, result.execution, result.reason = failure.outcome, failure.execution, failure.reason
-    elif not matches["must_match"]:
-        result.outcome = "fail"
-        result.reason = f"output did not match must_match {spec.must_match!r}"
-
-
-def _affected_command_tests(context: AdapterContext) -> Any:
-    from .checks import _finish_test_result
-
-    spec = context.check.spec
-    argv = spec.run
-    module = _unittest_module_index(argv)
-    if module is None or "{files}" in argv:
-        return _affected_opaque_tests(context, command._run_command)
-    start = time.monotonic()
-    plan = _affected_test_plan(context, argv[module + 2:])
-    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-    child, temporary_reason = _affected_test_child(context, plan, list(argv[:module]), environment, start)
-    result = _affected_test_report(context, plan.with_suffix(".result.json"), child, start)
-    _match_affected_output(context, child, result, start)
-    return _finish_test_result(result, temporary_reason, context.prefix, child.combined_text)
-
-
-def _affected_python_crap(context: AdapterContext) -> Any:
-    required = context.prior[context.check.spec.requires]
-    if required.outcome != "pass" and required.evidence_path is not None:
-        return _affected_crap(context, required)
+def _run_python_crap(context: AdapterContext) -> Any:
+    if context.selection is not None:
+        required = context.prior[context.check.spec.requires]
+        if required.outcome != "pass" and required.evidence_path is not None:
+            return _affected_crap(context, required)
     return python_crap._run_python_crap(context)
-
-
-def run_affected_check(context: AdapterContext) -> Any:
-    check = context.check
-    descriptor = adapter_for(check.adapter)
-    if check.adapter == "python_tests":
-        return _affected_python_tests(context)
-    if check.adapter == "python_crap":
-        return _affected_python_crap(context)
-    if check.adapter == "command" and "tests" in check.evidence:
-        return _affected_command_tests(context)
-    return descriptor.run(context)
 
 
 def _spec_budget(spec: Any) -> int:
@@ -722,7 +683,7 @@ register_adapter(AdapterDescriptor(
     "python_tests",
     ("run", "tests_pattern", "skipped_pattern", "budget_seconds"),
     python_tests._python_tests_spec,
-    python_tests._run_python_tests,
+    _run_python_tests,
     budget=_spec_budget,
     runs_suite=True,
 ))
@@ -757,7 +718,7 @@ register_adapter(AdapterDescriptor(
     "python_crap",
     ("requires", "threshold", "baseline"),
     python_crap._python_crap_spec,
-    python_crap._run_python_crap,
+    _run_python_crap,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",

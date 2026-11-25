@@ -376,20 +376,23 @@ class AffectedScopeTests(FixtureCase):
         self.assertIn(skipped, report["selection"]["selected"])
         self.assertEqual(report["skipped"], [skipped])
 
-    def test_hook_discovery_records_each_occurrence_of_the_same_case(self):
-        self.add_file("tests/test_hook.py", """\
+    def write_repeated_hook(self, first_invocation):
+        self.add_file("tests/test_hook.py", f"""\
 import unittest
 
 class Repeated(unittest.TestCase):
     def test_repeated(self):
         if not hasattr(self, "invoked"):
             self.invoked = True
-            self.skipTest("first occurrence")
+            {first_invocation}
 
 def load_tests(loader, suite, pattern):
     case = Repeated("test_repeated")
     return unittest.TestSuite([case, case])
 """)
+
+    def test_hook_discovery_records_each_occurrence_of_the_same_case(self):
+        self.write_repeated_hook('self.skipTest("first occurrence")')
         self.commit_all()
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
@@ -438,38 +441,84 @@ def load_tests(loader, suite, pattern):
         self.assertEqual(suite["executed"], [OTHER])
         self.assertEqual(suite["skipped"], [])
 
-    def test_command_adapter_unittest_uses_the_same_selector(self):
+    def test_command_adapter_suite_runs_the_configured_command_in_full(self):
         self.write_config(CONFIG.replace('adapter = "python_tests"', 'adapter = "command"')
-                          .replace('"{python}", "-m"', '"python3", "-I", "-m"'))
+                          .replace('"{python}", "-m"', '"python3", "-I", "-m"')
+                          .replace('"-s", "tests"]', '"tests", "-p", "test_importing.py", "-v"]')
+                          + 'must_match = "test_importing.Example.test_value"\n')
         self.commit_all()
-        self.write_test("other", decorator="    @unittest.skip('fixture skip')\n")
-        _, document = self.affected()
+        self.write_test("other", body="        self.fail('outside the configured pattern')\n")
+        full_result, full_document = self.run_gate()
+        result, document = self.affected()
+        self.assertEqual(full_result.returncode, 0, output(full_result))
+        self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
-        self.assertEqual(suite["measurement"], {"tests": 0})
-        self.assertEqual(suite["skipped"], [OTHER])
-        self.assertIn(IMPORTING, suite["selection"]["left_out"])
+        full_suite = self.checked(full_document)
+        self.assertEqual(suite["diagnostics"]["argv"], full_suite["diagnostics"]["argv"])
+        self.assertEqual(suite["measurement"], full_suite["measurement"])
+        self.assertEqual(suite["selection"], {
+            "selected": {}, "left_out": {}, "reason": "full run: command adapter suite is opaque",
+        })
+        self.assertNotIn("executed", suite)
 
-    def test_unittest_with_must_match_records_a_case_with_mixed_subtests(self):
-        config = CONFIG.replace('adapter = "python_tests"', 'adapter = "command"').replace(
-            '"{python}", "-m"', '"python3", "-I", "-m"',
+    def test_python_command_with_its_own_discovery_requires_skip_aware_counts(self):
+        config = CONFIG.replace(
+            '"-m", "unittest", "discover", "-s", "tests"', '"pkg/run_tests.py"',
         )
-        self.write_config(config + 'must_match = "captured marker"\n')
-        self.commit_all()
-        for marker, outcome in (("captured marker", "pass"), ("different marker", "fail")):
+        self.add_file("pkg/run_tests.py", (
+            "import unittest\n"
+            "suite = unittest.defaultTestLoader.discover('tests')\n"
+            "raise SystemExit(not unittest.TextTestRunner().run(suite).wasSuccessful())\n"
+        ))
+        self.write_test("other", decorator="    @unittest.skip('disabled')\n")
+        for pattern, outcome in (("", "unsupported"), (r"skipped_pattern = 'skipped=(\d+)'", "pass")):
             with self.subTest(outcome=outcome):
-                self.write_test("other", body=f"        print({marker!r})\n"
-                                             "        with self.subTest('passes'):\n"
-                                             "            self.assertTrue(True)\n"
-                                             "        with self.subTest('skips'):\n"
-                                             "            self.skipTest('disabled')\n")
-                _, document = self.affected()
+                self.write_config(config + pattern + "\n")
+                self.commit_all()
+                result, document = self.affected()
                 suite = self.checked(document)
-                self.assertEqual(suite["outcome"], outcome)
+                self.assertEqual(suite["outcome"], outcome, output(result))
+                self.assertEqual(suite["selection"]["reason"], "full run")
+                self.assertNotIn("executed", suite)
+                if pattern:
+                    self.assertEqual(suite["measurement"], {"tests": 1})
+                else:
+                    self.assertNotIn("measurement", suite)
+
+    def test_interrupted_suite_keeps_selection_and_completed_invocations(self):
+        self.write_config(CONFIG + "budget_seconds = 3\n")
+        self.write_test("later")
+        self.commit_all()
+        self.write_test("importing", body="        self.assertTrue(1)\n")
+        for body, execution in (
+            ("        import time\n        time.sleep(60)\n", "budget"),
+            ("        import os, signal\n        os.kill(os.getpid(), signal.SIGTERM)\n", "signal"),
+            ("        import os, signal\n        os.kill(os.getpid(), signal.SIGINT)\n", "signal"),
+        ):
+            with self.subTest(execution=execution):
+                self.write_test("later", body=body)
+                result, document = self.affected()
+                self.assertEqual(result.returncode, 1, output(result))
+                suite = self.checked(document)
+                later = "test_later.Example.test_value"
+                self.assertEqual(suite["execution"], execution)
+                self.assertEqual(suite["selection"]["selected"], {IMPORTING: "changed", later: "changed"})
+                self.assertIn(OTHER, suite["selection"]["left_out"])
+                self.assertEqual(suite["executed"], [IMPORTING])
                 self.assertEqual(suite["measurement"], {"tests": 1})
-                self.assertEqual(suite["executed"], [OTHER])
-                self.assertEqual(suite["skipped"], [])
-                if outcome == "fail":
-                    self.assertIn("must_match", suite["reason"])
+                self.assertEqual(suite["not_executed"], {later: "invocation interrupted"})
+
+    def test_hook_failure_is_attributed_to_its_discovery_occurrence(self):
+        self.write_repeated_hook('self.fail("first occurrence")')
+        self.commit_all()
+        result, document = self.affected()
+        self.assertEqual(result.returncode, 1, output(result))
+        suite = self.checked(document)
+        first = "test_hook.Repeated.test_repeated (discovery occurrence 1)"
+        second = "test_hook.Repeated.test_repeated (discovery occurrence 2)"
+        self.assertEqual(suite["outcome"], "fail")
+        self.assertEqual(suite["executed"][:2], [first, second])
+        self.assertEqual([finding["subject"] for finding in suite["findings"]], [first])
 
     def test_staged_initializer_deletion_expands_package_and_dependents(self):
         self.write_config(CONFIG + """
@@ -531,30 +580,6 @@ reason = "External package consumer"
         self.assertEqual(self.checked(document)["executed"], [])
         self.assertGreater(self.checked(document, "crap")["measurement"]["functions"], 0)
 
-    def test_opaque_test_command_runs_with_no_inferred_test_count(self):
-        from quality_gate.adapters import AdapterContext, run_affected_check
-        from quality_gate.checks import CheckSelection
-        from quality_gate.policy import load_config
-
-        config = CONFIG + """
-[checks.opaque]
-adapter = "command"
-tier = 1
-enforcement = "enforced"
-run = ["python3", "-c", "print('1 skipped')"]
-tests_pattern = '([0-9]+)'
-"""
-        self.write_config(config)
-        parsed = load_config(self.repo)
-        context = AdapterContext(
-            self.repo, parsed, parsed.checks["opaque"], [], {}, "fixture", {}, self.base,
-            selection=CheckSelection({}, {}, "full run"),
-        )
-        result = run_affected_check(context)
-        self.assertEqual(result.outcome, "unsupported")
-        self.assertIn("skip-aware test counts", result.reason)
-        self.assertIsNone(result.measurement)
-
     def test_shard_command_uses_ordinary_discovery_with_the_configured_pattern(self):
         script = GATE / "quality_gate" / "test_shards.py"
         argv = ["-s", "tests", "-p", "test_other.py", "-j", "1"]
@@ -571,6 +596,8 @@ tests_pattern = '([0-9]+)'
         self.assertEqual(self.discover_shards(argv, {"tests/test_other.py": "changed"})["executed"], [OTHER])
 
     def discover_shards(self, argv, paths):
+        from quality_gate.adapters import _read_affected_report
+
         plan = self.base / "plan.json"
         plan.write_text(json.dumps({
             "argv": argv, "shards": True, "full": None, "coverage": False,
@@ -582,7 +609,7 @@ tests_pattern = '([0-9]+)'
             env=self.default_tool_env(), capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(child.returncode, 0, output(child))
-        return json.loads(plan.with_suffix(".result.json").read_text(encoding="utf-8"))
+        return _read_affected_report(plan.with_suffix(".result.jsonl"))
 
     def test_unchanged_elisp_suite_is_not_run(self):
         self.write_config(CONFIG.replace('"*.py", "*.sh"', '"*.py", "*.sh", "*.el"') + """
@@ -634,6 +661,25 @@ suite = "tests/ert.el"
         self.assertEqual(suite["outcome"], "fail")
         self.assertEqual(suite["measurement"], {"tests": 0})
         self.assertIn("coverage required", suite["selection"]["reason"])
+        crap = self.checked(document, "elisp_crap")
+        self.assertEqual(crap["selection"]["selected"], {"lisp/calc.el": "changed"})
+        self.assertGreater(crap["measurement"]["functions"], 0)
+
+    def test_all_skipped_ert_suite_supplies_crap_coverage(self):
+        self.write_elisp_config()
+        self.add_file(
+            "tests/suite.el",
+            "(require 'ert)\n(ert-deftest skipped () (ert-skip \"disabled\"))\n"
+            "(ert-run-tests-batch-and-exit)\n",
+        )
+        self.add_file("lisp/calc.el", "(defun calc (a) a)\n(provide 'calc)\n")
+        self.change("lisp/calc.el", "(defun calc (a) (if a 1 2))\n(provide 'calc)\n")
+        result, document = self.affected("--only", "elisp_crap")
+        self.assertEqual(result.returncode, 1, output(result))
+        suite = self.checked(document, "elisp")
+        self.assertEqual(suite["outcome"], "fail")
+        self.assertEqual(suite["measurement"], {"tests": 0})
+        self.assertIn("1 selected, 1 skipped", suite["reason"])
         crap = self.checked(document, "elisp_crap")
         self.assertEqual(crap["selection"]["selected"], {"lisp/calc.el": "changed"})
         self.assertGreater(crap["measurement"]["functions"], 0)

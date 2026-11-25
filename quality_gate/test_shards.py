@@ -143,17 +143,27 @@ def _discovery_path(module):
 
 
 class AffectedResult(unittest.TextTestResult):
-    def __init__(self, *args, occurrences, **kwargs):
+    def __init__(self, *args, occurrences, journal, **kwargs):
         super().__init__(*args, **kwargs)
         self.occurrences = occurrences
-        self.executed = []
-        self.skipped_cases = []
+        self.journal = journal
+        self.current = None
         self.skipped_invocation = False
         self.has_result = False
+
+    def record(self, event, name):
+        print(json.dumps([event, name]), file=self.journal, flush=True)
+
+    def record_failure(self, test):
+        self.record("failed", self.current or test.id())
 
     def startTest(self, test):
         self.skipped_invocation = False
         self.has_result = False
+        names = self.occurrences.get(id(test))
+        self.current = names.popleft() if names else None
+        if self.current is not None:
+            self.record("started", self.current)
         super().startTest(test)
 
     def addSkip(self, test, reason):
@@ -162,28 +172,37 @@ class AffectedResult(unittest.TextTestResult):
 
     def addSubTest(self, test, subtest, err):
         self.has_result = True
+        if err is not None:
+            self.record_failure(test)
         super().addSubTest(test, subtest, err)
 
     def addError(self, test, err):
         self.has_result = True
+        if not isinstance(test, unittest.loader._FailedTest):
+            self.record_failure(test)
         super().addError(test, err)
 
     def addFailure(self, test, err):
         self.has_result = True
+        self.record_failure(test)
         super().addFailure(test, err)
 
+    def addUnexpectedSuccess(self, test):
+        self.record_failure(test)
+        super().addUnexpectedSuccess(test)
+
     def stopTest(self, test):
-        if not isinstance(test, unittest.loader._FailedTest):
+        if self.current is not None and sys.exception() is None:
             skipped = self.skipped_invocation and not self.has_result
-            recorded = self.skipped_cases if skipped else self.executed
-            names = self.occurrences.get(id(test))
-            recorded.append(names.popleft() if names else test.id())
+            self.record("skipped" if skipped else "executed", self.current)
+        self.current = None
         super().stopTest(test)
 
 
 class AffectedRunner(unittest.TextTestRunner):
-    def __init__(self, *, occurrences, **kwargs):
-        super().__init__(resultclass=functools.partial(AffectedResult, occurrences=occurrences), **kwargs)
+    def __init__(self, *, occurrences, journal, **kwargs):
+        result = functools.partial(AffectedResult, occurrences=occurrences, journal=journal)
+        super().__init__(resultclass=result, **kwargs)
 
 
 def _case_names(cases):
@@ -249,8 +268,9 @@ def _selected_suite(tests, names, selected):
 
 
 class AffectedProgram(unittest.TestProgram):
-    def __init__(self, plan, argv):
+    def __init__(self, plan, argv, journal):
         self.plan = plan
+        self.journal = journal
         super().__init__(
             module=None, argv=["unittest", *argv], testLoader=AffectedLoader(),
             exit=False,
@@ -262,21 +282,20 @@ class AffectedProgram(unittest.TestProgram):
         names = _case_names(cases)
         reasons, full = _affected_cases(cases, names, self.testLoader, self.plan)
         selection = _selection_report(reasons, full)
+        report = {
+            "selection": selection,
+            "discovery_errors": self.testLoader.errors,
+            "omitted": not (full or selection["selected"] or self.testLoader.errors),
+        }
+        print(json.dumps(report), file=self.journal, flush=True)
         if full is None:
             self.test = _selected_suite(tests, names, selection["selected"])
         occurrences = _case_occurrences(cases, names, selection["selected"])
         self.testRunner = AffectedRunner(
-            occurrences=occurrences, verbosity=self.verbosity, failfast=self.failfast,
+            occurrences=occurrences, journal=self.journal, verbosity=self.verbosity, failfast=self.failfast,
             buffer=self.buffer, warnings=self.warnings,
         )
         super().runTests()
-        self.report = {
-            "selection": selection,
-            "executed": self.result.executed,
-            "skipped": self.result.skipped_cases,
-            "discovery_errors": self.testLoader.errors,
-            "omitted": not (full or selection["selected"] or self.testLoader.errors or self.result.errors),
-        }
 
 
 def _run_affected(path):
@@ -285,13 +304,9 @@ def _run_affected(path):
     if plan["shards"]:
         options = _options(argv)
         argv = ["discover", "-s", options.start, "-p", options.pattern]
-    program = AffectedProgram(plan, argv)
-    result = program.result
-    failed = {test.id() for test, _ in (*result.errors, *result.failures)}
-    failed.update(test.id() for test in result.unexpectedSuccesses)
-    report = {**program.report, "failed": sorted(failed)}
-    path.with_suffix(".result.json").write_text(json.dumps(report), encoding="utf-8")
-    return int(not result.wasSuccessful())
+    with path.with_suffix(".result.jsonl").open("w", encoding="utf-8") as journal:
+        program = AffectedProgram(plan, argv, journal)
+    return int(not program.result.wasSuccessful())
 
 
 def _module_blocks(modules):

@@ -250,7 +250,7 @@ def _complexity(context: Any, selected: list[str], start: float) -> tuple[Any, A
 def _usable_evidence(context: Any, required: Any) -> bool:
     return required.outcome == "pass" or (
         context.selection is not None
-        and required.tests_ran == 0
+        and required.tests_ran == required.tests_skipped
         and required.evidence_path is not None
     )
 

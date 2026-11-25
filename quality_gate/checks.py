@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import gate_result
-from .adapters import AdapterContext, adapter_for, affected_graph, run_affected_check
+from .adapters import AdapterContext, adapter_for, affected_graph
 from .files import (
     BUILTIN_RESULT_KINDS,
     DiffBase,
@@ -510,8 +510,6 @@ def _adapter_runner(
         root, config, check, files, classes, prefix, prior, evidence_dir,
         base_override, selection,
     )
-    if selection is not None:
-        return run_affected_check(context)
     return _check_descriptor(check).run(context)
 
 
@@ -842,9 +840,13 @@ CHANGED_FILE_ADAPTERS = CRAP_ADAPTERS | {"source_chars", "comments"}
 OUTSIDE_SCOPE = "no changed file affects this input"
 
 
+def _command_suite(check: CheckDef) -> bool:
+    return check.adapter == "command" and "tests" in check.evidence
+
+
 def _per_file(check: CheckDef) -> bool:
     return check.adapter in DEPENDENT_FILE_ADAPTERS | CHANGED_FILE_ADAPTERS or (
-        check.adapter == "command" and "{files}" in check.spec.run and "tests" not in check.evidence
+        check.adapter == "command" and "{files}" in check.spec.run and not _command_suite(check)
     )
 
 
@@ -917,8 +919,11 @@ def _check_selection(
     if check.adapter == "elisp_tests":
         path = Path(check.spec.suite).as_posix()
         return _elisp_suite_scope(path, full or affected.get(path))
-    if "tests" in check.evidence:
+    if check.adapter == "python_tests":
         return CheckSelection({}, {}, full or "full run", test_paths=affected, full_suite=full)
+    if _command_suite(check):
+        reason = "full run: command adapter suite is opaque"
+        return CheckSelection({}, {}, reason)
     return _file_scope(check, inputs, changed, affected, full)
 
 
