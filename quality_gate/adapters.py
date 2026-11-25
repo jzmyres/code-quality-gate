@@ -18,15 +18,16 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, python_crap, python_mutation, shell_syntax,
+    module_graph, python_crap, python_mutation, secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .files import DiffBaseOverride, source_languages
+from .files import DiffBaseOverride, enumerate_entries, source_languages
 from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
     GateError,
+    UnsupportedError,
     _check_keys,
     _config_error,
     _describe,
@@ -35,7 +36,7 @@ from .policy import (
     _string,
     _string_list,
 )
-from .runner import execution_outcome, mark_step, remaining_budget, run
+from .runner import Diagnostics, RunResult, execution_outcome, mark_step, remaining_budget, run
 from .tools import tool_binary
 
 if TYPE_CHECKING:
@@ -413,6 +414,43 @@ def _run_comments(context: AdapterContext) -> Any:
     )
 
 
+def _secrets_result(context: AdapterContext, start: float, child: RunResult, budget: int) -> Any:
+    from .checks import _check_result
+
+    passed = child.execution == "completed" and child.returncode == 0
+    reason = None if passed else child.error or f"Betterleaks exited {child.returncode}"
+    return _check_result(
+        context.check, start, "pass" if passed else "fail", execution=child.execution,
+        reason=reason, diagnostics=child.diagnostics(), budget_seconds=budget,
+    )
+
+
+def _run_secrets(context: AdapterContext) -> Any:
+    from .checks import RATCHET_BUDGET_SECONDS, _check_result
+
+    start = time.monotonic()
+    try:
+        mark_step("verifying Betterleaks")
+        binary = tool_binary("betterleaks").resolve(strict=True)
+    except (OSError, UnsupportedError) as error:
+        print(f"{context.prefix}: {error}", file=sys.stderr)
+        return _check_result(context.check, start, "unsupported", execution="error", reason=str(error))
+
+    try:
+        with TemporaryDirectory(prefix="qg-secrets-", dir=context.evidence_dir) as directory:
+            mark_step("snapshot and scan of Git-selected files")
+            root = context.root.resolve()
+            selected = [entry.path for entry in enumerate_entries(root) if not entry.gitlink]
+            child = secrets.scan(binary, root, Path(directory), selected, RATCHET_BUDGET_SECONDS, run=run)
+    except (GateError, OSError, ValueError) as error:
+        print(f"{context.prefix}: {error}", file=sys.stderr)
+        return _check_result(
+            context.check, start, "error", execution="error", reason=str(error),
+            diagnostics=Diagnostics(error=str(error)),
+        )
+    return _secrets_result(context, start, child, RATCHET_BUDGET_SECONDS)
+
+
 def _affected_test_child(
     context: AdapterContext, plan: Path, command: list[str], environment: dict, start: float,
 ) -> tuple[Any, str | None]:
@@ -734,5 +772,12 @@ register_adapter(AdapterDescriptor(
     (),
     _comments_spec,
     _run_comments,
+    runs_suite=False,
+))
+register_adapter(AdapterDescriptor(
+    "secrets",
+    (),
+    lambda _raw, _root, _path, _key: ParsedSpec(None, "secrets/1", ("static",)),
+    _run_secrets,
     runs_suite=False,
 ))

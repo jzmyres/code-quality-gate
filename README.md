@@ -309,6 +309,27 @@ python3 -I qg.py check --only env_surface --json
 The `measurement.findings` array includes allowed accesses. See the
 [policy schema](docs/SCHEMA.md#environment-access-policy) for the full table.
 
+### Secrets
+
+Declare a `secrets` adapter check in a consumer policy, for example:
+
+```toml
+[checks.secrets]
+adapter = "secrets"
+tier = 1
+enforcement = "enforced"
+```
+
+When included in a gate run, the check scans the working-tree contents of
+tracked and stageable files with pinned Betterleaks 1.10.1. It scans offline
+with credential validation disabled. A missing or modified installation makes
+the check unsupported.
+
+Betterleaks prints redacted findings to stderr with the repository-relative
+path, line, and rule. Gate checks print paths, so a credential in a filename
+is visible. Fix findings, including false positives, by changing the file.
+The check has no exceptions.
+
 ### Source comments
 
 Use the `comments` check to reject comments in all files of the classes that
