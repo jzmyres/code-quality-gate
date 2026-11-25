@@ -509,23 +509,23 @@ def _unittest_findings(failed: list[str]) -> list[ratchet.FindingResult]:
     ]
 
 
-def _affected_test_plan(context: AdapterContext, argv: tuple[str, ...], *, shards: bool = False) -> Path:
+def _affected_test_plan(context: AdapterContext, argv: tuple[str, ...]) -> Path:
     selection = context.selection
     assert selection is not None
     plan = context.evidence_dir / "discovery.json"
     plan.write_text(json.dumps({
-        "argv": argv, "shards": shards, "paths": selection.test_paths,
+        "argv": argv, "paths": selection.test_paths,
         "full": selection.full_suite, "coverage": selection.coverage,
     }), encoding="utf-8")
     return plan
 
 
-def _affected_unittest(context: AdapterContext, argv: tuple[str, ...], *, shards: bool = False) -> Any:
+def _affected_unittest(context: AdapterContext, argv: tuple[str, ...]) -> Any:
     from .checks import CheckResult
 
     start = time.monotonic()
     check, prefix = context.check, context.prefix
-    plan = _affected_test_plan(context, argv, shards=shards)
+    plan = _affected_test_plan(context, argv)
     setup = python_tests._tests_setup(context.root, check, check.spec, start, prefix, context.evidence_dir)
     if isinstance(setup, CheckResult):
         return setup
@@ -557,9 +557,7 @@ def _run_python_tests(context: AdapterContext) -> Any:
         return python_tests._run_python_tests(context)
     argv = context.check.spec.run
     if python_tests._uses_shard_runner(context.root, argv):
-        return _affected_unittest(context, argv[2:], shards=True)
-    if argv[:3] == ("{python}", "-m", "unittest"):
-        return _affected_unittest(context, argv[3:])
+        return _affected_unittest(context, argv[2:])
     context.selection.reason = "full run: custom Python test command is opaque"
     return python_tests._run_python_tests(context)
 

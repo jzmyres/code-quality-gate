@@ -169,6 +169,7 @@ class AffectedResult(unittest.TextTestResult):
     def addSkip(self, test, reason):
         self.skipped_invocation = True
         super().addSkip(test, reason)
+        self.stream.writeln(f"skipped {test.id()}: {reason}")
 
     def addSubTest(self, test, subtest, err):
         self.has_result = True
@@ -200,9 +201,11 @@ class AffectedResult(unittest.TextTestResult):
 
 
 class AffectedRunner(unittest.TextTestRunner):
-    def __init__(self, *, occurrences, journal, **kwargs):
-        result = functools.partial(AffectedResult, occurrences=occurrences, journal=journal)
-        super().__init__(resultclass=result, **kwargs)
+    def run(self, suite, *, occurrences, journal):
+        result = AffectedResult(self.stream, self.descriptions, 0, occurrences=occurrences, journal=journal)
+        suite(result)
+        result.printErrors()
+        return result
 
 
 def _case_names(cases):
@@ -273,46 +276,32 @@ def _selected_suite(tests, names, selected):
     )
 
 
-class AffectedProgram(unittest.TestProgram):
-    def __init__(self, plan, argv, journal):
-        self.plan = plan
-        self.journal = journal
-        super().__init__(
-            module=None, argv=["unittest", *argv], testLoader=AffectedLoader(),
-            exit=False,
-        )
-
-    def runTests(self):
-        tests = list(_discovered_cases(self.test))
-        cases = _real_cases(tests)
-        names = _case_names(cases)
-        reasons, full = _affected_cases(cases, names, self.testLoader, self.plan)
-        selection = _selection_report(reasons, full)
-        report = {
-            "selection": selection,
-            "discovery_errors": self.testLoader.errors,
-            "omitted": not (full or selection["selected"] or self.testLoader.errors),
-        }
-        print(json.dumps(report), file=self.journal, flush=True)
-        if full is None:
-            self.test = _selected_suite(tests, names, selection["selected"])
-        occurrences = _case_occurrences(cases, names, selection["selected"])
-        self.testRunner = AffectedRunner(
-            occurrences=occurrences, journal=self.journal, verbosity=self.verbosity, failfast=self.failfast,
-            buffer=self.buffer, warnings=self.warnings,
-        )
-        super().runTests()
+def _run_affected_suite(suite, loader, plan, journal):
+    tests = list(_discovered_cases(suite))
+    cases = _real_cases(tests)
+    names = _case_names(cases)
+    reasons, full = _affected_cases(cases, names, loader, plan)
+    selection = _selection_report(reasons, full)
+    report = {
+        "selection": selection,
+        "discovery_errors": loader.errors,
+        "omitted": not (full or selection["selected"] or loader.errors),
+    }
+    print(json.dumps(report), file=journal, flush=True)
+    if full is None:
+        suite = _selected_suite(tests, names, selection["selected"])
+    occurrences = _case_occurrences(cases, names, selection["selected"])
+    return AffectedRunner().run(suite, occurrences=occurrences, journal=journal)
 
 
 def _run_affected(path):
     plan = json.loads(path.read_text(encoding="utf-8"))
-    argv = plan["argv"]
-    if plan["shards"]:
-        options = _options(argv)
-        argv = ["discover", "-s", options.start, "-p", options.pattern]
+    options = _options(plan["argv"])
+    loader = AffectedLoader()
+    suite = loader.discover(options.start, options.pattern)
     with path.with_suffix(".result.jsonl").open("w", encoding="utf-8") as journal:
-        program = AffectedProgram(plan, argv, journal)
-    return int(not program.result.wasSuccessful())
+        result = _run_affected_suite(suite, loader, plan, journal)
+    return int(not result.wasSuccessful())
 
 
 def _module_blocks(modules):

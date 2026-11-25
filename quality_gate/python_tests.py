@@ -502,9 +502,9 @@ def _tests_evidence(
     evidence_dir: Path,
     root: Path,
     data_dir: Path,
-    ran: int | None,
-    skipped: int | None,
-    executed: int | None,
+    ran: int,
+    skipped: int,
+    executed: int,
     diagnostics: Diagnostics,
 ) -> Any:
     from .checks import _check_result, _tests_result
@@ -546,41 +546,28 @@ def _tests_evidence(
         "pass",
         budget_seconds=spec.budget_seconds,
         diagnostics=diagnostics,
-        measurement=None if executed is None else {"tests": executed},
+        measurement={"tests": executed},
         tests_ran=ran,
         tests_skipped=skipped,
         evidence_path=combined_file,
         adapter_data={"coverage_config": config_file, "coverage_settings": settings},
     )
-    summary = "" if executed is None else f"{executed} tests, "
-    print(f"{prefix}: passed ({summary}{outcome.duration_seconds:.2f}s)", flush=True)
-    return outcome
-
-
-def _finish_opaque_suite(
-    context: Any, data_dir: Path, start: float, result: RunResult, temporary_reason: str | None,
-    diagnostics: Diagnostics,
-) -> Any:
-    from .checks import _combined_reason, _tests_result
-
-    check, prefix = context.check, context.prefix
-    spec = check.spec
-    reason = f"command exited {result.returncode}" if result.returncode else None
-    reason = _combined_reason(reason, temporary_reason)
-    if reason is not None:
-        return _tests_result(check, spec, start, prefix, reason, diagnostics=diagnostics)
-    return _tests_evidence(
-        check, spec, start, prefix, context.evidence_dir, context.root, data_dir,
-        None, None, None, diagnostics,
+    print(
+        f"{prefix}: passed ({executed} tests, "
+        f"{outcome.duration_seconds:.2f}s)",
+        flush=True,
     )
+    return outcome
 
 
 def _run_python_tests(context: Any) -> Any:
     from .checks import (
         CheckResult,
         _finish_temporary,
+        _finish_test_result,
         _temporary_reason,
         _temporary_test_directory,
+        _tests_result,
     )
 
     root, check, prefix = context.root, context.check, context.prefix
@@ -608,41 +595,14 @@ def _run_python_tests(context: Any) -> Any:
     finally:
         temporary_paths = _finish_temporary(temporary)
     temporary_reason = _temporary_reason(temporary_paths)
-    return _finish_python_suite(context, start, run_result, data_dir, temporary_reason, failed_report)
 
-
-def _finish_python_suite(
-    context: Any, start: float, run_result: RunResult, data_dir: Path,
-    temporary_reason: str | None, failed_report: Path | None,
-) -> Any:
-    from .checks import _finish_test_result
-
-    check, prefix = context.check, context.prefix
-    spec = check.spec
-    opaque = context.selection is not None
-    diagnostics = run_result.diagnostics(include_output=not opaque)
-    combined = "" if opaque else run_result.combined_text
+    diagnostics = run_result.diagnostics()
+    combined = run_result.combined_text
     failure = _tests_execution_failure(
         check, spec, run_result, diagnostics, combined, prefix, start,
     )
     if failure is not None:
         return _finish_test_result(failure, temporary_reason, prefix, combined)
-    if opaque:
-        return _finish_opaque_suite(context, data_dir, start, run_result, temporary_reason, diagnostics)
-    return _finish_counted_suite(
-        context, start, run_result, data_dir, temporary_reason, failed_report, diagnostics, combined,
-    )
-
-
-def _finish_counted_suite(
-    context: Any, start: float, run_result: RunResult, data_dir: Path, temporary_reason: str | None,
-    failed_report: Path | None, diagnostics: Diagnostics, combined: str,
-) -> Any:
-    from .checks import _finish_test_result, _tests_result
-
-    check, prefix = context.check, context.prefix
-    spec = check.spec
-    deadline = start + spec.budget_seconds
     if run_result.returncode != 0:
         result = _tests_failed(
             check,
@@ -686,8 +646,8 @@ def _finish_counted_suite(
         spec,
         start,
         prefix,
-        context.evidence_dir,
-        context.root,
+        evidence_dir,
+        root,
         data_dir,
         ran,
         skipped,

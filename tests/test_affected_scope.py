@@ -6,6 +6,10 @@ import subprocess
 from support import GATE, PYTHON_TEST_HEADER, FixtureCase, output
 
 
+SHARD_RUNNER = GATE / "quality_gate" / "test_shards.py"
+SHARD_COMMAND = json.dumps(["{python}", str(SHARD_RUNNER), "-s", "tests", "-j", "1"])
+UNITTEST_DISCOVER = ["{python}", "-m", "unittest", "discover"]
+
 CONFIG = r"""
 schema = 2
 
@@ -69,9 +73,9 @@ base = "HEAD"
 adapter = "python_tests"
 tier = 1
 enforcement = "enforced"
-run = ["{python}", "-m", "unittest", "discover", "-s", "tests"]
+run = @SHARD_COMMAND@
 tests_pattern = '^Ran (\d+) tests? in'
-"""
+""".replace("@SHARD_COMMAND@", SHARD_COMMAND)
 
 CRAP = """\
 [checks.crap]
@@ -205,7 +209,8 @@ class AffectedScopeTests(FixtureCase):
                       document["error"])
 
     def test_full_run_keeps_configured_pattern_and_json_shape(self):
-        self.write_config(CONFIG.replace('"-s", "tests"]', '"tests", "-p", "test_other.py"]'))
+        command = [*UNITTEST_DISCOVER, "tests", "-p", "test_other.py"]
+        self.write_config(CONFIG.replace(SHARD_COMMAND, json.dumps(command)))
         self.commit_all()
         result, document = self.run_gate()
         self.assertEqual(result.returncode, 0, output(result))
@@ -218,7 +223,8 @@ class AffectedScopeTests(FixtureCase):
         )
 
     def test_full_run_keeps_verbose_argument_and_runs_all_tests(self):
-        self.write_config(CONFIG.replace('"-s", "tests"]', '"-v", "-s", "tests"]'))
+        command = [*UNITTEST_DISCOVER, "-v", "-s", "tests"]
+        self.write_config(CONFIG.replace(SHARD_COMMAND, json.dumps(command)))
         self.commit_all()
         result, document = self.run_gate()
         self.assertEqual(result.returncode, 0, output(result))
@@ -413,20 +419,28 @@ def load_tests(loader, suite, pattern):
                 self.write_config(CONFIG + pattern + "\n")
                 self.git("add", "quality-gate.toml")
                 self.git("commit", "--allow-empty", "-m", "Configure skip reporting")
-                _, document = self.affected()
+                result, document = self.affected()
                 suite = self.checked(document)
                 self.assertEqual(suite["outcome"], "fail")
                 self.assertEqual(suite["measurement"], {"tests": 0})
                 self.assertEqual(suite["skipped"], [OTHER])
                 self.assertIn(IMPORTING, suite["selection"]["left_out"])
+                self.assertNotIn("Ran 1 test", result.stderr)
+                self.assertNotIn("Ran 1 test", suite["diagnostics"]["output_tail"])
+                self.assertIn(f"skipped {OTHER}: disabled", result.stderr)
 
     def test_discovery_import_error_is_not_an_executed_test(self):
         self.change("tests/test_other.py", "raise ImportError('fixture discovery error')\n")
-        _, document = self.affected()
+        result, document = self.affected()
         suite = self.checked(document)
         self.assertEqual(suite["outcome"], "fail")
         self.assertEqual(suite["executed"], [])
+        self.assertEqual(suite["measurement"], {"tests": 0})
         self.assertIn("ImportError: fixture discovery error", suite["discovery_errors"][0])
+        self.assertIn("ImportError: fixture discovery error", result.stderr)
+        self.assertIn("Traceback (most recent call last)", result.stderr)
+        self.assertNotIn("Ran 1 test", result.stderr)
+        self.assertNotIn("Ran 1 test", suite["diagnostics"]["output_tail"])
 
     def test_passing_subtest_counts_even_with_a_skipped_subtest(self):
         self.commit_all()
@@ -441,71 +455,50 @@ def load_tests(loader, suite, pattern):
         self.assertEqual(suite["executed"], [OTHER])
         self.assertEqual(suite["skipped"], [])
 
-    def test_command_adapter_suite_runs_the_configured_command_in_full(self):
-        self.write_config(CONFIG.replace('adapter = "python_tests"', 'adapter = "command"')
-                          .replace('"{python}", "-m"', '"python3", "-I", "-m"')
-                          .replace('"-s", "tests"]', '"tests", "-p", "test_importing.py", "-v"]')
-                          + 'must_match = "test_importing.Example.test_value"\n')
+    def test_opaque_suites_keep_full_run_verdict_counts_and_verification_findings(self):
+        for name in ("other", "disabled"):
+            self.write_test(name, decorator="    @unittest.skip('disabled by fixture')\n")
+        self.add_file("tests/test_unmatched.py", "raise AssertionError('outside configured pattern')\n")
+        argv = ["-m", "unittest", "discover", "tests", "-p", "test_[dio]*.py", "-v"]
+        adapters = (
+            ("command", ("python3", "-I"), "command adapter suite"),
+            ("python_tests", ("{python}",), "custom Python test command"),
+        )
+        for adapter, executable, description in adapters:
+            with self.subTest(adapter=adapter):
+                self.assert_opaque_suite_parity(adapter, executable, argv, description)
+
+    def assert_opaque_suite_parity(self, adapter, executable, argv, description):
+        self.write_config(
+            CONFIG.replace('adapter = "python_tests"', f'adapter = "{adapter}"')
+            .replace(SHARD_COMMAND, json.dumps([*executable, *argv]))
+            .replace('"lint", "tests", "chars"', '"lint", "tests", "chars", "verification"')
+            + "skipped_pattern = 'skipped=(\\d+)'\n" + VERIFICATION
+        )
         self.commit_all()
-        self.write_test("other", body="        self.fail('outside the configured pattern')\n")
         full_result, full_document = self.run_gate()
         result, document = self.affected()
-        self.assertEqual(full_result.returncode, 0, output(full_result))
-        self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
         full_suite = self.checked(full_document)
-        self.assertEqual(suite["diagnostics"]["argv"], full_suite["diagnostics"]["argv"])
-        self.assertEqual(full_suite["measurement"], {"tests": 1})
-        self.assertNotIn("measurement", suite)
+        self.assertEqual(result.returncode, full_result.returncode, output(result))
+        self.assertEqual(suite["outcome"], full_suite["outcome"], output(result))
+        self.assertEqual(suite["outcome"], "pass")
+        self.assertEqual(suite["measurement"], full_suite["measurement"])
+        self.assertEqual(suite["measurement"], {"tests": 1})
+        for report in (suite, full_suite):
+            self.assertEqual(report["diagnostics"]["argv"][-len(argv):], argv)
+            self.assertIn("skipped=2", report["diagnostics"]["output_tail"])
         self.assertEqual(suite["selection"], {
-            "selected": {}, "left_out": {}, "reason": "full run: command adapter suite is opaque",
+            "selected": {}, "left_out": {}, "reason": f"full run: {description} is opaque",
         })
         self.assertNotIn("executed", suite)
-
-    def test_opaque_suites_do_not_report_counts_for_skipped_cases(self):
-        python_config = CONFIG.replace(
-            '"-m", "unittest", "discover", "-s", "tests"', '"pkg/run_tests.py"',
-        )
-        command_config = python_config.replace('adapter = "python_tests"', 'adapter = "command"')
-        command_config = command_config.replace('"{python}"', '"python3"')
-        self.add_file("pkg/run_tests.py", (
-            "import unittest\n"
-            "suite = unittest.defaultTestLoader.discover('tests')\n"
-            "raise SystemExit(not unittest.TextTestRunner().run(suite).wasSuccessful())\n"
-        ))
-        for name in ("importing", "other"):
-            self.write_test(name, decorator="    @unittest.skip('disabled')\n")
-        configurations = {
-            "command adapter suite": command_config,
-            "custom Python test command": python_config,
-        }
-        for description, config in configurations.items():
-            for pattern, full_outcome, full_count in (("unmatched", "pass", 2), ("skipped", "fail", 0)):
-                with self.subTest(adapter=description, pattern=pattern):
-                    self.check_opaque_suite(config, description, pattern, full_outcome, full_count)
-
-    def check_opaque_suite(self, config, description, pattern, full_outcome, full_count):
-        self.write_config(config + f"skipped_pattern = '{pattern}=(\\d+)'\n")
-        self.commit_all()
-        full_result, full_document = self.run_gate()
-        result, document = self.affected()
-        suite = self.checked(document)
-        full_suite = self.checked(full_document)
-        self.assertEqual(full_result.returncode, int(full_outcome == "fail"), output(full_result))
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertEqual(suite["outcome"], "pass", output(result))
-        self.assertEqual(full_suite["outcome"], full_outcome, output(full_result))
-        self.assertEqual(suite["diagnostics"]["argv"][-1:], full_suite["diagnostics"]["argv"][-1:])
-        self.assertEqual(suite["selection"], {
-            "selected": {}, "left_out": {},
-            "reason": f"full run: {description} is opaque",
-        })
-        self.assertFalse({"measurement", "executed", "skipped", "tests"} & suite.keys())
-        self.assertEqual(full_suite["measurement"], {"tests": full_count})
-        self.assertIn("skipped=2", full_suite["diagnostics"]["output_tail"])
-        self.assertNotIn("skipped=2", suite["diagnostics"]["output_tail"])
-        self.assertNotIn("skipped=2", result.stderr)
-        self.assertNotIn("2 tests", result.stderr)
+        self.assertNotIn("skipped", suite)
+        verification = self.checked(document, "verification")
+        full_verification = self.checked(full_document, "verification")
+        self.assertEqual(verification["outcome"], full_verification["outcome"])
+        self.assertEqual(verification["findings"], full_verification["findings"])
+        skipped = {row["subject"]: row["value"] for row in verification["findings"]}
+        self.assertEqual(skipped["tests:tests:skipped"], 2)
 
     def test_retargeted_python_test_symlink_selects_the_discovery_file(self):
         before = self.add_file("pkg/before.py", "import unittest\n")
@@ -639,13 +632,10 @@ reason = "External package consumer"
         self.assertNotIn("measurement", crap)
 
     def test_shard_command_uses_ordinary_discovery_with_the_configured_pattern(self):
-        script = GATE / "quality_gate" / "test_shards.py"
         argv = ["-s", "tests", "-p", "test_other.py", "-j", "1"]
         self.add_file("tests/test_importing.py", "raise AssertionError('pattern selected the wrong file')\n")
-        configured = json.dumps(["{python}", str(script), *argv])
-        self.write_config(CONFIG.replace(
-            '["{python}", "-m", "unittest", "discover", "-s", "tests"]', configured,
-        ))
+        configured = json.dumps(["{python}", str(SHARD_RUNNER), *argv])
+        self.write_config(CONFIG.replace(SHARD_COMMAND, configured))
         self.commit_all()
         self.write_test("other", body="        self.assertEqual(1, 1)\n")
         result, document = self.affected()
@@ -658,11 +648,11 @@ reason = "External package consumer"
 
         plan = self.base / "plan.json"
         plan.write_text(json.dumps({
-            "argv": argv, "shards": True, "full": None, "coverage": False,
+            "argv": argv, "full": None, "coverage": False,
             "paths": paths,
         }), encoding="utf-8")
         child = subprocess.run(
-            [*self.python_prefix(), str(GATE / "quality_gate" / "test_shards.py"), "--affected", str(plan)],
+            [*self.python_prefix(), str(SHARD_RUNNER), "--affected", str(plan)],
             cwd=self.repo,
             env=self.default_tool_env(), capture_output=True, text=True, timeout=30,
         )

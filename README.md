@@ -1309,13 +1309,11 @@ their transitive module graph dependents. A changed or deleted package initializ
 package modules. Any changed tracked path outside the module graph expands every per-file
 check to its full input class, including changes to configuration, tool pins, data, and documentation.
 
-Unittest discovery selects changed test files and tests that reach changed modules through the
-graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.
+The gate's unittest shard runner selects changed test files and tests that reach changed modules
+through the graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.
 Test selection matches both a tracked symlink's path and its resolved target. Command-adapter
-suites and custom Python test commands run their full configured command. The affected result
-records their verdict and full-run reason. It evaluates exit status and applies `must_match`
-where configured. The full gate evaluates opaque suites' configured test-summary patterns.
-Affected execution counts and per-test records come from the gate's own test adapters.
+suites and custom Python test commands run their full configured command and retain the full run's
+policy verdict, test counts, and diagnostics. Their selection records the full-run reason.
 
 Verification runs with its full prerequisites. CRAP requests a coverage run for changed inputs even
 when discovery selects no tests. If the prerequisite suite fails, CRAP reports `unsupported`.

@@ -196,7 +196,7 @@ class RunResult:
     def combined_text(self) -> str:
         return self._text(self.combined)
 
-    def diagnostics(self, *, include_output: bool = True) -> Diagnostics:
+    def diagnostics(self) -> Diagnostics:
         exit_code = self.returncode
         signal_number = None
         if exit_code is not None and exit_code < 0:
@@ -207,7 +207,7 @@ class RunResult:
             exit_code=exit_code,
             signal=signal_number,
             output_bytes=self.output_bytes,
-            output_tail=self._text(self.output_tail[-TAIL_LIMIT:]) if include_output else "",
+            output_tail=self._text(self.output_tail[-TAIL_LIMIT:]),
             output_truncated=self.output_truncated,
             error=self.error,
         )
