@@ -34,6 +34,8 @@ from .files import (
     DiffBase,
     DiffBaseOverride,
     InventoryClasses,
+    _git,
+    _split_nul,
     affected_diff,
     changed_paths,
     git_argv,
@@ -45,6 +47,7 @@ from .policy import (
     MODULE_CONTRACTS_ID,
     CheckDef,
     Config,
+    ConfigError,
     GateError,
     UnsupportedError,
     UsageError,
@@ -1073,16 +1076,49 @@ def _extract_module_contracts(
             return None, execution
 
 
-def _shared_changed_paths(
-    root: Path, base_revision: str | None, diff: DiffBaseOverride,
-) -> set[str] | frozenset[str]:
-    if base_revision is None:
+def _tree_entry_modes(root: Path, commit: str, paths: Iterable[str]) -> dict[str, str]:
+    raw = _git(
+        root, ["--literal-pathspecs", "ls-tree", "-t", "-z", "--full-tree", commit, "--", *paths],
+        "base tree inspection",
+    )
+    entries = {}
+    for record in _split_nul(raw):
+        metadata, _, path = record.partition("\t")
+        entries[path] = metadata.split()[0]
+    return entries
+
+
+def _validate_protected_tree(root: Path, config: Config, base: DiffBase) -> None:
+    declarations = {
+        path: f"modules.{name}.protected_paths[{index}]"
+        for name, module in config.modules.items()
+        for index, path in enumerate(module.protected_paths)
+    }
+    if not declarations:
+        return
+    modes = _tree_entry_modes(root, base.commit, declarations)
+    entry_kinds = {None: "no entry for", "040000": "directory", "120000": "symlink", "160000": "gitlink"}
+    for path, item in declarations.items():
+        mode = modes.get(path)
+        if mode not in ("100644", "100755"):
+            kind = entry_kinds[mode]
+            raise ConfigError(
+                f"{config.path}: {item}: expected a regular file in diff base {base.commit}, "
+                f"got {kind} {path!r}"
+            )
+
+
+def _shared_changed_paths(root: Path, config: Config, diff: DiffBaseOverride) -> set[str] | frozenset[str]:
+    if config.shared_base is None:
         return frozenset()
-    if diff.changed_paths is not None:
-        return diff.changed_paths
     try:
-        base = diff.for_scope(root, base_revision)
+        base = diff.for_scope(root, config.shared_base)
+        _validate_protected_tree(root, config, base)
+        if diff.changed_paths is not None:
+            return diff.changed_paths
         return changed_paths(root, base.commit, "changed-file selection")
+    except UsageError:
+        raise
     except GateError as error:
         raise UsageError(f"module-contracts: {error}") from error
 
@@ -1102,13 +1138,15 @@ def _shared_entry_point_findings(
     ]
 
 
-def _inventory_shared_owners(
+def _inventory_blocked_contracts(
     config: Config, files: list[str], classes: dict[str, str], changed: set[str] | frozenset[str],
-) -> dict[str, str]:
+) -> tuple[str, dict[str, str]]:
+    skipped = "skipped" if config.shared_base is None else "graph checks skipped"
+    message = f"module-contracts: {skipped} because inventory failed"
+    owners = {}
     if changed and isinstance(classes, InventoryClasses):
         owners, _ = module_ownership(config, files, classes)
-        return owners
-    return {}
+    return message, owners
 
 
 def _run_module_contracts(
@@ -1122,11 +1160,11 @@ def _run_module_contracts(
     graph = None
     budget = None
     messages = []
-    changed = _shared_changed_paths(root, config.shared_base, diff)
+    changed = _shared_changed_paths(root, config, diff)
     if inventory_code != 0:
         execution = "error"
-        messages.append("module-contracts: graph checks skipped because inventory failed")
-        owners = _inventory_shared_owners(config, files, classes, changed)
+        message, owners = _inventory_blocked_contracts(config, files, classes, changed)
+        messages.append(message)
     else:
         assert isinstance(classes, InventoryClasses)
         owners, findings = module_ownership(config, files, classes)

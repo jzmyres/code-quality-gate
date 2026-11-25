@@ -151,8 +151,7 @@ Rules:
   empty, `.` and `..` components and NUL characters. `allowed_dependencies` names modules anywhere
   in the table. The optional `protected_paths` array uses the same path validation and names
   exact, case-sensitive repository-relative files without glob syntax. Each path may be
-  declared only once across all modules. Existing directories are invalid. Non-code paths are
-  allowed, and a declaration remains valid when the file is deleted. Invalid declarations exit 2.
+  declared only once across all modules. Non-code paths are allowed. Invalid declarations exit 2.
   The `module-contracts` check ID requires `adapter = "module_contracts"`, a tier from 1 to 4
   and `enforcement = "enforced"`.
   It produces a built-in result with a null tier and supplies no class obligation evidence.
@@ -530,11 +529,16 @@ includes committed, staged and unstaged changes. Rename detection is disabled so
 includes both names of a rename. Invalid bases and unreadable diffs are command errors even
 when inventory reports violations.
 
+For opted-in policies, Git must report each declared protected path as a regular file in the
+selected base commit's tree. Directories, symlinks, gitlinks and missing entries in that tree
+are configuration errors. The candidate worktree does not determine whether a declaration is valid.
+Policies without `shared_base` skip the base tree validation and both shared entry point rules.
+
 The `shared-entry-point` rule blocks each pair of a changed protected path and a changed,
-present, uniquely owned code file outside the declared protected paths. Deleting or renaming
-a protected path counts as a change. The rule can report these pairs even when inventory
-enumeration succeeds with violations. Put the registration or documentation beside the
-feature file in its owning module.
+present, uniquely owned code file outside the declared protected paths. A content edit, deletion,
+rename away or replacement by a directory or symlink counts when Git reports the protected path
+in the diff. The rule can report these pairs even when inventory enumeration succeeds with
+violations. Put the registration or documentation beside the feature file in its owning module.
 
 The `multi-module-file` rule blocks each present, index-tracked code file with direct
 dependents in at least two declared modules in the full extracted graph, even with an

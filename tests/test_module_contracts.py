@@ -342,9 +342,10 @@ class ModuleContractTests(FixtureCase):
         self.add_file("unknown.txt", "")
         with mock.patch.object(checks, "module_ownership") as ownership, \
                 mock.patch.object(checks, "extract_contract_graph") as extract:
-            _, _, check = self.contract(1)
+            result, _, check = self.contract(1)
         ownership.assert_not_called()
         extract.assert_not_called()
+        self.assertIn("module-contracts: skipped because inventory failed", result.stderr)
         self.assertEqual(check["caused_by"], ["inventory"])
         self.assertIn("inventory", check["reason"])
         self.assertEqual(check["findings"], [])
@@ -618,6 +619,22 @@ class SharedSurfaceTests(FixtureCase):
                 self.assertFalse(inventory["satisfied"])
                 self.assertIn("pattern '*.md'): matches no file", inventory["diagnostics"]["output_tail"])
 
+    def test_protected_file_replaced_by_directory_counts_as_an_edit(self) -> None:
+        trusted = self.trusted_directory("HEAD")
+        (self.repo / "README.md").unlink()
+        self.add_file("README.md/description.md", "# replacement\n")
+        self.change_feature()
+        for args in ((), ("--base", "HEAD"), ("--policy-from", str(trusted))):
+            with self.subTest(args=args):
+                self.assert_shared_entry_point(*args)
+
+    def test_protected_file_replaced_by_symlink_counts_as_an_edit(self) -> None:
+        readme = self.repo / "README.md"
+        readme.unlink()
+        readme.symlink_to("library/api.py")
+        self.change_feature()
+        self.assert_shared_entry_point()
+
     def test_unclassified_code_can_be_a_uniquely_owned_feature(self) -> None:
         config = self.config.replace('pattern = "*.py"', 'pattern = "library/*.py"')
         config = config.replace("[code]", 'module_dirs = ["app", "library"]\n\n[code]')
@@ -645,6 +662,7 @@ class SharedSurfaceTests(FixtureCase):
 
     def test_tracked_target_with_two_caller_modules_blocks_on_empty_diff(self) -> None:
         self.add_file("library/z.py", "import library.api\n")
+        self.write_config(self.config.replace('protected_paths = ["README.md"]\n', ""))
         self.commit_all("add an internal caller")
         result, document, findings = self.contract(1, "--base", "HEAD")
         self.assertEqual(document["changed_paths"], [])
@@ -733,17 +751,49 @@ class SharedSurfaceTests(FixtureCase):
                 with self.subTest(args=args):
                     self.assert_command_error("unreadable diff", *args)
 
-    def test_rejects_an_existing_directory_as_a_protected_path(self) -> None:
+    def test_rejects_a_directory_in_the_base_even_if_the_candidate_removes_it(self) -> None:
         self.write_config(self.config.replace('protected_paths = ["README.md"]',
                                               'protected_paths = ["library"]'))
         self.commit_all("declare a directory as a protected path")
         trusted = self.trusted_directory("HEAD")
         self.change_feature()
-        self.add_file("library/api.py", "value = 3\n")
-        for args in ((), ("--policy-from", str(trusted))):
+        shutil.rmtree(self.repo / "library")
+        for args in ((), ("--base", "HEAD"), ("--policy-from", str(trusted))):
             with self.subTest(args=args):
                 result = self.assert_command_error("directory 'library'", *args)
                 self.assertIn("modules.app.protected_paths[0]", result.stderr)
+
+    def test_rejects_paths_missing_from_the_selected_base(self) -> None:
+        self.add_file("docs/registry.md", "# registry\n")
+        self.commit_all("add a registry after the comparison base")
+        self.write_config(self.config.replace('["README.md"]', '["docs/registry.md"]'))
+        self.contract(0)
+        self.assert_command_error("no entry for 'docs/registry.md'", "--base", "HEAD^")
+        self.assert_command_error("no entry for 'docs/registry.md'", env={"QG_DIFF_BASE": "HEAD^"})
+        self.write_config(self.config.replace('["README.md"]', '["readme.md"]'))
+        self.assert_command_error("no entry for 'readme.md'")
+
+    def test_validates_paths_against_the_merge_base_in_affected_scope(self) -> None:
+        self.git("checkout", "-b", "other")
+        (self.repo / "README.md").unlink()
+        self.commit_all("remove the protected file on the other branch")
+        self.git("checkout", "main")
+        self.add_file("README.md", "# changed\n")
+        self.change_feature()
+        self.commit_all("edit the protected file and a feature on main")
+        self.assert_shared_entry_point("--base", "other")
+        self.assert_command_error("no entry for 'README.md'", env={"QG_DIFF_BASE": "other"})
+
+    def test_rejects_a_symlink_in_the_base(self) -> None:
+        (self.repo / "registry.md").symlink_to("README.md")
+        self.commit_all("add a symlink")
+        self.write_config(self.config.replace('["README.md"]', '["registry.md"]'))
+        self.assert_command_error("symlink 'registry.md'")
+
+    def test_opted_out_policy_does_not_validate_paths_against_a_base(self) -> None:
+        config = self.config.replace('shared_base = "HEAD"\n', "")
+        self.write_config(config.replace('["README.md"]', '["library", "absent.md"]'))
+        self.assertEqual(self.contract(0, "--base", "HEAD")[2], [])
 
     def test_rejects_invalid_protected_paths(self) -> None:
         for value in ('"README.md"', "[1]", '[""]', '["/README.md"]', '["docs/../README.md"]',
