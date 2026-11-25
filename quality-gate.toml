@@ -212,6 +212,14 @@ files = ["tests/*.py", "tests/elisp/*.el"]
 entry_points = []
 allowed_dependencies = ["core", "python", "elisp", "other-adapters"]
 
+[capabilities.run-quality-gate]
+owner = "core"
+entry_points = ["qg.py"]
+
+[capabilities.run-coverage-driver]
+owner = "python"
+entry_points = ["quality_gate/covrun.py"]
+
 [checks.module-contracts]
 adapter = "module_contracts"
 tier = 1

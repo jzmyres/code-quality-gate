@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
+import tempfile
 import time
+import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import BASE_CONFIG, FixtureCase, baseline_text, output, with_clones
+from support import BASE_CONFIG, GATE, FixtureCase, baseline_text, output, with_clones
 
 from quality_gate import adapters, checks, files, module_graph, runner
 from quality_gate.files import validate_inventory
-from quality_gate.policy import GateError, load_config
+from quality_gate.policy import CapabilityDef, GateError, load_config
 
 CONTRACT_CHECK = """\
 [checks.module-contracts]
@@ -46,6 +50,32 @@ ENTRY_POINTS = ["library/api.py", "library/z.py"]
 
 def capability(*paths: str, name: str = "run-library", owner: str = "library") -> str:
     return f'\n[capabilities.{name}]\nowner = "{owner}"\nentry_points = {json.dumps(paths)}\n'
+
+
+class ShippedCapabilityTests(unittest.TestCase):
+    def test_shipped_capability_ownership(self) -> None:
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=GATE)
+        with tempfile.TemporaryDirectory(prefix="qg-shipped-policy-") as directory:
+            repo = Path(directory)
+            for relative in os.fsdecode(tracked).split("\0")[:-1]:
+                destination = repo / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(GATE / relative, destination, follow_symlinks=False)
+
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "-A", "-f"], cwd=repo, check=True)
+
+            config = load_config(repo)
+            self.assertEqual(config.capabilities, {
+                "run-quality-gate": CapabilityDef(owner="core", entry_points=("qg.py",)),
+                "run-coverage-driver": CapabilityDef(
+                    owner="python", entry_points=("quality_gate/covrun.py",),
+                ),
+            })
+            paths, classes, violations = validate_inventory(repo, config)
+            self.assertEqual(violations, [])
+            _, findings = adapters.module_ownership(config, paths, classes)
+            self.assertEqual(findings, [])
 
 
 class ModuleContractTests(FixtureCase):
