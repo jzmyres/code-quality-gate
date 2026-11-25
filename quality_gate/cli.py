@@ -142,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     path = tool_commands.add_parser("path", help="print a pinned tool's binary")
     path.add_argument("name", metavar="NAME")
     check = commands.add_parser("check", help="run every configured check")
+    check.add_argument("--base", metavar="REV", help="run checks over the scope affected since REV")
     check.add_argument(
         "--json",
         action="store_true",
@@ -206,11 +207,15 @@ def _print_error_document(
     message: str,
     *,
     prune: dict[str, Any] | None = None,
+    affected_base: str | None = None,
 ) -> None:
     policy = root / "quality-gate.toml" if root is not None else None
+    document = error_document(root, policy, message, prune=prune)
+    if affected_base is not None:
+        document.update(scope="affected", base=affected_base)
     print(
         json.dumps(
-            error_document(root, policy, message, prune=prune),
+            document,
             indent=2,
             allow_nan=False,
         ),
@@ -245,6 +250,7 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         json_output=args.json,
         prune_ids=args.prune,
         only_ids=args.only,
+        affected_base=args.base,
     )
 
 
@@ -278,6 +284,7 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         prune_ids=args.prune,
         only_ids=args.only,
         trust=trust,
+        affected_base=args.base,
     )
 
 
@@ -303,7 +310,13 @@ _TRUSTED_COMMANDS = {
 }
 
 
+def _reject_affected_prune(args: Any) -> None:
+    if getattr(args, "base", None) is not None and args.prune:
+        raise UsageError("qg.py: --base: cannot be combined with --prune")
+
+
 def _reject_partial_options(args: Any) -> None:
+    _reject_affected_prune(args)
     if not getattr(args, "only", None):
         return
     if args.prune:
@@ -330,6 +343,7 @@ def _run_gate(root: Path, args: Any) -> int:
 def _main(raw: list[str]) -> int:
     json_requested = "--json" in raw
     root: Path | None = None
+    args = argparse.Namespace()
     try:
         _reject_nul(raw)
         args = build_parser().parse_args(raw)
@@ -342,7 +356,7 @@ def _main(raw: list[str]) -> int:
         if json_requested:
             if root is None:
                 root = _repo_hint(raw)
-            _print_error_document(root, str(error))
+            _print_error_document(root, str(error), affected_base=vars(args).get("base"))
         return error.exit_code
 
 

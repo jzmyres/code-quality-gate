@@ -767,12 +767,11 @@ def _graph_report(
     return report
 
 
-def measure(
-    root: Path, python_modules: list[str], spec: GraphSpec, *,
+def dependencies(
+    root: Path, python_modules: list[str], *,
     elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
     parse_shell: Callable[[bytes, str], dict] | None = None,
-    test_sources: frozenset[str] = frozenset(),
-) -> tuple[dict, list[Cycle], list[Edge], list[Edge]]:
+) -> tuple[list[str], list[Edge], list[dict]]:
     root = root.absolute()
     elisp = elisp or {}
     shell = _read_shell(root, shell_modules, parse_shell)
@@ -782,6 +781,41 @@ def measure(
         for source, row in _elisp_records(elisp, "outside")
     ]
     edges = _graph_edges(root, modules, python_modules, elisp, shell, outside)
+    return modules, edges, outside
+
+
+def _affected_seeds(modules: list[str], changed: set[str]) -> dict[str, str]:
+    affected = dict.fromkeys(sorted(changed), "changed")
+    initializers = (Path(path) for path in sorted(changed) if Path(path).name == "__init__.py")
+    for initializer in initializers:
+        for module in modules:
+            if Path(module).is_relative_to(initializer.parent):
+                affected.setdefault(module, f"package initializer {initializer} changed")
+    return affected
+
+
+def affected_paths(modules: list[str], edges: list[Edge], changed: set[str]) -> dict[str, str]:
+    _, incoming = _adjacency(modules, edges)
+    affected = _affected_seeds(modules, changed)
+    pending = deque(affected)
+    while pending:
+        path = pending.popleft()
+        for dependent in sorted(incoming.get(path, ())):
+            if dependent not in affected:
+                affected[dependent] = f"depends on {path}"
+                pending.append(dependent)
+    return affected
+
+
+def measure(
+    root: Path, python_modules: list[str], spec: GraphSpec, *,
+    elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
+    parse_shell: Callable[[bytes, str], dict] | None = None,
+    test_sources: frozenset[str] = frozenset(),
+) -> tuple[dict, list[Cycle], list[Edge], list[Edge]]:
+    modules, edges, outside = dependencies(
+        root, python_modules, elisp=elisp, shell_modules=shell_modules, parse_shell=parse_shell,
+    )
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [
         (component, _shortest_cycle(component, outgoing))

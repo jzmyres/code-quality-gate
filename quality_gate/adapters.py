@@ -7,20 +7,25 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
     module_graph, python_crap, python_mutation, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
+from .coverage_tool import _coverage_config_problem
 from .files import DiffBaseOverride, source_languages
 from .json_input import load_json
 from .policy import (
@@ -37,6 +42,9 @@ from .policy import (
 )
 from .runner import execution_outcome, mark_step, remaining_budget, run
 from .tools import tool_binary
+
+if TYPE_CHECKING:
+    from .checks import CheckSelection
 
 
 def _default_budget(_spec: Any) -> int:
@@ -58,6 +66,7 @@ class AdapterContext:
     prior: dict[str, Any]
     evidence_dir: Path
     base_override: DiffBaseOverride | None = None
+    selection: CheckSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -245,13 +254,27 @@ def _read_graph_elisp(
             mark_step("Emacs module graph")
             command = elisp_batch.batch_command("emacs", None, elisp_batch.MODULE_GRAPH_READER)
             child = run([*command, str(manifest), str(report)], cwd=context.root,
-                        budget_seconds=_default_budget(context.check.spec))
+                        budget_seconds=_default_budget(None))
             if not execution_outcome(child.execution).completed or child.returncode != 0:
                 status = f"Emacs execution {child.execution}, exit code {child.returncode}"
                 raise ValueError(child.error or child.stderr_text.strip() or status)
             return _graph_elisp_report(report, files)
     except (OSError, ValueError) as error:
         raise ValueError(f"cannot read Emacs Lisp module graph for {', '.join(files)}: {error}") from error
+
+
+def affected_graph(
+    root: Path, config: Any, files: list[str], classes: dict[str, str],
+    evidence_dir: Path, changed: set[str],
+) -> tuple[set[str], dict[str, str]]:
+    spec = module_graph.GraphSpec(tuple(config.classes), ())
+    context = AdapterContext(root, config, None, files, classes, "affected scope", {}, evidence_dir)
+    python, lisp, shell = _graph_modules(context, spec)
+    elisp = _read_graph_elisp(context, lisp, [*python, *lisp, *shell]) if lisp else {}
+    modules, edges, _ = module_graph.dependencies(
+        root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
+    )
+    return set(modules), module_graph.affected_paths(modules, edges, changed)
 
 
 def _run_module_graph(context: AdapterContext) -> Any:
@@ -266,7 +289,7 @@ def _run_module_graph(context: AdapterContext) -> Any:
         elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}
         measurement, cycles, suite_edges, program_edges = module_graph.measure(
             context.root, python_modules, check.spec, elisp=elisp, shell_modules=shell_modules,
-            parse_shell=partial(_parse_shell, required_fields=lambda _node: {}, verify_reproduction=True),
+            parse_shell=GRAPH_SHELL_PARSER,
             test_sources=test_sources,
         )
     except (GateError, ValueError) as error:
@@ -373,6 +396,9 @@ def _parse_shell(
         raise ValueError(f"{filename}: cannot run shfmt: {error}") from error
 
 
+GRAPH_SHELL_PARSER = partial(_parse_shell, required_fields=lambda _node: {}, verify_reproduction=True)
+
+
 def _run_comments(context: AdapterContext) -> Any:
     from .checks import _adapter_selection, _check_result
 
@@ -389,6 +415,232 @@ def _run_comments(context: AdapterContext) -> Any:
         reason="\n".join(problems) or None,
         measurement={"findings": [asdict(row) for row in findings]},
     )
+
+
+def _affected_coverage(context: AdapterContext, result: Any, data_dir: Path, start: float) -> None:
+    settings = python_tests.coverage_config_text(context.root)
+    problem = _coverage_config_problem(data_dir, settings)
+    if problem is not None:
+        result.reason = f"{result.reason}; {problem}"
+        return
+    evidence = context.evidence_dir / "combined" / ".coverage"
+    failure = python_tests._combine_tests_evidence(
+        context.check, context.check.spec, start, context.prefix, settings,
+        data_dir, evidence, result.diagnostics,
+    )
+    if failure is None:
+        result.evidence_path = evidence
+        result.adapter_data = {
+            "coverage_settings": settings, "coverage_config": python_tests.coverage_config_path(data_dir),
+        }
+
+
+def _affected_crap(context: AdapterContext, required: Any) -> Any:
+    from .checks import _adapter_selection, _finish_crap_ratchet
+
+    _, start, files, _ = _adapter_selection(context)
+    measurement, failure = python_crap._crap_measure(
+        context.root, files, required.evidence_path, required.adapter_data["coverage_settings"],
+        context.check, start, context.prefix,
+    )
+    if failure is not None:
+        return failure
+    return _finish_crap_ratchet(
+        context.check, measurement.findings, context.prefix, start,
+        lambda _entries: ratchet.Domain.of_files(files), ("functions", "function"),
+    )
+
+
+def _affected_test_child(
+    context: AdapterContext, plan: Path, command: list[str], environment: dict, start: float,
+) -> tuple[Any, str | None]:
+    from .checks import _finish_temporary, _temporary_reason, _temporary_test_directory
+
+    temporary = _temporary_test_directory()
+    environment["TMPDIR"] = str(temporary)
+    mark_step("affected unittest discovery and execution")
+    try:
+        result = run(
+            [*command, str(Path(__file__).with_name("test_shards.py")), "--affected", str(plan)],
+            cwd=context.root, env=environment,
+            budget_seconds=max(0.0, start + context.check.spec.budget_seconds - time.monotonic()),
+        )
+    finally:
+        temporary_paths = _finish_temporary(temporary)
+    return result, _temporary_reason(temporary_paths)
+
+
+def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | None]:
+    if report["omitted"]:
+        return "not_run", report["selection"]["reason"]
+    if report["discovery_errors"]:
+        return "fail", report["discovery_errors"][0].splitlines()[0]
+    if returncode:
+        return "fail", f"command exited {returncode}"
+    if not report["executed"]:
+        return "fail", "no test executed"
+    return "pass", None
+
+
+def _affected_test_report(context: AdapterContext, path: Path, child: Any, start: float) -> Any:
+    from .checks import _tests_result
+
+    check, spec, prefix = context.check, context.check.spec, context.prefix
+    diagnostics = child.diagnostics()
+    failure = python_tests._tests_execution_failure(
+        check, spec, child, diagnostics, child.combined_text, prefix, start,
+    )
+    if failure is not None:
+        return failure
+    try:
+        report = load_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        return _tests_result(
+            check, spec, start, prefix, f"unittest produced no discovery and execution report: {error}",
+            diagnostics=diagnostics, report=False,
+        )
+    return _affected_test_check(check, start, child, report)
+
+
+def _affected_test_check(check: Any, start: float, child: Any, report: dict) -> Any:
+    from .checks import _check_result
+
+    outcome, reason = _affected_test_verdict(report, child.returncode)
+    executed, skipped = len(report["executed"]), len(report["skipped"])
+    missed = report["selection"]["selected"].keys() - set(report["executed"]) - set(report["skipped"])
+    report["not_executed"] = dict.fromkeys(sorted(missed), "the run did not invoke this selected test")
+    report.pop("omitted")
+    findings = _unittest_findings(report.pop("failed"))
+    fields = {
+        "reason": reason, "diagnostics": child.diagnostics(), "budget_seconds": check.spec.budget_seconds,
+        "report_fields": report, "findings": findings,
+    }
+    if outcome == "not_run":
+        return _check_result(check, start, outcome, execution="not_run", satisfied=True, **fields)
+    return _check_result(check, start, outcome, measurement={"tests": executed},
+                         tests_ran=executed + skipped, tests_skipped=skipped, **fields)
+
+
+def _unittest_findings(failed: list[str]) -> list[ratchet.FindingResult]:
+    return [
+        ratchet.FindingResult(
+            subject=name, value=1, bound=None, threshold=0, baseline_reason=None,
+            blocking=True, location="unittest",
+        )
+        for name in failed
+    ]
+
+
+def _affected_test_plan(context: AdapterContext, argv: tuple[str, ...], *, shards: bool = False) -> Path:
+    selection = context.selection
+    assert selection is not None
+    plan = context.evidence_dir / "discovery.json"
+    plan.write_text(json.dumps({
+        "argv": argv, "shards": shards, "paths": selection.test_paths,
+        "full": selection.full_suite, "coverage": selection.coverage,
+    }), encoding="utf-8")
+    return plan
+
+
+def _affected_unittest(context: AdapterContext, argv: tuple[str, ...], *, shards: bool = False) -> Any:
+    from .checks import CheckResult
+
+    start = time.monotonic()
+    check, prefix = context.check, context.prefix
+    plan = _affected_test_plan(context, argv, shards=shards)
+    setup = python_tests._tests_setup(context.root, check, check.spec, start, prefix, context.evidence_dir)
+    if isinstance(setup, CheckResult):
+        return setup
+    data_dir, command = setup
+    child, temporary_reason = _affected_test_child(
+        context, plan, command, python_tests._test_environment(command), start,
+    )
+    result = _affected_test_report(context, plan.with_suffix(".result.json"), child, start)
+    return _finish_affected_unittest(context, result, data_dir, start, temporary_reason, child)
+
+
+def _finish_affected_unittest(context: AdapterContext, result: Any, data_dir: Path, start: float,
+                              temporary_reason: str | None, child: Any) -> Any:
+    from .checks import _finish_test_result
+
+    check, prefix = context.check, context.prefix
+    if result.outcome == "pass" and temporary_reason is None:
+        evidence = python_tests._tests_evidence(
+            check, check.spec, start, prefix, context.evidence_dir, context.root, data_dir,
+            result.tests_ran, result.tests_skipped, result.measurement["tests"], result.diagnostics,
+        )
+        evidence.report_fields = result.report_fields
+        return evidence
+    if context.selection.coverage and "executed" in result.report_fields:
+        _affected_coverage(context, result, data_dir, start)
+    return _finish_test_result(result, temporary_reason, prefix, child.combined_text)
+
+
+def _affected_opaque_tests(context: AdapterContext, execute: Callable) -> Any:
+    if context.check.spec.skipped_pattern is not None:
+        return execute(context)
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = execute(context)
+    result.measurement = result.tests_ran = result.tests_skipped = None
+    if result.outcome == "pass":
+        result.outcome = "unsupported"
+        result.reason = "full run: the command provided no skip-aware test counts"
+        print(f"{context.prefix}: {result.reason}", file=sys.stderr)
+    return result
+
+
+def _affected_python_tests(context: AdapterContext) -> Any:
+    argv = context.check.spec.run
+    if python_tests._uses_shard_runner(context.root, argv):
+        return _affected_unittest(context, argv[2:], shards=True)
+    if argv[:3] == ("{python}", "-m", "unittest"):
+        return _affected_unittest(context, argv[3:])
+    return _affected_opaque_tests(context, python_tests._run_python_tests)
+
+
+def _unittest_module_index(argv: tuple[str, ...]) -> int | None:
+    executable = Path(argv[0]).name
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+        return None
+    index = 1
+    while index < len(argv) and re.fullmatch(r"-[BEIsSu]+", argv[index]):
+        index += 1
+    return index if argv[index:index + 2] == ("-m", "unittest") else None
+
+
+def _affected_command_tests(context: AdapterContext) -> Any:
+    from .checks import _finish_test_result
+
+    spec = context.check.spec
+    argv = spec.run
+    module = _unittest_module_index(argv)
+    if module is None or spec.must_match is not None or "{files}" in argv:
+        return _affected_opaque_tests(context, command._run_command)
+    start = time.monotonic()
+    plan = _affected_test_plan(context, argv[module + 2:])
+    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    child, temporary_reason = _affected_test_child(context, plan, list(argv[:module]), environment, start)
+    result = _affected_test_report(context, plan.with_suffix(".result.json"), child, start)
+    return _finish_test_result(result, temporary_reason, context.prefix, child.combined_text)
+
+
+def _affected_python_crap(context: AdapterContext) -> Any:
+    required = context.prior[context.check.spec.requires]
+    if required.outcome != "pass" and required.evidence_path is not None:
+        return _affected_crap(context, required)
+    return python_crap._run_python_crap(context)
+
+
+def run_affected_check(context: AdapterContext) -> Any:
+    check = context.check
+    descriptor = adapter_for(check.adapter)
+    if check.adapter == "python_tests":
+        return _affected_python_tests(context)
+    if check.adapter == "python_crap":
+        return _affected_python_crap(context)
+    if check.adapter == "command" and "tests" in check.evidence:
+        return _affected_command_tests(context)
+    return descriptor.run(context)
 
 
 def _spec_budget(spec: Any) -> int:

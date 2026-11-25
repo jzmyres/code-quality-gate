@@ -1288,6 +1288,7 @@ The default tools directory is shared by every repository using the gate on this
 
     python3 -I qg.py check
     python3 -I qg.py check --json
+    python3 -I qg.py check --base main --json
     python3 -I qg.py check --only ruff clones
     python3 -I qg.py check --prune clones
     python3 -I qg.py check --prune clones --prune verification
@@ -1300,6 +1301,25 @@ The default tools directory is shared by every repository using the gate on this
 prints progress on stdout and failures on stderr. When inventory fails, configured checks are reported
 as skipped and the combined check still fails; hygiene still runs. Configuration errors exit 2 before
 any check starts.
+
+`check --base REV` is an affected-scope run for branch feedback. It uses `REV...HEAD` plus
+staged and unstaged tracked changes, including deletions and both sides of renames. Inventory and
+hygiene run in full. Per-file checks use the changed inputs, and lint and compilation also receive
+their transitive module graph dependents. A changed or deleted package initializer affects its
+package modules. Changes to policy, tool pins, and check configuration can expand a check to its
+full input class.
+
+Unittest discovery selects changed test files and tests that reach changed modules through the
+graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.
+Other test runners use their full configured command and need a skip-aware summary to report counts.
+Verification runs with its full prerequisites. CRAP measures changed inputs and requests a
+coverage run even when discovery selects no tests. The JSON records `"scope": "affected"`,
+the `base` revision, and each check's selection and reasons. Tests selected by discovery, left
+out by scope, and actually executed are reported separately.
+
+The graph cannot see a test's runtime read of a graph-node file as data or a check command's import
+of a module as its rules. A landing accepts only a full `python3 -I qg.py check` result, without
+`--base`.
 
 A rejected run's stderr summary lists only its **root** failures. A failure is a consequence when the
 gate itself can name its cause: an unsatisfied check whose dependency is unsatisfied, or an

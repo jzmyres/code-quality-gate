@@ -242,7 +242,7 @@ def _source_chars_measurement(
         context.config, context.check, context.files, context.classes
     )[0]
     base = None
-    if spec.scope == "changed":
+    if spec.scope == "changed" and context.selection is None:
         base = diff_base(
             context.root, spec.base,
             resolved=getattr(context, "base_override", None),

@@ -15,14 +15,16 @@ import tempfile
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
 from . import gate_result
-from .adapters import AdapterContext, adapter_for
+from .adapters import AdapterContext, adapter_for, affected_graph, run_affected_check
 from .files import (
     BUILTIN_RESULT_KINDS,
     DiffBaseOverride,
+    affected_changes,
     git_argv,
     hygiene_result,
     resolve_diff_base,
@@ -501,11 +503,14 @@ def _adapter_runner(
     evidence_dir: Path,
     prior: dict[str, CheckResult],
     base_override: DiffBaseOverride | None = None,
+    selection: CheckSelection | None = None,
 ) -> CheckResult:
     context = AdapterContext(
         root, config, check, files, classes, prefix, prior, evidence_dir,
-        base_override,
+        base_override, selection,
     )
+    if selection is not None:
+        return run_affected_check(context)
     return _check_descriptor(check).run(context)
 
 
@@ -520,13 +525,14 @@ def run_check(
     evidence_dir: Path,
     prior: dict[str, CheckResult] | None = None,
     base_override: DiffBaseOverride | None = None,
+    selection: CheckSelection | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
     start = time.monotonic()
     with check_deadline(check.id, start, _check_budget(check)):
         return _adapter_runner(
             root, config, check, files, classes, prefix, evidence_dir,
-            prior or {}, base_override,
+            prior or {}, base_override, selection,
         )
 
 
@@ -815,6 +821,214 @@ def _finish_test_result(
     return result
 
 
+@dataclass
+class CheckSelection:
+    selected: dict[str, str]
+    left_out: dict[str, str]
+    reason: str
+    skip: bool = False
+    test_paths: dict[str, str] | None = None
+    full_suite: str | None = None
+    coverage: bool = False
+
+    def report(self) -> dict[str, Any]:
+        return {"selected": self.selected, "left_out": self.left_out, "reason": self.reason}
+
+
+DEPENDENT_FILE_ADAPTERS = frozenset({"elisp_compile", "elisp_checkdoc"})
+CRAP_ADAPTERS = frozenset({"python_crap", "elisp_crap"})
+CHANGED_FILE_ADAPTERS = CRAP_ADAPTERS | {"source_chars", "comments"}
+OUTSIDE_SCOPE = "no changed file affects this input"
+TOOL_CONFIG_FILES = {
+    "ruff": {"ruff.toml", ".ruff.toml", "pyproject.toml"},
+    "shellcheck": {"shellcheckrc", ".shellcheckrc"},
+}
+
+
+def _per_file(check: CheckDef) -> bool:
+    return check.adapter in DEPENDENT_FILE_ADAPTERS | CHANGED_FILE_ADAPTERS or (
+        check.adapter == "command" and "{files}" in check.spec.run and "tests" not in check.evidence
+    )
+
+
+def _global_input(config: Config, classes: dict[str, str], changed: set[str]) -> str | None:
+    for path in sorted(changed):
+        if path in {"quality-gate.toml", "tools.lock.toml"}:
+            return f"full run: configuration input {path} changed"
+        if path not in classes and sum(fnmatchcase(path, rule.pattern) for rule in config.rules) != 1:
+            return f"full run: cannot attribute changed file {path}"
+    return None
+
+
+def _relative_input(root: Path, value: str | Path) -> str | None:
+    path = Path(os.path.normpath(root / value))
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else None
+
+
+def _explicit_inputs(root: Path, check: CheckDef) -> set[str]:
+    argv = getattr(check.spec, "run", ())
+    inputs = {_relative_input(root, argument.split("=", 1)[-1]) for argument in argv}
+    if check.baseline is not None:
+        inputs.add(_relative_input(root, check.baseline))
+    return inputs - {None}
+
+
+def _implicit_inputs(check: CheckDef, changed: set[str]) -> set[str]:
+    argv = getattr(check.spec, "run", ())
+    if not argv:
+        return set()
+    tool = Path(argv[0].removeprefix("{tool:").removesuffix("}")).name
+    names = TOOL_CONFIG_FILES.get(tool, ())
+    return {path for path in changed if Path(path).name in names}
+
+
+def _check_input(root: Path, check: CheckDef, changed: set[str]) -> str | None:
+    matched = sorted((changed & _explicit_inputs(root, check)) | _implicit_inputs(check, changed))
+    return f"full run: check input {matched[0]} changed" if matched else None
+
+
+def _selection_inputs(
+    root: Path, config: Config, files: list[str], classes: dict[str, str],
+    evidence_dir: Path, changed: set[str],
+) -> tuple[dict[str, str], str | None, str | None]:
+    full = _global_input(config, classes, changed)
+    if full or not changed:
+        return {}, full, full
+    try:
+        nodes, affected = affected_graph(root, config, files, classes, evidence_dir, changed)
+    except (GateError, ValueError) as error:
+        full = f"full run: module graph unavailable ({error})"
+        return {}, full, full
+    unplaced = sorted(changed - nodes)
+    full_suite = f"full run: unplaced file {unplaced[0]}" if unplaced else None
+    return affected, None, full_suite
+
+
+def _forced_inputs(config: Config, selected: list[CheckDef]) -> dict[str, str]:
+    return {
+        identifier: f"full run: required by {check.id}"
+        for check in selected if check.adapter == "verification"
+        for identifier in _needed_order(config, [check])
+        if identifier != check.id
+    }
+
+
+def _file_scope(
+    check: CheckDef, files: list[str], changed: set[str],
+    affected: dict[str, str], full: str | None,
+) -> CheckSelection:
+    per_file = _per_file(check)
+    if not per_file:
+        reason = full or "full run"
+        return CheckSelection(dict.fromkeys(files, reason), {}, reason)
+    if full is not None:
+        reason = full if files else f"{full} (no files in the input class)"
+        return CheckSelection(dict.fromkeys(files, full), {}, reason, skip=not files)
+    reasons = dict.fromkeys(changed, "changed") if check.adapter in CHANGED_FILE_ADAPTERS else affected
+    return _affected_file_scope(files, reasons)
+
+
+def _affected_file_scope(files: list[str], reasons: dict[str, str]) -> CheckSelection:
+    paths = set(files)
+    selected = {path: reasons[path] for path in sorted(paths & reasons.keys())}
+    left_out = dict.fromkeys(sorted(paths - reasons.keys()), OUTSIDE_SCOPE)
+    reason = "affected files" if selected else OUTSIDE_SCOPE
+    return CheckSelection(selected, left_out, reason, skip=not selected)
+
+
+def _elisp_suite_scope(path: str, reason: str | None) -> CheckSelection:
+    if reason is None:
+        return CheckSelection({}, {path: OUTSIDE_SCOPE}, OUTSIDE_SCOPE, skip=True)
+    return CheckSelection({path: reason}, {}, reason)
+
+
+def _check_selection(
+    check: CheckDef, inputs: list[str], changed: set[str], affected: dict[str, str],
+    full: str | None, suite_reason: str | None,
+) -> CheckSelection:
+    suite_full = full or suite_reason
+    if check.adapter == "elisp_tests":
+        path = check.spec.suite
+        return _elisp_suite_scope(path, suite_full or affected.get(path))
+    if "tests" in check.evidence:
+        return CheckSelection({}, {}, suite_full or "full run", test_paths=affected, full_suite=suite_full)
+    return _file_scope(check, inputs, changed, affected, full)
+
+
+def _require_coverage(
+    check: CheckDef, config: Config, selections: dict[str, CheckSelection],
+) -> None:
+    if check.adapter not in CRAP_ADAPTERS or selections[check.id].skip:
+        return
+    suite = check.spec.requires
+    if selections[suite].skip:
+        reason = f"full run: coverage required by {check.id}"
+        selections[suite] = _elisp_suite_scope(config.checks[suite].spec.suite, reason)
+    selections[suite].coverage = True
+
+
+def _affected_selection(
+    root: Path, config: Config, files: list[str], classes: dict[str, str],
+    evidence_dir: Path, changed: set[str], checks: list[CheckDef],
+) -> dict[str, CheckSelection]:
+    affected, global_reason, suite_reason = _selection_inputs(
+        root, config, files, classes, evidence_dir, changed,
+    )
+    forced = _forced_inputs(config, checks)
+    selections = {}
+    for check in checks:
+        full = global_reason or _check_input(root, check, changed) or forced.get(check.id)
+        inputs = _select_files(config, check, files, classes)[0]
+        selections[check.id] = _check_selection(check, inputs, changed, affected, full, suite_reason)
+    for check in checks:
+        _require_coverage(check, config, selections)
+    return selections
+
+
+def _run_selected_check(
+    root: Path, config: Config, check: CheckDef, files: list[str],
+    classes: dict[str, str], evidence_dir: Path, prior: dict[str, CheckResult],
+    base_override: DiffBaseOverride, selection: CheckSelection | None,
+) -> CheckResult:
+    prefix = f"check: {check.id}"
+    if selection is not None and selection.skip:
+        result = _check_result(
+            check, time.monotonic(), "not_run", execution="not_run",
+            reason=selection.reason, satisfied=True,
+        )
+        print(f"{prefix}: not run ({selection.reason})")
+    else:
+        print(f"{prefix} ({check.adapter})", flush=True)
+        if selection is not None and _per_file(check):
+            files = list(selection.selected)
+        result = run_check(
+            root, config, check, files, classes, prefix=prefix, evidence_dir=evidence_dir,
+            prior=prior, base_override=base_override, selection=selection,
+        )
+    if selection is not None:
+        result.report_fields.setdefault("selection", selection.report())
+    return result
+
+
+def _scope_plan(
+    root: Path, config: Config, files: list[str], classes: dict[str, str],
+    evidence_dir: Path, changed: set[str] | None, checks: list[CheckDef], inventory_code: int,
+) -> dict[str, CheckSelection]:
+    if changed is None:
+        return {}
+    if inventory_code != 0:
+        return {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
+    return _affected_selection(root, config, files, classes, evidence_dir, changed, checks)
+
+
+def _run_inventory_blocked_check(check: CheckDef, selection: CheckSelection | None) -> CheckResult:
+    result = _skipped(check)
+    print(f"check: {check.id}: {result.reason}", file=sys.stderr)
+    if selection is not None:
+        result.report_fields["selection"] = selection.report()
+    return result
+
+
 def _run_policy_checks(
     root: Path,
     config: Config,
@@ -822,6 +1036,7 @@ def _run_policy_checks(
     classes: dict[str, str],
     inventory_code: int,
     selected_ids: list[str] | None = None,
+    changed: set[str] | None = None,
 ) -> list[CheckResult]:
     selected = list(config.checks) if selected_ids is None else selected_ids
     selected_checks = [config.checks[identifier] for identifier in selected]
@@ -832,30 +1047,20 @@ def _run_policy_checks(
     try:
         base_override = resolve_diff_base(root)
         try:
+            directory = Path(run_directory.name)
+            selections = _scope_plan(
+                root, config, files, classes, directory, changed, selected_checks, inventory_code,
+            )
             for check in selected_checks:
+                selection = selections.get(check.id)
                 if inventory_code != 0:
-                    print(
-                        f"check: {check.id}: skipped because inventory failed",
-                        file=sys.stderr,
+                    outcome = _run_inventory_blocked_check(check, selection)
+                else:
+                    evidence_dir = directory / check.id
+                    evidence_dir.mkdir()
+                    outcome = _run_selected_check(
+                        root, config, check, files, classes, evidence_dir, prior, base_override, selection,
                     )
-                    skipped = _skipped(check)
-                    results.append(skipped)
-                    prior[check.id] = skipped
-                    continue
-                print(f"check: {check.id} ({check.adapter})", flush=True)
-                evidence_dir = Path(run_directory.name) / check.id
-                evidence_dir.mkdir()
-                outcome = run_check(
-                    root,
-                    config,
-                    check,
-                    files,
-                    classes,
-                    prefix=f"check: {check.id}",
-                    evidence_dir=evidence_dir,
-                    prior=prior,
-                    base_override=base_override,
-                )
                 results.append(outcome)
                 prior[check.id] = outcome
         except BaseException:
@@ -1193,8 +1398,9 @@ def _check_decision(
 def _finalize_check(
     root: Path, config: Config, results: list[CheckResult],
     prune_ids: list[str], trust: Any, selected: list[str] | None = None,
+    affected_base: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    partial = selected is not None
+    partial = selected is not None or affected_base is not None
     _assign_causes(config, results)
     obligations = [] if partial else gate_result.obligations(config, results)
     prune_document = _perform_prune(config, prune_ids, results)
@@ -1207,6 +1413,8 @@ def _finalize_check(
     )
     if configuration_error is not None:
         document["error"] = configuration_error
+    if affected_base is not None:
+        document.update(scope="affected", base=affected_base)
     return exit_code, document
 
 
@@ -1233,17 +1441,24 @@ def _check_command(
     prune_ids: list[str],
     trust: Any = None,
     only_ids: list[str] | None = None,
+    affected_base: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     problem = _prune_request_problem(config, prune_ids)
     if problem is not None:
         return _prune_option_error(root, config, prune_ids, problem)
     selected = _selected_check_ids(config, only_ids)
+    changed = affected_changes(root, affected_base) if affected_base is not None else None
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
+    if changed is not None:
+        for result in results:
+            result.report_fields["selection"] = CheckSelection(
+                dict.fromkeys(files, "full run"), {}, "full run",
+            ).report()
     results.extend(
-        _run_policy_checks(root, config, files, classes, code, selected)
+        _run_policy_checks(root, config, files, classes, code, selected, changed)
     )
-    return _finalize_check(root, config, results, prune_ids, trust, selected)
+    return _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
 
 
 def _run_check_document(
@@ -1253,11 +1468,12 @@ def _run_check_document(
     json_output: bool,
     trust: Any = None,
     only_ids: list[str] | None = None,
+    affected_base: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     if not json_output:
-        return _check_command(root, config, prune_ids, trust, only_ids)
+        return _check_command(root, config, prune_ids, trust, only_ids, affected_base)
     with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_ids, trust, only_ids)
+        return _check_command(root, config, prune_ids, trust, only_ids, affected_base)
 
 
 def command_check(
@@ -1268,17 +1484,18 @@ def command_check(
     prune_ids: list[str] | None = None,
     only_ids: list[str] | None = None,
     trust: Any = None,
+    affected_base: str | None = None,
 ) -> int:
     requested = prune_ids or []
     if trust is None:
         code, document = _run_check_document(
-            root, config, requested, json_output, only_ids=only_ids
+            root, config, requested, json_output, only_ids=only_ids, affected_base=affected_base,
         )
     else:
         try:
             with trust.activate():
                 code, document = _run_check_document(
-                    root, config, requested, json_output, trust, only_ids
+                    root, config, requested, json_output, trust, only_ids, affected_base,
                 )
             code, document = trust.finish(code, document)
         finally:

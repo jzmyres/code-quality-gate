@@ -112,6 +112,176 @@ def _discover(start, pattern):
     return list(_flatten(suite))
 
 
+class AffectedLoader(unittest.TestLoader):
+    def __init__(self):
+        super().__init__()
+        self.used_hook = False
+        self.paths = {}
+
+    def loadTestsFromModule(self, module, *args, **kwargs):
+        self.used_hook |= getattr(module, "load_tests", None) is not None
+        suite = super().loadTestsFromModule(module, *args, **kwargs)
+        if not self.used_hook:
+            path = _discovery_path(module)
+            self.paths.update((id(test), path) for test in _discovered_cases(suite))
+        return suite
+
+
+def _discovered_cases(suite):
+    for test in suite:
+        if isinstance(test, unittest.suite.BaseTestSuite):
+            yield from _discovered_cases(test)
+        else:
+            yield test
+
+
+def _discovery_path(module):
+    filename = getattr(module, "__file__", None)
+    if filename is None:
+        return None
+    return os.path.relpath(Path(filename).resolve())
+
+
+class AffectedResult(unittest.TextTestResult):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.executed = []
+        self.skipped_cases = []
+        self.skipped_invocation = False
+        self.has_result = False
+
+    def startTest(self, test):
+        self.skipped_invocation = False
+        self.has_result = False
+        super().startTest(test)
+
+    def addSkip(self, test, reason):
+        self.skipped_invocation = True
+        super().addSkip(test, reason)
+
+    def addSubTest(self, test, subtest, err):
+        self.has_result = True
+        super().addSubTest(test, subtest, err)
+
+    def addError(self, test, err):
+        self.has_result = True
+        super().addError(test, err)
+
+    def addFailure(self, test, err):
+        self.has_result = True
+        super().addFailure(test, err)
+
+    def stopTest(self, test):
+        if not isinstance(test, unittest.loader._FailedTest):
+            skipped = self.skipped_invocation and not self.has_result
+            recorded = self.skipped_cases if skipped else self.executed
+            recorded.append(test)
+        super().stopTest(test)
+
+
+class AffectedRunner(unittest.TextTestRunner):
+    resultclass = AffectedResult
+
+
+def _case_names(cases):
+    names = [test.id() for test in cases]
+    counts = Counter(names)
+    return {
+        id(test): f"{name} (discovery occurrence {index})" if counts[name] > 1 else name
+        for index, (test, name) in enumerate(zip(cases, names, strict=True), 1)
+    }
+
+
+def _case_reasons(names, discovered, paths):
+    return {name: paths.get(discovered.get(identity)) for identity, name in names.items()}
+
+
+def _suite_reason(full, loader, cases):
+    if loader.used_hook:
+        return "full run: unittest discovery used load_tests"
+    if full is not None:
+        return full
+    if any(loader.paths.get(id(test)) is None for test in cases):
+        return "full run: discovery returned a test without a source file"
+    return None
+
+
+def _real_cases(tests):
+    return [test for test in tests if not isinstance(test, unittest.loader._FailedTest)]
+
+
+def _affected_cases(cases, names, loader, plan):
+    full = _suite_reason(plan["full"], loader, cases)
+    if full is not None:
+        return dict.fromkeys(names.values(), full), full
+    reasons = _case_reasons(names, loader.paths, plan["paths"])
+    if plan["coverage"] and not any(reasons.values()):
+        full = "full run: coverage required for changed inputs"
+        return dict.fromkeys(reasons, full), full
+    return reasons, None
+
+
+def _selection_report(reasons, full):
+    selected = {name: reason for name, reason in reasons.items() if reason is not None}
+    left_out = dict.fromkeys(sorted(reasons.keys() - selected.keys()), "no changed file affects this test")
+    return {
+        "selected": selected, "left_out": left_out,
+        "reason": full or ("affected tests" if selected else "no affected tests discovered"),
+    }
+
+
+def _selected_suite(tests, names, selected):
+    return unittest.TestSuite(
+        test for test in tests
+        if isinstance(test, unittest.loader._FailedTest) or names[id(test)] in selected
+    )
+
+
+def _recorded_cases(tests, names):
+    return [names[id(test)] if id(test) in names else test.id() for test in tests]
+
+
+class AffectedProgram(unittest.TestProgram):
+    def __init__(self, plan, argv):
+        self.plan = plan
+        super().__init__(
+            module=None, argv=["unittest", *argv], testLoader=AffectedLoader(),
+            testRunner=AffectedRunner, exit=False,
+        )
+
+    def runTests(self):
+        tests = list(_discovered_cases(self.test))
+        cases = _real_cases(tests)
+        names = _case_names(cases)
+        reasons, full = _affected_cases(cases, names, self.testLoader, self.plan)
+        selection = _selection_report(reasons, full)
+        if full is None:
+            self.test = _selected_suite(tests, names, selection["selected"])
+        super().runTests()
+        self.report = {
+            "selection": selection,
+            "executed": _recorded_cases(self.result.executed, names),
+            "skipped": _recorded_cases(self.result.skipped_cases, names),
+            "discovery_errors": self.testLoader.errors,
+            "omitted": not (full or selection["selected"] or self.testLoader.errors or self.result.errors),
+        }
+
+
+def _run_affected(path):
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    argv = plan["argv"]
+    if plan["shards"]:
+        options = _options(argv)
+        argv = ["discover", "-s", options.start, "-p", options.pattern]
+    program = AffectedProgram(plan, argv)
+    result = program.result
+    failed = {test.id() for test, _ in (*result.errors, *result.failures)}
+    failed.update(test.id() for test in result.unexpectedSuccesses)
+    report = {**program.report, "failed": sorted(failed)}
+    path.with_suffix(".result.json").write_text(json.dumps(report), encoding="utf-8")
+    return int(not result.wasSuccessful())
+
+
 def _module_blocks(modules):
     last = {module: index for index, module in enumerate(modules)}
     start = end = 0
@@ -491,7 +661,13 @@ def main(argv=None):
     return _write_failed_report(options.failed_report, reports, status)
 
 
+def _entry(argv):
+    if len(argv) == 2 and argv[0] == "--affected":
+        return _run_affected(Path(argv[1]))
+    return main(argv)
+
+
 if __name__ == "__main__":
     with os.fdopen(os.dup(2), "w", encoding="utf-8") as diagnostics:
         faulthandler.enable(file=diagnostics)
-        sys.exit(main())
+        sys.exit(_entry(sys.argv[1:]))

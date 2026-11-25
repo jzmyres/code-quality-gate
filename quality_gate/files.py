@@ -187,7 +187,7 @@ class DiffBase:
 def _verified_commit(root: Path, value: str) -> tuple[str | None, str]:
     """The commit VALUE names, and why it does not when it names none."""
     checked = run(
-        git_argv(root, "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"),
+        git_argv(root, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{value}^{{commit}}"),
         budget_seconds=600,
         capture_limit=None,
     )
@@ -293,6 +293,22 @@ def _split_nul(raw: bytes) -> list[str]:
         for name in raw.decode("utf-8", "surrogateescape").split("\0")
         if name
     ]
+
+
+def affected_changes(root: Path, revision: str) -> set[str]:
+    commit, problem = _verified_commit(root, revision)
+    if commit is None:
+        raise UsageError(f"check: --base {revision!r}: expected an existing commit, {problem}")
+    names = set()
+    try:
+        for comparison in ([f"{commit}...HEAD"], ["--cached"], []):
+            names.update(_split_nul(_git(
+                root, ["diff", "--name-only", "--no-renames", "-z", *comparison, "--"],
+                f"check: --base {revision!r}: changed-file selection",
+            )))
+    except GateError as error:
+        raise UsageError(str(error)) from error
+    return names
 
 
 def _untracked_files(
