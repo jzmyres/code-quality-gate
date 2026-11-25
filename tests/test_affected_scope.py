@@ -462,10 +462,12 @@ def load_tests(loader, suite, pattern):
         })
         self.assertNotIn("executed", suite)
 
-    def test_python_command_with_its_own_discovery_keeps_policy_verdict_without_counts(self):
-        config = CONFIG.replace(
+    def test_opaque_suites_do_not_report_counts_for_skipped_cases(self):
+        python_config = CONFIG.replace(
             '"-m", "unittest", "discover", "-s", "tests"', '"pkg/run_tests.py"',
         )
+        command_config = python_config.replace('adapter = "python_tests"', 'adapter = "command"')
+        command_config = command_config.replace('"{python}"', '"python3"')
         self.add_file("pkg/run_tests.py", (
             "import unittest\n"
             "suite = unittest.defaultTestLoader.discover('tests')\n"
@@ -473,30 +475,57 @@ def load_tests(loader, suite, pattern):
         ))
         for name in ("importing", "other"):
             self.write_test(name, decorator="    @unittest.skip('disabled')\n")
-        for pattern, outcome, count in (
-            ("", "pass", 2),
-            (r"skipped_pattern = 'unmatched=(\d+)'", "pass", 2),
-            (r"skipped_pattern = 'skipped=(\d+)'", "fail", 0),
-        ):
-            with self.subTest(pattern=pattern):
-                self.write_config(config + pattern + "\n")
-                self.commit_all()
-                full_result, full_document = self.run_gate()
-                result, document = self.affected()
-                suite = self.checked(document)
-                full_suite = self.checked(full_document)
-                self.assertEqual(result.returncode, full_result.returncode, output(result))
-                self.assertEqual(suite["outcome"], outcome, output(result))
-                self.assertEqual(suite["outcome"], full_suite["outcome"])
-                self.assertEqual(suite["reason"], full_suite["reason"])
-                self.assertEqual(suite["diagnostics"]["argv"][-1:], full_suite["diagnostics"]["argv"][-1:])
-                self.assertEqual(suite["selection"], {
-                    "selected": {}, "left_out": {},
-                    "reason": "full run: custom Python test command is opaque",
-                })
-                self.assertNotIn("executed", suite)
-                self.assertEqual(full_suite["measurement"], {"tests": count})
-                self.assertNotIn("measurement", suite)
+        configurations = {
+            "command adapter suite": command_config,
+            "custom Python test command": python_config,
+        }
+        for description, config in configurations.items():
+            for pattern, full_outcome, full_count in (("unmatched", "pass", 2), ("skipped", "fail", 0)):
+                with self.subTest(adapter=description, pattern=pattern):
+                    self.check_opaque_suite(config, description, pattern, full_outcome, full_count)
+
+    def check_opaque_suite(self, config, description, pattern, full_outcome, full_count):
+        self.write_config(config + f"skipped_pattern = '{pattern}=(\\d+)'\n")
+        self.commit_all()
+        full_result, full_document = self.run_gate()
+        result, document = self.affected()
+        suite = self.checked(document)
+        full_suite = self.checked(full_document)
+        self.assertEqual(full_result.returncode, int(full_outcome == "fail"), output(full_result))
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(suite["outcome"], "pass", output(result))
+        self.assertEqual(full_suite["outcome"], full_outcome, output(full_result))
+        self.assertEqual(suite["diagnostics"]["argv"][-1:], full_suite["diagnostics"]["argv"][-1:])
+        self.assertEqual(suite["selection"], {
+            "selected": {}, "left_out": {},
+            "reason": f"full run: {description} is opaque",
+        })
+        self.assertFalse({"measurement", "executed", "skipped", "tests"} & suite.keys())
+        self.assertEqual(full_suite["measurement"], {"tests": full_count})
+        self.assertIn("skipped=2", full_suite["diagnostics"]["output_tail"])
+        self.assertNotIn("skipped=2", suite["diagnostics"]["output_tail"])
+        self.assertNotIn("skipped=2", result.stderr)
+        self.assertNotIn("2 tests", result.stderr)
+
+    def test_retargeted_python_test_symlink_selects_the_discovery_file(self):
+        before = self.add_file("pkg/before.py", "import unittest\n")
+        after = self.add_file(
+            "pkg/after.py",
+            "import unittest\n\nclass Cases(unittest.TestCase):\n"
+            "    def test_linked(self):\n        self.assertTrue(True)\n",
+        )
+        link = self.repo / "tests/test_linked.py"
+        link.symlink_to("../pkg/" + before.name)
+        self.commit_all()
+        link.unlink()
+        link.symlink_to("../pkg/" + after.name)
+        self.git("add", "tests/test_linked.py")
+
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document)
+        self.assertEqual(suite["executed"], ["test_linked.Cases.test_linked"])
+        self.assertEqual(suite["selection"]["selected"], {"test_linked.Cases.test_linked": "changed"})
 
     def test_interrupted_suite_keeps_selection_and_completed_invocations(self):
         self.write_config(CONFIG + "budget_seconds = 3\n")
@@ -674,6 +703,21 @@ suite = "tests/ert.el"
             "tests/suite.el",
             "(require 'ert)\n(ert-deftest selected () (should t))\n(ert-run-tests-batch-and-exit)\n",
         )
+        self.assert_changed_elisp_suite_runs()
+
+    def test_editing_tracked_ert_target_selects_the_linked_suite(self):
+        self.write_elisp_config()
+        self.add_file("lisp/calc.el", "(defun calc (a) a)\n(provide 'calc)\n")
+        target = "tests/ert-target.el"
+        self.add_file(target, "(require 'ert)\n(ert-run-tests-batch-and-exit)\n")
+        (self.repo / "tests/suite.el").symlink_to("ert-target.el")
+        self.change(
+            target,
+            "(require 'ert)\n(ert-deftest linked () (should t))\n(ert-run-tests-batch-and-exit)\n",
+        )
+        self.assert_changed_elisp_suite_runs()
+
+    def assert_changed_elisp_suite_runs(self):
         result, document = self.affected("--only", "elisp")
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document, "elisp")

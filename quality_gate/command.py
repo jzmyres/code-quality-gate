@@ -177,8 +177,8 @@ def _termination_failure(
     prefix: str,
     result: RunResult,
     diagnostics: Diagnostics,
+    combined: str | None,
 ) -> Any | None:
-    combined = result.combined_text
     outcome = execution_outcome(result.execution)
     if outcome.error:
         return _command_failure(
@@ -263,7 +263,7 @@ def _command_test_fields(
     prefix: str,
     matches: dict[str, Any],
     diagnostics: Diagnostics,
-    combined: str,
+    combined: str | None,
 ) -> tuple[dict[str, Any], Any | None]:
     if spec.tests_pattern_re is None:
         return {}, None
@@ -303,6 +303,20 @@ def _command_test_fields(
     }, None
 
 
+def _command_matches(
+    spec: CommandSpec, result: RunResult, deadline: float, opaque: bool,
+) -> tuple[dict[str, Any] | None, RunResult | None]:
+    if opaque:
+        patterns = {} if spec.must_match is None else {"must_match": spec.must_match}
+    else:
+        patterns = output_patterns._command_patterns(spec)
+    if not patterns:
+        return {}, None
+    return output_patterns._pattern_matches(
+        patterns, result.combined_text, max(0.0, deadline - time.monotonic()),
+    )
+
+
 def _command_evidence(
     check: CheckDef,
     spec: Any,
@@ -311,23 +325,16 @@ def _command_evidence(
     result: RunResult,
     diagnostics: Diagnostics,
     deadline: float,
+    combined: str | None,
+    *,
+    opaque: bool,
 ) -> Any:
     from .checks import _check_result
 
-    combined = result.combined_text
-    patterns = output_patterns._command_patterns(spec)
-    matches: dict[str, Any] = {}
-    if patterns:
-        matches, evaluation = output_patterns._pattern_matches(
-            patterns,
-            combined,
-            max(0.0, deadline - time.monotonic()),
-        )
-        if matches is None:
-            return _pattern_failure(
-                check, spec, start, prefix, diagnostics, evaluation
-            )
-    fields, failure = _command_test_fields(
+    matches, evaluation = _command_matches(spec, result, deadline, opaque)
+    if matches is None:
+        return _pattern_failure(check, spec, start, prefix, diagnostics, evaluation)
+    fields, failure = ({}, None) if opaque else _command_test_fields(
         check, spec, start, prefix, matches, diagnostics, combined
     )
     if failure is not None:
@@ -358,6 +365,22 @@ def _command_evidence(
     return outcome
 
 
+def _command_result(context: Any, start: float, result: RunResult, deadline: float) -> Any:
+    from .checks import _command_suite
+
+    check, prefix = context.check, context.prefix
+    spec = check.spec
+    opaque = context.selection is not None and _command_suite(check)
+    diagnostics = result.diagnostics(include_output=not opaque)
+    combined = None if opaque else result.combined_text
+    failure = _termination_failure(check, spec, start, prefix, result, diagnostics, combined)
+    if failure is not None:
+        return failure
+    return _command_evidence(
+        check, spec, start, prefix, result, diagnostics, deadline, combined, opaque=opaque,
+    )
+
+
 def _run_command(context: Any) -> Any:
     from .checks import _adapter_selection, _class_text
 
@@ -385,12 +408,4 @@ def _run_command(context: Any) -> Any:
         cwd=root,
         budget_seconds=max(0.0, deadline - time.monotonic()),
     )
-    diagnostics = result.diagnostics()
-    failure = _termination_failure(
-        check, spec, start, prefix, result, diagnostics
-    )
-    if failure is not None:
-        return failure
-    return _command_evidence(
-        check, spec, start, prefix, result, diagnostics, deadline
-    )
+    return _command_result(context, start, result, deadline)

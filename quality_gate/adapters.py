@@ -561,9 +561,7 @@ def _run_python_tests(context: AdapterContext) -> Any:
     if argv[:3] == ("{python}", "-m", "unittest"):
         return _affected_unittest(context, argv[3:])
     context.selection.reason = "full run: custom Python test command is opaque"
-    result = python_tests._run_python_tests(context)
-    result.measurement = None
-    return result
+    return python_tests._run_python_tests(context)
 
 
 def _spec_budget(spec: Any) -> int:

@@ -912,13 +912,18 @@ def _elisp_suite_scope(path: str, reason: str | None) -> CheckSelection:
     return CheckSelection({path: reason}, {}, reason)
 
 
+def _elisp_suite_reason(root: Path, path: str, affected: dict[str, str]) -> str | None:
+    target = os.path.relpath((root / path).resolve(), root)
+    return affected.get(path) or affected.get(target)
+
+
 def _check_selection(
-    check: CheckDef, inputs: list[str], changed: set[str], affected: dict[str, str],
+    root: Path, check: CheckDef, inputs: list[str], changed: set[str], affected: dict[str, str],
     full: str | None,
 ) -> CheckSelection:
     if check.adapter == "elisp_tests":
         path = Path(check.spec.suite).as_posix()
-        return _elisp_suite_scope(path, full or affected.get(path))
+        return _elisp_suite_scope(path, full or _elisp_suite_reason(root, path, affected))
     if check.adapter == "python_tests":
         return CheckSelection({}, {}, full or "full run", test_paths=affected, full_suite=full)
     if _command_suite(check):
@@ -951,7 +956,7 @@ def _affected_selection(
     for check in checks:
         inputs = _select_files(config, check, files, classes)[0]
         selections[check.id] = _check_selection(
-            check, inputs, changed, affected, full or forced.get(check.id),
+            root, check, inputs, changed, affected, full or forced.get(check.id),
         )
     for check in checks:
         _require_coverage(check, config, selections)
@@ -978,16 +983,9 @@ def _run_selected_check(
             root, config, check, files, classes, prefix=prefix, evidence_dir=evidence_dir,
             prior=prior, base_override=base_override, selection=selection,
         )
-    _record_selection(check, result, selection)
+    if selection is not None:
+        result.report_fields.setdefault("selection", selection.report())
     return result
-
-
-def _record_selection(check: CheckDef, result: CheckResult, selection: CheckSelection | None) -> None:
-    if selection is None:
-        return
-    if _command_suite(check):
-        result.measurement = None
-    result.report_fields.setdefault("selection", selection.report())
 
 
 def _scope_plan(

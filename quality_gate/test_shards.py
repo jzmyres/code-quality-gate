@@ -122,8 +122,8 @@ class AffectedLoader(unittest.TestLoader):
         self.used_hook |= getattr(module, "load_tests", None) is not None
         suite = super().loadTestsFromModule(module, *args, **kwargs)
         if not self.used_hook:
-            path = _discovery_path(module)
-            self.paths.update((id(test), path) for test in _discovered_cases(suite))
+            paths = _discovery_paths(module)
+            self.paths.update((id(test), paths) for test in _discovered_cases(suite))
         return suite
 
 
@@ -135,11 +135,11 @@ def _discovered_cases(suite):
             yield test
 
 
-def _discovery_path(module):
+def _discovery_paths(module):
     filename = getattr(module, "__file__", None)
     if filename is None:
         return None
-    return os.path.relpath(Path(filename).resolve())
+    return os.path.relpath(filename), os.path.relpath(Path(filename).resolve())
 
 
 class AffectedResult(unittest.TextTestResult):
@@ -236,12 +236,18 @@ def _real_cases(tests):
     return [test for test in tests if not isinstance(test, unittest.loader._FailedTest)]
 
 
+def _discovery_reason(paths, affected):
+    discovered, resolved = paths
+    return affected.get(discovered) or affected.get(resolved)
+
+
 def _affected_cases(cases, names, loader, plan):
     full = _suite_reason(plan["full"], loader, cases)
     if full is not None:
         return dict.fromkeys(names, full), full
+    paths = plan["paths"]
     reasons = {
-        name: plan["paths"].get(loader.paths[id(test)])
+        name: _discovery_reason(loader.paths[id(test)], paths)
         for test, name in zip(cases, names, strict=True)
     }
     if plan["coverage"] and not any(reasons.values()):
