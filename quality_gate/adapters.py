@@ -311,7 +311,9 @@ def _extract_graph(
 def module_ownership(
     config: Any, files: list[str], classes: InventoryClasses,
 ) -> tuple[dict[str, str], list[dict]]:
-    return module_graph.resolve_ownership(config.modules, files, classes.code_paths)
+    return module_graph.resolve_ownership(
+        config.modules, files, classes.code_paths, config.capabilities.items(),
+    )
 
 
 def extract_contract_graph(
@@ -327,6 +329,8 @@ def module_contract_findings(
     config: Any, owners: dict[str, str], graph: GraphExtraction, tracked_code_paths: frozenset[str],
 ) -> list[dict]:
     findings = module_graph.interface_findings(config.modules, owners, graph.edges)
+    if config.capabilities:
+        findings.extend(module_graph.capability_findings(config.capabilities, owners, graph.edges))
     if config.shared_base is not None:
         findings.extend(module_graph.multi_module_findings(owners, graph.edges, tracked_code_paths))
     return findings

@@ -4,7 +4,7 @@ import ast
 import os.path
 import re
 import symtable
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -66,18 +66,18 @@ def _entry_point_reason(path: str, name: str, files: set[str], matches: dict[str
 
 
 def _entry_point_findings(
-    modules: dict[str, Any], present: set[str], matches: dict[str, list[str]],
+    key: str, owner: str, paths: tuple[str, ...], present: set[str], matches: dict[str, list[str]],
 ) -> Iterator[dict]:
-    for name, module in sorted(modules.items()):
-        for index, path in enumerate(module.entry_points):
-            if reason := _entry_point_reason(path, name, present, matches):
-                key = f"modules.{name}.entry_points[{index}]"
-                yield {"rule": "invalid-entry-point", "module": name, "key": key, "file": path,
-                       "reason": reason, "message": f"{key}: {path}: {reason}"}
+    for index, path in enumerate(paths):
+        if reason := _entry_point_reason(path, owner, present, matches):
+            item = f"{key}.entry_points[{index}]"
+            yield {"rule": "invalid-entry-point", "module": owner, "key": item, "file": path,
+                   "reason": reason, "message": f"{item}: {path}: {reason}"}
 
 
 def resolve_ownership(
     modules: dict[str, Any], files: Iterable[str], code_paths: frozenset[str],
+    capabilities: Iterable[tuple[str, Any]] = (),
 ) -> tuple[dict[str, str], list[dict]]:
     findings: list[dict] = []
     matches = _pattern_owners(modules, code_paths, findings)
@@ -91,7 +91,13 @@ def resolve_ownership(
         else:
             findings.append({"rule": "uncovered-file", "file": path,
                              "message": f"{path}: no declared module owner"})
-    findings.extend(_entry_point_findings(modules, set(files), matches))
+    present = set(files)
+    for name, module in sorted(modules.items()):
+        findings.extend(_entry_point_findings(f"modules.{name}", name, module.entry_points, present, matches))
+    for name, capability in sorted(capabilities):
+        findings.extend(_entry_point_findings(
+            f"capabilities.{name}", capability.owner, capability.entry_points, present, matches,
+        ))
     return ownership, findings
 
 
@@ -106,12 +112,17 @@ def _failed_interface_conditions(
     return failed
 
 
+def _ordered_distinct_edges(edges: Iterable[Edge]) -> Iterator[Edge]:
+    distinct = {(edge.source, edge.line, edge.target, edge.kind): edge for edge in edges}
+    for key in sorted(distinct):
+        yield distinct[key]
+
+
 def interface_findings(
     modules: dict[str, Any], owners: dict[str, str], edges: Iterable[Edge],
 ) -> list[dict]:
-    distinct = {(edge.source, edge.line, edge.target, edge.kind): edge for edge in edges}
     findings = []
-    for _, edge in sorted(distinct.items()):
+    for edge in _ordered_distinct_edges(edges):
         source, target = owners[edge.source], owners[edge.target]
         if source == target:
             continue
@@ -122,6 +133,33 @@ def interface_findings(
                 "failed_conditions": failed, "permitted_entry_points": sorted(modules[target].entry_points),
             })
     return findings
+
+
+_CAPABILITY_CALL_KINDS = frozenset(("path-load", "require", "source", "execute"))
+
+
+def _capabilities_by_target(capabilities: dict[str, Any]) -> dict[str, list[tuple[str, str]]]:
+    by_target: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for name, capability in sorted(capabilities.items()):
+        for path in capability.entry_points:
+            by_target[path].append((name, capability.owner))
+    return by_target
+
+
+def capability_findings(
+    capabilities: dict[str, Any], owners: dict[str, str], edges: Iterable[Edge],
+) -> Iterator[dict]:
+    by_target = _capabilities_by_target(capabilities)
+    calls = (edge for edge in edges if edge.kind in _CAPABILITY_CALL_KINDS)
+    for edge in _ordered_distinct_edges(calls):
+        source = owners[edge.source]
+        for name, owner in by_target.get(edge.target, ()):
+            if source != owner:
+                yield {
+                    "rule": "capability-owner", "file": edge.source, "line": edge.line,
+                    "capability": name, "owner": owner, "source_module": source, "edge": edge.to_json(),
+                    "message": f"capability {name!r} can only be invoked by its owner {owner!r}",
+                }
 
 
 def multi_module_findings(

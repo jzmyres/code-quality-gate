@@ -31,6 +31,7 @@ TOP_LEVEL_KEYS = (
     "not_applicable",
     "protect",
     "modules",
+    "capabilities",
 )
 
 
@@ -102,6 +103,12 @@ class ModuleDef:
 
 
 @dataclass(frozen=True)
+class CapabilityDef:
+    owner: str
+    entry_points: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     root: Path
@@ -116,6 +123,7 @@ class Config:
     not_applicable: tuple[NotApplicable, ...]
     modules: dict[str, ModuleDef]
     module_contracts: bool
+    capabilities: dict[str, CapabilityDef]
     protect_paths: tuple[str, ...] = ()
     module_dirs: tuple[str, ...] | None = None
     shared_base: str | None = None
@@ -361,7 +369,7 @@ def _module_values(
     return values
 
 
-def _validate_protected_path(path: Path, item: str, value: str) -> None:
+def _validate_exact_path(path: Path, item: str, value: str) -> None:
     _validate_module_path(path, item, value)
     if set(value).intersection("*?[]"):
         raise _config_error(path, item, "an exact path without glob syntax", repr(value))
@@ -380,13 +388,45 @@ def _parse_modules(data: dict[str, Any], path: Path) -> dict[str, ModuleDef]:
         paths = _optional_string_list(raw, "protected_paths", path, protected_key)
         for index, value in enumerate(paths):
             item = f"{protected_key}[{index}]"
-            _validate_protected_path(path, item, value)
+            _validate_exact_path(path, item, value)
             _unique(protected, value, path, item, "a unique protected path", f"duplicate {value!r}",
                     _config_error)
         modules[name] = ModuleDef(
             *(_module_values(raw, name, field, path, raw_modules) for field in fields), protected_paths=paths,
         )
     return modules
+
+
+def _capability_entry_points(raw: dict[str, Any], path: Path, key: str) -> tuple[str, ...]:
+    values = _string_list(raw, "entry_points", path, key)
+    if not values:
+        raise _config_error(path, key, "a non-empty list of exact paths", "an empty list")
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        item = f"{key}[{index}]"
+        _validate_exact_path(path, item, value)
+        _unique(seen, value, path, item, "a unique value", f"duplicate {value!r}", _config_error)
+    return values
+
+
+def _parse_capabilities(
+    data: dict[str, Any], path: Path, modules: dict[str, ModuleDef], module_contracts: bool,
+) -> dict[str, CapabilityDef]:
+    declarations = _read_value(data, "capabilities", path, "capabilities", _TABLE, default={})
+    if declarations and not module_contracts:
+        raise _config_error(path, "capabilities", "[checks.module-contracts]", "missing")
+    capabilities = {}
+    for name in declarations:
+        key = f"capabilities.{name}"
+        _read_scalar(path, key, name, _STRING)
+        raw = _read_value(declarations, name, path, key, _TABLE)
+        _check_keys(raw, ("owner", "entry_points"), path, key)
+        owner_key = f"{key}.owner"
+        owner = _string(raw, "owner", path, owner_key)
+        if owner not in modules:
+            raise _config_error(path, owner_key, "a declared module", f"unknown module {owner!r}")
+        capabilities[name] = CapabilityDef(owner, _capability_entry_points(raw, path, f"{key}.entry_points"))
+    return capabilities
 
 
 def _scope(
@@ -1014,6 +1054,7 @@ def _config_from_data(
         module_dirs=module_dirs,
         modules=modules,
         module_contracts=module_contracts,
+        capabilities=_parse_capabilities(data, path, modules, module_contracts),
         shared_base=shared_base,
     )
 

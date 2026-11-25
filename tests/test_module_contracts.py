@@ -44,6 +44,10 @@ NO_ALLOWANCE = CONTRACT_CONFIG.replace('allowed_dependencies = ["library"]', "al
 ENTRY_POINTS = ["library/api.py", "library/z.py"]
 
 
+def capability(*paths: str, name: str = "run-library", owner: str = "library") -> str:
+    return f'\n[capabilities.{name}]\nowner = "{owner}"\nentry_points = {json.dumps(paths)}\n'
+
+
 class ModuleContractTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
@@ -105,6 +109,56 @@ class ModuleContractTests(FixtureCase):
                 self.assertEqual(result.returncode, 2, output(result))
                 self.assertIn(f"{self.config_path}: {diagnostic}", result.stderr)
 
+    def test_malformed_capability_policy_is_a_configuration_error(self) -> None:
+        table = "\n[capabilities.run-library]\n"
+        owner = 'owner = "library"\n'
+        entry_points = 'entry_points = ["library/api.py"]\n'
+        key = "capabilities.run-library"
+        for declaration, diagnostic in (
+            ("\ncapabilities = []\n", "capabilities"),
+            ("\n[capabilities]\nrun-library = false\n", key),
+            ('\n[capabilities."   "]\n' + owner + entry_points, "capabilities.   "),
+            ('\n[capabilities.""]\n' + owner + entry_points, "capabilities."),
+            (table + entry_points, f"{key}.owner"),
+            (table + owner, f"{key}.entry_points"),
+            (table + owner + entry_points + "extra = true\n", f"{key}.extra"),
+            (table + 'owner = ["library"]\n' + entry_points, f"{key}.owner"),
+            (table + 'owner = " "\n' + entry_points, f"{key}.owner"),
+            (table + 'owner = "missing"\n' + entry_points, f"{key}.owner"),
+            (table + owner + 'entry_points = "library/api.py"\n', f"{key}.entry_points"),
+            (table + owner + "entry_points = [1]\n", f"{key}.entry_points[0]"),
+            (capability(), f"{key}.entry_points"),
+            (capability("library/api.py", "library/api.py"), f"{key}.entry_points[1]"),
+        ):
+            with self.subTest(declaration=declaration):
+                config = (declaration + CONTRACT_CONFIG if diagnostic == "capabilities"
+                          else CONTRACT_CONFIG + declaration)
+                self.write_config(config)
+                self.assert_capability_config_error(diagnostic)
+
+    def assert_capability_config_error(self, key: str) -> None:
+        result = self.run_qg_process("check")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn(f"{self.config_path}: {key}:", result.stderr)
+
+    def test_capability_paths_must_be_exact_and_canonical(self) -> None:
+        for path in ("", "/library/api.py", "library/./api.py", "library/../api.py", "library//api.py",
+                     "library/api.py/", "library/api\0.py", "library/*.py", "library/?.py", "library/[a].py"):
+            with self.subTest(path=path):
+                self.write_config(CONTRACT_CONFIG + capability(path))
+                self.assert_capability_config_error("capabilities.run-library.entry_points[0]")
+
+    def test_only_nonempty_capabilities_require_the_contract_check(self) -> None:
+        config = CONTRACT_CONFIG.replace(CONTRACT_CHECK, "")
+        for declaration in ("", "\n[capabilities]\n"):
+            with self.subTest(declaration=declaration):
+                self.write_config(config + declaration)
+                self.assertEqual(load_config(self.repo).capabilities, {})
+                result = self.run_qg_process("check")
+                self.assertEqual(result.returncode, 0, output(result))
+        self.write_config(config + capability("library/api.py"))
+        self.assert_capability_config_error("capabilities")
+
     def test_explicit_contract_selection_runs_once_with_builtins(self) -> None:
         self.write_config(NO_ALLOWANCE)
         _, document, check = self.contract(1, "--only", "module-contracts")
@@ -145,6 +199,129 @@ class ModuleContractTests(FixtureCase):
         edges = [path_load, imported, path_load]
         findings = module_graph.interface_findings(config.modules, owners, edges)
         self.assertEqual([finding["edge"] for finding in findings], [imported.to_json(), path_load.to_json()])
+
+    def assert_capability_finding(self, result, finding, *, source, line, target, kind) -> None:
+        message = "capability 'run-library' can only be invoked by its owner 'library'"
+        self.assertEqual(finding, {
+            "rule": "capability-owner", "file": source, "line": line, "capability": "run-library",
+            "owner": "library", "source_module": "app", "message": message,
+            "edge": {"source": source, "target": target, "line": line, "kind": kind},
+        })
+        diagnostic = f"module-contracts: capability-owner: {source}:{line}: {message}"
+        self.assertIn(diagnostic, result.stderr.splitlines())
+
+    def test_resolved_python_path_loaders_enforce_capability_ownership(self) -> None:
+        target = "library/api.py"
+        self.write_config(CONTRACT_CONFIG + capability(target))
+        for statement, call in (
+            ("import runpy", 'runpy.run_path("../library/./api.py")'),
+            ("import importlib.util", 'importlib.util.spec_from_file_location("api", "../library/api.py")'),
+        ):
+            with self.subTest(call=call):
+                self.add_file("app/main.py", f"{statement}\n\n{call}\n")
+                result, _, check = self.contract(1)
+                finding, = check["findings"]
+                self.assert_capability_finding(result, finding, source="app/main.py", line=3,
+                                               target=target, kind="path-load")
+
+    def test_capability_and_interface_violations_are_both_reported(self) -> None:
+        target = "library/private.py"
+        self.write_config(CONTRACT_CONFIG + capability(target))
+        self.add_file("app/main.py", 'import runpy\nrunpy.run_path("../library/private.py")\n')
+        result, _, check = self.contract(1)
+        interface, ownership = check["findings"]
+        self.assertEqual(interface["rule"], "module-interface")
+        self.assertEqual(interface["failed_conditions"], ["target-not-entry-point"])
+        self.assertEqual(interface["edge"], ownership["edge"])
+        self.assert_capability_finding(result, ownership, source="app/main.py", line=2,
+                                       target=target, kind="path-load")
+
+    def test_unchanged_capability_violation_blocks_only_and_base_runs(self) -> None:
+        target = "library/api.py"
+        self.write_config(CONTRACT_CONFIG + capability(target))
+        self.add_file("app/main.py", 'import runpy\nrunpy.run_path("../library/api.py")\n')
+        self.commit_all()
+        for args in (("--only", "module-contracts"), ("--base", "HEAD"),
+                     ("--only", "module-contracts", "--base", "HEAD")):
+            with self.subTest(args=args):
+                result, document, check = self.contract(1, *args)
+                if "--base" in args:
+                    self.assertEqual(document["changed_paths"], [])
+                finding, = check["findings"]
+                self.assert_capability_finding(result, finding, source="app/main.py", line=2,
+                                               target=target, kind="path-load")
+
+    def test_owner_calls_imports_and_undeclared_or_unresolved_targets_are_allowed(self) -> None:
+        self.write_config(CONTRACT_CONFIG + capability("library/api.py", "library/private.py"))
+        self.add_file(
+            "library/z.py", 'import runpy\nrunpy.run_path("private.py")\nrunpy.run_path("api.py")\n',
+        )
+        self.add_file("app/main.py", 'import library.api\nimport runpy\nrunpy.run_path("../library/z.py")\n'
+                      'path = "../library/api.py"\nrunpy.run_path(path)\n')
+        _, _, check = self.contract(0)
+        self.assertEqual(check["findings"], [])
+
+    def test_multiple_capability_paths_and_shared_paths_produce_distinct_findings(self) -> None:
+        self.write_config(CONTRACT_CONFIG + capability("library/z.py", name="also-run")
+                          + capability("library/z.py", "library/api.py"))
+        self.add_file("app/main.py", 'import runpy\nrunpy.run_path("../library/z.py")\n'
+                      'runpy.run_path("../library/api.py")\n')
+        _, _, check = self.contract(1)
+        self.assertEqual([
+            (row["line"], row["edge"]["target"], row["capability"]) for row in check["findings"]
+        ], [
+            (2, "library/z.py", "also-run"),
+            (2, "library/z.py", "run-library"),
+            (3, "library/api.py", "run-library"),
+        ])
+
+    def test_capability_finding_order_and_deduplication_include_edge_kind_and_capability(self) -> None:
+        self.write_config(CONTRACT_CONFIG + capability("library/z.py", "library/api.py")
+                          + capability("library/api.py", name="also-run"))
+        config = load_config(self.repo)
+        source, api, other = "app/main.py", "library/api.py", "library/z.py"
+        owners = {source: "app", "app/helper.py": "app", api: "library", other: "library"}
+        execute = module_graph.Edge(source, api, 1, "execute")
+        edges = [
+            module_graph.Edge(source, other, 1, "execute"), module_graph.Edge(source, api, 2, "execute"),
+            module_graph.Edge(source, api, 1, "source"), execute, execute,
+            module_graph.Edge("app/helper.py", api, 9, "execute"),
+        ]
+        expected = [
+            ("app/helper.py", 9, api, "execute", "also-run"),
+            ("app/helper.py", 9, api, "execute", "run-library"),
+            (source, 1, api, "execute", "also-run"), (source, 1, api, "execute", "run-library"),
+            (source, 1, api, "source", "also-run"), (source, 1, api, "source", "run-library"),
+            (source, 1, other, "execute", "run-library"),
+            (source, 2, api, "execute", "also-run"), (source, 2, api, "execute", "run-library"),
+        ]
+        for calls in (edges, list(reversed(edges))):
+            findings = module_graph.capability_findings(config.capabilities, owners, calls)
+            self.assertEqual([
+                (row["file"], row["line"], row["edge"]["target"], row["edge"]["kind"], row["capability"])
+                for row in findings
+            ], expected)
+
+    def test_gate_capability_declarations_match_the_owned_inventory_paths(self) -> None:
+        policy = (self.gate / "quality-gate.toml").read_text(encoding="utf-8")
+        self.write_config(
+            policy + capability("qg.py", name="run-quality-gate", owner="core")
+            + capability("quality_gate/covrun.py", name="run-coverage-driver", owner="python"),
+        )
+        baseline = "quality-gate-verification.toml"
+        self.add_file(baseline, (self.gate / baseline).read_bytes())
+        config = load_config(self.repo, candidate_root=self.gate)
+        self.assertEqual({name: (declaration.owner, declaration.entry_points)
+                          for name, declaration in config.capabilities.items()}, {
+            "run-quality-gate": ("core", ("qg.py",)),
+            "run-coverage-driver": ("python", ("quality_gate/covrun.py",)),
+        })
+        files, classes, violations = validate_inventory(self.gate, config)
+        self.assertEqual(violations, [])
+        owners, findings = adapters.module_ownership(config, files, classes)
+        self.assertEqual(findings, [])
+        self.assertEqual(owners["qg.py"], "core")
+        self.assertEqual(owners["quality_gate/covrun.py"], "python")
 
     def test_rejects_an_allowed_dependency_on_a_private_file(self) -> None:
         self.add_file("app/main.py", "import app.helper\nimport library.private\n")
@@ -264,6 +441,36 @@ class ModuleContractTests(FixtureCase):
         self.assertEqual([row["reason"] for row in findings if row["rule"] == "invalid-entry-point"],
                          ["has no module owner", "has multiple module owners: app, library"])
 
+    def test_capability_entry_points_require_present_code_and_the_declared_owner(self) -> None:
+        self.add_file("orphan.py", "value = 0\n")
+        paths = ("missing.py", "README.md", "app/main.py", "orphan.py", "app/helper.py")
+        self.write_config(CONTRACT_CONFIG.replace(
+            'files = ["library/*.py"]', 'files = ["library/*.py", "app/helper.py"]',
+        ) + capability(*paths))
+        result, findings = self.assert_map_failure()
+        invalid = [row for row in findings if row["rule"] == "invalid-entry-point"]
+        reasons = ("absent from inventory", "not an inventoried code file", "owned by app",
+                   "has no module owner", "has multiple module owners: app, library")
+        for index, (row, path, reason) in enumerate(zip(invalid, paths, reasons, strict=True)):
+            key = f"capabilities.run-library.entry_points[{index}]"
+            self.assertEqual(
+                (row["key"], row["file"], row["module"], row["reason"]), (key, path, "library", reason),
+            )
+            self.assertIn(f"invalid-entry-point: {key}: {path}: {reason}", result.stderr)
+
+    def test_single_module_still_validates_capability_entry_points(self) -> None:
+        config = BASE_CONFIG + CONTRACT_CHECK + FIXTURE_MAP
+        self.write_config(config + capability("missing.py", owner="fixture"))
+        result, findings = self.assert_map_failure()
+        finding, = findings
+        self.assertEqual(finding["key"], "capabilities.run-library.entry_points[0]")
+        self.assertEqual(finding["reason"], "absent from inventory")
+        self.assertIn(finding["message"], result.stderr)
+        self.write_config(config + capability("library/api.py", owner="fixture"))
+        with mock.patch.object(adapters, "_extract_graph") as extract:
+            self.contract(0)
+        extract.assert_not_called()
+
     def test_all_code_requires_ownership_even_without_an_extractor(self) -> None:
         self.add_file("app/data.lua", "return 1\n")
         config = CONTRACT_CONFIG.replace('patterns = ["*.py",', 'patterns = ["*.lua", "*.py",')
@@ -370,8 +577,8 @@ class ModuleContractTests(FixtureCase):
         self.assertIn("app/main.py: expected readable, valid Python source", finding["message"])
         self.assertIn(finding["message"], result.stderr)
 
-    def test_shell_source_edge_is_checked_with_the_pinned_parser(self) -> None:
-        self.add_file("app/use.sh", "source ../library/private.sh\n")
+    def configure_shell(self, source: str) -> None:
+        self.add_file("app/use.sh", source)
         self.add_file("library/private.sh", "value=3\n")
         self.write_config(CONTRACT_CONFIG.replace('files = ["app/*.py"]', 'files = ["app/*"]')
                           .replace('files = ["library/*.py"]', 'files = ["library/*"]') + """
@@ -380,6 +587,9 @@ pattern = "*.sh"
 class = "python"
 reason = "Shell source"
 """)
+
+    def test_shell_source_edge_is_checked_with_the_pinned_parser(self) -> None:
+        self.configure_shell("source ../library/private.sh\n")
         with mock.patch.object(adapters, "run", wraps=runner.run) as run:
             _, _, check = self.contract(1, env=self.default_tool_env())
         self.assertEqual([call.args[0][-1] for call in run.call_args_list],
@@ -389,6 +599,27 @@ reason = "Shell source"
             "source": "app/use.sh", "target": "library/private.sh", "line": 1, "kind": "source",
         })
         self.assertEqual(finding["failed_conditions"], ["target-not-entry-point"])
+
+    def allow_library_target(self, target: str) -> None:
+        config = self.read_file("quality-gate.toml")
+        current = 'entry_points = ["library/z.py", "library/api.py"]'
+        self.write_config(config.replace(current, f"entry_points = {json.dumps([*ENTRY_POINTS, target])}")
+                          + capability(target))
+
+    def test_resolved_shell_calls_enforce_capability_ownership(self) -> None:
+        for command, kind in (
+            ("source ../library/private.sh", "source"), (". ../library/private.sh", "source"),
+            ("../library/private.sh", "execute"), ("bash ../library/private.sh", "execute"),
+            ("sh ../library/private.sh", "execute"),
+        ):
+            with self.subTest(command=command):
+                self.configure_shell(f"# Call the capability\n{command}\n")
+                target = "library/private.sh"
+                self.allow_library_target(target)
+                result, _, check = self.contract(1, env=self.default_tool_env())
+                finding, = check["findings"]
+                self.assert_capability_finding(result, finding, source="app/use.sh", line=2,
+                                               target=target, kind=kind)
 
     def configure_elisp(self, source: str) -> None:
         self.add_file("app/use.el", source)
@@ -410,6 +641,16 @@ reason = "Lisp source"
         })
         self.assertEqual(finding["failed_conditions"], ["target-not-entry-point"])
         self.assertIn("app/use.el:1 -> library/fixture.el (require)", result.stderr)
+
+    def test_resolved_elisp_require_enforces_capability_ownership(self) -> None:
+        self.configure_elisp(";; Call the capability\n(require 'fixture)\n")
+        target = "library/fixture.el"
+        self.allow_library_target(target)
+        result, _, check = self.contract(1)
+        finding, = check["findings"]
+        self.assert_capability_finding(
+            result, finding, source="app/use.el", line=2, target=target, kind="require",
+        )
 
     def test_elisp_reader_and_preparation_errors_block(self) -> None:
         for stage, line, source, detail in (

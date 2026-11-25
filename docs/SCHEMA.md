@@ -156,6 +156,11 @@ Rules:
   and `enforcement = "enforced"`.
   It produces a built-in result with a null tier and supplies no class obligation evidence.
   An optional nonblank `shared_base` revision opts into both shared entry point rules.
+* Optional `[capabilities.NAME]` tables declare a nonblank capability name and exactly two
+  required fields. `owner` is a nonblank string naming a declared module. `entry_points` is a
+  nonempty array of distinct, exact, case-sensitive repository-relative paths. The paths reject
+  glob syntax, empty, `.` and `..` components, and NUL characters. Declaring any capability
+  requires `[checks.module-contracts]`. An omitted or empty `[capabilities]` declares none.
 * `tier` is an integer from 1 to 4. `enforcement` is `enforced` or
   `advisory`. `direction` is `max` (the default) or `min`: a `max`
   metric's value must not exceed its bound and tightening lowers the bound,
@@ -510,6 +515,9 @@ policy's `baseline` key and the file are then deleted by hand.
 and staged files and nonignored untracked files, excluding gitlinks and non-code files. Each
 pattern must match code. Patterns within one module may overlap. Entry points must be present,
 uniquely owned code files of the declaring module. An empty `[modules]` requires a code-free tree.
+Capability entry points are validated during the same ownership pass, including in a single-module
+map. Each must be an inventoried code file uniquely owned by the capability's `owner`. The file
+can be private to that module, and multiple capabilities can name the same file with that owner.
 
 A cross-module direct edge must satisfy both requirements. The source must list the destination
 in `allowed_dependencies`, and the target must appear in the destination's `entry_points`. The
@@ -518,8 +526,29 @@ enabled check runs after inventory and hygiene and before the other configured c
 With successful inventory and a valid map declaring at least two modules, it extracts the full
 owned-code graph using the existing Python, Emacs Lisp and shell extractors. Required extraction
 failures, including Emacs preparation and reader errors, reject with exit 1, as do ownership
-and interface violations. Ordinary outside-extractor records are nonblocking. A valid zero- or
+and call violations. Ordinary outside-extractor records are nonblocking. A valid zero- or
 one-module map requires no extraction. `worklist` omits the built-in.
+
+Only the declared owner can invoke a capability entry point. The `capability-owner` rule matches
+the exact resolved target on `path-load` edges from Python `runpy.run_path` and
+`importlib.util.spec_from_file_location`, `require` edges from Emacs Lisp, and `source` and
+`execute` edges from the shell. Python `import` edges follow the module interface rule. Capability
+violations are checked across the full graph, regardless of the diff, `shared_base`, allowed
+dependencies or module entry points. A call can violate both the interface and capability rules.
+
+Upgrade the trusted gate to a version that accepts `[capabilities]` before adding declarations
+to an authorized policy. The gate's own CLI and isolated coverage driver can then be declared
+in `quality-gate.toml` as follows.
+
+```toml
+[capabilities.run-quality-gate]
+owner = "core"
+entry_points = ["qg.py"]
+
+[capabilities.run-coverage-driver]
+owner = "python"
+entry_points = ["quality_gate/covrun.py"]
+```
 
 With `shared_base` enabled, `--base` takes precedence and supplies its affected-scope diff
 from the merge base. Otherwise, the check compares the run's resolved `QG_DIFF_BASE` commit
@@ -767,13 +796,19 @@ Baseline errors carry `error`.
 `module-contracts` uses matching `id`, `kind` and `adapter`, `enforcement = "enforced"`,
 and `metric_version = "module-contracts/1"`. Failed inventory makes the contract unsatisfied
 with `caused_by = ["inventory"]`. Its `findings` array retains ownership, extraction,
-interface and shared entry point diagnostics. Reader errors include `file`, `stage`,
+interface, capability and shared entry point diagnostics. Reader errors include `file`, `stage`,
 `line` and `message`.
 Each distinct violating edge produces a `module-interface` finding ordered by source path, line,
 target path and edge kind. It has `rule`, `edge` (`source`, `line`, `target`, `kind`),
 `source_module`, `target_module`, `failed_conditions` and `permitted_entry_points`.
 `failed_conditions` lists each applicable condition, `dependency-not-allowed` and
 `target-not-entry-point`. `permitted_entry_points` is sorted and can be empty.
+Invalid capability paths report `invalid-entry-point` with `key` set to
+`capabilities.NAME.entry_points[INDEX]`, `file`, `module` (the declared owner), `reason` and
+`message`. Each `capability-owner` finding has the caller `file` and one-based `line`, `capability`,
+`owner`, `source_module`, `edge` (`source`, `line`, `target`, `kind`), and `message` naming the
+capability and owner. Findings are unique and sorted by caller path, line, target path, edge kind
+and capability name. Stderr includes the caller location.
 Each `shared-entry-point` finding has the feature `file`, its `module`, the
 `protected_path` and a diagnostic `message`. Findings are ordered by feature path,
 then protected path. Each `multi-module-file` finding has the target `file`, sorted
