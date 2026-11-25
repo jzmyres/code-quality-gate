@@ -27,3 +27,10 @@ sha256 = "0cc0a5c62bba143b540a5f266fc3bc826ce784bc244be957f3a5af77c65d2011"
 payload_sha256 = "25a74fe433754f10a50a4ee05aec3ccf96c09545b08f94d2595a895f8e36711e"
 format = "conda"
 binary = "bin/shfmt"
+
+[betterleaks]
+version = "1.10.1"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.10.1/betterleaks_1.10.1_linux_x64.tar.gz"
+sha256 = "c174b42d7aa60caf58c0c3e555c0e4bed01fe6b0d99a412bce777b5af4ce913e"
+payload_sha256 = "38fdb70ab9d7e4b90c359ae8dce71c4c03fe5c294b20604861d7128033d0eea0"
+binary = "betterleaks"

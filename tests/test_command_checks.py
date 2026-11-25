@@ -190,7 +190,7 @@ class CommandCheckTests(FixtureCase):
         result, check = self.failed_lint()
         reason = (
             f"{GATE / 'tools.lock.toml'}: unknown tool 'mystery' "
-            "(pinned tools: coverage, jscpd, ruff, shfmt); "
+            "(pinned tools: betterleaks, coverage, jscpd, ruff, shfmt); "
             "run 'python3 -I qg.py tools fetch'"
         )
         self.assertEqual(check["reason"], reason)
