@@ -978,9 +978,16 @@ def _run_selected_check(
             root, config, check, files, classes, prefix=prefix, evidence_dir=evidence_dir,
             prior=prior, base_override=base_override, selection=selection,
         )
-    if selection is not None:
-        result.report_fields.setdefault("selection", selection.report())
+    _record_selection(check, result, selection)
     return result
+
+
+def _record_selection(check: CheckDef, result: CheckResult, selection: CheckSelection | None) -> None:
+    if selection is None:
+        return
+    if _command_suite(check):
+        result.measurement = None
+    result.report_fields.setdefault("selection", selection.report())
 
 
 def _scope_plan(
@@ -990,7 +997,7 @@ def _scope_plan(
 ) -> tuple[DiffBaseOverride, dict[str, CheckSelection]]:
     if changed is None:
         return resolve_diff_base(root), {}
-    base_override = DiffBaseOverride(base=affected_base)
+    base_override = DiffBaseOverride(base=affected_base, changed_paths=frozenset(changed))
     if inventory_code != 0:
         selections = {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
     else:
@@ -1436,7 +1443,10 @@ def _check_command(
     results.extend(
         _run_policy_checks(root, config, files, classes, code, selected, changed, base)
     )
-    return _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
+    exit_code, document = _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
+    if changed is not None:
+        document["changed_paths"] = sorted(changed)
+    return exit_code, document
 
 
 def _run_check_document(

@@ -345,7 +345,7 @@ def _hunks(raw: bytes) -> tuple[set[str], dict[str, set[int]]]:
     return paths, added
 
 
-def _diff_lines(root: Path, base: str, *, tracked_only: bool = False) -> Diff:
+def _diff_lines(root: Path, base: str, *, changed_paths: frozenset[str] | None = None) -> Diff:
     """The added line numbers of every changed path, and new whole files."""
     raw = _git(
         root,
@@ -353,16 +353,18 @@ def _diff_lines(root: Path, base: str, *, tracked_only: bool = False) -> Diff:
             "-c", "core.quotePath=false",
             "diff", "--unified=0", "--no-color", "--no-ext-diff",
             "--src-prefix=a/", "--dst-prefix=b/", "--diff-filter=ACMRTUXB",
+            *(["--no-renames"] if changed_paths is not None else []),
             base, "--",
         ],
         "python-shape diff",
     )
     paths, added = _hunks(raw)
-    untracked = frozenset() if tracked_only else frozenset(
-        _untracked_files(root, "python-shape untracked-file selection")
-    )
+    untracked = frozenset()
+    if changed_paths is None:
+        untracked = frozenset(_untracked_files(root, "python-shape untracked-file selection"))
+        changed_paths = frozenset(paths) | untracked
     return Diff(
-        frozenset(paths) | untracked,
+        changed_paths,
         {name: frozenset(lines) for name, lines in added.items()},
         untracked,
     )
@@ -544,14 +546,19 @@ def _measured_paths(
 
 
 def _shape_input(
-    context: Any, spec: ShapeSpec, limit: float, base: DiffBase
+    context: Any, spec: ShapeSpec, limit: float, base: DiffBase,
+    *, changed: frozenset[str] | None = None,
 ) -> ShapeInput:
     """One parse of the measured files, and the indexes every rule reads.
 
     The CRAP-payoff rule compares against the before tree for files
     touched by the diff. The other rules use the after tree alone.
     """
-    diff = _diff_lines(context.root, base.commit, tracked_only=base.source == "--base")
+    tree = spec.scope == "tree"
+    if changed is not None and not tree:
+        diff = Diff(changed, {}, frozenset())
+    else:
+        diff = _diff_lines(context.root, base.commit, changed_paths=changed)
     scoped = _measured_paths(context, spec, diff)
     indexes = {
         path: _file_index(path, _read_source(context.root, path))
@@ -560,7 +567,7 @@ def _shape_input(
     base_functions = _base_functions(
         context.root, base.commit, sorted(diff.paths.intersection(scoped))
     )
-    if spec.scope == "tree":
+    if tree:
         functions, added = _tree_selection(indexes, diff)
         candidates = functions
     else:
@@ -1052,34 +1059,43 @@ def _findings(data: ShapeInput) -> list[Finding]:
     return findings
 
 
+def _shape_selection(context: Any, data: ShapeInput, start: float) -> Any:
+    from .checks import _check_result
+
+    selection = context.selection
+    if selection is None:
+        return None
+    candidates = selection.selected
+    reason = "in the requested diff" if data.spec.scope == "changed" else selection.reason
+    selection.selected = dict.fromkeys(data.paths, reason)
+    selection.left_out = dict.fromkeys(
+        sorted(candidates.keys() - selection.selected.keys()), "outside the shape measurement",
+    )
+    if data.paths:
+        return None
+    selection.reason = "no files in the shape measurement"
+    return _check_result(
+        context.check, start, "not_run", execution="not_run", satisfied=True, reason=selection.reason,
+    )
+
+
 def _run_python_shape(context: Any) -> Any:
-    from .checks import _check_result, _configuration_error, _finish_ratchet
+    from .checks import _configuration_error, _finish_ratchet
 
     check = context.check
     start = time.monotonic()
+    override = context.base_override
     try:
         limit = _crap_limit(context.config, check.spec)
-        base = diff_base(
-            context.root, check.spec.base,
-            resolved=context.base_override,
-        )
+        base = diff_base(context.root, check.spec.base, resolved=override)
         mark_step("python-shape analysis")
-        data = _shape_input(context, check.spec, limit, base)
+        changed = override.changed_paths if override is not None else None
+        data = _shape_input(context, check.spec, limit, base, changed=changed)
     except GateError as error:
         return _configuration_error(check, start, context.prefix, error)
-    selection = context.selection
-    if selection is not None:
-        candidates = selection.selected
-        reason = "in the requested diff" if check.spec.scope == "changed" else selection.reason
-        selection.selected = dict.fromkeys(data.paths, reason)
-        selection.left_out = dict.fromkeys(
-            sorted(candidates.keys() - selection.selected.keys()), "outside the shape measurement",
-        )
-        if not data.paths:
-            selection.reason = "no files in the shape measurement"
-            return _check_result(
-                check, start, "not_run", execution="not_run", satisfied=True, reason=selection.reason,
-            )
+    omitted = _shape_selection(context, data, start)
+    if omitted is not None:
+        return omitted
     mark_step("python-shape rules")
     measured = Domain.of_files(
         sorted({function.path for function in data.functions}),

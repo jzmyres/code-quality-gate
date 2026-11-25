@@ -1311,13 +1311,17 @@ check to its full input class, including changes to configuration, tool pins, da
 
 Unittest discovery selects changed test files and tests that reach changed modules through the
 graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.
-Suites declared through the command adapter run their full configured command and use the policy's
-usual output rules. Per-test selection and execution records come from the gate's own discovery.
-Verification runs with its full prerequisites. CRAP measures changed inputs and requests a
-coverage run even when discovery selects no tests. The JSON records `"scope": "affected"`,
-the `base` revision, and each check's selection and reasons. Tests selected by discovery, left
-out by scope, and actually executed are reported separately. Unittest selection and completed
-invocations are retained if the run times out or is terminated by a signal.
+Command-adapter suites and custom Python test commands run their full configured command and use
+the policy's usual verdict rules. The JSON includes a full-run reason for these suites. Execution
+counts and per-test records come from the gate's own test adapters.
+
+Verification runs with its full prerequisites. CRAP requests a coverage run for changed inputs even
+when discovery selects no tests. If the prerequisite suite fails, CRAP reports `unsupported`.
+The JSON records `"scope": "affected"`, the `base` revision, the union of `changed_paths`,
+and each check's selection and reasons. Python shape uses that same path union and reports which
+files it measured. Tests selected by discovery, left out by scope, and actually executed are
+reported separately. Unittest selection and completed invocations are retained if the run times
+out or is terminated by a signal.
 
 The graph cannot see a test's runtime read of a graph-node file as data or a check command's import
 of a module as its rules. A landing accepts only a full `python3 -I qg.py check` result, without

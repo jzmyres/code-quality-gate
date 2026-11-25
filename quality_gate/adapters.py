@@ -7,8 +7,6 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 """
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import sys
 import time
@@ -23,7 +21,6 @@ from . import (
     module_graph, python_crap, python_mutation, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .coverage_tool import _coverage_config_problem
 from .files import DiffBaseOverride, source_languages
 from .json_input import load_json
 from .policy import (
@@ -415,40 +412,6 @@ def _run_comments(context: AdapterContext) -> Any:
     )
 
 
-def _affected_coverage(context: AdapterContext, result: Any, data_dir: Path, start: float) -> None:
-    settings = python_tests.coverage_config_text(context.root)
-    problem = _coverage_config_problem(data_dir, settings)
-    if problem is not None:
-        result.reason = f"{result.reason}; {problem}"
-        return
-    evidence = context.evidence_dir / "combined" / ".coverage"
-    failure = python_tests._combine_tests_evidence(
-        context.check, context.check.spec, start, context.prefix, settings,
-        data_dir, evidence, result.diagnostics,
-    )
-    if failure is None:
-        result.evidence_path = evidence
-        result.adapter_data = {
-            "coverage_settings": settings, "coverage_config": python_tests.coverage_config_path(data_dir),
-        }
-
-
-def _affected_crap(context: AdapterContext, required: Any) -> Any:
-    from .checks import _adapter_selection, _finish_crap_ratchet
-
-    _, start, files, _ = _adapter_selection(context)
-    measurement, failure = python_crap._crap_measure(
-        context.root, files, required.evidence_path, required.adapter_data["coverage_settings"],
-        context.check, start, context.prefix,
-    )
-    if failure is not None:
-        return failure
-    return _finish_crap_ratchet(
-        context.check, measurement.findings, context.prefix, start,
-        lambda _entries: ratchet.Domain.of_files(files), ("functions", "function"),
-    )
-
-
 def _affected_test_child(
     context: AdapterContext, plan: Path, command: list[str], environment: dict, start: float,
 ) -> tuple[Any, str | None]:
@@ -586,22 +549,7 @@ def _finish_affected_unittest(context: AdapterContext, result: Any, data_dir: Pa
         )
         evidence.report_fields = result.report_fields
         return evidence
-    if child.execution == "completed" and context.selection.coverage and "executed" in result.report_fields:
-        _affected_coverage(context, result, data_dir, start)
     return _finish_test_result(result, temporary_reason, prefix, child.combined_text)
-
-
-def _affected_opaque_python_tests(context: AdapterContext) -> Any:
-    if context.check.spec.skipped_pattern is not None:
-        return python_tests._run_python_tests(context)
-    with contextlib.redirect_stdout(io.StringIO()):
-        result = python_tests._run_python_tests(context)
-    result.measurement = result.tests_ran = result.tests_skipped = None
-    if result.outcome == "pass":
-        result.outcome = "unsupported"
-        result.reason = "full run: the command provided no skip-aware test counts"
-        print(f"{context.prefix}: {result.reason}", file=sys.stderr)
-    return result
 
 
 def _run_python_tests(context: AdapterContext) -> Any:
@@ -612,15 +560,10 @@ def _run_python_tests(context: AdapterContext) -> Any:
         return _affected_unittest(context, argv[2:], shards=True)
     if argv[:3] == ("{python}", "-m", "unittest"):
         return _affected_unittest(context, argv[3:])
-    return _affected_opaque_python_tests(context)
-
-
-def _run_python_crap(context: AdapterContext) -> Any:
-    if context.selection is not None:
-        required = context.prior[context.check.spec.requires]
-        if required.outcome != "pass" and required.evidence_path is not None:
-            return _affected_crap(context, required)
-    return python_crap._run_python_crap(context)
+    context.selection.reason = "full run: custom Python test command is opaque"
+    result = python_tests._run_python_tests(context)
+    result.measurement = None
+    return result
 
 
 def _spec_budget(spec: Any) -> int:
@@ -718,7 +661,7 @@ register_adapter(AdapterDescriptor(
     "python_crap",
     ("requires", "threshold", "baseline"),
     python_crap._python_crap_spec,
-    _run_python_crap,
+    python_crap._run_python_crap,
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",

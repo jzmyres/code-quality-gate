@@ -209,7 +209,7 @@ class AffectedScopeTests(FixtureCase):
         self.commit_all()
         result, document = self.run_gate()
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertFalse({"scope", "base", "selected"} & document.keys())
+        self.assertFalse({"scope", "base", "selected", "changed_paths"} & document.keys())
         self.assertTrue(all("selection" not in row for row in document["checks"]))
         suite = self.checked(document)
         self.assertEqual(suite["measurement"], {"tests": 1})
@@ -455,13 +455,14 @@ def load_tests(loader, suite, pattern):
         suite = self.checked(document)
         full_suite = self.checked(full_document)
         self.assertEqual(suite["diagnostics"]["argv"], full_suite["diagnostics"]["argv"])
-        self.assertEqual(suite["measurement"], full_suite["measurement"])
+        self.assertEqual(full_suite["measurement"], {"tests": 1})
+        self.assertNotIn("measurement", suite)
         self.assertEqual(suite["selection"], {
             "selected": {}, "left_out": {}, "reason": "full run: command adapter suite is opaque",
         })
         self.assertNotIn("executed", suite)
 
-    def test_python_command_with_its_own_discovery_requires_skip_aware_counts(self):
+    def test_python_command_with_its_own_discovery_keeps_policy_verdict_without_counts(self):
         config = CONFIG.replace(
             '"-m", "unittest", "discover", "-s", "tests"', '"pkg/run_tests.py"',
         )
@@ -470,20 +471,32 @@ def load_tests(loader, suite, pattern):
             "suite = unittest.defaultTestLoader.discover('tests')\n"
             "raise SystemExit(not unittest.TextTestRunner().run(suite).wasSuccessful())\n"
         ))
-        self.write_test("other", decorator="    @unittest.skip('disabled')\n")
-        for pattern, outcome in (("", "unsupported"), (r"skipped_pattern = 'skipped=(\d+)'", "pass")):
-            with self.subTest(outcome=outcome):
+        for name in ("importing", "other"):
+            self.write_test(name, decorator="    @unittest.skip('disabled')\n")
+        for pattern, outcome, count in (
+            ("", "pass", 2),
+            (r"skipped_pattern = 'unmatched=(\d+)'", "pass", 2),
+            (r"skipped_pattern = 'skipped=(\d+)'", "fail", 0),
+        ):
+            with self.subTest(pattern=pattern):
                 self.write_config(config + pattern + "\n")
                 self.commit_all()
+                full_result, full_document = self.run_gate()
                 result, document = self.affected()
                 suite = self.checked(document)
+                full_suite = self.checked(full_document)
+                self.assertEqual(result.returncode, full_result.returncode, output(result))
                 self.assertEqual(suite["outcome"], outcome, output(result))
-                self.assertEqual(suite["selection"]["reason"], "full run")
+                self.assertEqual(suite["outcome"], full_suite["outcome"])
+                self.assertEqual(suite["reason"], full_suite["reason"])
+                self.assertEqual(suite["diagnostics"]["argv"][-1:], full_suite["diagnostics"]["argv"][-1:])
+                self.assertEqual(suite["selection"], {
+                    "selected": {}, "left_out": {},
+                    "reason": "full run: custom Python test command is opaque",
+                })
                 self.assertNotIn("executed", suite)
-                if pattern:
-                    self.assertEqual(suite["measurement"], {"tests": 1})
-                else:
-                    self.assertNotIn("measurement", suite)
+                self.assertEqual(full_suite["measurement"], {"tests": count})
+                self.assertNotIn("measurement", suite)
 
     def test_interrupted_suite_keeps_selection_and_completed_invocations(self):
         self.write_config(CONFIG + "budget_seconds = 3\n")
@@ -570,7 +583,7 @@ reason = "External package consumer"
                 self.assertEqual(affected["pkg/mod.py"], "package initializer pkg/__init__.py changed")
                 self.assertEqual(affected["consumer.py"], "depends on pkg/mod.py")
 
-    def test_crap_gets_coverage_when_entire_suite_executes_nothing(self):
+    def test_crap_remains_unsupported_when_entire_suite_executes_nothing(self):
         self.enable_crap()
         self.add_file("tests/test_importing.py", PYTHON_TEST_HEADER + "import pkg.a\n")
         self.add_file("tests/test_other.py", "")
@@ -578,7 +591,23 @@ reason = "External package consumer"
         _, document = self.affected()
         self.assertEqual(self.checked(document)["outcome"], "fail")
         self.assertEqual(self.checked(document)["executed"], [])
-        self.assertGreater(self.checked(document, "crap")["measurement"]["functions"], 0)
+        self.assertIn("coverage required", self.checked(document)["selection"]["reason"])
+        crap = self.checked(document, "crap")
+        self.assertEqual(crap["outcome"], "unsupported")
+        self.assertEqual(crap["reason"], "coverage unreliable: tests did not pass")
+        self.assertNotIn("measurement", crap)
+
+    def test_crap_remains_unsupported_when_an_executed_test_fails(self):
+        self.enable_crap()
+        self.commit_all()
+        self.add_file("pkg/a.py", "def changed():\n    return 2\n")
+        self.write_test("importing", "import pkg.b\n", body="        self.fail('bad change')\n")
+        _, document = self.affected()
+        self.assertEqual(self.checked(document)["executed"], [IMPORTING])
+        crap = self.checked(document, "crap")
+        self.assertEqual(crap["outcome"], "unsupported")
+        self.assertEqual(crap["reason"], "coverage unreliable: tests did not pass")
+        self.assertNotIn("measurement", crap)
 
     def test_shard_command_uses_ordinary_discovery_with_the_configured_pattern(self):
         script = GATE / "quality_gate" / "test_shards.py"
@@ -651,26 +680,21 @@ suite = "tests/ert.el"
         self.assertEqual(suite["selection"]["selected"], {"tests/suite.el": "changed"})
         self.assertEqual(suite["measurement"], {"tests": 1})
 
-    def test_empty_ert_suite_supplies_crap_coverage(self):
-        self.write_elisp_config()
-        self.add_file("tests/suite.el", "(require 'ert)\n(ert-run-tests-batch-and-exit)\n")
-        self.add_file("lisp/calc.el", "(defun calc (a) a)\n(provide 'calc)\n")
-        self.change("lisp/calc.el", "(defun calc (a) (if a 1 2))\n(provide 'calc)\n")
-        _, document = self.affected("--only", "elisp_crap")
-        suite = self.checked(document, "elisp")
-        self.assertEqual(suite["outcome"], "fail")
-        self.assertEqual(suite["measurement"], {"tests": 0})
+    def test_elisp_crap_remains_unsupported_for_empty_ert_suite(self):
+        suite = self.check_elisp_crap_without_executed_tests("")
         self.assertIn("coverage required", suite["selection"]["reason"])
-        crap = self.checked(document, "elisp_crap")
-        self.assertEqual(crap["selection"]["selected"], {"lisp/calc.el": "changed"})
-        self.assertGreater(crap["measurement"]["functions"], 0)
 
-    def test_all_skipped_ert_suite_supplies_crap_coverage(self):
+    def test_elisp_crap_remains_unsupported_for_all_skipped_ert_suite(self):
+        suite = self.check_elisp_crap_without_executed_tests(
+            "(ert-deftest skipped () (ert-skip \"disabled\"))\n",
+        )
+        self.assertIn("1 selected, 1 skipped", suite["reason"])
+
+    def check_elisp_crap_without_executed_tests(self, cases):
         self.write_elisp_config()
         self.add_file(
             "tests/suite.el",
-            "(require 'ert)\n(ert-deftest skipped () (ert-skip \"disabled\"))\n"
-            "(ert-run-tests-batch-and-exit)\n",
+            f"(require 'ert)\n{cases}(ert-run-tests-batch-and-exit)\n",
         )
         self.add_file("lisp/calc.el", "(defun calc (a) a)\n(provide 'calc)\n")
         self.change("lisp/calc.el", "(defun calc (a) (if a 1 2))\n(provide 'calc)\n")
@@ -679,10 +703,12 @@ suite = "tests/ert.el"
         suite = self.checked(document, "elisp")
         self.assertEqual(suite["outcome"], "fail")
         self.assertEqual(suite["measurement"], {"tests": 0})
-        self.assertIn("1 selected, 1 skipped", suite["reason"])
         crap = self.checked(document, "elisp_crap")
         self.assertEqual(crap["selection"]["selected"], {"lisp/calc.el": "changed"})
-        self.assertGreater(crap["measurement"]["functions"], 0)
+        self.assertEqual(crap["outcome"], "unsupported")
+        self.assertEqual(crap["reason"], "coverage unreliable: elisp did not pass")
+        self.assertNotIn("measurement", crap)
+        return suite
 
     def write_elisp_config(self):
         self.write_config(CONFIG.replace('"*.py", "*.sh"', '"*.py", "*.sh", "*.el"') + """
@@ -745,3 +771,29 @@ threshold = 6
         self.assertEqual(shape["reason"], "no files in the shape measurement")
         self.assertEqual(shape["selection"]["selected"], {})
         self.assertIn("pkg/a.py", shape["selection"]["left_out"])
+
+    def test_python_shape_uses_both_sides_of_a_pure_rename(self):
+        self.write_config(SHAPE_CONFIG)
+        self.add_file("pkg/a.py", "def moved():\n    return 1\n")
+        self.commit_all()
+        self.git("mv", "pkg/a.py", "pkg/renamed.py")
+        _, document = self.affected("--only", "shape")
+        shape = self.checked(document, "shape")
+        self.assertEqual(shape["selection"]["selected"], {"pkg/renamed.py": "in the requested diff"})
+        self.assertEqual(shape["measurement"]["functions"], 1)
+        self.assertEqual(document["changed_paths"], ["pkg/a.py", "pkg/renamed.py"])
+
+    def test_python_shape_lists_a_committed_change_reverted_in_the_worktree(self):
+        self.write_config(SHAPE_CONFIG)
+        original = "def reverted():\n    return 1\n"
+        self.add_file("pkg/a.py", original)
+        self.commit_all()
+        self.add_file("pkg/a.py", "def reverted():\n    return 2\n")
+        self.commit_all("Branch change")
+        self.add_file("pkg/a.py", original)
+        result, document = self.run_gate("--base", "HEAD^", "--only", "shape")
+        self.assertEqual(result.returncode, 0, output(result))
+        shape = self.checked(document, "shape")
+        self.assertEqual(shape["selection"]["selected"], {"pkg/a.py": "in the requested diff"})
+        self.assertEqual(shape["measurement"]["functions"], 0)
+        self.assertEqual(document["changed_paths"], ["pkg/a.py"])

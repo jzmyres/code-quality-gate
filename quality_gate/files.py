@@ -207,6 +207,7 @@ class DiffBaseOverride:
 
     base: DiffBase | None = None
     error: ConfigError | None = None
+    changed_paths: frozenset[str] | None = None
 
     def for_scope(
         self, root: Path, policy_base: str, *, override: bool = True
