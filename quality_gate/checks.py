@@ -35,6 +35,7 @@ from .files import (
     DiffBaseOverride,
     InventoryClasses,
     affected_diff,
+    changed_paths,
     git_argv,
     hygiene_result,
     resolve_diff_base,
@@ -1002,23 +1003,18 @@ def _run_selected_check(
     return result
 
 
-def _scope_plan(
+def _scope_selections(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str] | None, checks: list[CheckDef], inventory_code: int,
-    affected_base: DiffBase | None, contract_graph: GraphExtraction | None,
-) -> tuple[DiffBaseOverride, dict[str, CheckSelection]]:
-    if changed is None:
-        return resolve_diff_base(root), {}
-    base_override = DiffBaseOverride(base=affected_base, changed_paths=frozenset(changed))
-    if not checks:
-        return base_override, {}
+    contract_graph: GraphExtraction | None,
+) -> dict[str, CheckSelection]:
+    if changed is None or not checks:
+        return {}
     if inventory_code != 0:
-        selections = {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
-    else:
-        selections = _affected_selection(
-            root, config, files, classes, evidence_dir, changed, checks, contract_graph,
-        )
-    return base_override, selections
+        return {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
+    return _affected_selection(
+        root, config, files, classes, evidence_dir, changed, checks, contract_graph,
+    )
 
 
 def _run_inventory_blocked_check(check: CheckDef, selection: CheckSelection | None) -> CheckResult:
@@ -1062,7 +1058,7 @@ def _extract_module_contracts(
             _require_contract_budget()
             reader_failed = bool(findings)
             mark_step("module interface evaluation")
-            findings.extend(module_contract_findings(config, owners, graph))
+            findings.extend(module_contract_findings(config, owners, graph, classes.tracked_code_paths))
             _require_contract_budget()
             return (None if reader_failed else graph), "completed"
         except RunTimeout:
@@ -1077,9 +1073,39 @@ def _extract_module_contracts(
             return None, execution
 
 
+def _shared_changed_paths(
+    root: Path, base_revision: str, diff: DiffBaseOverride,
+) -> set[str] | frozenset[str]:
+    if diff.changed_paths is not None:
+        return diff.changed_paths
+    try:
+        base = diff.for_scope(root, base_revision)
+        return changed_paths(root, base.commit, "changed-file selection")
+    except GateError as error:
+        raise UsageError(f"module-contracts: {error}") from error
+
+
+def _shared_entry_point_findings(
+    root: Path, config: Config, owners: dict[str, str], diff: DiffBaseOverride,
+) -> list[dict]:
+    if config.shared_base is None:
+        return []
+    changed = _shared_changed_paths(root, config.shared_base, diff)
+    protected = {path for module in config.modules.values() for path in module.protected_paths}
+    edited_protected = sorted(protected.intersection(changed))
+    features = sorted((changed - protected).intersection(owners))
+    return [
+        {"rule": "shared-entry-point", "file": feature, "module": owners[feature],
+         "protected_path": path,
+         "message": f"{feature} changes with protected path {path}. Put the registration or "
+                    f"documentation beside {feature} in module {owners[feature]}."}
+        for feature in features for path in edited_protected
+    ]
+
+
 def _run_module_contracts(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    inventory_code: int, evidence_dir: Path,
+    inventory_code: int, evidence_dir: Path, diff: DiffBaseOverride,
 ) -> tuple[CheckResult, GraphExtraction | None]:
     print("check: module-contracts", flush=True)
     start = time.monotonic()
@@ -1094,11 +1120,13 @@ def _run_module_contracts(
     else:
         assert isinstance(classes, InventoryClasses)
         owners, findings = module_ownership(config, files, classes)
+        shared_findings = _shared_entry_point_findings(root, config, owners, diff)
         if not findings and len(config.modules) >= 2:
             budget = RATCHET_BUDGET_SECONDS
             graph, execution = _extract_module_contracts(
                 root, config, owners, classes, evidence_dir, findings,
             )
+        findings.extend(shared_findings)
         messages.extend(f"module-contracts: {_contract_message(row)}" for row in findings)
     for message in messages:
         print(message, file=sys.stderr)
@@ -1119,16 +1147,19 @@ def _policy_results(
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
     contract_graph = None
+    base_override = (
+        resolve_diff_base(root) if changed is None
+        else DiffBaseOverride(base=affected_base, changed_paths=frozenset(changed))
+    )
     if module_contracts:
         evidence_dir = directory / "module-contracts"
         evidence_dir.mkdir()
         result, contract_graph = _run_module_contracts(
-            root, config, files, classes, inventory_code, evidence_dir,
+            root, config, files, classes, inventory_code, evidence_dir, base_override,
         )
         results.append(result)
-    base_override, selections = _scope_plan(
-        root, config, files, classes, directory, changed, selected_checks, inventory_code,
-        affected_base, contract_graph,
+    selections = _scope_selections(
+        root, config, files, classes, directory, changed, selected_checks, inventory_code, contract_graph,
     )
     for check in selected_checks:
         selection = selections.get(check.id)

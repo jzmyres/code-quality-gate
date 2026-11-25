@@ -145,13 +145,17 @@ Rules:
 * `[checks.module-contracts]` enables the built-in and requires `[modules]`. The shared loader
   applies that requirement to standalone commands and historical `debt --revision` reads.
   Existing policies can omit both tables.
-* Each `[modules.NAME]` has exactly three required arrays of unique strings. `files` is nonempty
+* Each `[modules.NAME]` has three required arrays of unique strings. `files` is nonempty
   and uses case-sensitive `fnmatchcase` over the full repository-relative path. A wildcard can
   span slashes. `entry_points` names exact repository-relative files. Both path arrays reject
   empty, `.` and `..` components and NUL characters. `allowed_dependencies` names modules anywhere
-  in the table. Invalid declarations exit 2. The `module-contracts` check ID requires
+  in the table. The optional `protected_paths` array uses the same path validation and names
+  exact, case-sensitive repository-relative files without glob syntax. Each path may be
+  declared only once across all modules. Non-code paths are allowed, and a declaration remains
+  valid when the file is deleted. Invalid declarations exit 2. The `module-contracts` check ID requires
   `adapter = "module_contracts"`, a tier from 1 to 4 and `enforcement = "enforced"`.
   It produces a built-in result with a null tier and supplies no class obligation evidence.
+  An optional nonblank `shared_base` revision opts into both shared entry point rules.
 * `tier` is an integer from 1 to 4. `enforcement` is `enforced` or
   `advisory`. `direction` is `max` (the default) or `min`: a `max`
   metric's value must not exceed its bound and tightening lowers the bound,
@@ -515,7 +519,24 @@ With successful inventory and a valid map declaring at least two modules, it ext
 owned-code graph using the existing Python, Emacs Lisp and shell extractors. Required extraction
 failures, including Emacs preparation and reader errors, reject with exit 1, as do ownership
 and interface violations. Ordinary outside-extractor records are nonblocking. A valid zero- or
-one-module map passes without extraction. `worklist` omits the built-in.
+one-module map requires no extraction. `worklist` omits the built-in.
+
+With `shared_base` enabled, `--base` takes precedence and supplies its affected-scope diff
+from the merge base. Otherwise, the check compares the run's resolved `QG_DIFF_BASE` commit
+to `HEAD` when set, or the configured `shared_base` revision to `HEAD` when unset. Use
+`shared_base = "HEAD"` to check staged and unstaged edits on a plain local run. Each diff
+includes committed, staged and unstaged changes. Rename detection is disabled so the diff
+includes both names of a rename. Invalid bases and unreadable diffs are command errors.
+
+The `shared-entry-point` rule blocks each pair of a changed protected path and a changed,
+present, uniquely owned code file outside the declared protected paths. Deleting or renaming
+a protected path counts as a change. Put the registration or documentation beside the feature
+file in its owning module.
+
+The `multi-module-file` rule blocks each present, index-tracked code file with direct
+dependents in at least two declared modules in the full extracted graph, even with an
+empty diff. Callers in the target's own module count, and each caller module counts once.
+Both rules block with exit 1 and use the effective policy, including trusted policy.
 
 Land policy support before enabling module contracts. When the harness enables the check,
 cut over its gate pin and trusted policy snapshot together. Include the check declaration,
@@ -738,13 +759,18 @@ Baseline errors carry `error`.
 
 `module-contracts` uses matching `id`, `kind` and `adapter`, `enforcement = "enforced"`,
 and `metric_version = "module-contracts/1"`. Failed inventory makes the contract unsatisfied
-with `caused_by = ["inventory"]`. Its `findings` array retains complete ownership, extraction
-and interface diagnostics. Reader errors include `file`, `stage`, `line` and `message`.
+with `caused_by = ["inventory"]`. Its `findings` array retains ownership, extraction,
+interface and shared entry point diagnostics. Reader errors include `file`, `stage`,
+`line` and `message`.
 Each distinct violating edge produces a `module-interface` finding ordered by source path, line,
 target path and edge kind. It has `rule`, `edge` (`source`, `line`, `target`, `kind`),
 `source_module`, `target_module`, `failed_conditions` and `permitted_entry_points`.
 `failed_conditions` lists each applicable condition, `dependency-not-allowed` and
 `target-not-entry-point`. `permitted_entry_points` is sorted and can be empty.
+Each `shared-entry-point` finding has the feature `file`, its `module`, the
+`protected_path` and a diagnostic `message`. Findings are ordered by feature path,
+then protected path. Each `multi-module-file` finding has the target `file`, sorted
+dependent `modules` and a diagnostic `message`. Findings are ordered by target path.
 
 A completed `module_graph` check reports `measurement.modules` as sorted
 repository-relative paths and `measurement.edges` as objects with `source`, `target`

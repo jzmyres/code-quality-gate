@@ -323,8 +323,13 @@ def extract_contract_graph(
     return _extract_graph(context, inputs, reader_findings)
 
 
-def module_contract_findings(config: Any, owners: dict[str, str], graph: GraphExtraction) -> list[dict]:
-    return module_graph.interface_findings(config.modules, owners, graph.edges)
+def module_contract_findings(
+    config: Any, owners: dict[str, str], graph: GraphExtraction, tracked_code_paths: frozenset[str],
+) -> list[dict]:
+    findings = module_graph.interface_findings(config.modules, owners, graph.edges)
+    if config.shared_base is not None:
+        findings.extend(module_graph.multi_module_findings(owners, graph.edges, tracked_code_paths))
+    return findings
 
 
 def affected_graph(

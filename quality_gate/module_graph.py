@@ -124,6 +124,20 @@ def interface_findings(
     return findings
 
 
+def multi_module_findings(
+    owners: dict[str, str], edges: Iterable[Edge], tracked_code_paths: frozenset[str],
+) -> list[dict]:
+    dependents: dict[str, set[str]] = {}
+    for edge in edges:
+        if edge.target in tracked_code_paths:
+            dependents.setdefault(edge.target, set()).add(owners[edge.source])
+    return [
+        {"rule": "multi-module-file", "file": path, "modules": sorted(modules),
+         "message": f"{path}: direct dependents in modules {', '.join(sorted(modules))}"}
+        for path, modules in sorted(dependents.items()) if len(modules) >= 2
+    ]
+
+
 def _import_spec(name: str, directories: Sequence[str] | None) -> ModuleSpec | None:
     spec = None
     for part in name.split("."):

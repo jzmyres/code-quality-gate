@@ -98,6 +98,7 @@ class ModuleDef:
     files: tuple[str, ...]
     entry_points: tuple[str, ...]
     allowed_dependencies: tuple[str, ...]
+    protected_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,7 @@ class Config:
     module_contracts: bool
     protect_paths: tuple[str, ...] = ()
     module_dirs: tuple[str, ...] | None = None
+    shared_base: str | None = None
 
 
 def _config_error(path: Path, key: str, expected: str, actual: str) -> ConfigError:
@@ -329,14 +331,19 @@ def _optional_string_list(
     return _string_list(parent, key, path, full_key)
 
 
+def _validate_module_path(path: Path, item: str, value: str) -> None:
+    if "\x00" in value or {"", ".", ".."}.intersection(value.split("/")):
+        raise _config_error(path, item, "a canonical repository-relative path", repr(value))
+
+
 def _validate_module_item(
     path: Path, item: str, field: str, value: str, modules: dict[str, Any],
 ) -> None:
     if field == "allowed_dependencies":
         if value not in modules:
             raise _config_error(path, item, "a declared module", f"unknown module {value!r}")
-    elif "\x00" in value or {"", ".", ".."}.intersection(value.split("/")):
-        raise _config_error(path, item, "a canonical repository-relative path", repr(value))
+    else:
+        _validate_module_path(path, item, value)
 
 
 def _module_values(
@@ -357,12 +364,24 @@ def _module_values(
 def _parse_modules(data: dict[str, Any], path: Path) -> dict[str, ModuleDef]:
     raw_modules = _read_value(data, "modules", path, "[modules]", _TABLE)
     fields = ("files", "entry_points", "allowed_dependencies")
+    protected: set[str] = set()
     modules = {}
     for name in raw_modules:
         key = f"modules.{name}"
         raw = _read_value(raw_modules, name, path, key, _TABLE)
-        _check_keys(raw, fields, path, key)
-        modules[name] = ModuleDef(*(_module_values(raw, name, field, path, raw_modules) for field in fields))
+        _check_keys(raw, (*fields, "protected_paths"), path, key)
+        protected_key = f"{key}.protected_paths"
+        paths = _optional_string_list(raw, "protected_paths", path, protected_key)
+        for index, value in enumerate(paths):
+            item = f"{protected_key}[{index}]"
+            _validate_module_path(path, item, value)
+            if set(value).intersection("*?[]"):
+                raise _config_error(path, item, "an exact path without glob syntax", repr(value))
+            _unique(protected, value, path, item, "a unique protected path", f"duplicate {value!r}",
+                    _config_error)
+        modules[name] = ModuleDef(
+            *(_module_values(raw, name, field, path, raw_modules) for field in fields), protected_paths=paths,
+        )
     return modules
 
 
@@ -665,26 +684,27 @@ def _validate_crap_before_verification(
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path, *, validate_headers: bool = True,
     candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
-) -> dict[str, CheckDef]:
+) -> tuple[dict[str, CheckDef], str | None]:
     raw_checks = _optional_table(data, "checks", path, "checks")
     if raw_checks is None:
-        return {}
+        return {}, None
     checks: dict[str, CheckDef] = {}
+    shared_base = None
     for name, raw in raw_checks.items():
         if name == MODULE_CONTRACTS_ID:
-            _validate_module_contract_check(raw_checks, path)
+            shared_base = _validate_module_contract_check(raw_checks, path)
             continue
         checks[name] = _parse_check(name, raw, root, path, checks,
                                     candidate_root or root, parse_candidate_inputs)
     _validate_crap_before_verification(checks, path)
     _validate_baselines(checks, path, validate_headers=validate_headers)
-    return checks
+    return checks, shared_base
 
 
-def _validate_module_contract_check(checks: dict[str, Any], path: Path) -> None:
+def _validate_module_contract_check(checks: dict[str, Any], path: Path) -> str | None:
     key = f"checks.{MODULE_CONTRACTS_ID}"
     raw = _read_value(checks, MODULE_CONTRACTS_ID, path, key, _TABLE)
-    _check_keys(raw, ("adapter", "tier", "enforcement"), path, key)
+    _check_keys(raw, ("adapter", "tier", "enforcement", "shared_base"), path, key)
     adapter = _string(raw, "adapter", path, f"{key}.adapter")
     if adapter != "module_contracts":
         raise _config_error(
@@ -694,6 +714,13 @@ def _validate_module_contract_check(checks: dict[str, Any], path: Path) -> None:
     enforcement = _string(raw, "enforcement", path, f"{key}.enforcement")
     if enforcement != "enforced":
         raise _config_error(path, f"{key}.enforcement", "enforced", repr(enforcement))
+    if "shared_base" not in raw:
+        return None
+    base_key = f"{key}.shared_base"
+    shared_base = _string(raw, "shared_base", path, base_key)
+    if "\x00" in shared_base:
+        raise _config_error(path, base_key, "a revision without NUL characters", repr(shared_base))
+    return shared_base
 
 
 def _header_string(
@@ -954,9 +981,10 @@ def _config_from_data(
     classes = _parse_classes(data, path)
     rules = _parse_rules(data, path)
     max_bytes = _parse_hygiene(data, path)
-    checks = _parse_checks(data, root, path, validate_headers=validate_headers,
-                           candidate_root=candidate_root,
-                           parse_candidate_inputs=parse_candidate_inputs)
+    checks, shared_base = _parse_checks(
+        data, root, path, validate_headers=validate_headers, candidate_root=candidate_root,
+        parse_candidate_inputs=parse_candidate_inputs,
+    )
     required_tiers = _parse_levels(data, path)
     not_applicable = _parse_not_applicable(data, classes, path)
     protect_paths = _parse_protect(data, path)
@@ -980,6 +1008,7 @@ def _config_from_data(
         module_dirs=module_dirs,
         modules=modules,
         module_contracts=module_contracts,
+        shared_base=shared_base,
     )
 
 

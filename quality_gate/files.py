@@ -298,19 +298,24 @@ def _split_nul(raw: bytes) -> list[str]:
     ]
 
 
+def changed_paths(root: Path, commit: str, operation: str) -> set[str]:
+    names = set()
+    for comparison in ([commit, "HEAD"], ["--cached"], []):
+        names.update(_split_nul(_git(
+            root, ["diff", "--name-only", "--no-renames", "-z", *comparison, "--"],
+            operation,
+        )))
+    return names
+
+
 def affected_diff(root: Path, revision: str) -> tuple[DiffBase, set[str]]:
     commit, problem = _verified_commit(root, revision)
     if commit is None:
         raise UsageError(f"check: --base {revision!r}: expected an existing commit, {problem}")
-    names = set()
+    operation = f"check: --base {revision!r}: changed-file selection"
     try:
-        operation = f"check: --base {revision!r}: changed-file selection"
         merge_base = _git(root, ["merge-base", commit, "HEAD"], operation).decode().strip()
-        for comparison in ([f"{commit}...HEAD"], ["--cached"], []):
-            names.update(_split_nul(_git(
-                root, ["diff", "--name-only", "--no-renames", "-z", *comparison, "--"],
-                operation,
-            )))
+        names = changed_paths(root, merge_base, operation)
     except GateError as error:
         raise UsageError(str(error)) from error
     return DiffBase(merge_base, "--base"), names
@@ -549,10 +554,11 @@ class InventoryClasses(dict[str, str]):
     """Inventory classes and the source languages decided alongside them."""
 
     def __init__(
-        self, classes: dict[str, str], sources: dict[str, SourceClassification],
+        self, classes: dict[str, str], sources: dict[str, SourceClassification], tracked: set[str],
     ) -> None:
         super().__init__(classes)
         self.code_paths = frozenset(path for path, source in sources.items() if source.code)
+        self.tracked_code_paths = self.code_paths & tracked
         self.languages: dict[str, str | None] = {}
         self.deferred_links: set[str] = set()
         for path, source in sources.items():
@@ -683,7 +689,8 @@ class _InventoryValidator:
             for invalid, message in _STALE_RULE_CHECKS:
                 if invalid(self.matched[index]):
                     self.violations.append(message.format(**values))
-        return files, InventoryClasses(self.classes, self.sources), self.violations
+        classes = InventoryClasses(self.classes, self.sources, _tracked_paths(self.entries))
+        return files, classes, self.violations
 
     def _check_classes(self) -> None:
         known = _known_names(self.config.checks)
@@ -785,10 +792,14 @@ def _outside_module_paths(paths: set[str], modules: tuple[str, ...]) -> list[str
     return [path for path in sorted(paths) if not path.startswith(prefixes)]
 
 
+def _tracked_paths(entries: list[GitFile]) -> set[str]:
+    return {entry.path for entry in entries if entry.mode is not None}
+
+
 def _unused_module_violations(
     entries: list[GitFile], gitlinks: set[str], modules: tuple[str, ...]
 ) -> list[str]:
-    tracked = {entry.path for entry in entries if entry.mode is not None} - gitlinks
+    tracked = _tracked_paths(entries) - gitlinks
     return [
         f"module_dirs: unused module directory {module!r} (contains no tracked file)"
         for module in modules

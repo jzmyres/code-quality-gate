@@ -128,7 +128,9 @@ class ModuleContractTests(FixtureCase):
         graph = adapters.extract_contract_graph(self.repo, config, owners, classes, self.base, findings)
         self.assertEqual(graph.modules, sorted(owners))
         self.assertEqual(findings, [])
-        self.assertEqual(adapters.module_contract_findings(config, owners, graph), [])
+        self.assertEqual(
+            adapters.module_contract_findings(config, owners, graph, classes.tracked_code_paths), [],
+        )
 
     def test_edge_kind_is_part_of_deduplication_and_ordering(self) -> None:
         config = load_config(self.repo)
@@ -535,3 +537,176 @@ reason = "Lisp source"
         contract, affected = [call.args[1] for call in extract.call_args_list]
         self.assertEqual(sorted([*contract, "data.py"]), affected)
         self.assertEqual(document["changed_paths"], ["data.py"])
+
+
+class SharedSurfaceTests(FixtureCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "a.py").unlink()
+        self.add_file("app/main.py", "import library.api\n")
+        self.add_file("library/api.py", "value = 1\n")
+        self.add_file("library/z.py", "value = 2\n")
+        self.config = CONTRACT_CONFIG.replace(
+            CONTRACT_CHECK, CONTRACT_CHECK.rstrip() + '\nshared_base = "HEAD"\n\n',
+        ).replace("[modules.app]\n", '[modules.app]\nprotected_paths = ["README.md"]\n')
+        self.write_config(self.config)
+        self.commit_all()
+
+    def contract(self, code: int, *args: str, env: dict[str, str] | None = None):
+        result, document = self.run_json(*args, env=env)
+        self.assertEqual(result.returncode, code, output(result))
+        return result, document, self.check_by_id(document, "module-contracts")["findings"]
+
+    def assert_shared_entry_point(self, *args: str, env: dict[str, str] | None = None):
+        result, document, findings = self.contract(1, *args, env=env)
+        finding, = findings
+        self.assertEqual(finding["rule"], "shared-entry-point")
+        self.assertEqual(finding["file"], "app/main.py")
+        self.assertEqual(finding["module"], "app")
+        self.assertEqual(finding["protected_path"], "README.md")
+        for message in (finding["message"], "app/main.py", "README.md", "in module app"):
+            self.assertIn(message, result.stderr)
+        return document
+
+    def change_feature(self) -> None:
+        self.add_file("app/main.py", "import library.api\nvalue = 2\n")
+
+    def test_shared_entry_point_blocks_full_only_and_trusted_checks(self) -> None:
+        trusted = self.trusted_directory("HEAD")
+        self.write_config(self.config.replace('shared_base = "HEAD"\n', ""))
+        self.change_feature()
+        self.add_file("README.md", "# changed\n")
+        self.assert_shared_entry_point("--policy-from", str(trusted))
+        self.write_config(self.config)
+        self.assert_shared_entry_point()
+        self.assert_shared_entry_point("--only", "module-contracts")
+
+    def test_committed_feature_and_staged_protected_edit_block_together(self) -> None:
+        self.change_feature()
+        self.contract(0)
+        self.commit_all("feature")
+        self.contract(0, "--base", "HEAD^")
+        self.add_file("README.md", "# changed\n")
+        self.git("add", "README.md")
+        self.contract(0)
+        document = self.assert_shared_entry_point("--base", "HEAD^")
+        self.assertEqual(document["changed_paths"], ["README.md", "app/main.py"])
+
+    def test_protected_rename_counts_as_an_edit(self) -> None:
+        self.git("mv", "README.md", "MOVED.md")
+        self.contract(0)
+        self.change_feature()
+        document = self.assert_shared_entry_point("--base", "HEAD")
+        self.assertEqual(document["changed_paths"], ["MOVED.md", "README.md", "app/main.py"])
+
+    def test_pairs_are_ordered_and_protected_code_is_excluded_as_a_feature(self) -> None:
+        self.write_config(self.config.replace('["README.md"]', '["library/z.py", "README.md"]'))
+        self.add_file("README.md", "# changed\n")
+        self.add_file("library/z.py", "value = 3\n")
+        self.contract(0)
+        self.change_feature()
+        self.add_file("app/another.py", "value = 1\n")
+        self.git("add", "app/another.py")
+        _, _, findings = self.contract(1)
+        self.assertEqual(
+            [(row["file"], row["protected_path"]) for row in findings],
+            [("app/another.py", "README.md"), ("app/another.py", "library/z.py"),
+             ("app/main.py", "README.md"), ("app/main.py", "library/z.py")],
+        )
+
+    def test_tracked_target_with_two_caller_modules_blocks_on_empty_diff(self) -> None:
+        self.add_file("library/z.py", "import library.api\n")
+        self.commit_all("add an internal caller")
+        result, document, findings = self.contract(1, "--base", "HEAD")
+        self.assertEqual(document["changed_paths"], [])
+        finding, = findings
+        self.assertEqual(finding["rule"], "multi-module-file")
+        self.assertEqual(finding["file"], "library/api.py")
+        self.assertEqual(finding["modules"], ["app", "library"])
+        self.assertIn(finding["message"], result.stderr)
+        self.write_config(self.config.replace('shared_base = "HEAD"\n', ""))
+        self.change_feature()
+        self.add_file("README.md", "# changed\n")
+        self.assertEqual(self.contract(0)[2], [])
+
+    def test_multiple_callers_in_one_module_pass(self) -> None:
+        self.add_file("app/another.py", "import library.api\n")
+        self.commit_all("add another app caller")
+        self.assertEqual(self.contract(0, "--base", "HEAD")[2], [])
+
+    def test_multi_module_findings_excludes_transitive_callers(self) -> None:
+        owners = {"app/main.py": "app", "library/z.py": "library", "library/api.py": "library"}
+        edges = [
+            module_graph.Edge("app/main.py", "library/z.py", 1),
+            module_graph.Edge("library/z.py", "library/api.py", 1),
+        ]
+        self.assertEqual(module_graph.multi_module_findings(owners, edges, frozenset(owners)), [])
+
+    def test_untracked_target_passes_until_added_to_the_index(self) -> None:
+        self.add_file("library/z.py", "import library.api\n")
+        self.commit_all("add an internal caller")
+        self.git("rm", "--cached", "library/api.py")
+        self.assertEqual(self.contract(0)[2], [])
+        self.git("add", "library/api.py")
+        self.assertEqual(self.contract(1)[2][0]["rule"], "multi-module-file")
+
+    def test_base_precedence(self) -> None:
+        self.change_feature()
+        self.add_file("README.md", "# changed\n")
+        self.commit_all("feature and shared edit")
+        self.contract(0)
+        self.assert_shared_entry_point(env={"QG_DIFF_BASE": "HEAD^"})
+        self.contract(0, "--base", "HEAD", env={"QG_DIFF_BASE": "HEAD^"})
+        self.assert_shared_entry_point("--base", "HEAD^", env={"QG_DIFF_BASE": "invalid"})
+        self.write_config(self.config.replace('shared_base = "HEAD"', 'shared_base = "HEAD^"'))
+        self.assert_shared_entry_point()
+        self.contract(0, env={"QG_DIFF_BASE": "HEAD"})
+
+    def test_affected_scope_uses_merge_base_and_override_uses_resolved_commit(self) -> None:
+        self.git("checkout", "-b", "other")
+        self.add_file("README.md", "# changed\n")
+        self.commit_all("edit documentation on other branch")
+        self.git("checkout", "main")
+        self.add_file("README.md", "# changed\n")
+        self.change_feature()
+        self.commit_all("edit documentation and feature on main")
+        self.assert_shared_entry_point("--base", "other")
+        self.contract(0, env={"QG_DIFF_BASE": "other"})
+
+    def test_invalid_base_is_a_command_error(self) -> None:
+        invalid = "qg-unknown-revision"
+        for args, env in ((("--base", invalid), None), ((), {"QG_DIFF_BASE": invalid}), ((), None)):
+            with self.subTest(args=args, env=env):
+                if not args and env is None:
+                    self.write_config(self.config.replace(
+                        'shared_base = "HEAD"', f'shared_base = "{invalid}"',
+                    ))
+                result, document = self.run_json(*args, env=env)
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertEqual(document["decision"], "error")
+                self.assertIn(invalid, document["error"])
+
+    def test_rejects_invalid_protected_paths(self) -> None:
+        for value in ('"README.md"', "[1]", '[""]', '["/README.md"]', '["docs/../README.md"]',
+                      '["docs//README.md"]', '["READ*.md"]', '["README.m?"]', '["README.[m]d"]',
+                      '["README.md", "README.md"]'):
+            with self.subTest(value=value):
+                self.write_config(self.config.replace('protected_paths = ["README.md"]',
+                                                      f"protected_paths = {value}"))
+                result = self.run_qg("check")
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertIn("modules.app.protected_paths", result.stderr)
+        self.write_config(self.config.replace("[modules.library]\n",
+                                              '[modules.library]\nprotected_paths = ["README.md"]\n'))
+        result = self.run_qg("check")
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertIn("modules.library.protected_paths[0]", result.stderr)
+        self.assertIn("duplicate 'README.md'", result.stderr)
+
+    def test_rejects_malformed_shared_base(self) -> None:
+        for value in ('"  "', '1', r'"HEAD\u0000"'):
+            with self.subTest(value=value):
+                self.write_config(self.config.replace('shared_base = "HEAD"', f"shared_base = {value}"))
+                result = self.run_qg("check")
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertIn("checks.module-contracts.shared_base", result.stderr)
