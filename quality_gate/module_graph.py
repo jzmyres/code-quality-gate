@@ -794,9 +794,12 @@ def _affected_seeds(modules: list[str], changed: set[str]) -> dict[str, str]:
     return affected
 
 
-def affected_paths(modules: list[str], edges: list[Edge], changed: set[str]) -> dict[str, str]:
+def affected_paths(
+    modules: list[str], edges: list[Edge], changed: set[str],
+) -> tuple[dict[str, str], dict[str, str]]:
     _, incoming = _adjacency(modules, edges)
-    affected = _affected_seeds(modules, changed)
+    expanded = _affected_seeds(modules, changed)
+    affected = expanded.copy()
     pending = deque(affected)
     while pending:
         path = pending.popleft()
@@ -804,7 +807,7 @@ def affected_paths(modules: list[str], edges: list[Edge], changed: set[str]) -> 
             if dependent not in affected:
                 affected[dependent] = f"depends on {path}"
                 pending.append(dependent)
-    return affected
+    return expanded, affected
 
 
 def measure(

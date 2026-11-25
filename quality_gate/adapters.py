@@ -261,7 +261,7 @@ def _read_graph_elisp(
 def affected_graph(
     root: Path, config: Any, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str],
-) -> tuple[set[str], dict[str, str]]:
+) -> tuple[set[str], dict[str, str], dict[str, str]]:
     spec = module_graph.GraphSpec(tuple(config.classes), ())
     context = AdapterContext(root, config, None, files, classes, "affected scope", {}, evidence_dir)
     python, lisp, shell = _graph_modules(context, spec)
@@ -269,7 +269,8 @@ def affected_graph(
     modules, edges, _ = module_graph.dependencies(
         root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
     )
-    return set(modules), module_graph.affected_paths(modules, edges, changed)
+    expanded, affected = module_graph.affected_paths(modules, edges, changed)
+    return set(modules), expanded, affected
 
 
 def _run_module_graph(context: AdapterContext) -> Any:

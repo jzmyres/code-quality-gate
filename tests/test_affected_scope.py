@@ -555,6 +555,40 @@ def load_tests(loader, suite, pattern):
         self.assertEqual(suite["executed"][:2], [first, second])
         self.assertEqual([finding["subject"] for finding in suite["findings"]], [first])
 
+    def test_changed_initializer_reaches_every_per_file_check(self):
+        self.enable_crap()
+        self.add_file("pkg/a.py", "# \u202e\nvalue = 1\n")
+        self.add_file("pkg/b.py", "import pkg.a\n# \u202e\n")
+        self.add_file("pkg_consumer.py", "import pkg.b\n")
+        self.write_config(self.read_file("quality-gate.toml") + """
+[[rule]]
+pattern = "pkg_consumer.py"
+class = "source"
+reason = "Consumer outside the package"
+""")
+        self.change("pkg/__init__.py", "value = 2\n")
+        result, document = self.affected()
+        self.assertEqual(document["changed_paths"], ["pkg/__init__.py"])
+        self.assertEqual(self.checked(document)["outcome"], "pass", output(result))
+        package = {
+            "pkg/__init__.py": "changed",
+            "pkg/a.py": "package initializer pkg/__init__.py changed",
+            "pkg/b.py": "package initializer pkg/__init__.py changed",
+        }
+        lint = self.checked(document, "lint")
+        self.assertEqual(lint["diagnostics"]["argv"][-4:], [*package, "pkg_consumer.py"])
+        self.assertEqual(lint["selection"]["selected"], {**package, "pkg_consumer.py": "depends on pkg/b.py"})
+        chars = self.checked(document, "chars")
+        self.assertEqual(chars["selection"]["selected"], package)
+        self.assertEqual(
+            {finding["subject"] for finding in chars["findings"]}, {"pkg/a.py:U+202E", "pkg/b.py:U+202E"},
+        )
+        crap = self.checked(document, "crap")
+        self.assertEqual(crap["selection"]["selected"], package)
+        self.assertEqual(
+            {finding["subject"] for finding in crap["findings"]}, {f"{path}:<module>" for path in package},
+        )
+
     def test_staged_initializer_deletion_expands_package_and_dependents(self):
         self.write_config(CONFIG + """
 [[rule]]
@@ -591,7 +625,7 @@ reason = "External package consumer"
         config = load_config(self.repo)
         files, classes, violations = validate_inventory(self.repo, config)
         self.assertEqual(violations, [])
-        _, affected = affected_graph(self.repo, config, files, classes, self.base, {"pkg/source.sh"})
+        _, _, affected = affected_graph(self.repo, config, files, classes, self.base, {"pkg/source.sh"})
         self.assertEqual(affected["pkg/consumer.sh"], "depends on pkg/source.sh")
 
     def test_initializer_change_seeds_every_package_module(self):
@@ -601,8 +635,8 @@ reason = "External package consumer"
         states = (["consumer.py", "pkg/mod.py"], ["consumer.py", "pkg/mod.py", "pkg/__init__.py"])
         for nodes in states:
             with self.subTest(nodes=nodes):
-                affected = affected_paths(nodes, edges, {"pkg/__init__.py"})
-                self.assertEqual(affected["pkg/mod.py"], "package initializer pkg/__init__.py changed")
+                expanded, affected = affected_paths(nodes, edges, {"pkg/__init__.py"})
+                self.assertEqual(expanded["pkg/mod.py"], "package initializer pkg/__init__.py changed")
                 self.assertEqual(affected["consumer.py"], "depends on pkg/mod.py")
 
     def test_crap_remains_unsupported_when_entire_suite_executes_nothing(self):

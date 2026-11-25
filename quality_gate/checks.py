@@ -862,16 +862,16 @@ def _global_input(config: Config, classes: dict[str, str], changed: set[str]) ->
 def _selection_inputs(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str],
-) -> tuple[dict[str, str], str | None]:
+) -> tuple[dict[str, str], dict[str, str], str | None]:
     full = _global_input(config, classes, changed)
     if full or not changed:
-        return {}, full
+        return {}, {}, full
     try:
-        nodes, affected = affected_graph(root, config, files, classes, evidence_dir, changed)
+        nodes, expanded, affected = affected_graph(root, config, files, classes, evidence_dir, changed)
     except (GateError, ValueError) as error:
-        return {}, f"full run: module graph unavailable ({error})"
+        return {}, {}, f"full run: module graph unavailable ({error})"
     unplaced = sorted(changed - nodes)
-    return affected, f"full run: unplaced file {unplaced[0]}" if unplaced else None
+    return expanded, affected, f"full run: unplaced file {unplaced[0]}" if unplaced else None
 
 
 def _forced_inputs(config: Config, selected: list[CheckDef]) -> dict[str, str]:
@@ -884,7 +884,7 @@ def _forced_inputs(config: Config, selected: list[CheckDef]) -> dict[str, str]:
 
 
 def _file_scope(
-    check: CheckDef, files: list[str], changed: set[str],
+    check: CheckDef, files: list[str], expanded: dict[str, str],
     affected: dict[str, str], full: str | None,
 ) -> CheckSelection:
     per_file = _per_file(check)
@@ -894,7 +894,7 @@ def _file_scope(
     if full is not None:
         reason = full if files else f"{full} (no files in the input class)"
         return CheckSelection(dict.fromkeys(files, full), {}, reason, skip=not files)
-    reasons = dict.fromkeys(changed, "changed") if check.adapter in CHANGED_FILE_ADAPTERS else affected
+    reasons = expanded if check.adapter in CHANGED_FILE_ADAPTERS else affected
     return _affected_file_scope(files, reasons)
 
 
@@ -918,7 +918,7 @@ def _elisp_suite_reason(root: Path, path: str, affected: dict[str, str]) -> str 
 
 
 def _check_selection(
-    root: Path, check: CheckDef, inputs: list[str], changed: set[str], affected: dict[str, str],
+    root: Path, check: CheckDef, inputs: list[str], expanded: dict[str, str], affected: dict[str, str],
     full: str | None,
 ) -> CheckSelection:
     if check.adapter == "elisp_tests":
@@ -929,7 +929,7 @@ def _check_selection(
     if _command_suite(check):
         reason = "full run: command adapter suite is opaque"
         return CheckSelection({}, {}, reason)
-    return _file_scope(check, inputs, changed, affected, full)
+    return _file_scope(check, inputs, expanded, affected, full)
 
 
 def _require_coverage(
@@ -948,7 +948,7 @@ def _affected_selection(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str], checks: list[CheckDef],
 ) -> dict[str, CheckSelection]:
-    affected, full = _selection_inputs(
+    expanded, affected, full = _selection_inputs(
         root, config, files, classes, evidence_dir, changed,
     )
     forced = _forced_inputs(config, checks)
@@ -956,7 +956,7 @@ def _affected_selection(
     for check in checks:
         inputs = _select_files(config, check, files, classes)[0]
         selections[check.id] = _check_selection(
-            root, check, inputs, changed, affected, full or forced.get(check.id),
+            root, check, inputs, expanded, affected, full or forced.get(check.id),
         )
     for check in checks:
         _require_coverage(check, config, selections)

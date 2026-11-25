@@ -1304,10 +1304,11 @@ any check starts.
 
 `check --base REV` is an affected-scope run for branch feedback. It uses `REV...HEAD` plus
 staged and unstaged tracked changes, including deletions and both sides of renames. Inventory and
-hygiene run in full. Per-file checks use the changed inputs, and lint and compilation also receive
-their transitive module graph dependents. A changed or deleted package initializer affects its
-package modules. Any changed tracked path outside the module graph expands every per-file
-check to its full input class, including changes to configuration, tool pins, data, and documentation.
+hygiene run in full. For every per-file check, a changed or deleted package initializer counts as
+a change to every module in its package. Lint and compilation also receive the transitive module
+graph dependents of those inputs. Any changed tracked path outside the module graph expands every
+per-file check to its full input class, including changes to configuration, tool pins, data, and
+documentation.
 
 The gate's unittest shard runner selects changed test files and tests that reach changed modules
 through the graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.
