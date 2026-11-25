@@ -619,6 +619,44 @@ class SharedSurfaceTests(FixtureCase):
                 self.assertFalse(inventory["satisfied"])
                 self.assertIn("pattern '*.md'): matches no file", inventory["diagnostics"]["output_tail"])
 
+    def test_inventory_enumeration_error_skips_graph_checks_and_reports_no_pairs(self) -> None:
+        self.change_feature()
+        self.add_file("README.md", "# changed\n")
+        error = "could not enumerate inventory entries"
+
+        def fail_first_enumeration(_root):
+            if enumerate_entries.call_count == 1:
+                raise GateError(error)
+            return mock.DEFAULT
+
+        with (
+            mock.patch.object(
+                files, "enumerate_entries", wraps=files.enumerate_entries, side_effect=fail_first_enumeration,
+            ) as enumerate_entries,
+            mock.patch.object(checks, "module_ownership") as ownership,
+            mock.patch.object(checks, "extract_contract_graph") as extract,
+        ):
+            result, document, findings = self.contract(1, "--base", "HEAD")
+
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["changed_paths"], ["README.md", "app/main.py"])
+        inventory = self.check_by_id(document, "inventory")
+        self.assertFalse(inventory["satisfied"])
+        self.assertEqual(inventory["execution"], "error")
+        self.assertIn(error, inventory["diagnostics"]["output_tail"])
+        ownership.assert_not_called()
+        extract.assert_not_called()
+        self.assertEqual(findings, [])
+        contracts = self.check_by_id(document, "module-contracts")
+        self.assertFalse(contracts["satisfied"])
+        self.assertEqual(contracts["outcome"], "fail")
+        self.assertEqual(contracts["execution"], "error")
+        self.assertEqual(contracts["caused_by"], ["inventory"])
+        self.assertIsNone(contracts["budget_seconds"])
+        reason = "module-contracts: graph checks skipped because inventory failed"
+        self.assertEqual(contracts["reason"], reason)
+        self.assertIn(reason, result.stderr.splitlines())
+
     def test_protected_file_replaced_by_directory_counts_as_an_edit(self) -> None:
         trusted = self.trusted_directory("HEAD")
         (self.repo / "README.md").unlink()
@@ -789,6 +827,26 @@ class SharedSurfaceTests(FixtureCase):
         self.commit_all("add a symlink")
         self.write_config(self.config.replace('["README.md"]', '["registry.md"]'))
         self.assert_command_error("symlink 'registry.md'")
+
+    def test_rejects_a_gitlink_in_the_base_even_if_the_candidate_stages_a_regular_file(self) -> None:
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("update-index", "--add", "--cacheinfo", "160000", head, "vendor.md")
+        self.git("commit", "-q", "-m", "add a gitlink")
+        self.add_file("vendor.md", "# vendor\n")
+        self.git("add", "vendor.md")
+        self.write_config(self.config.replace('["README.md"]', '["vendor.md"]'))
+
+        result, document = self.run_json()
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertEqual(document["checks"], [])
+        for fragment in (
+            "modules.app.protected_paths[0]",
+            "expected a regular file in diff base",
+            "got gitlink 'vendor.md'",
+        ):
+            self.assertIn(fragment, document["error"])
+            self.assertIn(fragment, result.stderr)
 
     def test_opted_out_policy_does_not_validate_paths_against_a_base(self) -> None:
         config = self.config.replace('shared_base = "HEAD"\n', "")
