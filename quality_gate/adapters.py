@@ -21,7 +21,7 @@ from . import (
     module_graph, python_crap, python_mutation, secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .files import DiffBaseOverride, enumerate_entries, source_languages
+from .files import DiffBaseOverride, InventoryClasses, enumerate_entries, source_languages
 from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -36,7 +36,7 @@ from .policy import (
     _string,
     _string_list,
 )
-from .runner import Diagnostics, RunResult, execution_outcome, mark_step, remaining_budget, run
+from .runner import Diagnostics, RunResult, RunTimeout, execution_outcome, mark_step, remaining_budget, run
 from .tools import tool_binary
 
 if TYPE_CHECKING:
@@ -225,17 +225,38 @@ def _graph_modules(
     return modules["python"], modules["lisp"], modules["bash"]
 
 
-def _graph_elisp_records(records: Any) -> list[dict]:
+def _valid_elisp_payload(record: dict, modules: set[str]) -> bool:
+    match record:
+        case {"kind": "require", "target": str() as target}:
+            return target in modules
+        case {"kind": "outside", "message": str()}:
+            return True
+        case {"kind": "reader-error", "message": str(), "stage": "preparation" | "reader"}:
+            return True
+    return False
+
+
+def _valid_elisp_record(record: Any, modules: set[str]) -> bool:
+    match record:
+        case {"line": int() as line}:
+            return type(line) is int and line > 0 and _valid_elisp_payload(record, modules)
+    return False
+
+
+def _graph_elisp_records(records: Any, path: str, modules: set[str]) -> list[dict]:
     if not isinstance(records, list):
-        raise ValueError("expected a list of Emacs reader records")
+        raise ValueError(f"{path}: expected a list of Emacs reader records")
+    for index, record in enumerate(records):
+        if not _valid_elisp_record(record, modules):
+            raise ValueError(f"{path}: invalid Emacs reader record at index {index}")
     return records
 
 
-def _graph_elisp_report(report: Path, files: list[str]) -> dict[str, list[dict]]:
+def _graph_elisp_report(report: Path, files: list[str], modules: set[str]) -> dict[str, list[dict]]:
     document = load_json(report.read_text(encoding="utf-8"))
     if not isinstance(document, dict) or document.keys() != set(files):
         raise ValueError("expected an Emacs reader report for each selected file")
-    return {path: _graph_elisp_records(document[path]) for path in files}
+    return {path: _graph_elisp_records(document[path], path, modules) for path in files}
 
 
 def _read_graph_elisp(
@@ -254,24 +275,65 @@ def _read_graph_elisp(
             if not execution_outcome(child.execution).completed or child.returncode != 0:
                 status = f"Emacs execution {child.execution}, exit code {child.returncode}"
                 raise ValueError(child.error or child.stderr_text.strip() or status)
-            return _graph_elisp_report(report, files)
-    except (OSError, ValueError) as error:
+            return _graph_elisp_report(report, files, set(modules))
+    except (OSError, ValueError, RecursionError) as error:
         raise ValueError(f"cannot read Emacs Lisp module graph for {', '.join(files)}: {error}") from error
+
+
+GraphInputs = tuple[list[str], list[str], list[str]]
+
+
+@dataclass(frozen=True)
+class GraphExtraction:
+    inputs: GraphInputs
+    modules: list[str]
+    edges: list[module_graph.Edge]
+    reader_errors: list[dict]
+
+
+def _extract_graph(context: AdapterContext, inputs: GraphInputs) -> GraphExtraction:
+    python, lisp, shell = inputs
+    elisp = _read_graph_elisp(context, lisp, [*python, *lisp, *shell]) if lisp else {}
+    mark_step("module graph dependencies")
+    if remaining_budget(_default_budget(None)) <= 0:
+        raise ValueError("module graph dependency extraction deadline exceeded")
+    modules, edges, outside = module_graph.dependencies(
+        context.root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
+    )
+    reader_errors = [row for row in outside if row.get("kind") == "reader-error"]
+    return GraphExtraction(inputs, modules, edges, reader_errors)
+
+
+def module_ownership(
+    config: Any, files: list[str], classes: InventoryClasses,
+) -> tuple[dict[str, str], list[dict]]:
+    return module_graph.resolve_ownership(config.modules, files, classes.code_paths)
+
+
+def extract_contract_graph(
+    root: Path, config: Any, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
+) -> GraphExtraction:
+    context = AdapterContext(root, config, None, list(owners), classes, "module-contracts", {}, evidence_dir)
+    return _extract_graph(context, _graph_modules(context, module_graph.GraphSpec(tuple(config.classes), ())))
+
+
+def module_contract_findings(config: Any, owners: dict[str, str], graph: GraphExtraction) -> list[dict]:
+    reader_errors = [{"rule": "module-extraction", **row} for row in graph.reader_errors]
+    return reader_errors + module_graph.interface_findings(config.modules, owners, graph.edges)
 
 
 def affected_graph(
     root: Path, config: Any, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str],
+    evidence_dir: Path, changed: set[str], contract_graph: GraphExtraction | None = None,
 ) -> tuple[set[str], dict[str, str], dict[str, str]]:
     spec = module_graph.GraphSpec(tuple(config.classes), ())
     context = AdapterContext(root, config, None, files, classes, "affected scope", {}, evidence_dir)
-    python, lisp, shell = _graph_modules(context, spec)
-    elisp = _read_graph_elisp(context, lisp, [*python, *lisp, *shell]) if lisp else {}
-    modules, edges, _ = module_graph.dependencies(
-        root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
+    inputs = _graph_modules(context, spec)
+    graph = contract_graph if contract_graph is not None and contract_graph.inputs == inputs else (
+        _extract_graph(context, inputs)
     )
-    expanded, affected = module_graph.affected_paths(modules, edges, changed)
-    return set(modules), expanded, affected
+    expanded, affected = module_graph.affected_paths(graph.modules, graph.edges, changed)
+    return set(graph.modules), expanded, affected
 
 
 def _run_module_graph(context: AdapterContext) -> Any:
@@ -389,6 +451,8 @@ def _parse_shell(
             tool_binary=tool_binary, run=run, execution_outcome=execution_outcome,
             remaining_budget=remaining_budget, verify_reproduction=verify_reproduction,
         )
+    except RunTimeout:
+        raise
     except (GateError, OSError) as error:
         raise ValueError(f"{filename}: cannot run shfmt: {error}") from error
 

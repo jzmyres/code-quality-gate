@@ -20,11 +20,20 @@ from pathlib import Path
 from typing import Any
 
 from . import gate_result
-from .adapters import AdapterContext, adapter_for, affected_graph
+from .adapters import (
+    AdapterContext,
+    GraphExtraction,
+    adapter_for,
+    affected_graph,
+    extract_contract_graph,
+    module_contract_findings,
+    module_ownership,
+)
 from .files import (
     BUILTIN_RESULT_KINDS,
     DiffBase,
     DiffBaseOverride,
+    InventoryClasses,
     affected_diff,
     git_argv,
     hygiene_result,
@@ -32,6 +41,7 @@ from .files import (
     validate_inventory,
 )
 from .policy import (
+    MODULE_CONTRACTS_ID,
     CheckDef,
     Config,
     GateError,
@@ -52,6 +62,7 @@ from .runner import (
     RunTimeout,
     check_deadline,
     mark_step,
+    remaining_budget,
 )
 
 
@@ -560,7 +571,7 @@ def _skipped(check: CheckDef) -> CheckResult:
 
 
 def _tail_text(messages: list[str]) -> tuple[str, int, bool]:
-    encoded = "\n".join(messages).encode("utf-8")
+    encoded = "\n".join(messages).encode("utf-8", errors="backslashreplace")
     return (
         encoded[-4096:].decode("utf-8", "replace"),
         len(encoded),
@@ -649,7 +660,7 @@ def _prune_option_error(
     )
 
 
-def _run_limit(selected_checks: Iterable[CheckDef]) -> float:
+def _run_limit(selected_checks: Iterable[CheckDef], *, contract_extraction: bool = False) -> float:
     """In-process analysis takes time even over bounded inputs, so the run
     allowance lets a subprocess exhaust its own budget and end the check.
     The run timer starts before any subprocess, so a limit of exactly the
@@ -657,6 +668,7 @@ def _run_limit(selected_checks: Iterable[CheckDef]) -> float:
     """
     return (
         sum(_check_budget(check) for check in selected_checks)
+        + RATCHET_BUDGET_SECONDS * contract_extraction
         + RUN_ALLOWANCE_SECONDS
     )
 
@@ -861,13 +873,15 @@ def _global_input(config: Config, classes: dict[str, str], changed: set[str]) ->
 
 def _selection_inputs(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str],
+    evidence_dir: Path, changed: set[str], contract_graph: GraphExtraction | None,
 ) -> tuple[dict[str, str], dict[str, str], str | None]:
     full = _global_input(config, classes, changed)
     if full or not changed:
         return {}, {}, full
     try:
-        nodes, expanded, affected = affected_graph(root, config, files, classes, evidence_dir, changed)
+        nodes, expanded, affected = affected_graph(
+            root, config, files, classes, evidence_dir, changed, contract_graph,
+        )
     except (GateError, ValueError) as error:
         return {}, {}, f"full run: module graph unavailable ({error})"
     unplaced = sorted(changed - nodes)
@@ -946,10 +960,10 @@ def _require_coverage(
 
 def _affected_selection(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str], checks: list[CheckDef],
+    evidence_dir: Path, changed: set[str], checks: list[CheckDef], contract_graph: GraphExtraction | None,
 ) -> dict[str, CheckSelection]:
     expanded, affected, full = _selection_inputs(
-        root, config, files, classes, evidence_dir, changed,
+        root, config, files, classes, evidence_dir, changed, contract_graph,
     )
     forced = _forced_inputs(config, checks)
     selections = {}
@@ -991,15 +1005,19 @@ def _run_selected_check(
 def _scope_plan(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: set[str] | None, checks: list[CheckDef], inventory_code: int,
-    affected_base: DiffBase | None,
+    affected_base: DiffBase | None, contract_graph: GraphExtraction | None,
 ) -> tuple[DiffBaseOverride, dict[str, CheckSelection]]:
     if changed is None:
         return resolve_diff_base(root), {}
     base_override = DiffBaseOverride(base=affected_base, changed_paths=frozenset(changed))
+    if not checks:
+        return base_override, {}
     if inventory_code != 0:
         selections = {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
     else:
-        selections = _affected_selection(root, config, files, classes, evidence_dir, changed, checks)
+        selections = _affected_selection(
+            root, config, files, classes, evidence_dir, changed, checks, contract_graph,
+        )
     return base_override, selections
 
 
@@ -1011,6 +1029,121 @@ def _run_inventory_blocked_check(check: CheckDef, selection: CheckSelection | No
     return result
 
 
+def _contract_message(finding: dict) -> str:
+    if finding["rule"] == "module-interface":
+        edge = finding["edge"]
+        failed = ", ".join(finding["failed_conditions"])
+        permitted = json.dumps(finding["permitted_entry_points"], ensure_ascii=False)
+        return (
+            f"module-interface: {edge['source']}:{edge['line']} -> {edge['target']} ({edge['kind']}), "
+            f"{finding['source_module']} -> {finding['target_module']}: {failed}; "
+            f"permitted entry points: {permitted}"
+        )
+    location = f"{finding['file']}:{finding['line']}: " if "line" in finding else ""
+    return f"{finding['rule']}: {location}{finding['message']}"
+
+
+def _require_contract_budget() -> None:
+    if remaining_budget(RATCHET_BUDGET_SECONDS) <= 0:
+        raise TimeoutError("module contract budget exceeded")
+
+
+def _extract_module_contracts(
+    root: Path, config: Config, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
+    findings: list[dict],
+) -> tuple[GraphExtraction | None, str]:
+    start = time.monotonic()
+    budget = RATCHET_BUDGET_SECONDS
+    with check_deadline("module-contracts", start, budget) as deadline:
+        try:
+            mark_step("module graph inputs")
+            _require_contract_budget()
+            graph = extract_contract_graph(root, config, owners, classes, evidence_dir)
+            _require_contract_budget()
+            mark_step("module interface evaluation")
+            findings.extend(module_contract_findings(config, owners, graph))
+            _require_contract_budget()
+            return (None if graph.reader_errors else graph), "completed"
+        except RunTimeout:
+            raise
+        except (GateError, ValueError, TimeoutError, RecursionError) as error:
+            message = str(error)
+            execution = "error"
+            if remaining_budget(budget) <= 0:
+                message = _budget_detail(f"{deadline.step}: {message}", start, budget)
+                execution = "budget"
+            findings.append({"rule": "module-extraction", "stage": deadline.step, "message": message})
+            return None, execution
+
+
+def _run_module_contracts(
+    root: Path, config: Config, files: list[str], classes: dict[str, str],
+    inventory_code: int, evidence_dir: Path,
+) -> tuple[CheckResult, GraphExtraction | None]:
+    print("check: module-contracts", flush=True)
+    start = time.monotonic()
+    findings: list[dict] = []
+    execution = "completed"
+    graph = None
+    budget = None
+    messages = []
+    if inventory_code != 0:
+        execution = "error"
+        messages.append("module-contracts: skipped because inventory failed")
+    else:
+        assert isinstance(classes, InventoryClasses)
+        owners, findings = module_ownership(config, files, classes)
+        if not findings and len(config.modules) >= 2:
+            budget = RATCHET_BUDGET_SECONDS
+            graph, execution = _extract_module_contracts(
+                root, config, owners, classes, evidence_dir, findings,
+            )
+        messages.extend(f"module-contracts: {_contract_message(row)}" for row in findings)
+    for message in messages:
+        print(message, file=sys.stderr)
+    result = _builtin_result(
+        "module-contracts", ok=not messages, duration_seconds=time.monotonic() - start,
+        messages=messages, execution=execution, argv=None,
+    )
+    result.findings = findings
+    result.budget_seconds = budget
+    return result, graph
+
+
+def _policy_results(
+    root: Path, config: Config, files: list[str], classes: dict[str, str], inventory_code: int,
+    selected_checks: list[CheckDef], changed: set[str] | None, affected_base: DiffBase | None,
+    directory: Path, module_contracts: bool,
+) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    prior: dict[str, CheckResult] = {}
+    contract_graph = None
+    if module_contracts:
+        evidence_dir = directory / "module-contracts"
+        evidence_dir.mkdir()
+        result, contract_graph = _run_module_contracts(
+            root, config, files, classes, inventory_code, evidence_dir,
+        )
+        results.append(result)
+    base_override, selections = _scope_plan(
+        root, config, files, classes, directory, changed, selected_checks, inventory_code,
+        affected_base, contract_graph,
+    )
+    for check in selected_checks:
+        selection = selections.get(check.id)
+        if inventory_code != 0:
+            outcome = _run_inventory_blocked_check(check, selection)
+        else:
+            evidence_dir = directory / check.id
+            evidence_dir.mkdir()
+            outcome = _run_selected_check(
+                root, config, check, files, classes, evidence_dir, prior, base_override, selection,
+            )
+        results.append(outcome)
+        prior[check.id] = outcome
+    return results
+
+
 def _run_policy_checks(
     root: Path,
     config: Config,
@@ -1020,32 +1153,20 @@ def _run_policy_checks(
     selected_ids: list[str] | None = None,
     changed: set[str] | None = None,
     affected_base: DiffBase | None = None,
+    *,
+    module_contracts: bool = False,
 ) -> list[CheckResult]:
     selected = list(config.checks) if selected_ids is None else selected_ids
     selected_checks = [config.checks[identifier] for identifier in selected]
-    results: list[CheckResult] = []
-    prior: dict[str, CheckResult] = {}
     run_directory = tempfile.TemporaryDirectory(prefix="qg-run-")
-    previous = _arm_run_limit(_run_limit(selected_checks))
+    contract_extraction = module_contracts and inventory_code == 0 and len(config.modules) >= 2
+    previous = _arm_run_limit(_run_limit(selected_checks, contract_extraction=contract_extraction))
     try:
         try:
-            directory = Path(run_directory.name)
-            base_override, selections = _scope_plan(
-                root, config, files, classes, directory, changed, selected_checks, inventory_code,
-                affected_base,
+            results = _policy_results(
+                root, config, files, classes, inventory_code, selected_checks, changed,
+                affected_base, Path(run_directory.name), module_contracts,
             )
-            for check in selected_checks:
-                selection = selections.get(check.id)
-                if inventory_code != 0:
-                    outcome = _run_inventory_blocked_check(check, selection)
-                else:
-                    evidence_dir = directory / check.id
-                    evidence_dir.mkdir()
-                    outcome = _run_selected_check(
-                        root, config, check, files, classes, evidence_dir, prior, base_override, selection,
-                    )
-                results.append(outcome)
-                prior[check.id] = outcome
         except BaseException:
             _remove_run_directory(run_directory, report=True)
             raise
@@ -1402,11 +1523,13 @@ def _finalize_check(
 
 
 def _reject_unknown_checks(config: Config, identifiers: list[str]) -> None:
-    known = ", ".join(config.checks) or "none"
+    known = list(config.checks)
+    if config.module_contracts:
+        known.insert(0, MODULE_CONTRACTS_ID)
     for identifier in identifiers:
-        if identifier not in config.checks:
+        if identifier not in known:
             raise UsageError(
-                f"qg.py check: unknown check {identifier!r}; known checks: {known}"
+                f"qg.py check: unknown check {identifier!r}; known checks: {', '.join(known) or 'none'}"
             )
 
 
@@ -1415,7 +1538,20 @@ def _selected_check_ids(config: Config, only_ids: list[str] | None) -> list[str]
         return None
     _require_distinct("check", only_ids)
     _reject_unknown_checks(config, only_ids)
-    return _needed_order(config, [config.checks[identifier] for identifier in only_ids])
+    selected = _needed_order(config, [config.checks[name] for name in only_ids if name in config.checks])
+    if MODULE_CONTRACTS_ID in only_ids:
+        selected.insert(0, MODULE_CONTRACTS_ID)
+    return selected
+
+
+def _report_affected_scope(document: dict[str, Any], files: list[str], changed: set[str] | None) -> None:
+    if changed is None:
+        return
+    selection = CheckSelection(dict.fromkeys(files, "full run"), {}, "full run").report()
+    for result in document["checks"]:
+        if result["kind"] in BUILTIN_RESULT_KINDS:
+            result["selection"] = selection
+    document["changed_paths"] = sorted(changed)
 
 
 def _check_command(
@@ -1433,17 +1569,15 @@ def _check_command(
     base, changed = (None, None) if affected_base is None else affected_diff(root, affected_base)
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
-    if changed is not None:
-        for result in results:
-            result.report_fields["selection"] = CheckSelection(
-                dict.fromkeys(files, "full run"), {}, "full run",
-            ).report()
+    configured = None if selected is None else [name for name in selected if name in config.checks]
     results.extend(
-        _run_policy_checks(root, config, files, classes, code, selected, changed, base)
+        _run_policy_checks(
+            root, config, files, classes, code, configured, changed, base,
+            module_contracts=config.module_contracts,
+        )
     )
     exit_code, document = _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
-    if changed is not None:
-        document["changed_paths"] = sorted(changed)
+    _report_affected_scope(document, files, changed)
     return exit_code, document
 
 

@@ -13,7 +13,7 @@ from typing import Any
 from . import checks
 from .adapters import ADAPTERS
 from .files import (
-    BUILTIN_RESULT_KINDS,
+    STANDALONE_BUILTINS,
     command_hygiene,
     command_inventory,
     resolve_repo,
@@ -55,7 +55,7 @@ def _agent_selected_checks(
         return list(config.checks.values())
     identifiers = checks._selected_check_ids(config, only_ids)
     assert identifiers is not None
-    return [config.checks[identifier] for identifier in identifiers]
+    return [config.checks[identifier] for identifier in identifiers if identifier in config.checks]
 
 
 def _agent_refusal(config: Config, selected: list[CheckDef]) -> str | None:
@@ -239,7 +239,7 @@ def _run_builtin(root: Path, config: Any, args: Any) -> int:
 
 def _dispatch(root: Path, config: Any, args: Any) -> int:
     _reject_partial_options(args)
-    if args.command in BUILTIN_RESULT_KINDS:
+    if args.command in STANDALONE_BUILTINS:
         return _run_builtin(root, config, args)
     if args.command == "worklist":
         return command_worklist(root, config, args.check_ids, args.json)

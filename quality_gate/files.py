@@ -69,7 +69,8 @@ _INTERPRETER_LANGUAGE = dict.fromkeys(
 ) | {"python": "python", "emacs": "lisp"}
 _INTERPRETER_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*$")
 DIFF_BASE_ENV = "QG_DIFF_BASE"
-BUILTIN_RESULT_KINDS = ("inventory", "hygiene")
+STANDALONE_BUILTINS = ("inventory", "hygiene")
+BUILTIN_RESULT_KINDS = (*STANDALONE_BUILTINS, "module-contracts")
 _SHEBANG_ENV = "env"
 _TYPE_NAMES = {
     stat.S_IFIFO: "FIFO",
@@ -503,6 +504,7 @@ class InventoryClasses(dict[str, str]):
         self, classes: dict[str, str], sources: dict[str, SourceClassification],
     ) -> None:
         super().__init__(classes)
+        self.code_paths = frozenset(path for path, source in sources.items() if source.code)
         self.languages: dict[str, str | None] = {}
         self.deferred_links: set[str] = set()
         for path, source in sources.items():

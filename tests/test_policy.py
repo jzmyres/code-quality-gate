@@ -13,8 +13,83 @@ sys.path.insert(0, str(GATE))
 policy = importlib.import_module("quality_gate.policy")
 shards = importlib.import_module("quality_gate.test_shards")
 
+MODULE_CHECK = """\
+[checks.module-contracts]
+adapter = "module_contracts"
+tier = 1
+enforcement = "enforced"
+"""
+MODULE_POLICY = BASE_CONFIG + MODULE_CHECK + """
+[modules.fixture]
+files = ["*"]
+entry_points = []
+allowed_dependencies = []
+"""
+
 
 class PolicyTests(FixtureCase):
+    def test_check_requires_modules_and_resolves_dependency_names(self) -> None:
+        for text, key, detail in (
+            (BASE_CONFIG + MODULE_CHECK, "[modules]", "missing"),
+            (MODULE_POLICY.replace("allowed_dependencies = []", 'allowed_dependencies = ["unknown"]'),
+             "modules.fixture.allowed_dependencies[0]", "unknown module 'unknown'"),
+        ):
+            with self.subTest(key=key):
+                self.write_config(text)
+                result = self.run_qg_process("check")
+                self.assertEqual(result.returncode, 2, output(result))
+                self.assertIn(f"{self.config_path}: {key}", result.stderr)
+                self.assertIn(detail, result.stderr)
+
+    def test_module_tables_and_fields(self) -> None:
+        for text, key in (
+            ("modules = false\n" + BASE_CONFIG, "[modules]"),
+            (BASE_CONFIG + "\n[modules]\nfixture = 1\n", "modules.fixture"),
+            (MODULE_POLICY.replace('files = ["*"]\n', ""), "modules.fixture.files"),
+            (MODULE_POLICY.replace("entry_points = []\n", ""), "modules.fixture.entry_points"),
+            (MODULE_POLICY.replace("allowed_dependencies = []\n", ""),
+             "modules.fixture.allowed_dependencies"),
+            (MODULE_POLICY.replace("entry_points = []", "extra = []"), "modules.fixture.extra"),
+            (MODULE_POLICY.replace('files = ["*"]', "files = []"), "modules.fixture.files"),
+        ):
+            with self.subTest(text=text):
+                self.config_error(text, f"{self.config_path}: {key}")
+
+    def test_module_arrays_and_items(self) -> None:
+        for field, original, repeat in (
+            ("files", '["*"]', "*"),
+            ("entry_points", "[]", "a.py"),
+            ("allowed_dependencies", "[]", "fixture"),
+        ):
+            for value, suffix in (("true", ""), ("[true]", "[0]"), (json.dumps([repeat, repeat]), "[1]")):
+                with self.subTest(field=field, value=value):
+                    text = MODULE_POLICY.replace(f"{field} = {original}", f"{field} = {value}")
+                    self.config_error(text, f"{self.config_path}: modules.fixture.{field}{suffix}")
+
+    def test_module_paths_are_canonical(self) -> None:
+        for field, original in (("files", '["*"]'), ("entry_points", "[]")):
+            for path in ("", "/a", "a/", "a//b", "./a", "a/../b", "a/./b", "a\x00b"):
+                with self.subTest(field=field, path=path):
+                    text = MODULE_POLICY.replace(f"{field} = {original}", f"{field} = {json.dumps([path])}")
+                    self.config_error(
+                        text, f"modules.fixture.{field}[0]", "canonical repository-relative path",
+                    )
+
+    def test_module_contracts_check_id_is_reserved(self) -> None:
+        self.config_error(
+            BASE_CONFIG.replace("[checks.smoke]", "[checks.module-contracts]"),
+            "checks.module-contracts",
+        )
+
+    def test_module_contracts_rejects_another_adapter_or_advisory_enforcement(self) -> None:
+        for original, replacement, field in (
+            ('adapter = "module_contracts"', 'adapter = "command"', "adapter"),
+            ('enforcement = "enforced"', 'enforcement = "advisory"', "enforcement"),
+        ):
+            with self.subTest(field=field):
+                config = BASE_CONFIG + MODULE_CHECK.replace(original, replacement)
+                self.config_error(config, f"checks.module-contracts.{field}")
+
     def config_error(self, text: str, *needles: str) -> str:
         self.write_config(text)
         result = self.run_qg("inventory")

@@ -43,7 +43,8 @@ consumer's own tree. The [quick start](#quick-start-in-a-consuming-repository) a
 its path.
 
 **Policy.** `quality-gate.toml` declares the classes and rules that classify every file, `[code]`
-detection, and one `[checks.ID]` table per check naming its adapter, tier, enforcement and that
+detection, an optional `[modules]` ownership and interface map, and one `[checks.ID]` table per
+configured check naming its adapter, tier, enforcement and that
 adapter's keys (for a measuring adapter, its threshold and baseline), while the baseline files hold
 the reasoned exceptions and `[protect]` adds further paths the trust root guards. The shape is in
 [Configuration](#configuration) and [`docs/SCHEMA.md`](docs/SCHEMA.md).
@@ -51,7 +52,8 @@ the reasoned exceptions and `[protect]` adds further paths the trust root guards
 **Tools.** `tools fetch` installs the pinned tools once, and every later run is offline and verifies
 each install before it is used. See [tools](#tools).
 
-**Run.** `python3 -I qg.py check` runs inventory, hygiene and every configured check in policy order,
+**Run.** `python3 -I qg.py check` runs inventory, hygiene, module contracts if enabled, and the
+remaining configured checks in policy order,
 with `--json` for one result document and `--only` for a partial run; a caller that must not trust
 the candidate passes `--policy-from DIR` so the policy, baselines, tools lock and protected paths come
 from a trusted directory outside the candidate. See [check](#check) and [Trust root](#trust-root).
@@ -70,6 +72,31 @@ in how each one invokes the gate.
 | This repository | Python, with Emacs Lisp helpers | `*.py`, `*.sh`, `*.el`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `elisp`, `elisp-suite`, `config`, `build`, `doc`; `ruff` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `shape` (`python_shape`), `variant-dispatch` (`variant_dispatch`), `verification`, `elisp-tests`, `elisp-crap`, `elisp-compile`, `elisp-checkdoc` | `make check` runs `python3 -I qg.py check`; CI runs `make -k check` with `QG_DIFF_BASE` naming the pushed change |
 | A shell and Python agent harness | Shell and Python | `*.py`, `*.sh`; shebangs `sh`, `bash`, `python*` | `python`, `test`, `shell-tested`, `shell-sourced`, `shell-probe`, `config`, `build`, `doc`, `gate`; `ruff`, `shellcheck`, `json` (`command`), `clones`, `tests` (`python_tests`), `crap` (`python_crap`), `verification` | A runner gates each candidate with `--policy-from` the last landed commit |
 | An Emacs Lisp editor configuration | Emacs Lisp, with shell helpers | Emacs Lisp sources and their shell helpers | `modules`, `tools`, `suites`, `startup`, `shell`, `config`, `data`, `docs`, `fixture`, `gate`; `emacs-tests`, `tooling-tests` (`elisp_tests`), `emacs-crap`, `tooling-crap` (`elisp_crap`), `elisp-compile`, `elisp-checkdoc`, `shellcheck` (`command`) | Ran beside its own older gate, recording parity first |
+
+### Upgrading consumer pins for module contracts
+
+Land support for the module policy keys before enabling the check on this repository or in a
+consumer. To enable contracts, cut over the harness's gate pin and trusted policy snapshot
+together. The snapshot selected by `--policy-from` must include the check declaration, a valid
+module map and any required shfmt pin. The trusted lane validates that snapshot before
+considering an authorized candidate policy replacement. An enabled trusted policy with a
+missing map therefore fails even if the candidate supplies one. Cut over the editor's gate pin
+and local policy together. Both consumers can start with one explicit module using
+`files = ["*"]` and empty `entry_points` and `allowed_dependencies` arrays.
+
+When either consumer introduces a second module, every enabled `check` with successful inventory
+and a valid map extracts the full owned-code graph. This includes three pinned shfmt invocations per
+selected shell file and one Emacs batch when Lisp is selected. Trusted runs use the effective
+tool lock. Measure the incremental runtime when each consumer introduces its split.
+
+The loader requires `[modules]` whenever the policy enables the check, including for
+standalone inventory and hygiene and historical `debt --revision` reads. Historical policies
+that predate the opt-in still load.
+
+#### Later slices
+
+* Step 2 declares the gate's own five-module map and enables `module-contracts` after the trusted
+  gate recognizes the policy keys.
 
 ## Requirements
 
@@ -1318,15 +1345,27 @@ The default tools directory is shared by every repository using the gate on this
     python3 -I qg.py check --policy-from DIR --allow-protected ruff.toml
     QG_AGENT=1 python3 -I qg.py check --only ruff
 
-`check` runs inventory and hygiene (built in, always), then every configured check in policy order. It
-prints progress on stdout and failures on stderr. When inventory fails, configured checks are reported
-as skipped and the combined check still fails; hygiene still runs. Configuration errors exit 2 before
-any check starts.
+`check` runs `inventory` and `hygiene`, then `module-contracts` if enabled, followed by the
+remaining configured checks in policy order. It prints progress on stdout and failures on stderr.
+When inventory fails, hygiene still runs, and the subsequent checks report that inventory blocked
+them. A malformed module declaration or a missing map for an enabled check exits 2 before checks start.
+
+Enable `module-contracts` with `[checks.module-contracts]` and a `[modules]` table. The check
+validates ownership over every inventoried code file using the effective policy.
+The inventory includes present tracked and staged files and nonignored untracked files. Gitlinks and
+non-code files are outside the ownership set. A direct cross-module edge must target an entry point
+of a module that the source module allows. Ownership, edge and required extraction failures reject
+with exit 1. The check validates ownership even for code without a supported extractor. A valid map
+with zero or one module requires no extraction. With two or more modules the gate extracts the
+graph for the full owned-code tree on every scope, including an empty affected diff. The extractors
+cover Python, Emacs Lisp and shell. Emacs preparation and reader errors block the contract.
+`worklist` runs its selected configured checks and omits `module-contracts`.
 
 `check --base REV` is an affected-scope run for branch feedback. It uses `REV...HEAD` plus
-staged and unstaged tracked changes, including deletions and both sides of renames. Inventory and
-hygiene run in full. For every per-file check, a changed or deleted package initializer counts as
-a change to every module in its package. Lint and compilation also receive the transitive module
+staged and unstaged tracked changes, including deletions and both sides of renames. Inventory,
+hygiene and any enabled module contracts run in full. For every per-file check, a changed or
+deleted package initializer counts as a change to every module in its package. Lint and compilation
+also receive the transitive module
 graph dependents of those inputs. Any changed tracked path outside the module graph expands every
 per-file check to its full input class, including changes to configuration, tool pins, data, and
 documentation.
@@ -1362,7 +1401,7 @@ The summary line `check: failed (...)` names the roots in the usual order. When 
 `check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry is spelled as the
 summary spells it and `CAUSE` is a root check id. A consequence still rejects and still exits 1.
 
-`check --only CHECK [CHECK ...]` runs inventory and hygiene, then exactly those checks and the checks
+`check --only CHECK [CHECK ...]` runs inventory, hygiene and module contracts, then those checks and the checks
 they require, in policy order. Nothing else runs. An unknown or repeated check id is a usage error
 (exit 2) naming it, before any check runs. A partial run never prunes and never runs under a trusted
 directory: `--only` with `--prune` or with `--policy-from` is a usage error (exit 2) naming both
@@ -1386,8 +1425,9 @@ top-level keys are `schema`, `gate_version`, `revision`, `dirty`, `policy_sha256
 `checks`, `obligations` and `prune`; a `decision = "error"` document also has `error`, and a
 `check --only` document has `selected`.
 
-`checks` contains inventory, hygiene and every configured check, in that order. Each check has `id`,
-`kind` (`inventory`, `hygiene` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
+`checks` contains inventory, hygiene, module contracts if enabled, and the remaining configured
+checks, in that order. Each check has `id`,
+`kind` (`inventory`, `hygiene`, `module-contracts` or `check`), `tier` (null for built-ins), `enforcement`, `adapter`,
 `evidence` (the evidence names the adapter produces), `metric_version`, `execution`, `outcome`,
 `satisfied`, `caused_by`, `duration_seconds`, `budget_seconds`, `diagnostics`, `findings`,
 `resolved_baseline_entries`, `unmeasured_baseline_entries`, `location_coverage` and `reason` (a structured explanation of
@@ -1395,7 +1435,12 @@ a non-passing adapter verdict, null otherwise); a measuring check may also carry
 object (for example `{"tests": 12}`). Any adapter can report its measured tool identity as
 `tool`, an object with string `name` and `version` fields; it is absent when no identity is reported.
 
-`execution` is `completed`, `budget` (a subprocess budget expired), `signal` or `error`.
+`module-contracts` reports complete ownership, extraction and interface findings in `findings`.
+A `module-interface` finding includes the file edge with its line and kind, both module owners,
+the failed conditions and the destination's sorted public entry points. If inventory failed,
+the contract has `caused_by = ["inventory"]`.
+
+`execution` is `completed`, `budget` (a budget expired), `signal` or `error`.
 `outcome` is the adapter's raw verdict: `pass`, `fail`, `unsupported` or `error`; later
 tier-3 adapters add `proved`, `no_counterexample` and `unknown`. `satisfied` is true when the
 policy obligation is met after baselines and enforcement: a finding inside a valid baseline keeps
@@ -1403,7 +1448,9 @@ policy obligation is met after baselines and enforcement: a finding inside a val
 judgement. Missing evidence is `unsupported`, never `pass`. The policy checks have one wall-clock
 run limit: the sum of every check's configured budget (command, Python test and Emacs Lisp checks use
 their configured budgets; clone, CRAP and verification checks each have 600 seconds) plus a
-300-second allowance. The allowance covers in-process analysis over bounded input and keeps the
+300-second allowance. After successful inventory, enabling module contracts with at least two
+declared modules adds 600 seconds for contract extraction and edge evaluation. The contract
+reports that budget when it attempts extraction. The allowance covers in-process analysis over bounded input and keeps the
 backstop from racing a subprocess budget, which must end its check and never the run. The check loop
 arms one timer before the first check and restores the previous `SIGALRM` handler after the last,
 releasing test evidence in between. A run that exceeds the limit ends with `decision = "error"`
@@ -1545,8 +1592,8 @@ naming both options, before any check runs; `--prune` without `--policy-from` is
 The decision is `error` (exit 2) for invalid policy, usage or configuration, when the run exceeds
 its limit, when the run directory cannot be removed, or when a test check cannot remove its temporary
 suite directory, `rejected` (exit 1) when
-inventory, hygiene, any enforced check or any obligation is not satisfied, `partial` (exit 0) when a
-`--only` run's inventory, hygiene and every enforced check that ran are satisfied, and
+inventory, hygiene, module contracts, any enforced check or any obligation is not satisfied,
+`partial` (exit 0) when a `--only` run's built-ins and every enforced check that ran are satisfied, and
 `accepted_with_exceptions` (exit 0) when every obligation and enforced check is satisfied but at least
 one finding passes only through a baseline entry or an advisory check does not pass, and `accepted`
 (exit 0) otherwise. A partial run evaluates no obligations, so its rejection depends only on the checks
@@ -1620,6 +1667,11 @@ and the allowed keys. The complete shape is:
     patterns = ["*.py", "*.sh", "*.el"]   # fnmatch on the repository-relative path
     shebangs = ["sh", "bash", "python*"]  # fnmatch on the first-line interpreter basename, after env
 
+    [modules.application]
+    files = ["*"]
+    entry_points = []
+    allowed_dependencies = []
+
     [hygiene]
     max_bytes = 10485760                  # optional; this is the default
 
@@ -1639,6 +1691,11 @@ and the allowed keys. The complete shape is:
     [classes.config]
     code = false
     description = "Configuration and pinned data"
+
+    [checks.module-contracts]
+    adapter = "module_contracts"
+    tier = 1
+    enforcement = "enforced"
 
     [checks.ruff]
     adapter = "command"                   # see adapter sections above for other choices
@@ -1747,6 +1804,11 @@ Notes:
 * `pattern` is matched with `fnmatch.fnmatchcase` against the repository-relative path. `*` matches
   slashes too, so `*.py` matches Python files at any depth.
 * Every enumerated file must match exactly one rule, and every rule must match at least one file.
+* With module contracts enabled, every inventoried code file must match exactly one declared
+  module. Module `files` patterns use the same case-sensitive repository-relative matching as inventory rules. Every module pattern
+  must match code, and multiple patterns may match the same file within one module. Entry points
+  are exact owned code paths. Dependency allowances name declared modules. Use an explicit empty
+  `[modules]` table for a code-free tree. The check ID `module-contracts` is reserved.
 * `reason` is mandatory and must be non-empty for every rule. `description` is mandatory and non-empty
   for every class.
 * A class with `code = true` may hold code files. A code file may not be placed in a class with

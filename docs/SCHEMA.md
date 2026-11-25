@@ -23,6 +23,16 @@ schema = 2
 patterns = ["*.py"]
 shebangs = ["python*"]
 
+[modules.app]
+files = ["app/*.py"]
+entry_points = []
+allowed_dependencies = ["library"]
+
+[modules.library]
+files = ["library/*.py"]
+entry_points = ["library/api.py"]
+allowed_dependencies = []
+
 [hygiene]
 max_bytes = 10485760          # optional
 
@@ -37,6 +47,11 @@ checks = ["ruff", "clones", "tests", "crap"]
 [classes.config]
 code = false
 description = "Configuration"
+
+[checks.module-contracts]
+adapter = "module_contracts"
+tier = 1
+enforcement = "enforced"
 
 [checks.ruff]
 adapter = "command"
@@ -127,6 +142,16 @@ reason = "Python source"
 Rules:
 
 * `schema = 2` is mandatory. Unknown keys are configuration errors.
+* `[checks.module-contracts]` enables the built-in and requires `[modules]`. The shared loader
+  applies that requirement to standalone commands and historical `debt --revision` reads.
+  Existing policies can omit both tables.
+* Each `[modules.NAME]` has exactly three required arrays of unique strings. `files` is nonempty
+  and uses case-sensitive `fnmatchcase` over the full repository-relative path. A wildcard can
+  span slashes. `entry_points` names exact repository-relative files. Both path arrays reject
+  empty, `.` and `..` components and NUL characters. `allowed_dependencies` names modules anywhere
+  in the table. Invalid declarations exit 2. The `module-contracts` check ID requires
+  `adapter = "module_contracts"`, a tier from 1 to 4 and `enforcement = "enforced"`.
+  It produces a built-in result with a null tier and supplies no class obligation evidence.
 * `tier` is an integer from 1 to 4. `enforcement` is `enforced` or
   `advisory`. `direction` is `max` (the default) or `min`: a `max`
   metric's value must not exceed its bound and tightening lowers the bound,
@@ -475,7 +500,39 @@ deleted from the repository resolves. A baseline whose entries all resolve
 keeps its header and no entries, and prune reports that it is now empty; the
 policy's `baseline` key and the file are then deleted by hand.
 
+### Module contracts and consumer cutover
+
+`module-contracts` assigns each inventoried code file exactly one module. It uses present tracked
+and staged files and nonignored untracked files, excluding gitlinks and non-code files. Each
+pattern must match code. Patterns within one module may overlap. Entry points must be present,
+uniquely owned code files of the declaring module. An empty `[modules]` requires a code-free tree.
+
+A cross-module direct edge must satisfy both requirements. The source must list the destination
+in `allowed_dependencies`, and the target must appear in the destination's `entry_points`. The
+enabled check runs after inventory and hygiene and before the other configured checks in full,
+`--only` and `--base` runs, including an empty diff.
+With successful inventory and a valid map declaring at least two modules, it extracts the full
+owned-code graph using the existing Python, Emacs Lisp and shell extractors. Required extraction
+failures, including Emacs preparation and reader errors, reject with exit 1, as do ownership
+and interface violations. Ordinary outside-extractor records are nonblocking. A valid zero- or
+one-module map passes without extraction. `worklist` omits the built-in.
+
+Land policy support before enabling module contracts. When the harness enables the check,
+cut over its gate pin and trusted policy snapshot together. Include the check declaration,
+a valid map and any required shfmt pin in the `--policy-from` snapshot. The trusted lane
+validates the snapshot before considering an authorized candidate policy. An enabled
+snapshot must therefore supply its own map. Cut over the editor's gate pin and local policy
+together. Either consumer can start with one explicit module with `files = ["*"]` and both
+other arrays empty.
+
+When either consumer adds a second module, every enabled check run with successful inventory
+and a valid map extracts the full owned-code graph. Allow for three shfmt calls per selected shell
+file and one Emacs batch when Lisp is selected. Trusted runs use the effective policy and tool lock.
+Measure the incremental runtime when each consumer introduces its split.
+
 ## Result: `check --json`
+
+The example shows the configured tests result from the `checks` array.
 
 ```json
 {
@@ -545,11 +602,12 @@ Top-level keys:
   directory's policy; an authorized replacement is the candidate's.
 * `decision` - `accepted`, `accepted_with_exceptions`, `partial`,
   `rejected`, `blocked` or `error`.
-* `checks` - inventory, hygiene and every configured check, in that order.
+* `checks` - `inventory`, `hygiene`, `module-contracts` if enabled, and the remaining
+  configured checks that ran, in that order.
 * `obligations` - one entry per code class and required tier; empty on a
   partial run.
-* `selected` - present only on a `check --only` result: the ids that ran, in
-  policy order, prerequisites included.
+* `selected` - present only on a `check --only` result. Lists the requested check IDs and
+  prerequisites in policy order, with `module-contracts` first when requested by ID.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
 * `trust` - present only on a `--policy-from` result; see below.
@@ -627,14 +685,15 @@ A `--policy-from` result adds one `trust` object and declares schema 4:
 
 Check keys:
 
-* `id`, `kind` (`inventory`, `hygiene` or `check`), `tier` (null for
+* `id`, `kind` (`inventory`, `hygiene`, `module-contracts` or `check`), `tier` (null for
   built-ins), `enforcement`, `adapter`, `evidence` (array),
   `metric_version`.
-* `execution` - `completed`, `budget` (a subprocess budget expired),
+* `execution` - `completed`, `budget` (a budget expired),
   `signal` or `error`. It says how the attempt to produce evidence ended,
   independently of its verdict. A run that exceeds its overall limit (the sum
-  of the checks' configured budgets plus a 300-second allowance) produces a
-  decision error instead of a check result.
+  of selected check budgets plus a 300-second allowance) produces a
+  decision error instead of a check result. The run limit adds 600 seconds
+  when module contracts are enabled, inventory succeeds and the policy declares at least two modules.
 * `outcome` - the adapter's raw verdict: `pass`, `fail`, `unsupported` or
   `error`. Tier 3 adapters later add `proved`, `no_counterexample` and
   `unknown`.
@@ -644,7 +703,8 @@ Check keys:
   judgement.
 * `caused_by` - the root check ids this failure follows from, or null for a
   root and for a satisfied entry; see [Roots and consequences](#roots-and-consequences).
-* `duration_seconds`, `budget_seconds` (null for built-ins).
+* `duration_seconds`, `budget_seconds`. The module contract reports 600 seconds when it attempts
+  extraction, covering extraction and edge evaluation. Built-ins otherwise report a null budget.
 * `diagnostics` - `argv` (array or null), `exit_code` (integer or null),
   `signal` (integer or null), `output_bytes`, `output_tail` (at most 4 KiB),
   `output_truncated`, and `error` when execution failed. Check subprocess
@@ -675,6 +735,16 @@ A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `locations` and `expired`. `locations` is an array of objects with `path`,
 `start_line` and `end_line`, or null when the source locations are incomplete.
 Baseline errors carry `error`.
+
+`module-contracts` uses matching `id`, `kind` and `adapter`, `enforcement = "enforced"`,
+and `metric_version = "module-contracts/1"`. Failed inventory makes the contract unsatisfied
+with `caused_by = ["inventory"]`. Its `findings` array retains complete ownership, extraction
+and interface diagnostics. Reader errors include `file`, `stage`, `line` and `message`.
+Each distinct violating edge produces a `module-interface` finding ordered by source path, line,
+target path and edge kind. It has `rule`, `edge` (`source`, `line`, `target`, `kind`),
+`source_module`, `target_module`, `failed_conditions` and `permitted_entry_points`.
+`failed_conditions` lists each applicable condition, `dependency-not-allowed` and
+`target-not-entry-point`. `permitted_entry_points` is sorted and can be empty.
 
 A completed `module_graph` check reports `measurement.modules` as sorted
 repository-relative paths and `measurement.edges` as objects with `source`, `target`
@@ -729,10 +799,10 @@ the existing order. When consequences exist, the next line is
 is spelled as the summary spells it: a check id or `obligation CLASS tier
 TIER`. A consequence still rejects and still exits 1.
 
-The decision is `rejected` when inventory or hygiene fails, when an enforced
+The decision is `rejected` when inventory, hygiene or module contracts fail, when an enforced
 check is not satisfied, or when any obligation is `unsatisfied`. A
-`check --only` run evaluates no obligations; it is `rejected` when inventory,
-hygiene or any enforced check that ran is not satisfied, and `partial` (exit
+`check --only` run evaluates no obligations; it is `rejected` when a built-in
+or any enforced check that ran is not satisfied, and `partial` (exit
 0) otherwise. `accepted_with_exceptions` means every obligation and enforced
 check is satisfied, but a baseline exception or a non-passing advisory check
 exists.
@@ -905,7 +975,7 @@ path with an embedded NUL is rejected the same way in either mode. It never repo
 * Debt result: `schema = 1`.
 * Metric versions: `command-exit/1`, `test-count/1`,
   `jscpd-clone-occurrences/1`, `python-lines/1`, `elisp-edebug/1`, `elisp-lint/1`, `verification/1`,
-  `inventory/1`, `hygiene/1`.
+  `inventory/1`, `hygiene/1`, `module-contracts/1`.
 
 The following proposals in the historical plans are superseded and are not part
 of the version-2 contract:

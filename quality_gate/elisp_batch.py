@@ -131,7 +131,7 @@ MODULE_GRAPH_READER = r"""
                      (eval-buffer buffer)))))
               (nreverse rows)))
         (error
-         (list (list 'outside error-line
+         (list (list 'reader-error error-line error-stage
                      (format "Emacs Lisp source with a %s error (%s)"
                              error-stage (error-message-string failure))))))))
 
@@ -139,6 +139,9 @@ MODULE_GRAPH_READER = r"""
     (pcase row
       (`(outside ,line ,description)
        (qg-graph-outside line description))
+      (`(reader-error ,line ,stage ,description)
+       (cons (cons 'stage stage)
+             (cons (cons 'kind "reader-error") (cdr (qg-graph-outside line description)))))
       (`(require ,line ,feature ,filename)
        (let ((candidates (if filename
                              (delq nil (list (gethash (concat filename ".el") modules)

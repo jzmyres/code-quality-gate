@@ -146,6 +146,10 @@ def _check_causes(
     config: Any, identifier: str, by_id: dict[str, Any]
 ) -> list[str] | None:
     """A check's root causes: ids for a consequence, null for a root."""
+    if identifier == "module-contracts" and _unsatisfied(by_id.get("inventory")):
+        return ["inventory"]
+    if identifier not in config.checks:
+        return None
     roots = _root_causes(config, identifier, by_id)
     return None if roots == [identifier] else roots
 
@@ -158,7 +162,7 @@ def check_causes(
     return {
         identifier: (
             _check_causes(config, identifier, by_id)
-            if identifier in config.checks and not result.is_satisfied()
+            if not result.is_satisfied()
             else None
         )
         for identifier, result in by_id.items()

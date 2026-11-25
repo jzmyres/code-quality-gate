@@ -17,6 +17,7 @@ DEFAULT_BUDGET_SECONDS = 600
 DEFAULT_TESTS_BUDGET_SECONDS = 900
 DEFAULT_CRAP_THRESHOLD = 6.0
 SUPPORTED_SCHEMA = 2
+MODULE_CONTRACTS_ID = "module-contracts"
 COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement", "direction")
 TOP_LEVEL_KEYS = (
     "schema",
@@ -29,6 +30,7 @@ TOP_LEVEL_KEYS = (
     "levels",
     "not_applicable",
     "protect",
+    "modules",
 )
 
 
@@ -92,6 +94,13 @@ class NotApplicable:
 
 
 @dataclass(frozen=True)
+class ModuleDef:
+    files: tuple[str, ...]
+    entry_points: tuple[str, ...]
+    allowed_dependencies: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     root: Path
@@ -104,6 +113,8 @@ class Config:
     checks: dict[str, CheckDef]
     required_tiers: tuple[int, ...]
     not_applicable: tuple[NotApplicable, ...]
+    modules: dict[str, ModuleDef]
+    module_contracts: bool
     protect_paths: tuple[str, ...] = ()
     module_dirs: tuple[str, ...] | None = None
 
@@ -316,6 +327,43 @@ def _optional_string_list(
     if key not in parent:
         return ()
     return _string_list(parent, key, path, full_key)
+
+
+def _validate_module_item(
+    path: Path, item: str, field: str, value: str, modules: dict[str, Any],
+) -> None:
+    if field == "allowed_dependencies":
+        if value not in modules:
+            raise _config_error(path, item, "a declared module", f"unknown module {value!r}")
+    elif "\x00" in value or {"", ".", ".."}.intersection(value.split("/")):
+        raise _config_error(path, item, "a canonical repository-relative path", repr(value))
+
+
+def _module_values(
+    raw: dict[str, Any], name: str, field: str, path: Path, modules: dict[str, Any],
+) -> tuple[str, ...]:
+    key = f"modules.{name}.{field}"
+    values = _string_list(raw, field, path, key)
+    if field == "files" and not values:
+        raise _config_error(path, key, "a non-empty list of file patterns", "an empty list")
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        item = f"{key}[{index}]"
+        _unique(seen, value, path, item, "a unique value", f"duplicate {value!r}", _config_error)
+        _validate_module_item(path, item, field, value, modules)
+    return values
+
+
+def _parse_modules(data: dict[str, Any], path: Path) -> dict[str, ModuleDef]:
+    raw_modules = _read_value(data, "modules", path, "[modules]", _TABLE)
+    fields = ("files", "entry_points", "allowed_dependencies")
+    modules = {}
+    for name in raw_modules:
+        key = f"modules.{name}"
+        raw = _read_value(raw_modules, name, path, key, _TABLE)
+        _check_keys(raw, fields, path, key)
+        modules[name] = ModuleDef(*(_module_values(raw, name, field, path, raw_modules) for field in fields))
+    return modules
 
 
 def _scope(
@@ -623,11 +671,29 @@ def _parse_checks(
         return {}
     checks: dict[str, CheckDef] = {}
     for name, raw in raw_checks.items():
+        if name == MODULE_CONTRACTS_ID:
+            _validate_module_contract_check(raw_checks, path)
+            continue
         checks[name] = _parse_check(name, raw, root, path, checks,
                                     candidate_root or root, parse_candidate_inputs)
     _validate_crap_before_verification(checks, path)
     _validate_baselines(checks, path, validate_headers=validate_headers)
     return checks
+
+
+def _validate_module_contract_check(checks: dict[str, Any], path: Path) -> None:
+    key = f"checks.{MODULE_CONTRACTS_ID}"
+    raw = _read_value(checks, MODULE_CONTRACTS_ID, path, key, _TABLE)
+    _check_keys(raw, ("adapter", "tier", "enforcement"), path, key)
+    adapter = _string(raw, "adapter", path, f"{key}.adapter")
+    if adapter != "module_contracts":
+        raise _config_error(
+            path, f"{key}.adapter", "module_contracts for this reserved check id", repr(adapter),
+        )
+    _integer(raw, "tier", path, f"{key}.tier", minimum=1, maximum=4)
+    enforcement = _string(raw, "enforcement", path, f"{key}.enforcement")
+    if enforcement != "enforced":
+        raise _config_error(path, f"{key}.enforcement", "enforced", repr(enforcement))
 
 
 def _header_string(
@@ -894,6 +960,9 @@ def _config_from_data(
     required_tiers = _parse_levels(data, path)
     not_applicable = _parse_not_applicable(data, classes, path)
     protect_paths = _parse_protect(data, path)
+    module_dirs = _parse_module_dirs(data, path)
+    module_contracts = MODULE_CONTRACTS_ID in data.get("checks", {})
+    modules = _parse_modules(data, path) if module_contracts or "modules" in data else {}
 
     return Config(
         path=path,
@@ -908,7 +977,9 @@ def _config_from_data(
         required_tiers=required_tiers,
         not_applicable=not_applicable,
         protect_paths=protect_paths,
-        module_dirs=_parse_module_dirs(data, path),
+        module_dirs=module_dirs,
+        modules=modules,
+        module_contracts=module_contracts,
     )
 
 

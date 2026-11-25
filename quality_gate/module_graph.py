@@ -5,7 +5,7 @@ import os.path
 import re
 import symtable
 from collections import Counter, deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from importlib.machinery import ModuleSpec, PathFinder, all_suffixes
@@ -15,7 +15,6 @@ from pathlib import Path
 from runpy import run_path
 from tokenize import open as open_source
 from typing import Any
-
 
 @dataclass(frozen=True)
 class GraphSpec:
@@ -33,6 +32,96 @@ class Edge:
 
     def to_json(self) -> dict[str, str | int]:
         return {"source": self.source, "target": self.target, "line": self.line, "kind": self.kind}
+
+
+def _pattern_owners(
+    modules: dict[str, Any], code_paths: frozenset[str], findings: list[dict],
+) -> dict[str, list[str]]:
+    matches: dict[str, list[str]] = {path: [] for path in sorted(code_paths)}
+    for name, module in sorted(modules.items()):
+        owned = set()
+        for index, pattern in enumerate(module.files):
+            paths = _matched_paths(matches, (pattern,))
+            owned.update(paths)
+            if not paths:
+                key = f"modules.{name}.files[{index}]"
+                findings.append({"rule": "unused-pattern", "module": name, "key": key, "pattern": pattern,
+                                 "message": f"{key}: pattern {pattern!r} matches no inventoried code file"})
+        for path in owned:
+            matches[path].append(name)
+    return matches
+
+
+def _entry_point_reason(path: str, name: str, files: set[str], matches: dict[str, list[str]]) -> str | None:
+    if path not in files:
+        return "absent from inventory"
+    if path not in matches:
+        return "not an inventoried code file"
+    owners = matches[path]
+    if owners == [name]:
+        return None
+    if len(owners) == 1:
+        return f"owned by {owners[0]}"
+    return f"has multiple module owners: {', '.join(owners)}" if owners else "has no module owner"
+
+
+def _entry_point_findings(
+    modules: dict[str, Any], present: set[str], matches: dict[str, list[str]],
+) -> Iterator[dict]:
+    for name, module in sorted(modules.items()):
+        for index, path in enumerate(module.entry_points):
+            if reason := _entry_point_reason(path, name, present, matches):
+                key = f"modules.{name}.entry_points[{index}]"
+                yield {"rule": "invalid-entry-point", "module": name, "key": key, "file": path,
+                       "reason": reason, "message": f"{key}: {path}: {reason}"}
+
+
+def resolve_ownership(
+    modules: dict[str, Any], files: Iterable[str], code_paths: frozenset[str],
+) -> tuple[dict[str, str], list[dict]]:
+    findings: list[dict] = []
+    matches = _pattern_owners(modules, code_paths, findings)
+    ownership = {}
+    for path, owners in matches.items():
+        if len(owners) == 1:
+            ownership[path] = owners[0]
+        elif owners:
+            findings.append({"rule": "ambiguous-ownership", "file": path, "owners": owners,
+                             "message": f"{path}: multiple module owners: {', '.join(owners)}"})
+        else:
+            findings.append({"rule": "uncovered-file", "file": path,
+                             "message": f"{path}: no declared module owner"})
+    findings.extend(_entry_point_findings(modules, set(files), matches))
+    return ownership, findings
+
+
+def _failed_interface_conditions(
+    modules: dict[str, Any], source: str, target: str, path: str,
+) -> list[str]:
+    failed = []
+    if target not in modules[source].allowed_dependencies:
+        failed.append("dependency-not-allowed")
+    if path not in modules[target].entry_points:
+        failed.append("target-not-entry-point")
+    return failed
+
+
+def interface_findings(
+    modules: dict[str, Any], owners: dict[str, str], edges: Iterable[Edge],
+) -> list[dict]:
+    distinct = {(edge.source, edge.line, edge.target, edge.kind): edge for edge in edges}
+    findings = []
+    for _, edge in sorted(distinct.items()):
+        source, target = owners[edge.source], owners[edge.target]
+        if source == target:
+            continue
+        if failed := _failed_interface_conditions(modules, source, target, edge.target):
+            findings.append({
+                "rule": "module-interface", "edge": edge.to_json(),
+                "source_module": source, "target_module": target,
+                "failed_conditions": failed, "permitted_entry_points": sorted(modules[target].entry_points),
+            })
+    return findings
 
 
 def _import_spec(name: str, directories: Sequence[str] | None) -> ModuleSpec | None:
@@ -734,7 +823,7 @@ def _shortest_cycle(component: list[str], outgoing: Outgoing) -> tuple[Edge, ...
     )
 
 
-def _matched_paths(modules: list[str], patterns: tuple[str, ...]) -> set[str]:
+def _matched_paths(modules: Iterable[str], patterns: tuple[str, ...]) -> set[str]:
     return {module for module in modules if any(fnmatchcase(module, pattern) for pattern in patterns)}
 
 
@@ -763,7 +852,11 @@ def _graph_report(
         "threshold": 0,
     }
     if outside:
-        report["outside_extractor"] = sorted(outside, key=lambda row: (row["file"], row["line"]))
+        projected = [
+            {"file": row["file"], "line": row["line"], "message": row["message"]}
+            for row in outside
+        ]
+        report["outside_extractor"] = sorted(projected, key=lambda row: (row["file"], row["line"]))
     return report
 
 
@@ -780,6 +873,11 @@ def dependencies(
         {"file": source, "line": row["line"], "message": row["message"]}
         for source, row in _elisp_records(elisp, "outside")
     ]
+    outside.extend(
+        {"file": source, "line": row["line"], "message": row["message"], "kind": "reader-error",
+         "stage": row["stage"]}
+        for source, row in _elisp_records(elisp, "reader-error")
+    )
     edges = _graph_edges(root, modules, python_modules, elisp, shell, outside)
     return modules, edges, outside
 
