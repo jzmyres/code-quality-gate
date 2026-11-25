@@ -635,11 +635,16 @@ class SharedSurfaceTests(FixtureCase):
             ) as enumerate_entries,
             mock.patch.object(checks, "module_ownership") as ownership,
             mock.patch.object(checks, "extract_contract_graph") as extract,
+            mock.patch.object(
+                checks, "_inventory_blocked_contracts", wraps=checks._inventory_blocked_contracts,
+            ) as blocked,
         ):
             result, document, findings = self.contract(1, "--base", "HEAD")
 
         self.assertEqual(document["decision"], "rejected")
         self.assertEqual(document["changed_paths"], ["README.md", "app/main.py"])
+        blocked.assert_called_once()
+        self.assertEqual(blocked.call_args.args[3], {"README.md", "app/main.py"})
         inventory = self.check_by_id(document, "inventory")
         self.assertFalse(inventory["satisfied"])
         self.assertEqual(inventory["execution"], "error")
@@ -840,13 +845,17 @@ class SharedSurfaceTests(FixtureCase):
         self.assertEqual(result.returncode, 2, output(result))
         self.assertEqual(document["decision"], "error")
         self.assertEqual(document["checks"], [])
+        error = document["error"]
         for fragment in (
             "modules.app.protected_paths[0]",
             "expected a regular file in diff base",
             "got gitlink 'vendor.md'",
         ):
-            self.assertIn(fragment, document["error"])
+            self.assertIn(fragment, error)
             self.assertIn(fragment, result.stderr)
+        prefix = f"{self.config_path}: modules.app.protected_paths[0]:"
+        self.assertTrue(error.startswith(prefix), error)
+        self.assertIn(error, result.stderr.splitlines())
 
     def test_opted_out_policy_does_not_validate_paths_against_a_base(self) -> None:
         config = self.config.replace('shared_base = "HEAD"\n', "")
