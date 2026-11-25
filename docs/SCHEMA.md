@@ -151,9 +151,10 @@ Rules:
   empty, `.` and `..` components and NUL characters. `allowed_dependencies` names modules anywhere
   in the table. The optional `protected_paths` array uses the same path validation and names
   exact, case-sensitive repository-relative files without glob syntax. Each path may be
-  declared only once across all modules. Non-code paths are allowed, and a declaration remains
-  valid when the file is deleted. Invalid declarations exit 2. The `module-contracts` check ID requires
-  `adapter = "module_contracts"`, a tier from 1 to 4 and `enforcement = "enforced"`.
+  declared only once across all modules. Existing directories are invalid. Non-code paths are
+  allowed, and a declaration remains valid when the file is deleted. Invalid declarations exit 2.
+  The `module-contracts` check ID requires `adapter = "module_contracts"`, a tier from 1 to 4
+  and `enforcement = "enforced"`.
   It produces a built-in result with a null tier and supplies no class obligation evidence.
   An optional nonblank `shared_base` revision opts into both shared entry point rules.
 * `tier` is an integer from 1 to 4. `enforcement` is `enforced` or
@@ -526,12 +527,14 @@ from the merge base. Otherwise, the check compares the run's resolved `QG_DIFF_B
 to `HEAD` when set, or the configured `shared_base` revision to `HEAD` when unset. Use
 `shared_base = "HEAD"` to check staged and unstaged edits on a plain local run. Each diff
 includes committed, staged and unstaged changes. Rename detection is disabled so the diff
-includes both names of a rename. Invalid bases and unreadable diffs are command errors.
+includes both names of a rename. Invalid bases and unreadable diffs are command errors even
+when inventory reports violations.
 
 The `shared-entry-point` rule blocks each pair of a changed protected path and a changed,
 present, uniquely owned code file outside the declared protected paths. Deleting or renaming
-a protected path counts as a change. Put the registration or documentation beside the feature
-file in its owning module.
+a protected path counts as a change. The rule can report these pairs even when inventory
+enumeration succeeds with violations. Put the registration or documentation beside the
+feature file in its owning module.
 
 The `multi-module-file` rule blocks each present, index-tracked code file with direct
 dependents in at least two declared modules in the full extracted graph, even with an

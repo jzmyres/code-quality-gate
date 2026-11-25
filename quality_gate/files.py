@@ -652,14 +652,6 @@ _RULE_CHECKS = (
     ),
 )
 
-_STALE_RULE_CHECKS = (
-    (
-        lambda matched: matched == 0,
-        "rule[{index}] (pattern {pattern}): matches no file",
-    ),
-)
-
-
 @dataclass
 class _InventoryValidator:
     root: Path
@@ -676,19 +668,16 @@ class _InventoryValidator:
         self._check_classes()
         self._check_rules()
         self._classify_files()
-        if self.config.module_dirs is not None:
-            self._check_module_placement(set(files) - self.gitlinks, self.config.module_dirs)
-            self.violations.extend(
-                _unused_module_violations(self.entries, self.gitlinks, self.config.module_dirs)
-            )
-        for index, rule in enumerate(self.config.rules):
-            values = {
-                "index": rule.index,
-                "pattern": repr(rule.pattern),
-            }
-            for invalid, message in _STALE_RULE_CHECKS:
-                if invalid(self.matched[index]):
-                    self.violations.append(message.format(**values))
+        paths = set(files) - self.gitlinks
+        outside: list[str] = []
+        modules = self.config.module_dirs
+        if modules is not None:
+            outside = self._check_module_placement(paths, modules)
+            self.violations.extend(_unused_module_violations(self.entries, self.gitlinks, modules))
+        if self.config.shared_base is not None:
+            for relative in sorted(paths.difference(self.classes, outside)):
+                self._record_source(relative)
+        self.violations.extend(_unused_rule_violations(self.config.rules, self.matched))
         classes = InventoryClasses(self.classes, self.sources, _tracked_paths(self.entries))
         return files, classes, self.violations
 
@@ -775,9 +764,10 @@ class _InventoryValidator:
         self.sources[relative] = source
         return source
 
-    def _check_module_placement(self, paths: set[str], modules: tuple[str, ...]) -> None:
+    def _check_module_placement(self, paths: set[str], modules: tuple[str, ...]) -> list[str]:
         declared = _known_names(map(repr, modules))
-        for relative in _outside_module_paths(paths, modules):
+        outside = _outside_module_paths(paths, modules)
+        for relative in outside:
             if relative not in self.classes:
                 self._record_source(relative)
             source = self.sources.get(relative)
@@ -785,6 +775,7 @@ class _InventoryValidator:
                 self.violations.append(
                     f"{relative}: code file outside declared module directories ({declared})"
                 )
+        return outside
 
 
 def _outside_module_paths(paths: set[str], modules: tuple[str, ...]) -> list[str]:
@@ -794,6 +785,14 @@ def _outside_module_paths(paths: set[str], modules: tuple[str, ...]) -> list[str
 
 def _tracked_paths(entries: list[GitFile]) -> set[str]:
     return {entry.path for entry in entries if entry.mode is not None}
+
+
+def _unused_rule_violations(rules: tuple[Rule, ...], matched: list[int]) -> list[str]:
+    return [
+        f"rule[{rule.index}] (pattern {rule.pattern!r}): matches no file"
+        for rule, hits in zip(rules, matched, strict=True)
+        if hits == 0
+    ]
 
 
 def _unused_module_violations(

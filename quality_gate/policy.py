@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import operator
+import stat
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -361,7 +362,21 @@ def _module_values(
     return values
 
 
-def _parse_modules(data: dict[str, Any], path: Path) -> dict[str, ModuleDef]:
+def _validate_protected_path(root: Path, path: Path, item: str, value: str) -> None:
+    _validate_module_path(path, item, value)
+    if set(value).intersection("*?[]"):
+        raise _config_error(path, item, "an exact path without glob syntax", repr(value))
+    try:
+        mode = (root / value).lstat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError as error:
+        raise _config_error(path, item, "an inspectable file path", str(error)) from error
+    if stat.S_ISDIR(mode):
+        raise _config_error(path, item, "a repository-relative file path", f"directory {value!r}")
+
+
+def _parse_modules(data: dict[str, Any], path: Path, root: Path) -> dict[str, ModuleDef]:
     raw_modules = _read_value(data, "modules", path, "[modules]", _TABLE)
     fields = ("files", "entry_points", "allowed_dependencies")
     protected: set[str] = set()
@@ -374,9 +389,7 @@ def _parse_modules(data: dict[str, Any], path: Path) -> dict[str, ModuleDef]:
         paths = _optional_string_list(raw, "protected_paths", path, protected_key)
         for index, value in enumerate(paths):
             item = f"{protected_key}[{index}]"
-            _validate_module_path(path, item, value)
-            if set(value).intersection("*?[]"):
-                raise _config_error(path, item, "an exact path without glob syntax", repr(value))
+            _validate_protected_path(root, path, item, value)
             _unique(protected, value, path, item, "a unique protected path", f"duplicate {value!r}",
                     _config_error)
         modules[name] = ModuleDef(
@@ -990,7 +1003,9 @@ def _config_from_data(
     protect_paths = _parse_protect(data, path)
     module_dirs = _parse_module_dirs(data, path)
     module_contracts = MODULE_CONTRACTS_ID in data.get("checks", {})
-    modules = _parse_modules(data, path) if module_contracts or "modules" in data else {}
+    modules = (
+        _parse_modules(data, path, candidate_root or root) if module_contracts or "modules" in data else {}
+    )
 
     return Config(
         path=path,

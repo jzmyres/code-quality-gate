@@ -640,7 +640,7 @@ def _run_inventory(
         messages = [f"inventory: {violation}" for violation in violations]
         for message in messages:
             print(message, file=sys.stderr)
-        return 1, [], {}, messages, "completed", time.monotonic() - start
+        return 1, files, classes, messages, "completed", time.monotonic() - start
     print(f"inventory: {len(files)} files match {len(config.rules)} rules")
     return 0, files, classes, [], "completed", time.monotonic() - start
 
@@ -1074,8 +1074,10 @@ def _extract_module_contracts(
 
 
 def _shared_changed_paths(
-    root: Path, base_revision: str, diff: DiffBaseOverride,
+    root: Path, base_revision: str | None, diff: DiffBaseOverride,
 ) -> set[str] | frozenset[str]:
+    if base_revision is None:
+        return frozenset()
     if diff.changed_paths is not None:
         return diff.changed_paths
     try:
@@ -1086,11 +1088,8 @@ def _shared_changed_paths(
 
 
 def _shared_entry_point_findings(
-    root: Path, config: Config, owners: dict[str, str], diff: DiffBaseOverride,
+    config: Config, owners: dict[str, str], changed: set[str] | frozenset[str],
 ) -> list[dict]:
-    if config.shared_base is None:
-        return []
-    changed = _shared_changed_paths(root, config.shared_base, diff)
     protected = {path for module in config.modules.values() for path in module.protected_paths}
     edited_protected = sorted(protected.intersection(changed))
     features = sorted((changed - protected).intersection(owners))
@@ -1101,6 +1100,15 @@ def _shared_entry_point_findings(
                     f"documentation beside {feature} in module {owners[feature]}."}
         for feature in features for path in edited_protected
     ]
+
+
+def _inventory_shared_owners(
+    config: Config, files: list[str], classes: dict[str, str], changed: set[str] | frozenset[str],
+) -> dict[str, str]:
+    if changed and isinstance(classes, InventoryClasses):
+        owners, _ = module_ownership(config, files, classes)
+        return owners
+    return {}
 
 
 def _run_module_contracts(
@@ -1114,20 +1122,21 @@ def _run_module_contracts(
     graph = None
     budget = None
     messages = []
+    changed = _shared_changed_paths(root, config.shared_base, diff)
     if inventory_code != 0:
         execution = "error"
-        messages.append("module-contracts: skipped because inventory failed")
+        messages.append("module-contracts: graph checks skipped because inventory failed")
+        owners = _inventory_shared_owners(config, files, classes, changed)
     else:
         assert isinstance(classes, InventoryClasses)
         owners, findings = module_ownership(config, files, classes)
-        shared_findings = _shared_entry_point_findings(root, config, owners, diff)
         if not findings and len(config.modules) >= 2:
             budget = RATCHET_BUDGET_SECONDS
             graph, execution = _extract_module_contracts(
                 root, config, owners, classes, evidence_dir, findings,
             )
-        findings.extend(shared_findings)
-        messages.extend(f"module-contracts: {_contract_message(row)}" for row in findings)
+    findings.extend(_shared_entry_point_findings(config, owners, changed))
+    messages.extend(f"module-contracts: {_contract_message(row)}" for row in findings)
     for message in messages:
         print(message, file=sys.stderr)
     result = _builtin_result(
@@ -1576,10 +1585,13 @@ def _selected_check_ids(config: Config, only_ids: list[str] | None) -> list[str]
     return selected
 
 
-def _report_affected_scope(document: dict[str, Any], files: list[str], changed: set[str] | None) -> None:
+def _report_affected_scope(
+    document: dict[str, Any], files: list[str], changed: set[str] | None, inventory_code: int,
+) -> None:
     if changed is None:
         return
-    selection = CheckSelection(dict.fromkeys(files, "full run"), {}, "full run").report()
+    selected = dict.fromkeys(files, "full run") if inventory_code == 0 else {}
+    selection = CheckSelection(selected, {}, "full run").report()
     for result in document["checks"]:
         if result["kind"] in BUILTIN_RESULT_KINDS:
             result["selection"] = selection
@@ -1609,7 +1621,7 @@ def _check_command(
         )
     )
     exit_code, document = _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
-    _report_affected_scope(document, files, changed)
+    _report_affected_scope(document, files, changed, code)
     return exit_code, document
 
 

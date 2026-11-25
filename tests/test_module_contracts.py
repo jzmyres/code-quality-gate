@@ -9,9 +9,9 @@ from unittest import mock
 
 from support import BASE_CONFIG, FixtureCase, baseline_text, output, with_clones
 
-from quality_gate import adapters, checks, module_graph, runner
+from quality_gate import adapters, checks, files, module_graph, runner
 from quality_gate.files import validate_inventory
-from quality_gate.policy import load_config
+from quality_gate.policy import GateError, load_config
 
 CONTRACT_CHECK = """\
 [checks.module-contracts]
@@ -571,6 +571,14 @@ class SharedSurfaceTests(FixtureCase):
     def change_feature(self) -> None:
         self.add_file("app/main.py", "import library.api\nvalue = 2\n")
 
+    def assert_command_error(self, message: str, *args: str, env: dict[str, str] | None = None):
+        result, document = self.run_json(*args, env=env)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn(message, document["error"])
+        self.assertIn(message, result.stderr)
+        return result
+
     def test_shared_entry_point_blocks_full_only_and_trusted_checks(self) -> None:
         trusted = self.trusted_directory("HEAD")
         self.write_config(self.config.replace('shared_base = "HEAD"\n', ""))
@@ -598,6 +606,27 @@ class SharedSurfaceTests(FixtureCase):
         self.change_feature()
         document = self.assert_shared_entry_point("--base", "HEAD")
         self.assertEqual(document["changed_paths"], ["MOVED.md", "README.md", "app/main.py"])
+
+    def test_protected_deletion_reports_the_pair_when_its_inventory_rule_is_unmatched(self) -> None:
+        (self.repo / "README.md").unlink()
+        self.change_feature()
+        for args in ((), ("--base", "HEAD")):
+            with self.subTest(args=args), mock.patch.object(checks, "extract_contract_graph") as extract:
+                document = self.assert_shared_entry_point(*args)
+                extract.assert_not_called()
+                inventory = self.check_by_id(document, "inventory")
+                self.assertFalse(inventory["satisfied"])
+                self.assertIn("pattern '*.md'): matches no file", inventory["diagnostics"]["output_tail"])
+
+    def test_unclassified_code_can_be_a_uniquely_owned_feature(self) -> None:
+        config = self.config.replace('pattern = "*.py"', 'pattern = "library/*.py"')
+        config = config.replace("[code]", 'module_dirs = ["app", "library"]\n\n[code]')
+        self.write_config(config)
+        self.change_feature()
+        self.add_file("README.md", "# changed\n")
+        document = self.assert_shared_entry_point()
+        inventory = self.check_by_id(document, "inventory")
+        self.assertIn("app/main.py: unclassified", inventory["diagnostics"]["output_tail"])
 
     def test_pairs_are_ordered_and_protected_code_is_excluded_as_a_feature(self) -> None:
         self.write_config(self.config.replace('["README.md"]', '["library/z.py", "README.md"]'))
@@ -681,10 +710,40 @@ class SharedSurfaceTests(FixtureCase):
                     self.write_config(self.config.replace(
                         'shared_base = "HEAD"', f'shared_base = "{invalid}"',
                     ))
-                result, document = self.run_json(*args, env=env)
-                self.assertEqual(result.returncode, 2, output(result))
-                self.assertEqual(document["decision"], "error")
-                self.assertIn(invalid, document["error"])
+                self.assert_command_error(invalid, *args, env=env)
+
+    def test_invalid_base_is_a_command_error_with_an_unclassified_file(self) -> None:
+        self.add_file("unknown.txt", "")
+        invalid = "qg-unknown-revision"
+        for args, env in ((("--base", invalid), None), ((), {"QG_DIFF_BASE": invalid})):
+            with self.subTest(args=args, env=env):
+                self.assert_command_error(invalid, *args, env=env)
+
+    def test_unreadable_diff_is_a_command_error_with_an_unclassified_file(self) -> None:
+        self.add_file("unknown.txt", "")
+        original = files._git
+
+        def unreadable_diff(root, args, operation):
+            if args[0] == "diff":
+                raise GateError(f"{operation} failed: unreadable diff")
+            return original(root, args, operation)
+
+        with mock.patch.object(files, "_git", side_effect=unreadable_diff):
+            for args in ((), ("--base", "HEAD")):
+                with self.subTest(args=args):
+                    self.assert_command_error("unreadable diff", *args)
+
+    def test_rejects_an_existing_directory_as_a_protected_path(self) -> None:
+        self.write_config(self.config.replace('protected_paths = ["README.md"]',
+                                              'protected_paths = ["library"]'))
+        self.commit_all("declare a directory as a protected path")
+        trusted = self.trusted_directory("HEAD")
+        self.change_feature()
+        self.add_file("library/api.py", "value = 3\n")
+        for args in ((), ("--policy-from", str(trusted))):
+            with self.subTest(args=args):
+                result = self.assert_command_error("directory 'library'", *args)
+                self.assertIn("modules.app.protected_paths[0]", result.stderr)
 
     def test_rejects_invalid_protected_paths(self) -> None:
         for value in ('"README.md"', "[1]", '[""]', '["/README.md"]', '["docs/../README.md"]',
