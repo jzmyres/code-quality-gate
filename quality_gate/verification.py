@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .files import _regular_interpreter, source_languages
+from .files import source_languages
 from .policy import CheckDef, Config, GateError, _string
 from .ratchet import Domain, Finding, Location
 from .runner import Diagnostics, mark_step
@@ -297,22 +297,6 @@ def _verification_counts(
         assert recorded is not None
         counts.append((identifier, *recorded))
     return counts, None
-
-
-PYTHON_INTERPRETER = re.compile(r"python(?:3(?:\.[0-9]+)?)?")
-
-
-def _is_python_program(root: Path, relative: str) -> bool:
-    if relative.endswith(".py"):
-        return True
-    try:
-        interpreter = _regular_interpreter(root / relative)
-    except OSError as error:
-        raise GateError(f"cannot read shebang of {relative}: {error}") from error
-    return (
-        interpreter is not None
-        and PYTHON_INTERPRETER.fullmatch(interpreter) is not None
-    )
 
 
 def _verification_domain(findings: list[Any]) -> Domain:

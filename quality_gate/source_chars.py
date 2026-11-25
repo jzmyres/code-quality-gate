@@ -15,8 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .clones import _read_regular
-from .files import DiffBase, _git, _split_nul, _untracked_files, diff_base
+from .files import DiffBase, _git, _split_nul, _untracked_files, diff_base, read_regular
 from .policy import (
     ConfigError,
     GateError,
@@ -180,7 +179,7 @@ def _file_findings(relative: str, data: bytes) -> list[Finding]:
 def measure_source_chars(root: Path, files: list[str]) -> list[Finding]:
     findings: list[Finding] = []
     for relative in files:
-        data = _read_regular(root, relative)
+        data = read_regular(root, relative)
         if data is None:
             findings.append(_not_scanned_finding(relative))
         else:

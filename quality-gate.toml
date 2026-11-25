@@ -103,6 +103,120 @@ pattern = "LICENSE"
 class = "doc"
 reason = "AGPL-3.0 licence text"
 
+[modules.core]
+files = [
+    "qg.py",
+    "quality_gate/__init__.py",
+    "quality_gate/adapters.py",
+    "quality_gate/checks.py",
+    "quality_gate/cli.py",
+    "quality_gate/files.py",
+    "quality_gate/gate_result.py",
+    "quality_gate/json_input.py",
+    "quality_gate/module_graph.py",
+    "quality_gate/output_patterns.py",
+    "quality_gate/payload.py",
+    "quality_gate/policy.py",
+    "quality_gate/ratchet.py",
+    "quality_gate/regexrun.py",
+    "quality_gate/runner.py",
+    "quality_gate/tools.py",
+    "quality_gate/trust.py",
+    "quality_gate/worklist.py",
+]
+entry_points = [
+    "quality_gate/adapters.py",
+    "quality_gate/checks.py",
+    "quality_gate/cli.py",
+    "quality_gate/files.py",
+    "quality_gate/json_input.py",
+    "quality_gate/module_graph.py",
+    "quality_gate/output_patterns.py",
+    "quality_gate/payload.py",
+    "quality_gate/policy.py",
+    "quality_gate/ratchet.py",
+    "quality_gate/runner.py",
+    "quality_gate/tools.py",
+    "quality_gate/trust.py",
+    "quality_gate/worklist.py",
+]
+allowed_dependencies = ["python", "elisp", "other-adapters"]
+
+[modules.python]
+files = [
+    "quality_gate/coverage_tool.py",
+    "quality_gate/covrun.py",
+    "quality_gate/python_crap.py",
+    "quality_gate/python_mutation.py",
+    "quality_gate/python_shape.py",
+    "quality_gate/python_tests.py",
+    "quality_gate/test_shards.py",
+    "quality_gate/variant_dispatch.py",
+]
+entry_points = [
+    "quality_gate/coverage_tool.py",
+    "quality_gate/python_crap.py",
+    "quality_gate/python_mutation.py",
+    "quality_gate/python_shape.py",
+    "quality_gate/python_tests.py",
+    "quality_gate/variant_dispatch.py",
+]
+allowed_dependencies = ["core"]
+
+[modules.elisp]
+files = [
+    "quality_gate/elisp_batch.py",
+    "quality_gate/elisp_crap.py",
+    "quality_gate/elisp_lint.py",
+    "quality_gate/elisp_rules.py",
+    "quality_gate/elisp_tests.py",
+    "quality_gate/elisp/*.el",
+]
+entry_points = [
+    "quality_gate/elisp_batch.py",
+    "quality_gate/elisp_crap.py",
+    "quality_gate/elisp_lint.py",
+    "quality_gate/elisp_tests.py",
+    "quality_gate/elisp/qg-elisp-child.el",
+    "quality_gate/elisp/qg-elisp-complexity.el",
+    "quality_gate/elisp/qg-elisp-lint.el",
+    "quality_gate/elisp/qg-env-surface.el",
+]
+allowed_dependencies = ["core"]
+
+[modules.other-adapters]
+files = [
+    "quality_gate/clones.py",
+    "quality_gate/command.py",
+    "quality_gate/comments.py",
+    "quality_gate/env_surface.py",
+    "quality_gate/secrets.py",
+    "quality_gate/shell_syntax.py",
+    "quality_gate/source_chars.py",
+    "quality_gate/verification.py",
+]
+entry_points = [
+    "quality_gate/clones.py",
+    "quality_gate/command.py",
+    "quality_gate/comments.py",
+    "quality_gate/env_surface.py",
+    "quality_gate/secrets.py",
+    "quality_gate/shell_syntax.py",
+    "quality_gate/source_chars.py",
+    "quality_gate/verification.py",
+]
+allowed_dependencies = ["core", "elisp"]
+
+[modules.tests]
+files = ["tests/*.py", "tests/elisp/*.el"]
+entry_points = []
+allowed_dependencies = ["core", "python", "elisp", "other-adapters"]
+
+[checks.module-contracts]
+adapter = "module_contracts"
+tier = 1
+enforcement = "enforced"
+
 [checks.ruff]
 adapter = "command"
 tier = 1

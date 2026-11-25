@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from .files import DiffBase, _git, _split_nul, _untracked_files, diff_base
+from .files import DiffBase, _git, _split_nul, _untracked_files, diff_base, is_python_program
 from .policy import (
     ConfigError,
     GateError,
@@ -40,7 +40,6 @@ from .python_crap import (
 )
 from .ratchet import Domain, Finding, Location
 from .runner import mark_step
-from .verification import _is_python_program
 
 
 if TYPE_CHECKING:
@@ -491,7 +490,7 @@ def _scan_files(
     measured = set(scoped)
     indexes: dict[str, FileIndex] = {}
     for relative in context.files:
-        if relative in measured or not _is_python_program(
+        if relative in measured or not is_python_program(
             context.root, relative
         ):
             continue

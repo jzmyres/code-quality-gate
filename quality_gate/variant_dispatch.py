@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .files import DiffBase, diff_base
+from .files import DiffBase, diff_base, is_python_program
 from .policy import ConfigError, GateError, _optional_string
 from .python_crap import (
     _called_name,
@@ -32,7 +32,6 @@ from .python_crap import (
 from .python_shape import SCOPES, _diff_lines, _parse_tree, _read_source, _touched
 from .ratchet import Domain, Finding, Location
 from .runner import mark_step
-from .verification import _is_python_program
 
 
 if TYPE_CHECKING:
@@ -826,7 +825,7 @@ def _measure(
     owners: list[Owner] = []
     trials: list[tuple[Finding, Owner]] = []
     for relative in selected:
-        if _is_python_program(context.root, relative):
+        if is_python_program(context.root, relative):
             source = _read_source(context.root, relative)
             owners.extend(_python_owners(relative, source))
             trials.extend(_python_trials(relative, source))

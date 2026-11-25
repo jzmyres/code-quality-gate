@@ -67,6 +67,7 @@ SOURCE_LANGUAGE_BY_SUFFIX = {
 _INTERPRETER_LANGUAGE = dict.fromkeys(
     ("sh", "bash", "rbash", "dash", "ksh", "mksh", "posh"), "bash",
 ) | {"python": "python", "emacs": "lisp"}
+_PYTHON_INTERPRETER = re.compile(r"python(?:3(?:\.[0-9]+)?)?")
 _INTERPRETER_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*$")
 DIFF_BASE_ENV = "QG_DIFF_BASE"
 STANDALONE_BUILTINS = ("inventory", "hygiene")
@@ -447,6 +448,53 @@ def _regular_interpreter(path: Path) -> str | None:
     if not stat.S_ISREG(path.lstat().st_mode):
         return None
     return _shebang_interpreter(_shebang_line(path), path)
+
+
+def is_python_program(root: Path, relative: str) -> bool:
+    if relative.endswith(".py"):
+        return True
+    try:
+        interpreter = _regular_interpreter(root / relative)
+    except OSError as error:
+        raise GateError(f"cannot read shebang of {relative}: {error}") from error
+    return (
+        interpreter is not None
+        and _PYTHON_INTERPRETER.fullmatch(interpreter) is not None
+    )
+
+
+def _parent_fd(root: Path, relative: str) -> int:
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in PurePosixPath(relative).parts[:-1]:
+            following = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = following
+        return descriptor
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
+def read_regular(root: Path, relative: str) -> bytes | None:
+    parent = -1
+    try:
+        parent = _parent_fd(root, relative)
+        name = PurePosixPath(relative).name
+        if not stat.S_ISREG(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+            return None
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise GateError(f"cannot scan {relative}: expected a regular file")
+            return stream.read()
+    except OSError as error:
+        raise GateError(f"cannot scan {relative}: {error}") from error
+    finally:
+        if parent >= 0:
+            os.close(parent)
 
 
 @dataclass(frozen=True)

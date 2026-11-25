@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 import sys
 import tempfile
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .files import SOURCE_LANGUAGE_BY_SUFFIX, source_languages
+from .files import SOURCE_LANGUAGE_BY_SUFFIX, read_regular, source_languages
 from .json_input import load_json
 from .policy import (
     DEFAULT_MAX_BYTES,
@@ -521,7 +519,7 @@ def _clone_inputs(
 
 
 def _copy_clone_input(root: Path, path: str, target: Path) -> None:
-    content = _read_regular(root, path)
+    content = read_regular(root, path)
     if content is None:
         raise GateError(f"cannot copy clone input {path}: expected a regular file")
     try:
@@ -558,40 +556,6 @@ def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
     ]
 
 
-def _parent_fd(root: Path, relative: str) -> int:
-    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for part in PurePosixPath(relative).parts[:-1]:
-            following = os.open(
-                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor
-            )
-            os.close(descriptor)
-            descriptor = following
-        return descriptor
-    except OSError:
-        os.close(descriptor)
-        raise
-
-
-def _read_regular(root: Path, relative: str) -> bytes | None:
-    parent = -1
-    try:
-        parent = _parent_fd(root, relative)
-        name = PurePosixPath(relative).name
-        if not stat.S_ISREG(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
-            return None
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-        with os.fdopen(fd, "rb") as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise GateError(f"cannot scan {relative}: expected a regular file")
-            return stream.read()
-    except OSError as error:
-        raise GateError(f"cannot scan {relative}: {error}") from error
-    finally:
-        if parent >= 0:
-            os.close(parent)
-
-
 def _directive_lines(
     relative: str, data: bytes
 ) -> list[tuple[str, int, str]]:
@@ -607,7 +571,7 @@ def _directive_lines(
 def _directive_matches(root: Path, files: list[str]) -> list[tuple[str, int, str]]:
     matches: list[tuple[str, int, str]] = []
     for relative in files:
-        data = _read_regular(root, relative)
+        data = read_regular(root, relative)
         if data is not None:
             matches.extend(_directive_lines(relative, data))
     return matches

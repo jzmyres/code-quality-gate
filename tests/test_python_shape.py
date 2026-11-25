@@ -2002,6 +2002,13 @@ class HelperInputTests(ShapeCase):
 
 
 SHIPPED_POLICY = (GATE / "quality-gate.toml").read_text(encoding="utf-8")
+SHIPPED_FIXTURE_MODULES = """\
+[modules.fixture]
+files = ["*"]
+entry_points = []
+allowed_dependencies = []
+
+"""
 
 SHIPPED_FILES = {
     "qg.py": "VALUE = 1\n",
@@ -2047,7 +2054,9 @@ class ShippedPolicyTests(FixtureCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.write_config(SHIPPED_POLICY)
+        start = SHIPPED_POLICY.index("[modules.core]")
+        end = SHIPPED_POLICY.index("[checks.module-contracts]", start)
+        self.write_config(SHIPPED_POLICY[:start] + SHIPPED_FIXTURE_MODULES + SHIPPED_POLICY[end:])
         (self.repo / "a.py").unlink()
         for relative, content in SHIPPED_FILES.items():
             self.add_file(relative, content)
@@ -2060,6 +2069,8 @@ class ShippedPolicyTests(FixtureCase):
             "check", "--json", "--only", "shape", env=env
         )
         document = self.parse_json(result)
+        contract = self.check_by_id(document, "module-contracts")
+        self.assertEqual(contract["outcome"], "pass", output(result))
         return result, document, self.check_by_id(document, "shape")
 
     def add_wrapper(self) -> str:
