@@ -826,10 +826,6 @@ class _PytestEvidence:
     executed: tuple[str, ...]
     assertions: tuple[str, ...]
 
-    @property
-    def cohort(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self.collected, self.executed
-
 
 def _pytest_names(receipt: dict[str, Any], key: str) -> tuple[str, ...]:
     values = receipt.get(key)
@@ -1133,7 +1129,7 @@ def _pytest_outcome(
     assert isinstance(baseline, _PytestEvidence)
     if evidence is None:
         return "timed out"
-    if evidence.cohort != baseline.cohort:
+    if (evidence.collected, evidence.executed) != (baseline.collected, baseline.executed):
         raise GateError(
             f"python-mutation: pytest mutant run for {function.identity} "
             "collected or executed different tests from the original"

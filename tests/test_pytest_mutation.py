@@ -233,12 +233,22 @@ class ReceiptTests(PytestMutationCase):
 
     def test_mutant_outcome_requires_identical_cohort(self) -> None:
         function = SimpleNamespace(identity="pkg/app.py:flag")
-        baseline = python_mutation._PytestEvidence(("one",), ("one",), ())
-        other = python_mutation._PytestEvidence(("two",), ("two",), ())
+        collected = ("one", "two")
+        executed = ("one",)
+        baseline = python_mutation._PytestEvidence(collected, executed, ())
+        killed = python_mutation._PytestEvidence(collected, executed, executed)
         self.assertEqual(python_mutation._pytest_outcome(function, baseline, None), "timed out")
         self.assertEqual(python_mutation._pytest_outcome(function, baseline, baseline), "survived")
-        with self.assertRaisesRegex(GateError, "different tests"):
-            python_mutation._pytest_outcome(function, baseline, other)
+        self.assertEqual(python_mutation._pytest_outcome(function, baseline, killed), "killed")
+        changed_cohorts = (
+            python_mutation._PytestEvidence(("one", "three"), executed, executed),
+            python_mutation._PytestEvidence(collected, ("two",), ("two",)),
+        )
+        for other in changed_cohorts:
+            with self.subTest(other=other), self.assertRaisesRegex(
+                GateError, "collected or executed different tests from the original",
+            ):
+                python_mutation._pytest_outcome(function, baseline, other)
 
 
 class HookEvidenceTests(unittest.TestCase):
@@ -250,6 +260,44 @@ class HookEvidenceTests(unittest.TestCase):
         report = SimpleNamespace(when=when, failed=failed, skipped=skipped)
         with self.assertRaises(StopIteration):
             hook.send(SimpleNamespace(get_result=lambda: report))
+
+    def test_record_item_checks_the_loaded_module_origin(self) -> None:
+        test_file = Path("/copied/test_file.py")
+        module = ModuleType("test_file")
+        module.__file__ = str(test_file)
+        item = SimpleNamespace(
+            path=test_file, nodeid="test_file.py::test_one",
+            getparent=mock.Mock(return_value=SimpleNamespace(obj=module)),
+        )
+        evidence = pytest_mutation_run.Evidence({test_file}, object, AssertionError)
+        evidence._record_item(item)
+        self.assertEqual(evidence.collected, [item.nodeid])
+        self.assertEqual(evidence.errors, set())
+
+        module.__file__ = "/other/test_file.py"
+        item.nodeid = "test_file.py::test_two"
+        evidence._record_item(item)
+        self.assertEqual(evidence.collected, ["test_file.py::test_one", item.nodeid])
+        self.assertEqual(evidence.errors, {
+            f"pytest loaded a test module outside its copied file: {item.nodeid}",
+        })
+
+    def test_only_assertions_and_explicit_failures_in_the_call_phase_kill(self) -> None:
+        evidence = pytest_mutation_run.Evidence(set(), object, LookupError)
+        cases = (
+            ("call", AssertionError(), True),
+            ("call", LookupError(), True),
+            ("call", RuntimeError(), False),
+            ("call", None, False),
+            ("setup", AssertionError(), False),
+            ("teardown", LookupError(), False),
+        )
+        for phase, exception, expected in cases:
+            with self.subTest(phase=phase, exception=exception):
+                report = SimpleNamespace(when=phase)
+                excinfo = None if exception is None else SimpleNamespace(value=exception)
+                call = SimpleNamespace(excinfo=excinfo)
+                self.assertIs(evidence._is_assertion(report, call), expected)
 
     def test_hooks_distinguish_assertions_skips_and_fixture_errors(self) -> None:
         test_file = Path("/copied/test_file.py")
