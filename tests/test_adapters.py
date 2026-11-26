@@ -18,6 +18,7 @@ from test_python_tests import tests_config
 
 from quality_gate.files import DiffBaseOverride
 from quality_gate.python_tests import _parse_python_tests
+from quality_gate.runner import Diagnostics
 
 sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
@@ -401,6 +402,50 @@ class StubAdapterTests(unittest.TestCase):
         (self.root / "quality-gate.toml").write_text(text, encoding="utf-8")
         return policy.load_config(self.root)
 
+    def test_adapter_context_requires_keyword_inventory(self) -> None:
+        config = self.config(STUB_CONFIG)
+        args = (self.root, config, config.checks["stub"], ["a.py"], {}, "stub", {}, self.root)
+        with self.assertRaisesRegex(TypeError, "keyword-only argument: 'inventory_files'"):
+            adapters.AdapterContext(*args)
+
+    def test_elisp_crap_uses_the_longest_inventory_path_for_baseline_subjects(self) -> None:
+        selected_path = "lisp/calc.el"
+        unselected_path = "lisp/calc.el:variant.el"
+        context = adapters.AdapterContext(
+            self.root, None, None, [selected_path], {}, "elisp-crap", {}, self.root,
+            inventory_files=[selected_path, unselected_path],
+        )
+        selected = f"{selected_path}:compute"
+        unselected = f"{unselected_path}:compute"
+        entries = [ratchet.BaselineEntry(subject, 1, "reviewed") for subject in (selected, unselected)]
+        domain = adapters.elisp_crap._domain(context, [selected_path], entries)
+        self.assertEqual(domain.subjects, (selected,))
+
+    def test_clone_baseline_sees_inventory_outside_the_planned_inputs(self) -> None:
+        (self.root / "README.md").write_text("Fixture documentation.\n", encoding="utf-8")
+        (self.root / "quality-gate-clones.toml").write_text(
+            baseline_text([{
+                "subject": "fp-present", "files": ["a.py", "README.md"], "reason": "reviewed",
+            }]),
+            encoding="utf-8",
+        )
+        config = self.config(with_clones())
+        check = config.checks["clones"]
+        classes = {"a.py": "python", "README.md": "doc"}
+        graph = (set(classes), {"a.py": "changed"}, {"a.py": "changed"})
+        measurement = adapters.clones.CloneMeasurement([], Diagnostics(), "completed")
+        for changed in (None, {"a.py"}):
+            with (
+                self.subTest(changed=changed),
+                mock.patch.object(adapters.clones, "measure_clones", return_value=measurement) as measure,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                document = self.run_selection(config, check, classes, changed, graph).to_json()
+                measure.assert_called_once()
+                self.assertEqual(measure.call_args.args[1], {"a.py": "python"})
+                self.assertEqual(document["resolved_baseline_entries"], [])
+                self.assertEqual(document["unmeasured_baseline_entries"], ["fp-present"])
+
     def test_descriptor_selection_controls_the_runner_and_report(self) -> None:
         initializer, seed = "pkg/__init__.py", "pkg/seed.py"
         dependent, unrelated, external = "consumer.py", "unrelated.py", "external.py"
@@ -458,20 +503,21 @@ description = "Other source"
                         self.assertEqual(result.execution, "not_run", check.id)
 
     def run_selection(self, config, check, classes, changed, graph):
+        diff = DiffBaseOverride(changed_paths=None if changed is None else frozenset(changed))
         with (
             tempfile.TemporaryDirectory(dir=self.root) as directory,
             mock.patch.object(checks, "affected_graph", return_value=graph),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             return checks._policy_results(
-                self.root, config, sorted(classes), classes, 0, [check],
-                DiffBaseOverride(changed_paths=frozenset(changed)), Path(directory), False,
+                self.root, config, sorted(classes), classes, 0, [check], diff, Path(directory), False,
             )[0]
 
     @staticmethod
     def run_selection_stub(context: adapters.AdapterContext) -> checks.CheckResult:
         assert context.selection is not None
         context.selection.selected.clear()
+        context.selection.left_out["injected.py"] = "adapter reason"
         result = run_stub(context)
         result.report_fields["selection"] = {"reason": "adapter report"}
         return result
@@ -626,7 +672,7 @@ description = "Other source"
         config = self.config(STUB_CONFIG)
         result = run_stub(adapters.AdapterContext(
             self.root, config, config.checks["stub"], [], {}, "stub", {},
-            self.root / "evidence",
+            self.root / "evidence", inventory_files=[],
         ))
         self.assertNotIn("tool", result.to_json())
         result.tool = {"name": "fixture compiler", "version": "2.3"}

@@ -274,7 +274,7 @@ def _domain(context: Any, selected: list[str], entries: list[Any]) -> Domain:
     for entry in entries:
         candidates = [
             name
-            for name in context.files
+            for name in context.inventory_files
             if entry.subject.startswith(f"{name}:")
         ]
         if candidates and max(candidates, key=len) in selected:

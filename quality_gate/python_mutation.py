@@ -561,14 +561,13 @@ def _changed_functions(
 
 
 def _selected_test_files(context: Any) -> list[str]:
-    from .adapters import _inventory_files
     from .checks import _select_files
 
     selected: list[str] = []
     for check in context.config.checks.values():
         if check.adapter == "python_tests":
             files, _names = _select_files(
-                context.config, check, _inventory_files(context), context.classes
+                context.config, check, context.inventory_files, context.classes
             )
             selected.extend(files)
     return selected
@@ -614,9 +613,7 @@ def _matches_discovery(relative: str, discovery: list[tuple[str, str]]) -> bool:
 
 
 def _fallback_test_paths(context: Any) -> list[str]:
-    from .adapters import _inventory_files
-
-    selected = _selected_test_files(context) or _inventory_files(context)
+    selected = _selected_test_files(context) or context.inventory_files
     return [
         relative for relative in selected
         if python_shape._is_test_path(relative)
@@ -633,14 +630,12 @@ def _matching_test_paths(
 
 
 def _test_file_paths(context: Any) -> list[str]:
-    from .adapters import _inventory_files
-
     discovery = _test_discovery(context)
     directory_rules = [
         (directory, pattern) for directory, pattern in discovery if directory
     ]
     if directory_rules:
-        return _matching_test_paths(_inventory_files(context), directory_rules)
+        return _matching_test_paths(context.inventory_files, directory_rules)
     return _matching_test_paths(
         _fallback_test_paths(context), discovery or [("", _DEFAULT_TEST_PATTERN)],
     )

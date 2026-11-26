@@ -238,6 +238,7 @@ class Example:
         context = adapters.AdapterContext(
             self.repo, config, check, ["a.py", "README.md"],
             {"a.py": "python", "README.md": "doc"}, "check: env_surface", {}, self.base,
+            inventory_files=["a.py", "README.md"],
         )
         result = adapters._run_env_surface(context)
         self.assertEqual(result.outcome, "pass")

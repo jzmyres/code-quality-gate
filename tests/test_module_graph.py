@@ -1521,7 +1521,40 @@ enforcement = "enforced"
             spec = SimpleNamespace(classes=check.spec.classes, suites=check.spec.suites, programs=programs)
             check = replace(check, spec=spec)
         classes = dict.fromkeys(files, "python")
-        return adapters.AdapterContext(self.repo, config, check, files, classes, "check", {}, self.base)
+        return adapters.AdapterContext(
+            self.repo, config, check, files, classes, "check", {}, self.base, inventory_files=files,
+        )
+
+    def test_module_graph_selects_configured_classes_from_the_inventory(self) -> None:
+        self.configure_graph()
+        self.add_file("library.py", "")
+        self.add_file("other.py", "")
+        context = self.graph_context(["a.py", "library.py", "other.py"])
+        context.classes["other.py"] = "doc"
+        context = replace(context, files=["a.py"])
+        for inventory_files, expected in (
+            (context.inventory_files, ["a.py", "library.py"]),
+            ([], []),
+        ):
+            with self.subTest(inventory_files=inventory_files):
+                result = adapters._run_module_graph(replace(context, inventory_files=inventory_files))
+                self.assertEqual(result.measurement["modules"], expected)
+
+    def test_affected_graph_receives_the_full_inventory(self) -> None:
+        self.configure_graph()
+        self.add_file("caller.py", "import a\n")
+        config = policy.load_config(self.repo)
+        paths, classes, violations = inventory.validate_inventory(self.repo, config)
+        self.assertEqual(violations, [])
+        with mock.patch.object(adapters, "_extract_graph", wraps=adapters._extract_graph) as extract:
+            nodes, expanded, affected = adapters.affected_graph(
+                self.repo, config, paths, classes, self.base, {"a.py"},
+            )
+        context = extract.call_args.args[0]
+        self.assertIs(context.inventory_files, paths)
+        self.assertEqual(nodes, {"a.py", "caller.py"})
+        self.assertEqual(expanded, {"a.py": "changed"})
+        self.assertEqual(affected, {"a.py": "changed", "caller.py": "depends on a.py"})
 
     def test_module_graph_program_dependency(self) -> None:
         self.configure_graph()
@@ -1584,7 +1617,9 @@ enforcement = "enforced"
         self.configure_graph()
         config = policy.load_config(self.repo)
         check = config.checks["module-graph"]
-        context = adapters.AdapterContext(self.repo, config, check, [], {}, "check", {}, self.base)
+        context = adapters.AdapterContext(
+            self.repo, config, check, [], {}, "check", {}, self.base, inventory_files=[],
+        )
         result = adapters._run_module_graph(context)
         self.assertEqual(result.outcome, "pass")
         measurement, cycles, suite_edges, program_edges = module_graph.measure(self.repo, [], check.spec)

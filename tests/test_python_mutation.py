@@ -1929,19 +1929,21 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([function.name for function in found], ["second"])
 
     def test_selected_test_files_reads_python_tests_checks(self) -> None:
-        check = SimpleNamespace(adapter="python_tests")
+        check = SimpleNamespace(id="tests", adapter="python_tests")
+        config = SimpleNamespace(checks={"tests": check}, classes={
+            "python": SimpleNamespace(checks=("mutation",)),
+            "test": SimpleNamespace(checks=("tests",)),
+        })
         context = SimpleNamespace(
-            config=SimpleNamespace(checks={"tests": check}),
-            files=["pkg/app.py"], classes={},
+            config=config,
+            files=["pkg/app.py"],
+            inventory_files=["pkg/app.py", "tests/test_app.py"],
+            classes={"pkg/app.py": "python", "tests/test_app.py": "test"},
         )
-        with mock.patch(
-            "quality_gate.checks._select_files",
-            return_value=(["tests/test_app.py"], []),
-        ):
-            self.assertEqual(
-                python_mutation._selected_test_files(context),
-                ["tests/test_app.py"],
-            )
+        self.assertEqual(
+            python_mutation._selected_test_files(context),
+            ["tests/test_app.py"],
+        )
 
     def test_test_discovery_pairs_the_directory_and_pattern(self) -> None:
         check = SimpleNamespace(
@@ -1975,7 +1977,8 @@ class ContractTests(unittest.TestCase):
 
     def test_fallback_test_paths_keeps_test_shaped_files(self) -> None:
         context = SimpleNamespace(
-            files=["pkg/app.py", "tests/test_app.py", "tests/helper.py"]
+            files=["pkg/app.py"],
+            inventory_files=["pkg/app.py", "tests/test_app.py", "tests/helper.py"],
         )
         with mock.patch.object(
             python_mutation, "_selected_test_files",
@@ -1995,7 +1998,8 @@ class ContractTests(unittest.TestCase):
         )
         context = SimpleNamespace(
             config=SimpleNamespace(checks={"tests": check}),
-            files=["pkg/check_app.py", "tests/test_app.py", "tests/check_app.py"],
+            files=["pkg/check_app.py"],
+            inventory_files=["pkg/check_app.py", "tests/test_app.py", "tests/check_app.py"],
         )
         with mock.patch.object(
             python_mutation, "_selected_test_files", return_value=[],
@@ -2010,7 +2014,10 @@ class ContractTests(unittest.TestCase):
             spec=SimpleNamespace(run=("-s", "checks", "-p", "check*")),
         )
         context = SimpleNamespace(
-            files=["checks/check_b.py", "checks/check_helper.txt", "checks/check_a.py"],
+            files=["pkg/app.py"],
+            inventory_files=[
+                "pkg/app.py", "checks/check_b.py", "checks/check_helper.txt", "checks/check_a.py",
+            ],
             config=SimpleNamespace(checks={"tests": check}),
         )
         self.assertEqual(

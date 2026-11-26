@@ -716,7 +716,6 @@ def _clone_domain(
 
 
 def _run_clones(context: Any) -> Any:
-    from .adapters import _inventory_files
     from .checks import _adapter_selection, _class_text
 
     root, config = context.root, context.config
@@ -742,7 +741,7 @@ def _run_clones(context: Any) -> Any:
         spec.min_tokens,
         config.max_bytes,
     )
-    return _finish_clones(check, start, prefix, measurement, selected, _inventory_files(context))
+    return _finish_clones(check, start, prefix, measurement, selected, context.inventory_files)
 
 
 def _finish_clones(

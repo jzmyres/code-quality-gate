@@ -70,12 +70,7 @@ class AdapterContext:
     evidence_dir: Path
     base_override: DiffBaseOverride | None = None
     selection: CheckSelection | None = None
-    inventory_files: list[str] | None = None
-
-
-def _inventory_files(context: AdapterContext) -> list[str]:
-    inventory = getattr(context, "inventory_files", None)
-    return context.files if inventory is None else inventory
+    inventory_files: list[str] = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -223,14 +218,14 @@ def _graph_findings(
 
 
 def _graph_modules(
-    context: AdapterContext, spec: module_graph.GraphSpec,
+    context: AdapterContext, spec: module_graph.GraphSpec, candidates: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
     unknown = sorted(set(spec.classes) - context.config.classes.keys())
     if unknown:
         key = f"checks.{context.check.id}.classes"
         known = ", ".join(sorted(context.config.classes))
         raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
-    selected = sorted(path for path in _inventory_files(context) if context.classes.get(path) in spec.classes)
+    selected = sorted(path for path in candidates if context.classes.get(path) in spec.classes)
     languages = source_languages(context.root, selected, context.config, context.classes)
     modules: dict[str, list[str]] = {"python": [], "lisp": [], "bash": []}
     for path, language in languages.items():
@@ -332,10 +327,13 @@ def module_ownership(
 
 def extract_contract_graph(
     root: Path, config: Any, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
-    reader_findings: list[dict],
+    reader_findings: list[dict], *, inventory_files: list[str],
 ) -> GraphExtraction:
-    context = AdapterContext(root, config, None, list(owners), classes, "module-contracts", {}, evidence_dir)
-    inputs = _graph_modules(context, module_graph.GraphSpec(tuple(config.classes), ()))
+    context = AdapterContext(
+        root, config, None, list(owners), classes, "module-contracts", {}, evidence_dir,
+        inventory_files=inventory_files,
+    )
+    inputs = _graph_modules(context, module_graph.GraphSpec(tuple(config.classes), ()), context.files)
     return _extract_graph(context, inputs, reader_findings)
 
 
@@ -355,8 +353,10 @@ def affected_graph(
     evidence_dir: Path, changed: set[str], contract_graph: GraphExtraction | None = None,
 ) -> tuple[set[str], dict[str, str], dict[str, str]]:
     spec = module_graph.GraphSpec(tuple(config.classes), ())
-    context = AdapterContext(root, config, None, files, classes, "affected scope", {}, evidence_dir)
-    inputs = _graph_modules(context, spec)
+    context = AdapterContext(
+        root, config, None, files, classes, "affected scope", {}, evidence_dir, inventory_files=files,
+    )
+    inputs = _graph_modules(context, spec, context.inventory_files)
     graph = contract_graph if contract_graph is not None and contract_graph.inputs == inputs else (
         _extract_graph(context, inputs)
     )
@@ -370,7 +370,9 @@ def _run_module_graph(context: AdapterContext) -> Any:
     start = time.monotonic()
     check = context.check
     try:
-        python_modules, elisp_modules, shell_modules = _graph_modules(context, check.spec)
+        python_modules, elisp_modules, shell_modules = _graph_modules(
+            context, check.spec, context.inventory_files,
+        )
         modules = [*python_modules, *elisp_modules, *shell_modules]
         test_sources = frozenset(path for path in modules if python_shape._is_test_path(path))
         elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}

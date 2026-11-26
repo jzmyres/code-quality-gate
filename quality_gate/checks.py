@@ -1045,7 +1045,7 @@ def _require_contract_budget() -> None:
 
 def _extract_module_contracts(
     root: Path, config: Config, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
-    findings: list[dict],
+    findings: list[dict], *, inventory_files: list[str],
 ) -> tuple[GraphExtraction | None, str]:
     start = time.monotonic()
     budget = RATCHET_BUDGET_SECONDS
@@ -1053,7 +1053,9 @@ def _extract_module_contracts(
         try:
             mark_step("module graph inputs")
             _require_contract_budget()
-            graph = extract_contract_graph(root, config, owners, classes, evidence_dir, findings)
+            graph = extract_contract_graph(
+                root, config, owners, classes, evidence_dir, findings, inventory_files=inventory_files,
+            )
             _require_contract_budget()
             reader_failed = bool(findings)
             mark_step("module interface evaluation")
@@ -1167,7 +1169,7 @@ def _run_module_contracts(
         if not findings and len(config.modules) >= 2:
             budget = RATCHET_BUDGET_SECONDS
             graph, execution = _extract_module_contracts(
-                root, config, owners, classes, evidence_dir, findings,
+                root, config, owners, classes, evidence_dir, findings, inventory_files=files,
             )
     findings.extend(_shared_entry_point_findings(config, owners, changed))
     messages.extend(f"module-contracts: {_contract_message(row)}" for row in findings)

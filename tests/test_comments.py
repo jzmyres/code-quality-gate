@@ -49,6 +49,7 @@ enforcement = "enforced"
         context = adapters.AdapterContext(
             self.repo, config, check, ["a.py", "sample.py", "ignored.py"],
             {"a.py": "python", "sample.py": "python", "ignored.py": "doc"}, "check", {}, self.repo,
+            inventory_files=["a.py", "sample.py", "ignored.py"],
         )
         result = adapters._run_comments(context)
         self.assertEqual(result.outcome, "fail")
@@ -183,6 +184,7 @@ enforcement = "enforced"
         self.assertIn(path, paths)
         context = adapters.AdapterContext(
             self.repo, config, check, [path], classes, "check", {}, self.repo,
+            inventory_files=paths,
         )
         try:
             shell_syntax = import_module("quality_gate.shell_syntax")

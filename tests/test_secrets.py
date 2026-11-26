@@ -255,7 +255,7 @@ class SecretsTests(FixtureCase):
         os.mkfifo(target)
         context = adapters.AdapterContext(
             self.repo, self.config, self.config.checks["secrets"], [], {},
-            "check: secrets", {}, self.evidence,
+            "check: secrets", {}, self.evidence, inventory_files=[],
         )
         stderr = io.StringIO()
         with mock.patch.object(adapters, "tool_binary", return_value=Path(sys.executable)), mock.patch.object(

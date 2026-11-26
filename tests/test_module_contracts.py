@@ -14,7 +14,7 @@ from unittest import mock
 from support import BASE_CONFIG, GATE, FixtureCase, baseline_text, output, with_clones
 
 from quality_gate import adapters, checks, files, module_graph, runner
-from quality_gate.files import validate_inventory
+from quality_gate.files import DiffBaseOverride, validate_inventory
 from quality_gate.policy import CapabilityDef, GateError, load_config
 
 CONTRACT_CHECK = """\
@@ -209,12 +209,21 @@ class ModuleContractTests(FixtureCase):
             "library/private.py": "library",
             "library/z.py": "library",
         })
-        graph = adapters.extract_contract_graph(self.repo, config, owners, classes, self.base, findings)
+        self.assertIn("README.md", files)
+        self.assertNotIn("README.md", owners)
+        with (
+            mock.patch.object(adapters, "_extract_graph", wraps=adapters._extract_graph) as extract,
+            mock.patch.object(adapters, "source_languages", wraps=adapters.source_languages) as languages,
+        ):
+            result, graph = checks._run_module_contracts(
+                self.repo, config, files, classes, 0, self.base, DiffBaseOverride(),
+            )
+        context = extract.call_args.args[0]
+        self.assertIs(context.inventory_files, files)
+        self.assertCountEqual(context.files, owners)
+        languages.assert_called_once_with(self.repo, sorted(owners), config, classes)
+        self.assertEqual(result.findings, [])
         self.assertEqual(graph.modules, sorted(owners))
-        self.assertEqual(findings, [])
-        self.assertEqual(
-            adapters.module_contract_findings(config, owners, graph, classes.tracked_code_paths), [],
-        )
 
     def test_edge_kind_is_part_of_deduplication_and_ordering(self) -> None:
         config = load_config(self.repo)

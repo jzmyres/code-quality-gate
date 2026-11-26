@@ -1956,9 +1956,10 @@ class HelperInputTests(ShapeCase):
         self.add_file("pkg/shell", "#!/bin/sh\nrender_json()\n")
         context = SimpleNamespace(
             root=self.repo,
-            files=["pkg/app.py", "pkg/helper", "pkg/shell"],
+            files=["pkg/app.py"],
+            inventory_files=["pkg/app.py", "pkg/helper", "pkg/shell"],
         )
-        indexes = _scan_files(context, [], {"render_json"})
+        indexes = _scan_files(context, context.files, {"render_json"})
         self.assertEqual(set(indexes), {"pkg/helper"})
 
     def test_shape_input_selects_the_changed_definitions(self) -> None:
