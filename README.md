@@ -287,8 +287,10 @@ pattern that matches nothing, `--no-gitignore` and a format list based on the la
 inventory when they are all known. Inline jscpd ignore directives are refused: the check reads every selected file with
 the bounded regular-file reader and fails on any line containing either directive, naming the first file,
 line and directive and the total count. A clone is accepted only through a baseline entry with a reason.
-The JSON report's `statistics.total.sources` must equal the number of selected files; a mismatch is
-`unsupported` and names the files jscpd did not analyse. The SARIF report must contain exactly one run
+The JSON report's `statistics.total.sources` normally equals the number of selected files. On a
+count deficit, a second scan tokenizes every selected path without a minimum and proves that the
+missing count consists only of files below the configured token or line limit. An unproved deficit
+is `unsupported`. The SARIF report must contain exactly one run
 produced by jscpd with a `results` list; absent, malformed or foreign evidence is `unsupported`
 (`no completed jscpd run`), never zero clones. A clone fingerprint is a subject; its value is how many reported clones have that
 fingerprint; the threshold is `0`, so any occurrence needs a baseline entry.
