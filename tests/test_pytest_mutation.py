@@ -351,6 +351,7 @@ class HookEvidenceTests(unittest.TestCase):
             directory = Path(temporary).resolve()
             original = directory / "original"
             copy = directory / "copy"
+            interpreter = str(directory / "interpreter")
             target = copy / "pkg.py"
             module = ModuleType("pkg")
             module.__file__ = str(target)
@@ -365,13 +366,13 @@ class HookEvidenceTests(unittest.TestCase):
             modules = {"pytest": pytest, "pkg": module, "leaked": leaked, "empty": None}
             with (
                 mock.patch.object(pytest_mutation_run.Path, "cwd", return_value=copy),
-                mock.patch.object(sys, "path", [str(original)]),
+                mock.patch.object(sys, "path", [str(original), interpreter]),
                 mock.patch.dict(sys.modules, modules),
             ):
                 code = pytest_mutation_run._main(
                     [str(original), str(report), "pkg.py", '["."]', "test_file.py"],
                 )
-                self.assertEqual(sys.path, [str(copy)])
+                self.assertEqual(sys.path, [str(copy), interpreter])
             self.assertEqual(code, 0)
             self.assertEqual(pytest.main.call_args.args[0], [f"--rootdir={copy}", "--", "./test_file.py"])
             self.assertIn("pytest imported from the source checkout", report.read_text(encoding="utf-8"))

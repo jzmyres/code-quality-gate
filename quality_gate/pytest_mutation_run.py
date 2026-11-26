@@ -92,11 +92,14 @@ class Evidence:
 
 
 def _import_path(copy: Path, original: Path, roots: list[str]) -> list[str]:
-    local = [(copy / relative).resolve() for relative in roots]
-    if any(not path.is_relative_to(copy) for path in local):
-        raise ValueError("pytest mutation import root escapes its copy")
+    local = []
+    for relative in roots:
+        path = (copy / relative).resolve()
+        if not path.is_relative_to(copy):
+            raise ValueError("pytest mutation import root escapes its copy")
+        local.append(str(path))
     remaining = (entry for entry in sys.path if not Path(entry).resolve().is_relative_to(original))
-    return list(dict.fromkeys([*map(str, local), str(copy), *remaining]))
+    return list(dict.fromkeys([*local, str(copy), *remaining]))
 
 
 def _main(argv: list[str]) -> int:
