@@ -396,6 +396,11 @@ classes, using the inventory's language classification.
 Python imports anywhere in a file count, including function bodies and `TYPE_CHECKING` blocks.
 Files with a Python shebang are read as Python even when their names end in `.el`.
 
+For a project with packages under `src/`, add `python_import_roots = ["src"]` at the top level of
+`quality-gate.toml`. The default is `["."]` for packages at the repository root. A mixed layout can
+list both directories. Module graph reports, module contracts, affected selection, and Python
+mutation test association share this setting. See the [policy schema](docs/SCHEMA.md#python-import-roots).
+
 Python recognizes two forms for `path-load` edges.
 
 - `import runpy` followed by `runpy.run_path(...)`, with a string literal path passed
@@ -1104,7 +1109,9 @@ fixing a generation rule here.
 The test files for a function are the Python files under the test directory a `python_tests`
 check discovers whose parsed source names the function or imports the function's module in any form:
 `import pkg.mod`, `import pkg.mod as m`, `from pkg import mod`, `from pkg.mod import name` and
-`from pkg.mod import *` all select it. When the policy configures no `python_tests` check, every
+`from pkg.mod import *` all select it. Module names are relative to `python_import_roots`.
+The test suite must make its packages importable inside the isolated copy. When the policy
+configures no `python_tests` check, every
 selected test-shaped Python file is considered. A function no such file names is a finding with
 `no test names it`: it has no tests, and mutation testing cannot show its tests can fail. Each
 mutant is written to a copy of the repository in a temporary directory; the working tree is never

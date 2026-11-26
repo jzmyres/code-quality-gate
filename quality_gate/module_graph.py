@@ -16,6 +16,7 @@ from runpy import run_path
 from tokenize import open as open_source
 from typing import Any
 
+
 @dataclass(frozen=True)
 class GraphSpec:
     classes: tuple[str, ...]
@@ -193,12 +194,68 @@ def _origin(name: str, directories: Sequence[str]) -> str | None:
     return spec.origin if spec is not None else None
 
 
-def _import_directories(root: Path, source: Path) -> list[str]:
-    return [str(root), str(root / source.parent)]
+def _import_names(path: Path) -> Iterator[str]:
+    parts = path.with_suffix("").parts
+    if not all(part.isidentifier() for part in parts):
+        return
+    yield ".".join(parts)
+    if len(parts) > 1 and path.name == "__init__.py":
+        yield ".".join(parts[:-1])
 
 
-def _from_base(path: Path, node: ast.ImportFrom) -> str | None:
-    package = path.parts[:-1]
+@dataclass(frozen=True)
+class PythonImports:
+    """Repository paths and identities used by graph and mutation analysis."""
+
+    root: Path
+    roots: tuple[str, ...]
+
+    @classmethod
+    def from_repository(cls, root: Path, roots: tuple[str, ...]) -> PythonImports:
+        canonical_root = root.resolve()
+        for relative in roots:
+            directory = canonical_root / relative
+            if Path(os.path.realpath(directory)) != directory or not directory.is_dir():
+                raise ValueError(
+                    f"python_import_roots: {relative!r}: expected an existing repository directory"
+                )
+        return cls(root, roots)
+
+    def directories(self, source: Path | None = None) -> list[str]:
+        directories = [str(self.root / directory) for directory in self.roots]
+        if source is not None:
+            directories.append(str(self.root / source.parent))
+        return directories
+
+    def _relative_paths(self, source: Path) -> Iterator[Path]:
+        for directory in self.roots:
+            if source.is_relative_to(directory):
+                yield source.relative_to(directory)
+
+    def package(self, source: Path) -> tuple[str, ...]:
+        relative = min(self._relative_paths(source), key=lambda path: len(path.parts), default=None)
+        return relative.parts[:-1] if relative is not None else ()
+
+    def _names(self, source: Path) -> Iterator[str]:
+        if source.suffix == ".py":
+            for relative in self._relative_paths(source):
+                yield from _import_names(relative)
+
+    def identities(self, paths: Iterable[str]) -> dict[str, frozenset[str]]:
+        providers: dict[str, str] = {}
+        identities = {}
+        for path in sorted(set(paths)):
+            names = frozenset(self._names(Path(path)))
+            for name in sorted(names):
+                previous = providers.setdefault(name, path)
+                if previous != path:
+                    raise ValueError(f"ambiguous Python module {name!r}: {previous}, {path}")
+            identities[path] = names
+        return identities
+
+
+def _from_base(imports: PythonImports, source: Path, node: ast.ImportFrom) -> str | None:
+    package = imports.package(source) if node.level else ()
     if node.level > len(package):
         return None
     prefix = package[:len(package) - node.level + 1] if node.level else ()
@@ -206,12 +263,12 @@ def _from_base(path: Path, node: ast.ImportFrom) -> str | None:
 
 
 def _from_origins(
-    root: Path, path: Path, node: ast.ImportFrom, paths: dict[str, str]
+    imports: PythonImports, path: Path, node: ast.ImportFrom, paths: dict[str, str]
 ) -> Iterator[str | None]:
-    base = _from_base(path, node)
+    base = _from_base(imports, path, node)
     if base is None:
         return
-    directories = [str(root)] if node.level else _import_directories(root, path)
+    directories = imports.directories(None if node.level else path)
     parent = _origin(base, directories)
     for alias in node.names:
         child = None if alias.name == "*" else _origin(f"{base}.{alias.name}", directories)
@@ -219,13 +276,13 @@ def _from_origins(
 
 
 def _import_origins(
-    root: Path, source: str, node: ast.Import | ast.ImportFrom, paths: dict[str, str]
+    imports: PythonImports, source: str, node: ast.Import | ast.ImportFrom, paths: dict[str, str]
 ) -> Iterator[str | None]:
     path = Path(source)
     if isinstance(node, ast.ImportFrom):
-        yield from _from_origins(root, path, node, paths)
+        yield from _from_origins(imports, path, node, paths)
     else:
-        directories = _import_directories(root, path)
+        directories = imports.directories(path)
         for alias in node.names:
             yield _origin(alias.name, directories)
 
@@ -329,16 +386,16 @@ def _measured_loader_shadows(modules: list[str]) -> dict[str, str]:
     return shadows
 
 
-def _loader_shadow(root: Path, source: str, head: str, measured: dict[str, str]) -> str | None:
+def _loader_shadow(imports: PythonImports, source: str, head: str, measured: dict[str, str]) -> str | None:
     if head in measured:
         return measured[head]
-    spec = _import_spec(head, _import_directories(root, Path(source)))
+    spec = _import_spec(head, imports.directories(Path(source)))
     if spec is None:
         return None
     if spec.origin is not None:
-        return os.path.relpath(spec.origin, root)
+        return os.path.relpath(spec.origin, imports.root)
     assert spec.submodule_search_locations is not None
-    return os.path.relpath(next(iter(spec.submodule_search_locations)), root)
+    return os.path.relpath(next(iter(spec.submodule_search_locations)), imports.root)
 
 
 def _measured_path(root: Path, source: str, paths: dict[str, str], operand: str) -> str | None:
@@ -367,7 +424,7 @@ def _resolve_path_load(
 
 
 def _loader_import_refusals(
-    root: Path, source: str, binding_refusals: dict[str, str], shadow_modules: dict[str, str],
+    imports: PythonImports, source: str, binding_refusals: dict[str, str], shadow_modules: dict[str, str],
     positions: dict[str, int],
 ) -> dict[str, str]:
     refusals = {}
@@ -377,7 +434,7 @@ def _loader_import_refusals(
             refusals[module] = binding_refusals[head]
         elif module not in positions:
             refusals[module] = f"requires a direct, unaliased top-level import {module}"
-        elif (shadow := _loader_shadow(root, source, head, shadow_modules)) is not None:
+        elif (shadow := _loader_shadow(imports, source, head, shadow_modules)) is not None:
             refusals[module] = f"repository module or package {shadow!r} provides {head!r}"
     return refusals
 
@@ -430,17 +487,17 @@ def _loader_reference_refusal(
 
 
 def _path_loads(
-    root: Path, source: str, paths: dict[str, str], tree: ast.Module, binding_refusals: dict[str, str],
-    shadow_modules: dict[str, str], outside: list[dict],
+    imports: PythonImports, source: str, paths: dict[str, str], tree: ast.Module,
+    binding_refusals: dict[str, str], shadow_modules: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
     positions = _loader_import_positions(tree)
-    import_refusals = _loader_import_refusals(root, source, binding_refusals, shadow_modules, positions)
+    import_refusals = _loader_import_refusals(imports, source, binding_refusals, shadow_modules, positions)
     for reference in _loader_references(tree):
         target = reference.target
         reason = _loader_reference_refusal(reference, positions, import_refusals)
         if reason is None:
             assert reference.call is not None
-            module, reason = _resolve_path_load(root, source, paths, reference.call, target)
+            module, reason = _resolve_path_load(imports.root, source, paths, reference.call, target)
             if module is not None:
                 yield Edge(source, module, reference.node.lineno, "path-load")
                 continue
@@ -475,30 +532,33 @@ def _from_loader_diagnostics(source: str, imports: list[ast.Import | ast.ImportF
 
 
 def _source_edges(
-    root: Path, source: str, paths: dict[str, str], literal_paths: dict[str, str],
+    python_imports: PythonImports, source: str, paths: dict[str, str], literal_paths: dict[str, str],
     shadow_modules: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
-    tree, table = _parse_source(root, source)
+    tree, table = _parse_source(python_imports.root, source)
     nodes = list(ast.walk(tree))
     imports = [node for node in nodes if isinstance(node, _IMPORTS)]
     yield from {
         Edge(source, paths[origin], node.lineno)
         for node in imports
-        for origin in _import_origins(root, source, node, paths)
+        for origin in _import_origins(python_imports, source, node, paths)
         if origin in paths
     }
     outside.extend(_from_loader_diagnostics(source, imports))
     binding_refusals = _loader_binding_refusals(table, nodes, imports)
-    yield from _path_loads(root, source, literal_paths, tree, binding_refusals, shadow_modules, outside)
+    yield from _path_loads(
+        python_imports, source, literal_paths, tree, binding_refusals, shadow_modules, outside,
+    )
 
 
 def _python_edges(
-    root: Path, python_modules: list[str], literal_paths: dict[str, str],
+    imports: PythonImports, python_modules: list[str], literal_paths: dict[str, str],
     shadow_modules: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
-    paths = {str(root / module): module for module in python_modules}
+    imports.identities(python_modules)
+    paths = {str(imports.root / module): module for module in python_modules}
     for module in sorted(python_modules):
-        yield from _source_edges(root, module, paths, literal_paths, shadow_modules, outside)
+        yield from _source_edges(imports, module, paths, literal_paths, shadow_modules, outside)
 
 
 _SHELL_SCHEMA = {
@@ -776,19 +836,19 @@ def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[st
 
 
 def _graph_edges(
-    root: Path, modules: list[str], python_modules: list[str],
+    imports: PythonImports, modules: list[str], python_modules: list[str],
     elisp: dict[str, list[dict]], shell: dict[str, tuple[_ShellFields, dict]], outside: list[dict],
 ) -> list[Edge]:
-    resolved_root = root.resolve()
+    resolved_root = imports.root.resolve()
     paths = {str(resolved_root / module): module for module in modules}
     require_edges = {
         Edge(source, row["target"], row["line"], "require")
         for source, row in _elisp_records(elisp, "require")
     }
     return sorted([
-        *_python_edges(root, python_modules, paths, _measured_loader_shadows(modules), outside),
+        *_python_edges(imports, python_modules, paths, _measured_loader_shadows(modules), outside),
         *require_edges,
-        *_shell_edges(root, shell, paths, outside),
+        *_shell_edges(imports.root, shell, paths, outside),
     ])
 
 
@@ -924,6 +984,7 @@ def dependencies(
     root: Path, python_modules: list[str], *,
     elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
     parse_shell: Callable[[bytes, str], dict] | None = None,
+    python_import_roots: tuple[str, ...] = (".",),
 ) -> tuple[list[str], list[Edge], list[dict]]:
     root = root.absolute()
     elisp = elisp or {}
@@ -934,7 +995,8 @@ def dependencies(
         for source, row in _elisp_records(elisp, "outside")
     ]
     outside.extend(elisp_reader_errors(elisp))
-    edges = _graph_edges(root, modules, python_modules, elisp, shell, outside)
+    imports = PythonImports.from_repository(root, python_import_roots)
+    edges = _graph_edges(imports, modules, python_modules, elisp, shell, outside)
     return modules, edges, outside
 
 
@@ -969,9 +1031,11 @@ def measure(
     elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
     parse_shell: Callable[[bytes, str], dict] | None = None,
     test_sources: frozenset[str] = frozenset(),
+    python_import_roots: tuple[str, ...] = (".",),
 ) -> tuple[dict, list[Cycle], list[Edge], list[Edge]]:
     modules, edges, outside = dependencies(
         root, python_modules, elisp=elisp, shell_modules=shell_modules, parse_shell=parse_shell,
+        python_import_roots=python_import_roots,
     )
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [

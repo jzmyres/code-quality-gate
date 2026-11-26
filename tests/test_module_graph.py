@@ -58,6 +58,36 @@ def shell_json(tree: dict) -> runner.RunResult:
 
 
 class ModuleGraphTests(FixtureCase):
+    def test_src_layout_absolute_and_relative_imports(self) -> None:
+        self.configure_graph()
+        self.write_config('python_import_roots = ["src"]\n' + self.config_path.read_text())
+        self.add_file("scripts/build.py", "from pkg.runtime import util as helper\n")
+        self.add_file("src/pkg/runtime/util.py", "from . import sibling\nfrom ... import unrelated\n")
+        self.add_file("src/pkg/runtime/sibling.py", "value = 1\n")
+        self.add_file("src/unrelated.py", "value = 2\n")
+        self.assertEqual(self.graph(0)["measurement"]["edges"], [
+            edge("scripts/build.py", "src/pkg/runtime/util.py", 1),
+            edge("src/pkg/runtime/util.py", "src/pkg/runtime/sibling.py", 1),
+        ])
+
+    def test_graph_rejects_duplicate_module_providers_across_import_roots(self) -> None:
+        self.configure_graph()
+        self.write_config('python_import_roots = ["src", "vendor"]\n' + self.config_path.read_text())
+        self.add_file("src/pkg/api.py", "")
+        self.add_file("vendor/pkg/api/__init__.py", "")
+        check = self.graph(1)
+        self.assertIn("ambiguous Python module 'pkg.api': src/pkg/api.py, vendor/pkg/api/__init__.py",
+                      check["reason"])
+
+    def test_graph_rejects_unusable_import_root(self) -> None:
+        self.configure_graph()
+        self.write_config('python_import_roots = ["src"]\n' + self.config_path.read_text())
+        diagnostic = "python_import_roots: 'src': expected an existing repository directory"
+        self.assertIn(diagnostic, self.graph(1)["reason"])
+        self.add_file(".gitignore", "__pycache__/\nsrc\n")
+        (self.repo / "src").symlink_to(self.base, target_is_directory=True)
+        self.assertIn(diagnostic, self.graph(1)["reason"])
+
     def configure_graph(self, options: str = "", *, elisp: bool = False, shell: bool = False) -> None:
         config = BASE_CONFIG + """
 [checks.module-graph]
