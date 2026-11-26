@@ -16,7 +16,7 @@ from unittest import mock
 
 from support import BASE_CONFIG, FixtureCase, _add_check_to_class, output
 
-from quality_gate import python_mutation
+from quality_gate import module_graph, python_mutation
 from quality_gate.files import DiffBase
 from quality_gate.runner import RunResult
 
@@ -475,13 +475,15 @@ class EquivalenceAndSelectionTests(MutationCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            imports = module_graph.PythonImports.from_repository(root, (".",))
+            module_names = imports.identities([function.path])
             (root / "tests").mkdir()
             for source, selected in forms.items():
                 with self.subTest(source=source):
                     relative = "tests/test_form.py"
                     (root / relative).write_text(source, encoding="utf-8")
                     tests = python_mutation._tests_by_function(
-                        root, [function], [relative],
+                        root, [function], [relative], module_names,
                     )
                     self.assertEqual(
                         bool(tests[function.identity]), selected, tests
@@ -507,6 +509,37 @@ class EquivalenceAndSelectionTests(MutationCase):
 
 
 class SelectionTests(MutationCase):
+    def test_src_layout_aliased_import_selects_the_test(self) -> None:
+        self.write_config('python_import_roots = ["src"]\n' + mutation_config())
+        self.base_commit()
+        self.commit({
+            "src/pkg/runtime/util.py": CLASSIFY + "\nRESULT = classify(1)\n",
+            "tests/test_src_layout.py": (
+                "import pathlib\n"
+                "import sys\n"
+                "import unittest\n"
+                "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'src'))\n"
+                "from pkg.runtime import util as helper\n\n"
+                "class ModuleTests(unittest.TestCase):\n"
+                "    def test_result(self):\n"
+                "        self.assertEqual(helper.RESULT, 'positive')\n"
+            ),
+        })
+        result, _document, check = self.run_mutation()
+        self.assert_function_was_mutated(result, check)
+        self.assertEqual(
+            {tuple(record["tests"]) for record in self.mutants(check)},
+            {("tests/test_src_layout.py",)},
+        )
+        self.assertIn("killed", {record["outcome"] for record in self.mutants(check)})
+
+    def test_mutation_rejects_duplicate_module_providers_across_import_roots(self) -> None:
+        self.write_config('python_import_roots = ["src", "vendor"]\n' + mutation_config())
+        self.base_commit({"vendor/pkg/app.py": "value = 1\n"})
+        self.commit({"src/pkg/app.py": CLASSIFY})
+        check = self.assert_check_error()
+        self.assertIn("ambiguous Python module 'pkg.app': src/pkg/app.py, vendor/pkg/app.py", check["reason"])
+
     def assert_discovered_test_file(self, expected: str) -> None:
         result, _document, check = self.run_mutation()
         self.assertEqual(result.returncode, 0, output(result))
@@ -2025,10 +2058,18 @@ class ContractTests(unittest.TestCase):
             ["checks/check_a.py", "checks/check_b.py"],
         )
 
-    def test_module_name_is_the_dotted_path(self) -> None:
-        self.assertEqual(
-            python_mutation._module_name("pkg/app.py"), "pkg.app"
-        )
+    def test_module_names_use_each_root_and_include_package_initializers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            imports = module_graph.PythonImports.from_repository(root, (".", "src"))
+            self.assertEqual(
+                imports.identities(["pkg/app.py", "src/pkg/__init__.py"]),
+                {
+                    "pkg/app.py": {"pkg.app"},
+                    "src/pkg/__init__.py": {"src.pkg", "src.pkg.__init__", "pkg", "pkg.__init__"},
+                },
+            )
 
     def test_discover_argv_runs_one_discovered_file(self) -> None:
         self.assertEqual(

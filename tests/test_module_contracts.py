@@ -118,6 +118,20 @@ class ModuleContractTests(FixtureCase):
         self.assertEqual(check["findings"], [])
         self.assertEqual(check["budget_seconds"], 600)
 
+    def test_rejects_forbidden_src_layout_import(self) -> None:
+        target = "src/pkg/runtime/api.py"
+        (self.repo / "src/pkg").mkdir(parents=True)
+        (self.repo / "library").rename(self.repo / "src/pkg/runtime")
+        self.add_file("app/main.py", "import app.helper\nfrom pkg.runtime import api as service\n")
+        config = NO_ALLOWANCE.replace("library/", "src/pkg/runtime/")
+        self.write_config('python_import_roots = ["src"]\n' + config)
+        result, _, check = self.contract(1)
+        finding, = check["findings"]
+        self.assert_interface(
+            result, finding, target=target,
+            failed=["dependency-not-allowed"], permitted=[target, "src/pkg/runtime/z.py"],
+        )
+
     def test_map_alone_does_not_enable_contracts(self) -> None:
         self.write_config(NO_ALLOWANCE.replace(CONTRACT_CHECK, ""))
         self.add_file("orphan.py", "value = 0\n")
