@@ -662,6 +662,9 @@ Top-level keys:
   comparisons and every inventory-visible untracked path. Both names of a rename are included.
   For a nonempty union, each selected test suite that reaches execution runs the full
   configured command or discovery suite. The graph remains an input to per-file selection.
+  Affected unittest uses the shard runner's standard-suite admission and validates one
+  terminal record per scheduled occurrence. Its report uses distinct labels for duplicate
+  IDs and retains completed records and outstanding positions after interruption.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
 * `trust` - present only on a `--policy-from` result; see below.

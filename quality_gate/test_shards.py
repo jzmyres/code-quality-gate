@@ -21,10 +21,15 @@ from pathlib import Path
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 CGROUP_MEMBERSHIP = Path("/proc/self/cgroup")
 FAILED_OUTCOMES = ("failure", "error", "unexpected success")
+RUNTIME_SUITE_REASON = "full run: suite runtime inputs are undeclared"
 
 
 class ShardError(Exception):
     pass
+
+
+def _journal_event(journal, event, value):
+    print(json.dumps([event, value]), file=journal, flush=True)
 
 
 class ShardResult(unittest.TextTestResult):
@@ -36,38 +41,80 @@ class ShardResult(unittest.TextTestResult):
         ("error", "errors"),
     )
 
-    def __init__(self, stream, descriptions, verbosity, *, ids, journal):
+    def __init__(self, stream, descriptions, verbosity, *, ids, observe):
         super().__init__(stream, descriptions, verbosity)
         self.ids = ids
-        self.journal = journal
+        self.observe = observe
         self.records = []
         self.fixtures = []
+        self.fixture_outcomes = {}
         self.offsets = dict.fromkeys((field for _, field in self.event_fields), 0)
+        self.scheduled_test = self.active_test = None
 
     def startTest(self, test):
-        self.fixtures.extend(self.events())
+        if test is not self.scheduled_test:
+            name = _test_ids([test])[0]
+            raise ShardError(f"unexpected unittest occurrence {name!r}")
+        if self.active_test is not None:
+            raise ShardError(f"unittest occurrence {self.ids[self.position]!r} started again before stopping")
+        self.active_test = test
+        self.passed_subtest = False
+        self.emit("started", self.position)
         super().startTest(test)
 
+    def addSubTest(self, test, subtest, err):
+        self.passed_subtest |= err is None
+        super().addSubTest(test, subtest, err)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self.fixture_event(test, "skipped", reason)
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self.fixture_event(test, "error", self.errors[-1][1])
+
+    def fixture_event(self, test, outcome, detail):
+        if isinstance(test, unittest.suite._ErrorHolder):
+            name = test.id()
+            event = (name, outcome, detail)
+            self.fixtures.append(event)
+            self.fixture_outcomes[name] = outcome
+            self.emit("fixture", event)
+
     def stopTest(self, test):
-        events = list(self.events(test))
-        outcome = events[-1][1] if events else "passed"
-        self.record(outcome, events)
+        if test is not self.active_test:
+            raise ShardError(f"unittest occurrence {_test_ids([test])[0]!r} stopped without starting")
+        self.active_test = None
+        if sys.exception() is None:
+            events = list(self.events(test))
+            outcome = self.case_outcome(events)
+            self.record(outcome, events)
         super().stopTest(test)
+
+    def case_outcome(self, events):
+        outcomes = [outcome for _, outcome, _ in events]
+        if outcomes and (outcomes[-1] != "skipped" or not self.passed_subtest):
+            return outcomes[-1]
+        return "passed"
 
     def record(self, outcome, events):
         record = [self.position, self.ids[self.position], outcome, events]
-        if self.journal is None:
-            self.records.append(record)
-        else:
-            print(json.dumps(record), file=self.journal, flush=True)
+        self.records.append(record)
+        self.emit("terminal", record)
 
-    def events(self, current=None):
+    def emit(self, event, value):
+        if self.observe is not None:
+            self.observe(event, value)
+
+    def events(self, current):
         for outcome, field in self.event_fields:
             entries = getattr(self, field)
             for entry in entries[self.offsets[field]:]:
                 test, detail = entry if isinstance(entry, tuple) else (entry, "")
-                name = self.ids[self.position] if test is current else _test_ids([test])[0]
-                yield name, outcome, detail
+                if not isinstance(test, unittest.suite._ErrorHolder):
+                    name = self.ids[self.position] if test is current else _test_ids([test])[0]
+                    yield name, outcome, detail
             self.offsets[field] = len(entries)
 
 
@@ -77,10 +124,25 @@ class ShardSuite(unittest.TestSuite):
         self.positions = iter(positions)
 
     def _handleClassSetUp(self, test, result):
-        super()._handleClassSetUp(test, result)
         result.position = next(self.positions)
-        if result._moduleSetUpFailed or getattr(type(test), "_classSetupFailed", False):
-            result.record("blocked", [])
+        result.active_test = result.scheduled_test = None
+        super()._handleClassSetUp(test, result)
+        fixture = _blocking_fixture(test, result)
+        if fixture is None:
+            result.scheduled_test = test
+            return
+        outcome = result.fixture_outcomes.get(fixture)
+        if outcome is not None:
+            result.record("fixture skipped" if outcome == "skipped" else "blocked", [])
+
+
+def _blocking_fixture(test, result):
+    cls = type(test)
+    if result._moduleSetUpFailed:
+        return f"setUpModule ({cls.__module__})"
+    if getattr(cls, "_classSetupFailed", False):
+        return f"setUpClass ({unittest.util.strclass(cls)})"
+    return None
 
 
 def _check_suite(suite):
@@ -102,9 +164,10 @@ def _flatten(suite):
             yield test
 
 
-def _discover(start, pattern):
+def _discover(start, pattern, loader=None):
+    loader = unittest.TestLoader() if loader is None else loader
     try:
-        suite = unittest.TestLoader().discover(start, pattern)
+        suite = loader.discover(start, pattern)
     except ImportError as error:
         raise ShardError(
             f"discovery start {start!r}: expected an importable test directory, got {error}"
@@ -122,163 +185,84 @@ class AffectedLoader(unittest.TestLoader):
         self.used_hook |= getattr(module, "load_tests", None) is not None
         suite = super().loadTestsFromModule(module, *args, **kwargs)
         if not self.used_hook and getattr(module, "__file__", None) is not None:
-            self.sourced_cases.update(id(test) for test in _discovered_cases(suite))
+            self.sourced_cases.update(id(test) for test in _flatten(suite))
         return suite
 
 
-def _discovered_cases(suite):
-    for test in suite:
-        if isinstance(test, unittest.suite.BaseTestSuite):
-            yield from _discovered_cases(test)
-        else:
-            yield test
-
-
-class AffectedResult(unittest.TextTestResult):
-    def __init__(self, *args, occurrences, journal, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.occurrences = occurrences
-        self.journal = journal
-        self.current = None
-        self.skipped_invocation = False
-        self.has_result = False
-
-    def record(self, event, name):
-        print(json.dumps([event, name]), file=self.journal, flush=True)
-
-    def record_failure(self, test):
-        self.record("failed", self.current or test.id())
-
-    def startTest(self, test):
-        self.skipped_invocation = False
-        self.has_result = False
-        names = self.occurrences.get(id(test))
-        self.current = names.popleft() if names else None
-        if self.current is not None:
-            self.record("started", self.current)
-        elif not isinstance(test, unittest.loader._FailedTest):
-            self.record("unexpected", test.id())
-        super().startTest(test)
-
-    def addSkip(self, test, reason):
-        self.skipped_invocation = True
-        super().addSkip(test, reason)
-        self.stream.writeln(f"skipped {test.id()}: {reason}")
-
-    def addSubTest(self, test, subtest, err):
-        self.has_result = True
-        if err is not None:
-            self.record_failure(test)
-        super().addSubTest(test, subtest, err)
-
-    def addError(self, test, err):
-        self.has_result = True
-        if not isinstance(test, unittest.loader._FailedTest):
-            self.record_failure(test)
-        super().addError(test, err)
-
-    def addFailure(self, test, err):
-        self.has_result = True
-        self.record_failure(test)
-        super().addFailure(test, err)
-
-    def addUnexpectedSuccess(self, test):
-        self.record_failure(test)
-        super().addUnexpectedSuccess(test)
-
-    def stopTest(self, test):
-        if self.current is not None and sys.exception() is None:
-            skipped = self.skipped_invocation and not self.has_result
-            self.record("skipped" if skipped else "executed", self.current)
-        self.current = None
-        super().stopTest(test)
-
-
-class AffectedRunner(unittest.TextTestRunner):
-    def run(self, suite, *, occurrences, journal):
-        result = AffectedResult(self.stream, self.descriptions, 0, occurrences=occurrences, journal=journal)
-        suite(result)
-        result.printErrors()
-        return result
-
-
-def _case_names(cases):
-    names = [test.id() for test in cases]
-    counts = Counter(names)
-    return [
-        f"{name} (discovery occurrence {index})" if counts[name] > 1 else name
-        for index, name in enumerate(names, 1)
-    ]
-
-
-def _case_occurrences(cases, names):
-    occurrences = {}
-    for test, name in zip(cases, names, strict=True):
-        occurrences.setdefault(id(test), deque()).append(name)
-    return occurrences
-
-
-def _suite_reason(plan, loader, cases):
+def _suite_reason(full, loader, cases):
     if loader.used_hook:
         return "full run: unittest discovery used load_tests"
-    if plan["full"] is not None:
-        return plan["full"]
-    if any(id(test) not in loader.sourced_cases for test in cases):
+    if full not in (None, RUNTIME_SUITE_REASON):
+        return full
+    if not cases.issubset(loader.sourced_cases):
         return "full run: discovery returned a test without a source file"
-    return plan["fallback"]
+    return full
 
 
-def _record_fixture_skips(result, cases):
-    """Record occurrences blocked by a setup skip reported against a fixture holder."""
-    fixtures = {test.id() for test, _ in result.skipped if isinstance(test, unittest.suite._ErrorHolder)}
-    for test in cases:
-        cls = type(test)
-        if {f"setUpModule ({cls.__module__})", f"setUpClass ({unittest.util.strclass(cls)})"} & fixtures:
-            for name in result.occurrences.pop(id(test), ()):
-                result.record("skipped", name)
-
-
-def _real_cases(tests):
-    return [test for test in tests if not isinstance(test, unittest.loader._FailedTest)]
-
-
-def _selection_report(names, full):
-    if full is None:
-        return {
-            "selected": {},
-            "left_out": dict.fromkeys(names, "no changed file affects this test"),
-            "reason": "no affected tests discovered",
-        }
-    return {"selected": dict.fromkeys(names, full), "left_out": {}, "reason": full}
-
-
-def _run_affected_suite(suite, loader, plan, journal):
-    tests = list(_discovered_cases(suite))
-    cases = _real_cases(tests)
-    names = _case_names(cases)
-    full = _suite_reason(plan, loader, cases)
-    report = {
-        "selection": _selection_report(names, full),
-        "discovery_errors": loader.errors,
-        "omitted": full is None and not loader.errors,
-    }
-    print(json.dumps(report), file=journal, flush=True)
-    if full is None:
-        suite = unittest.TestSuite(test for test in tests if isinstance(test, unittest.loader._FailedTest))
-        return AffectedRunner().run(suite, occurrences={}, journal=journal)
-    result = AffectedRunner().run(suite, occurrences=_case_occurrences(cases, names), journal=journal)
-    _record_fixture_skips(result, cases)
-    return result
-
-
-def _run_affected(path):
+def _affected_discovery(path, journal):
     plan = json.loads(path.read_text(encoding="utf-8"))
     options = _options(plan["argv"])
     loader = AffectedLoader()
-    suite = loader.discover(options.start, options.pattern)
+    tests = _discover(options.start, options.pattern, loader)
+    return _affected_schedule(tests, _test_ids(tests), loader, plan["full"], journal)
+
+
+def _affected_schedule(tests, ids, loader, full, journal):
+    cases = set()
+    reported_ids = []
+    failed = []
+    for position, (test, name) in enumerate(zip(tests, ids, strict=True)):
+        if isinstance(test, unittest.loader._FailedTest):
+            reported_ids.append(None)
+            failed.append(position)
+        else:
+            reported_ids.append(name)
+            cases.add(id(test))
+    full = _suite_reason(full, loader, cases)
+    header = {
+        "ids": reported_ids,
+        "full": full,
+        "discovery_errors": loader.errors,
+    }
+    print(json.dumps(header), file=journal, flush=True)
+    positions = range(len(tests)) if full is not None else failed
+    return tests, ids, positions
+
+
+def _affected_event(journal, event, value):
+    _journal_event(journal, event, value)
+    if event == "started":
+        return
+    events = [value] if event == "fixture" else value[3]
+    _print_details(events)
+    for name, outcome, detail in events:
+        if outcome == "skipped":
+            print(f"skipped {name}: {detail}", flush=True)
+    sys.stdout.flush()
+
+
+def _affected_execution(tests, ids, positions, journal):
+    report = _execute(tests, ids, positions, functools.partial(_affected_event, journal))
+    _validate_records(ids, positions, report["records"])
+    _journal_event(journal, "finished", None)
+    return int(any(outcome in FAILED_OUTCOMES for _, outcome, _ in _events(report["records"], [report])))
+
+
+def _run_affected(path):
     with path.with_suffix(".result.jsonl").open("w", encoding="utf-8") as journal:
-        result = _run_affected_suite(suite, loader, plan, journal)
-    return int(not result.wasSuccessful())
+        try:
+            tests, ids, positions = _affected_discovery(path, journal)
+            return _affected_execution(tests, ids, positions, journal)
+        except ShardError as error:
+            return _affected_error(journal, error)
+
+
+def _affected_error(journal, error):
+    if journal.tell() == 0:
+        print(json.dumps({"ids": [], "full": None, "discovery_errors": []}), file=journal, flush=True)
+    _journal_event(journal, "error", str(error))
+    print(f"unittest shards: {error}", file=sys.stderr)
+    return 1
 
 
 def _module_blocks(modules):
@@ -322,15 +306,14 @@ def _test_ids(tests):
         return [test.id() for test in tests]
 
 
-def _execute(tests, ids, positions=None, journal=None):
+def _execute(tests, ids, positions=None, observe=None):
     selected = range(len(tests)) if positions is None else positions
     suite = ShardSuite([tests[position] for position in selected], selected)
-    result_class = functools.partial(ShardResult, ids=ids, journal=journal)
+    result_class = functools.partial(ShardResult, ids=ids, observe=observe)
     with open(os.devnull, "w", encoding="utf-8") as stream:
         result = unittest.TextTestRunner(
             stream=stream, resultclass=result_class, warnings=None if sys.warnoptions else "default",
         ).run(suite)
-    result.fixtures.extend(result.events())
     return {"ids": ids, "records": result.records, "fixtures": result.fixtures}
 
 
@@ -410,7 +393,7 @@ def _worker(options):
     ids = _test_ids(tests)
     selected = plan["shares"][int(index)] if ids == plan["ids"] else []
     with path.with_suffix(".jsonl").open("w", encoding="utf-8") as journal:
-        report = _execute(tests, ids, selected, journal)
+        report = _execute(tests, ids, selected, functools.partial(_journal_event, journal))
     path.write_text(json.dumps({"ids": ids, "fixtures": report["fixtures"]}), encoding="utf-8")
 
 
@@ -419,7 +402,8 @@ def _completed_records(path):
         contents = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
-    return [json.loads(line) for line in contents.split("\n")[:-1]]
+    events = (json.loads(line) for line in contents.split("\n")[:-1])
+    return [record for event, record in events if event == "terminal"]
 
 
 def _worker_failure(path, ids, positions, records, reason):
@@ -519,7 +503,7 @@ def _summary(reports, elapsed):
     events = list(_events(records, reports))
     _print_details(events)
     outcomes = [record[2] for record in records]
-    ran = len(records) - outcomes.count("blocked")
+    ran = len(records) - outcomes.count("blocked") - outcomes.count("fixture skipped")
     counts = Counter(event[1] for event in events)
     failed, status = _summary_status(counts)
     if ran == 0 and not counts["skipped"]:

@@ -843,7 +843,6 @@ class CheckSelection:
     reason: str
     skip: bool = False
     full_suite: str | None = None
-    suite_fallback: str | None = None
 
     def report(self) -> dict[str, Any]:
         return {"selected": self.selected, "left_out": self.left_out, "reason": self.reason}
@@ -932,15 +931,13 @@ def _elisp_suite_scope(path: str, reason: str | None) -> CheckSelection:
 
 def _check_selection(
     check: CheckDef, inputs: list[str], expanded: dict[str, str], affected: dict[str, str],
-    full: str | None, suite_fallback: str | None,
+    full: str | None, runtime_reason: str | None,
 ) -> CheckSelection:
+    suite_reason = full or runtime_reason
     if check.adapter == "elisp_tests":
-        path = Path(check.spec.suite).as_posix()
-        return _elisp_suite_scope(path, full or suite_fallback)
+        return _elisp_suite_scope(Path(check.spec.suite).as_posix(), suite_reason)
     if check.adapter == "python_tests":
-        return CheckSelection(
-            {}, {}, full or "full run", full_suite=full, suite_fallback=suite_fallback,
-        )
+        return CheckSelection({}, {}, suite_reason or "full run", full_suite=suite_reason)
     if _command_suite(check):
         reason = "full run: command adapter suite is opaque"
         return CheckSelection({}, {}, reason)
@@ -967,12 +964,12 @@ def _affected_selection(
         root, config, files, classes, evidence_dir, changed, contract_graph,
     )
     forced = _forced_inputs(config, checks)
-    suite_fallback = RUNTIME_SUITE_REASON if changed else None
+    runtime_reason = RUNTIME_SUITE_REASON if changed else None
     selections = {}
     for check in checks:
         inputs = _select_files(config, check, files, classes)[0]
         selections[check.id] = _check_selection(
-            check, inputs, expanded, affected, full or forced.get(check.id), suite_fallback,
+            check, inputs, expanded, affected, full or forced.get(check.id), runtime_reason,
         )
     for check in checks:
         _require_coverage(check, config, selections)

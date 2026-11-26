@@ -656,6 +656,10 @@ def load_tests(loader, suite, pattern):
         self.assertEqual(suite["executed"], [IMPORTING, OTHER])
         report = self.discover_shards(["-s", "tests"])
         self.assertEqual(report["selection"], suite["selection"])
+        self.add_file("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.checked(document)["selection"], suite["selection"])
 
     def test_completed_suite_accounts_for_class_and_module_setup_skips(self):
         self.add_file(
@@ -680,35 +684,149 @@ def load_tests(loader, suite, pattern):
         ]
         self.assertCountEqual(suite["skipped"], skipped)
         self.assertEqual(suite["not_executed"], {})
-        report = self.discover_shards(["-s", "tests"], fallback=RUNTIME_REASON)
+        report = self.discover_shards(["-s", "tests"], full=RUNTIME_REASON)
         self.assertCountEqual(report["skipped"], skipped)
 
-    def test_completed_suite_rejects_silent_omission(self):
+    def test_affected_discovery_refuses_a_suite_that_could_hide_a_fixture_skip(self):
         self.add_file("tests/test_incomplete.py", """\
 import unittest
 
 class Incomplete(unittest.TestSuite):
     def run(self, result, debug=False):
-        next(iter(self))(result)
+        first, omitted, passing = list(self)
+        return unittest.TestSuite([first, passing]).run(result, debug)
 
-class Cases(unittest.TestCase):
+class Blocked(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        raise unittest.SkipTest("class setup")
+
     def test_first(self):
-        pass
+        self.fail("not reachable")
 
     def test_omitted(self):
+        self.fail("not reachable")
+
+class Passing(unittest.TestCase):
+    def test_passes(self):
         pass
 
 def load_tests(loader, suite, pattern):
-    return Incomplete(loader.loadTestsFromTestCase(Cases))
+    return Incomplete([Blocked("test_first"), Blocked("test_omitted"), Passing("test_passes")])
 """)
         self.change("pkg/a.py", "value = 2\n")
         result, document = self.affected("--only", "tests")
         self.assertEqual(result.returncode, 1, output(result))
         suite = self.checked(document)
-        omitted = "test_incomplete.Cases.test_omitted"
         self.assertEqual(suite["outcome"], "fail")
-        self.assertIn(omitted, suite["reason"])
-        self.assertEqual(list(suite["not_executed"]), [omitted])
+        self.assertIn("suite Incomplete in module test_incomplete", suite["reason"])
+        self.assertIn("expected standard unittest suite execution", suite["reason"])
+        self.assertEqual(suite["executed"], [])
+
+    def test_affected_execution_rejects_missing_replayed_and_unexpected_occurrences(self):
+        self.commit_all()
+        case = "test_accounting.Changed.test_case"
+        unexpected = "test_accounting.Unexpected.test_unscheduled"
+        for invocation, diagnosis, outstanding in (
+            ("return result", f"missing position 1 ({case!r})", [case]),
+            ("super().run(result); super().run(result)", f"duplicated position 1 ({case!r})", []),
+            ("Unexpected('test_unscheduled')(result)", f"unexpected unittest occurrence {unexpected!r}", [
+                case, IMPORTING, OTHER,
+            ]),
+            ("result.stopTest(self)", f"occurrence {case!r} stopped without starting", [
+                case, IMPORTING, OTHER,
+            ]),
+            ("result.startTest(self); result.startTest(self)", f"occurrence {case!r} started again", [
+                case, IMPORTING, OTHER,
+            ]),
+        ):
+            with self.subTest(invocation=invocation):
+                self.add_file("tests/test_accounting.py", f"""\
+import unittest
+
+class Unexpected(unittest.TestCase):
+    def test_unscheduled(self):
+        pass
+
+class Changed(unittest.TestCase):
+    def run(self, result):
+        {invocation}
+
+    def test_case(self):
+        pass
+
+def load_tests(loader, suite, pattern):
+    return unittest.TestSuite([Changed("test_case")])
+""")
+                result, document = self.affected("--only", "tests")
+                self.assertEqual(result.returncode, 1, output(result))
+                suite = self.checked(document)
+                self.assertEqual(suite["outcome"], "fail")
+                self.assertIn(diagnosis, suite["reason"])
+                self.assertCountEqual(suite["not_executed"], outstanding)
+
+    def test_affected_execution_accounts_for_fixture_failures(self):
+        for scope, fixture in (
+            ("class", "    @classmethod\n    def setUpClass(cls):\n"
+             "        raise RuntimeError('class setup')\n"),
+            ("module", "def setUpModule():\n    raise RuntimeError('module setup')\n"),
+        ):
+            definition = "class Cases(unittest.TestCase):\n"
+            prefix = definition + fixture if scope == "class" else fixture + definition
+            self.add_file(f"tests/test_{scope}_error.py", "import unittest\n" + prefix +
+                          "    def test_first(self):\n        self.fail('not reachable')\n"
+                          "    def test_second(self):\n        self.fail('not reachable')\n")
+        self.change("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 1, output(result))
+        suite = self.checked(document)
+        self.assertEqual(suite["executed"], [IMPORTING, OTHER])
+        self.assertEqual(suite["skipped"], [])
+        self.assertEqual(suite["not_executed"], {
+            f"test_{scope}_error.Cases.test_{name}": "fixture setup failed"
+            for scope in ("class", "module") for name in ("first", "second")
+        })
+        self.assertCountEqual(
+            [finding["subject"] for finding in suite["findings"]],
+            ["setUpClass (test_class_error.Cases)", "setUpModule (test_module_error)"],
+        )
+        for scope in ("class", "module"):
+            self.assertIn(f"RuntimeError: {scope} setup", result.stderr)
+
+    def test_duplicate_discovery_labels_cannot_overwrite_a_literal_id(self):
+        self.add_file("tests/test_collision.py", """\
+import unittest
+
+class Cases(unittest.TestCase):
+    def __init__(self, name):
+        super().__init__("runTest")
+        self.name = name
+
+    def id(self):
+        return self.name
+
+    def runTest(self):
+        pass
+
+def load_tests(loader, suite, pattern):
+    return unittest.TestSuite(Cases(name) for name in (
+        "sample", "sample", "sample (discovery occurrence 1)",
+        "sample (discovery occurrence 1) (duplicate)",
+    ))
+""")
+        self.change("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document)
+        self.assertCountEqual(suite["selection"]["selected"], [
+            "sample (discovery occurrence 1) (duplicate) (duplicate)",
+            "sample (discovery occurrence 2)",
+            "sample (discovery occurrence 1)",
+            "sample (discovery occurrence 1) (duplicate)",
+            IMPORTING, OTHER,
+        ])
+        self.assertCountEqual(suite["executed"], suite["selection"]["selected"])
+        self.assertEqual(suite["not_executed"], {})
 
     def test_passing_subtest_counts_even_with_a_skipped_subtest(self):
         self.commit_all()
@@ -789,6 +907,17 @@ def load_tests(loader, suite, pattern):
 
     def test_interrupted_suite_keeps_selection_and_completed_invocations(self):
         self.write_config(CONFIG + "budget_seconds = 3\n")
+        self.add_file("tests/test_fixture.py", """\
+import unittest
+
+def setUpModule():
+    raise RuntimeError("fixture failure before interruption")
+
+class Blocked(unittest.TestCase):
+    def test_blocked(self):
+        self.fail("not reachable")
+""")
+        blocked = "test_fixture.Blocked.test_blocked"
         self.write_test("later")
         self.commit_all()
         self.write_test("importing", body="        self.assertTrue(1)\n")
@@ -796,6 +925,7 @@ def load_tests(loader, suite, pattern):
             ("        import time\n        time.sleep(60)\n", "budget"),
             ("        import os, signal\n        os.kill(os.getpid(), signal.SIGTERM)\n", "signal"),
             ("        import os, signal\n        os.kill(os.getpid(), signal.SIGINT)\n", "signal"),
+            ("        import os\n        os._exit(0)\n", "completed"),
         ):
             with self.subTest(execution=execution):
                 self.write_test("later", body=body)
@@ -805,12 +935,17 @@ def load_tests(loader, suite, pattern):
                 later = "test_later.Example.test_value"
                 self.assertEqual(suite["execution"], execution)
                 self.assertEqual(suite["selection"]["selected"], dict.fromkeys(
-                    [IMPORTING, later, OTHER], RUNTIME_REASON,
+                    [blocked, IMPORTING, later, OTHER], RUNTIME_REASON,
                 ))
                 self.assertEqual(suite["selection"]["left_out"], {})
                 self.assertEqual(suite["executed"], [IMPORTING])
                 self.assertEqual(suite["measurement"], {"tests": 1})
+                self.assertIn("RuntimeError: fixture failure before interruption", result.stderr)
+                self.assertEqual([finding["subject"] for finding in suite["findings"]], [
+                    "setUpModule (test_fixture)",
+                ])
                 self.assertEqual(suite["not_executed"], {
+                    blocked: "fixture setup failed",
                     later: "invocation interrupted",
                     OTHER: "the run did not invoke this selected test",
                 })
@@ -947,14 +1082,14 @@ reason = "External package consumer"
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(self.checked(document)["executed"], [OTHER])
-        self.assertEqual(self.discover_shards(argv, fallback=RUNTIME_REASON)["executed"], [OTHER])
+        self.assertEqual(self.discover_shards(argv, full=RUNTIME_REASON)["executed"], [OTHER])
 
-    def discover_shards(self, argv, *, fallback=None):
+    def discover_shards(self, argv, *, full=None):
         from quality_gate.adapters import _read_affected_report
 
         plan = self.base / "plan.json"
         plan.write_text(json.dumps({
-            "argv": argv, "full": None, "fallback": fallback,
+            "argv": argv, "full": full,
         }), encoding="utf-8")
         child = subprocess.run(
             [*self.python_prefix(), str(SHARD_RUNNER), "--affected", str(plan)],

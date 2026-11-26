@@ -1372,10 +1372,11 @@ configuration, tool pins, data, and documentation.
 
 Every selected suite that reaches execution runs in full on a nonempty affected diff. The module
 graph records extractable dependencies and cannot account for test runtime inputs such as files read as
-data. The unittest shard runner uses the configured discovery arguments. On an empty diff it still
-reports discovery errors and runs the full suite when discovery uses `load_tests` or returns a test
-without a source file. Command-adapter suites and custom Python test commands run their full
-configured command and retain the full run's policy verdict, test counts, and diagnostics.
+data. The unittest shard runner uses the configured discovery arguments and requires standard
+unittest suite execution. It checks for one terminal record per scheduled discovery occurrence.
+On an empty diff it still reports discovery errors and runs the full suite when discovery uses
+`load_tests` or returns a test without a source file. ERT, command-adapter suites, and custom
+Python test commands retain their configured invocations and result contracts.
 
 Verification runs with its full prerequisites. CRAP schedules its prerequisite coverage suite for
 changed inputs. If that suite fails, CRAP reports `unsupported`.
@@ -1383,8 +1384,9 @@ The JSON records `"scope": "affected"`, the `base` revision, the union of `chang
 and each check's selection and reasons. Selection, affected module contracts, and Python shape use
 that same union. Python shape reports which files it measured and treats untracked paths as whole
 new files for added-helper analysis. Unittest reports selected discovery occurrences, any left out
-on an empty diff, and invocation results separately. Selection and completed invocations are
-retained if the run times out or is terminated by a signal.
+on an empty diff, and invocation results separately. The report preserves duplicate IDs as
+distinct occurrences, accounts for fixture blocks at their scheduled positions, and retains
+completed records and outstanding positions after a timeout or signal.
 
 Attempt consumers requiring full assurance must use an unscoped `check` result with decision
 `accepted` or `accepted_with_exceptions`.

@@ -550,39 +550,100 @@ def _affected_test_child(
 
 
 def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | None]:
-    if report["discovery_errors"]:
-        return "fail", report["discovery_errors"][0].splitlines()[0]
+    if report["error"] is not None:
+        return "fail", report["error"]
     if returncode:
         return "fail", f"command exited {returncode}"
+    if not report["finished"]:
+        return "fail", "unittest did not finish validating the discovery occurrences"
     if report["omitted"]:
         return "not_run", report["selection"]["reason"]
-    expected = Counter(report["selection"]["selected"].keys())
-    completed = Counter([*report["executed"], *report["skipped"]])
-    mismatched = sorted((expected - completed).keys() | (completed - expected).keys())
-    mismatched.extend(report["unexpected"])
-    if mismatched:
-        names = ", ".join(mismatched)
-        return "fail", f"unittest did not record one completion per selected occurrence: {names}"
     if not report["executed"]:
         return "fail", "no test executed"
     return "pass", None
 
 
+def _occurrence_labels(ids: list[str | None]) -> dict[int, str]:
+    counts = Counter(ids)
+    reserved = set(counts)
+    labels = {}
+    for position, name in enumerate(ids):
+        if name is None:
+            continue
+        label = name
+        if counts[name] > 1:
+            label = f"{name} (discovery occurrence {len(labels) + 1})"
+            while label in reserved:
+                label += " (duplicate)"
+            reserved.add(label)
+        labels[position] = label
+    return labels
+
+
+def _affected_selection_report(labels: dict[int, str], full: str | None) -> dict:
+    if full is None:
+        return {
+            "selected": {},
+            "left_out": dict.fromkeys(labels.values(), "no changed file affects this test"),
+            "reason": "no affected tests discovered",
+        }
+    return {"selected": dict.fromkeys(labels.values(), full), "left_out": {}, "reason": full}
+
+
+def _affected_invocations(labels: dict[int, str], events: dict[str, list]) -> dict:
+    outcomes = {position: outcome for position, _, outcome, _ in events["terminal"]}
+    started = set(events["started"])
+    executed, skipped, outstanding = [], [], {}
+    for position, label in labels.items():
+        outcome = outcomes.get(position)
+        if outcome in (None, "blocked"):
+            outstanding[label] = _outstanding_reason(outcome, position in started)
+        elif outcome in ("skipped", "fixture skipped"):
+            skipped.append(label)
+        else:
+            executed.append(label)
+    return {"executed": executed, "skipped": skipped, "not_executed": outstanding}
+
+
+def _outstanding_reason(outcome: str | None, started: bool) -> str:
+    if outcome == "blocked":
+        return "fixture setup failed"
+    if started:
+        return "invocation interrupted"
+    return "the run did not invoke this selected test"
+
+
+def _affected_failures(labels: dict[int, str], events: dict[str, list]) -> list[str]:
+    failed = {"failure", "error", "unexpected success"}
+    return [
+        labels[pos] for pos, _, outcome, _ in events["terminal"] if pos in labels and outcome in failed
+    ] + [name for name, outcome, _ in events["fixture"] if outcome in failed]
+
+
 def _read_affected_report(path: Path) -> dict:
     with path.open(encoding="utf-8") as journal:
-        report = load_json(journal.readline())
-        records = {event: [] for event in ("started", "executed", "skipped", "failed", "unexpected")}
+        header = load_json(journal.readline())
+        events = {name: [] for name in ("started", "terminal", "fixture", "error", "finished")}
         for line in journal:
             if line.endswith("\n"):
-                event, name = load_json(line)
-                records[event].append(name)
-    started = set(records.pop("started"))
-    missed = report["selection"]["selected"].keys() - set(records["executed"]) - set(records["skipped"])
-    report["not_executed"] = {
-        name: "invocation interrupted" if name in started else "the run did not invoke this selected test"
-        for name in sorted(missed)
+                event, value = load_json(line)
+                events[event].append(value)
+    return _affected_journal_report(header, events)
+
+
+def _affected_journal_report(header: dict, events: dict[str, list]) -> dict:
+    labels = _occurrence_labels(header["ids"])
+    full, errors = header["full"], header["discovery_errors"]
+    error = errors[0].splitlines()[0] if errors else next(iter(events["error"]), None)
+    return {
+        "selection": _affected_selection_report(labels, full),
+        "discovery_errors": errors,
+        "omitted": full is None,
+        "finished": bool(events["finished"]),
+        "error": error,
+        "failed": _affected_failures(labels, events),
+        **_affected_invocations(labels if full is not None else {}, events),
     }
-    return {**report, **records}
 
 
 def _affected_test_report(context: AdapterContext, path: Path, child: Any, start: float) -> Any:
@@ -613,7 +674,8 @@ def _affected_test_check(check: Any, start: float, child: Any, report: dict, fai
     )
     executed, skipped = len(report["executed"]), len(report["skipped"])
     report.pop("omitted")
-    report.pop("unexpected")
+    report.pop("finished")
+    report.pop("error")
     findings = _unittest_findings(sorted(set(report.pop("failed"))))
     fields = {
         "reason": reason, "diagnostics": child.diagnostics(), "budget_seconds": check.spec.budget_seconds,
@@ -640,7 +702,7 @@ def _affected_test_plan(context: AdapterContext, argv: tuple[str, ...]) -> Path:
     assert selection is not None
     plan = context.evidence_dir / "discovery.json"
     plan.write_text(json.dumps({
-        "argv": argv, "full": selection.full_suite, "fallback": selection.suite_fallback,
+        "argv": argv, "full": selection.full_suite,
     }), encoding="utf-8")
     return plan
 
