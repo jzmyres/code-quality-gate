@@ -450,27 +450,31 @@ def _entry_type(path: Path) -> str | None:
 
 def _shebang_line(path: Path) -> str:
     with path.open("rb") as stream:
-        data = stream.read(SHEBANG_LIMIT)
-    return data.decode("utf-8", "replace").split("\n", 1)[0]
+        return _bounded_shebang(stream.read(SHEBANG_LIMIT))
 
 
-def _regular_interpreter(path: Path) -> str | None:
-    if not stat.S_ISREG(path.lstat().st_mode):
-        return None
-    return _shebang_interpreter(_shebang_line(path), path)
+def _bounded_shebang(data: bytes) -> str:
+    return data[:SHEBANG_LIMIT].decode("utf-8", "replace").split("\n", 1)[0]
+
+
+def _python_shebang(first_line: str, path: Path | str) -> bool:
+    interpreter = _shebang_interpreter(first_line, path)
+    return interpreter is not None and _PYTHON_INTERPRETER.fullmatch(interpreter) is not None
+
+
+def is_python_blob(relative: str, data: bytes) -> bool:
+    """Classify a regular Git blob by the same suffix and shebang as the worktree."""
+    return relative.endswith(".py") or _python_shebang(_bounded_shebang(data), relative)
 
 
 def is_python_program(root: Path, relative: str) -> bool:
     if relative.endswith(".py"):
         return True
+    path = root / relative
     try:
-        interpreter = _regular_interpreter(root / relative)
+        return stat.S_ISREG(path.lstat().st_mode) and _python_shebang(_shebang_line(path), path)
     except OSError as error:
         raise GateError(f"cannot read shebang of {relative}: {error}") from error
-    return (
-        interpreter is not None
-        and _PYTHON_INTERPRETER.fullmatch(interpreter) is not None
-    )
 
 
 def _parent_fd(root: Path, relative: str) -> int:

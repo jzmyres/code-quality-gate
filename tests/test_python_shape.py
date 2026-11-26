@@ -57,8 +57,8 @@ from support import (
     output,
 )
 
-from quality_gate import policy
-from quality_gate.files import DiffBase
+from quality_gate import policy, python_shape
+from quality_gate.files import SHEBANG_LIMIT, DiffBase, is_python_blob
 from quality_gate.python_shape import (
     CallSite,
     Diff,
@@ -999,7 +999,7 @@ class SingleUseMethodTests(ShapeCase):
 
 
 class UncalledTests(ShapeCase):
-    """An added function named but not called and not tested is refused."""
+    """An added or newly orphaned function needs an outside call or direct test."""
 
     def uncalled_subjects(self, check: dict[str, Any]) -> list[str]:
         return [finding["subject"] for finding in check["findings"]]
@@ -1012,6 +1012,109 @@ class UncalledTests(ShapeCase):
         self.assertTrue(
             subjects[0].startswith(f"UNCALLED pkg/app.py:{name} "), subjects
         )
+
+    def test_orphan_from_deleted_caller_and_same_file_span(self) -> None:
+        notes = "pkg/notes.py"
+        shifted = "pkg/shifted.py"
+        removed = "pkg/removed.py"
+        deleted_caller = "pkg/legacy"
+        surviving_caller = "pkg/still.py"
+        moved_caller = "pkg/moved.py"
+        definitions = {
+            f"{notes}:Archive.archive_note": True,
+            f"{notes}:retained": True,
+            f"{notes}:relocated": True,
+            f"{notes}:covered": True,
+            f"{notes}:already_unused": True,
+            f"{shifted}:shifted": True,
+            f"{shifted}:recursive_only": True,
+            f"{removed}:removed": False,
+        }
+        self_calls = {f"{shifted}:shifted", f"{shifted}:recursive_only"}
+        before = {
+            deleted_caller: ("archive_note", "retained", "relocated", "covered", "removed"),
+            surviving_caller: ("retained", "relocated"),
+            shifted: ("shifted",),
+        }
+        deletion_only = {surviving_caller: before[surviving_caller], shifted: before[shifted]}
+        after_move = {surviving_caller: ("retained",), moved_caller: ("relocated",)}
+        direct_tests = {"covered"}
+        prior_names = set().union(*before.values())
+        expected = []
+        for after in (deletion_only, after_move):
+            current_names = set().union(*after.values())
+            expected.append({
+                identity for identity, survives in definitions.items()
+                if survives and (name := identity.rsplit(":", 1)[1].rsplit(".", 1)[-1])
+                in prior_names and name not in current_names
+                and name not in direct_tests
+            })
+
+        self.write_config(shape_config(extra=(
+            "\n[[rule]]\n"
+            f'pattern = "{deleted_caller}*"\n'
+            'class = "python"\n'
+            'reason = "a suffixless Python program"\n'
+        )))
+        sources = {f"{deleted_caller}-stub": "#!/usr/bin/env python3\n"}
+        for identity in definitions:
+            path, qualified = identity.split(":")
+            owner, _, name = qualified.rpartition(".")
+            indent = "    " if owner else ""
+            header = f"class {owner}:\n" if owner else ""
+            value = f"{qualified}()" if identity in self_calls else "None"
+            definition = f"{header}{indent}def {name}():\n{indent}    return {value}\n"
+            sources[path] = sources.get(path, "") + definition
+        for path, calls in before.items():
+            prefix = "#!/usr/bin/env python3\n" if path == deleted_caller else ""
+            sources[path] = prefix + "".join(f"{name}()\n" for name in calls) + sources.get(path, "")
+        sources["tests/test_notes.py"] = (
+            "def test_covered():\n" + "".join(f"    {name}()\n" for name in sorted(direct_tests))
+            + "\narchive_note()\n"
+        )
+        self.base_commit(sources)
+        self.git("rm", "--", deleted_caller, removed)
+        self.commit_all("remove the legacy caller and an obsolete definition")
+
+        locations = {
+            f"{notes}:Archive.archive_note": (notes, 2, 3),
+            f"{shifted}:shifted": (shifted, 1, 3),
+        }
+        for moved, identities in enumerate(expected):
+            if moved:
+                for path, calls in after_move.items():
+                    self.add_file(path, "".join(f"{name.replace('d', '\uff44')}()\n" for name in calls))
+                definition = sources[shifted].removeprefix("shifted()\n")
+                definition = definition.replace("def recursive_only", "\n\n\ndef recursive_only")
+                self.add_file(shifted, definition.replace("    return", "\n    return", 1))
+            for override in ((), ("--base", "HEAD^")):
+                with self.subTest(moved=bool(moved), base=override):
+                    result, document = self.run_json("--only", "shape", *override)
+                    self.assertEqual(result.returncode, 1, output(result))
+                    self.assertEqual(document["decision"], "rejected")
+                    check = self.check_by_id(document, "shape")
+                    actual = [
+                        (f'{item["measurement"]["file"]}:{item["measurement"]["name"]}', item)
+                        for item in check["findings"] if item["measurement"]["rule"] == "UNCALLED"
+                    ]
+                    self.assertCountEqual([identity for identity, _ in actual], identities, output(result))
+                    for identity, item in actual:
+                        path, start, end = locations[identity]
+                        self.assertEqual((item["value"], item["threshold"], item["blocking"]), (1, 0, True))
+                        self.assertEqual(item["location"], f"{path}:{start}-{end}")
+                        self.assertEqual(
+                            item["locations"], [{"path": path, "start_line": start, "end_line": end}],
+                        )
+                    self.assertEqual(check["measurement"]["functions"], len(identities))
+                    self.assertEqual(check["measurement"]["added"], 0)
+                    base = self.policy_base()
+                    if override:
+                        base["source"] = "--base"
+                        selected = check["selection"]["selected"]
+                        self.assertEqual(selected[notes], "lost its last production call")
+                        if not moved:
+                            self.assertEqual(set(selected), {notes})
+                    self.assertEqual(check["measurement"]["base"], base)
 
     def test_a_dispatch_table_of_uncalled_functions_is_refused(self) -> None:
         self.base_commit({"pkg/app.py": DISPATCH_BASE})
@@ -1568,7 +1671,7 @@ class ProductionCallerTests(unittest.TestCase):
             )
         calls, tests = _uses(indexes, {helper.final_name})
         data = ShapeInput(
-            (helper,), {}, (helper,), (helper,), calls, tests, SHAPE_SPEC, 6,
+            (helper,), {}, (helper,), (helper,), (), calls, tests, SHAPE_SPEC, 6,
         )
         return _cpf_findings(data)
 
@@ -1767,7 +1870,7 @@ class HelperTests(unittest.TestCase):
         data = ShapeInput(
             (paid, still_complex),
             {"pkg/app.py": {paid.identity: 7, still_complex.identity: 7}},
-            (), (), {}, frozenset(), SHAPE_SPEC, 6,
+            (), (), (), {}, frozenset(), SHAPE_SPEC, 6,
         )
         self.assertEqual(_cpf_targets(data), {paid.identity: (7, paid)})
 
@@ -1777,7 +1880,7 @@ class HelperTests(unittest.TestCase):
         outside = shape_function("def outside():\n    return 3\n")
         candidates = (head, tail, outside)
         data = ShapeInput(
-            candidates, {}, (), candidates,
+            candidates, {}, (), candidates, (),
             {
                 "tail": (
                     CallSite(
@@ -1851,7 +1954,7 @@ class HelperTests(unittest.TestCase):
         first = shape_function("def first():\n    return 1\n")
         second = shape_function("def second():\n    return 2\n")
         data = ShapeInput(
-            (first, second), {}, (), (first, second), {},
+            (first, second), {}, (), (first, second), (), {},
             frozenset(), SHAPE_SPEC, 6,
         )
         tokens = {first.identity: ("ID",), second.identity: ()}
@@ -1866,7 +1969,7 @@ class HelperTests(unittest.TestCase):
         lonely = shape_function("def lonely():\n    return 3\n")
         data = ShapeInput(
             (recursive, named, tested, lonely), {}, (),
-            (recursive, named, tested, lonely),
+            (recursive, named, tested, lonely), (lonely,),
             {
                 "recursive": (
                     CallSite(
@@ -1962,35 +2065,30 @@ class HelperInputTests(ShapeCase):
         indexes = _scan_files(context, context.files, {"render_json"})
         self.assertEqual(set(indexes), {"pkg/helper"})
 
-    def test_shape_input_selects_the_changed_definitions(self) -> None:
-        source = (
-            "def first():\n    return 1\n\n\ndef second():\n    return 2\n"
+    def shape_context(self, paths: list[str]) -> SimpleNamespace:
+        config = policy.load_config(self.repo)
+        return SimpleNamespace(
+            root=self.repo, config=config, check=config.checks["shape"],
+            files=paths, inventory_files=paths, classes=dict.fromkeys(paths, "python"),
         )
-        self.add_file("pkg/app.py", source)
-        diff = Diff(
-            frozenset({"pkg/app.py"}),
-            {"pkg/app.py": frozenset({1})},
-            frozenset(),
-        )
-        context = SimpleNamespace(root=self.repo, files=["pkg/app.py"])
-        before = {
-            "pkg/app.py": {
-                function.identity: function
-                for function in _file_index(
-                    "pkg/app.py", "def first():\n    return 1\n"
-                ).functions
-            }
-        }
-        with mock.patch.multiple(
-            "quality_gate.python_shape",
-            _diff_lines=mock.Mock(return_value=diff),
-            _measured_paths=mock.Mock(return_value=["pkg/app.py"]),
-            _scan_files=mock.Mock(return_value={}),
-            _base_functions=mock.Mock(return_value=before),
-        ):
-            data = _shape_input(context, SHAPE_SPEC, 6, DiffBase("HEAD", "base"))
-        self.assertEqual(
-            [function.name for function in data.functions], ["second"]
+
+    def test_orphan_shape_input_reuses_each_revision_index(self) -> None:
+        path = "pkg/app.py"
+        other = "pkg/other.py"
+        first = "def first():\n    return 1\n\n"
+        before = first + "first()\n"
+        after = first + "def second():\n    return 2\n\nsecond()\n"
+        other_source = "def untouched():\n    return second\n"
+        self.base_commit({path: before, other: other_source})
+        self.add_file(path, after)
+        context = self.shape_context([path, path, other, other])
+        base = DiffBase(self.git("rev-parse", "HEAD").stdout.strip(), "base")
+        with mock.patch.object(python_shape, "_parse_tree", wraps=python_shape._parse_tree) as parse:
+            data = _shape_input(context, SHAPE_SPEC, 6, base)
+        self.assertCountEqual(
+            parse.call_args_list, [
+                mock.call(path, before), mock.call(path, after), mock.call(other, other_source),
+            ],
         )
         self.assertEqual(
             [function.name for function in data.added], ["second"]
@@ -1998,8 +2096,24 @@ class HelperInputTests(ShapeCase):
         self.assertEqual(
             [function.name for function in data.candidates], ["second"]
         )
-        self.assertEqual(data.calls, {})
+        self.assertEqual([function.name for function in data.functions], ["second"])
+        self.assertEqual([function.name for function in data.orphans], ["first"])
+        self.assertEqual(set(data.calls), {"second"})
         self.assertEqual(data.tests, frozenset())
+
+    def test_orphan_invalid_deleted_base_source_names_the_path(self) -> None:
+        path = "pkg/broken.py"
+        self.base_commit({path: "def invalid(\n"})
+        self.git("rm", "--", path)
+        base = DiffBase(self.git("rev-parse", "HEAD").stdout.strip(), "base")
+        with self.assertRaisesRegex(policy.GateError, r"cannot parse pkg/broken\.py"):
+            _shape_input(self.shape_context([]), SHAPE_SPEC, 6, base)
+
+    def test_orphan_base_blob_classification_uses_the_bounded_shebang(self) -> None:
+        prefix = b"#!/usr/bin/env "
+        self.assertTrue(is_python_blob("pkg/legacy", prefix + b"python3\n"))
+        self.assertFalse(is_python_blob("pkg/legacy", prefix + b" " * SHEBANG_LIMIT + b"python3\n"))
+        self.assertTrue(is_python_blob("pkg/legacy.py", b""))
 
 
 SHIPPED_POLICY = (GATE / "quality-gate.toml").read_text(encoding="utf-8")
@@ -2148,8 +2262,8 @@ MUTATIONS = {
         "        False",
     ),
     "changed scope judges the added": (
-        "        candidates = added",
-        "        candidates = functions",
+        "    return functions, added, added",
+        "    return functions, added, functions",
     ),
 }
 
