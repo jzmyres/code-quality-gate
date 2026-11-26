@@ -1130,10 +1130,10 @@ read a record is a check error naming the pid and the failure. Where the subreap
 or the process table cannot be enumerated to confirm the adopted descendants stopped, the check is
 an error naming why, never a pass or a completed run.
 Runner tests check that a noisy timeout ends with SIGKILL and returns `execution == "budget"`.
-That outcome establishes that cleanup succeeded because a cleanup failure takes precedence over a
-timeout. When the group's absence cannot be confirmed, a separate test checks that the drain sends
-SIGKILL before handing off to cleanup, which then reports the error. The tests also check that a
-permission failure reading a process record propagates from the reader.
+That outcome establishes the absence of a cleanup error because cleanup failure takes precedence
+over the timeout outcome. A separate test checks that the drain requests SIGKILL before `_reap`
+and that the run reports a cleanup error when it cannot confirm the group's absence. The tests
+also check that a permission failure reading a process record propagates from the reader.
 
 `mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
 mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering

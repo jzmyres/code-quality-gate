@@ -668,9 +668,9 @@ class UnconfirmedCleanupTests(unittest.TestCase):
         signals_before_reap: list[signal.Signals] = []
 
         def reap(process: subprocess.Popen[bytes]) -> bool:
-            signals_before_reap.extend(
+            signals_before_reap[:] = [
                 call.args[1] for call in signal_group.call_args_list if call.args[0] == process.pid
-            )
+            ]
             return real_reap(process)
 
         with (
@@ -692,7 +692,10 @@ class UnconfirmedCleanupTests(unittest.TestCase):
         self.assertEqual(result.error, runner.CLEANUP_ERROR)
         self.assertIn(signal.SIGTERM, signals_before_reap)
         after_sigterm = signals_before_reap.index(signal.SIGTERM) + 1
-        self.assertIn(signal.SIGKILL, signals_before_reap[after_sigterm:])
+        self.assertIn(
+            signal.SIGKILL, signals_before_reap[after_sigterm:],
+            "Expected the drain to request SIGKILL after SIGTERM before _reap",
+        )
 
 
 if __name__ == "__main__":

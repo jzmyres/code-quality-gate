@@ -1,3 +1,4 @@
+import re
 import unittest
 
 from support import GATE
@@ -6,10 +7,12 @@ from support import GATE
 class ReadmeTests(unittest.TestCase):
     def test_readme_inline_code(self) -> None:
         readme = (GATE / "README.md").read_text(encoding="utf-8")
-        mutation = readme.partition("\n### Python mutation\n")[2].partition("\n### ")[0]
-        delimiter_line = mutation.partition("Lines are split only on ")[2].partition("\n")[0]
-        self.assertTrue(
-            delimiter_line.startswith(r"`\n`,"),
-            f"README.md Python mutation must show the delimiter as `\\n` on one line. "
-            f"Found {delimiter_line!r} after 'Lines are split only on '.",
+        sections = re.findall(r"(?ms)^### Python mutation\n(.*?)(?=^#{1,3} |\Z)", readme)
+        self.assertEqual(len(sections), 1, "Expected one Python mutation section in README.md")
+
+        clauses = re.split(r"\bLines are split only on\b", sections[0])
+        self.assertEqual(len(clauses) - 1, 1, "Expected one LF-split clause in Python mutation")
+        self.assertIsNotNone(
+            re.match(r"\s+`\\n`(?!`)", clauses[1]),
+            r"README.md Python mutation must show the delimiter as `\n` on one line",
         )
