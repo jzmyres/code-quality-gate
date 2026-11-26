@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .elisp_batch import batch_command
 from .elisp_tests import _common_spec, _lisp_string, _temporary, _validate_report_version, probe_version
@@ -13,6 +13,10 @@ from .runner import execution_outcome, mark_step, run
 
 if TYPE_CHECKING:
     from .adapters import ParsedSpec
+
+
+LINT_KEYS = ("load_path", "emacs", "budget_seconds")
+LintMode = Literal["compile", "checkdoc"]
 
 
 @dataclass(frozen=True)
@@ -35,10 +39,10 @@ def parse_spec(raw: dict[str, Any], root: Path | None, path: Path, key: str) -> 
     return ElispLintSpec(*_common_spec(raw, root, path, key))
 
 
-def _command(spec: ElispLintSpec, mode: str, files: list[str], output: Path, report: Path) -> list[str]:
+def _command(spec: ElispLintSpec, mode: LintMode, files: list[str], output: Path, report: Path) -> list[str]:
     names = " ".join(_lisp_string(name) for name in files)
-    extra = _lisp_string(str(output)) + " " if mode == "elisp_compile" else ""
-    form = f"(qg-elisp-lint-{mode.removeprefix('elisp_')} '({names}) {extra}{_lisp_string(str(report))})"
+    extra = _lisp_string(str(output)) + " " if mode == "compile" else ""
+    form = f"(qg-elisp-lint-{mode} '({names}) {extra}{_lisp_string(str(report))})"
     helper = Path(__file__).with_name("elisp") / "qg-elisp-lint.el"
     return batch_command(spec.emacs, helper, form, spec.load_path)
 
@@ -54,14 +58,15 @@ def _issue_valid(issue: Any, files: list[str]) -> bool:
     return _issue_location(issue, files) and isinstance(issue["message"], str) and bool(issue["message"])
 
 
-def _document_header(document: Any, files: list[str]) -> bool:
-    if not isinstance(document, dict) or set(document) != {"emacs_version", "files", "failed", "issues"}:
+def _document_header(document: Any, files: list[str], mode: LintMode) -> bool:
+    keys = {"emacs_version", "mode", "files", "failed", "issues"}
+    if not isinstance(document, dict) or set(document) != keys:
         return False
-    return document["files"] == files
+    return document["mode"] == mode and document["files"] == files
 
 
-def _document_valid(document: Any, files: list[str], mode: str) -> bool:
-    if not _document_header(document, files):
+def _document_valid(document: Any, files: list[str], mode: LintMode) -> bool:
+    if not _document_header(document, files, mode):
         return False
     if not isinstance(document["failed"], list) or not isinstance(document["issues"], list):
         return False
@@ -72,20 +77,20 @@ def _failed_valid(failed: list[Any], files: list[str]) -> bool:
     return all(isinstance(name, str) and name in files for name in failed)
 
 
-def _content_valid(document: dict[str, Any], files: list[str], mode: str) -> bool:
+def _content_valid(document: dict[str, Any], files: list[str], mode: LintMode) -> bool:
     failed, issues = document["failed"], document["issues"]
     return (_failed_valid(failed, files) and all(_issue_valid(issue, files) for issue in issues)
-            and not (issues if mode == "elisp_compile" else failed))
+            and not (issues if mode == "compile" else failed))
 
 
-def _read_document(path: Path, files: list[str], mode: str, version: str) -> dict[str, Any]:
+def _read_document(path: Path, files: list[str], mode: LintMode, version: str) -> dict[str, Any]:
     try:
         document = load_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError(f"a JSON lint report, got {error}") from error
     _validate_report_version(document, version)
     if not _document_valid(document, files, mode):
-        raise ValueError(f"a valid {mode} report for {files!r}, got {document!r}")
+        raise ValueError(f"a valid elisp_{mode} report for {files!r}, got {document!r}")
     return document
 
 
@@ -111,8 +116,8 @@ def _checkdoc_problem(document: dict[str, Any]) -> str | None:
     return None
 
 
-def _problem(mode: str, document: dict[str, Any], child: Any) -> str | None:
-    if mode == "elisp_compile":
+def _problem(mode: LintMode, document: dict[str, Any], child: Any) -> str | None:
+    if mode == "compile":
         return _compile_problem(document, child)
     return _checkdoc_problem(document)
 
@@ -141,8 +146,8 @@ def _execution_failure(context: Any, start: float, child: Any, version: str | No
 
 
 def _run_batch(context: Any, start: float, files: list[str], directory: Path,
-               version: str) -> tuple[Any, Any, Any]:
-    spec, mode = context.check.spec, context.check.adapter
+               version: str, mode: LintMode) -> tuple[Any, Any, Any]:
+    spec = context.check.spec
     report = directory / "result.json"
     report.unlink(missing_ok=True)
     mark_step("Emacs lint command")
@@ -166,8 +171,8 @@ def _run_batch(context: Any, start: float, files: list[str], directory: Path,
     return document, child, None
 
 
-def _batches(mode: str, files: list[str]) -> list[list[str]]:
-    return [[name] for name in files] if mode == "elisp_compile" else [files]
+def _batches(mode: LintMode, files: list[str]) -> list[list[str]]:
+    return [[name] for name in files] if mode == "compile" else [files]
 
 
 def _finish(context: Any, start: float, version: str, problems: list[str], diagnostics: Any) -> Any:
@@ -188,9 +193,9 @@ class _State:
     diagnostics: Any = None
 
 
-def _record_problem(context: Any, state: _State, document: dict[str, Any], child: Any) -> None:
+def _record_problem(mode: LintMode, state: _State, document: dict[str, Any], child: Any) -> None:
     mark_step("Emacs lint findings")
-    problem = _problem(context.check.adapter, document, child)
+    problem = _problem(mode, document, child)
     if problem is not None:
         state.problems.append(problem)
         state.diagnostics = child.diagnostics()
@@ -198,15 +203,16 @@ def _record_problem(context: Any, state: _State, document: dict[str, Any], child
         state.diagnostics = child.diagnostics()
 
 
-def _collect_batch(context: Any, start: float, batch: list[str], directory: Path, state: _State) -> Any:
-    document, child, failure = _run_batch(context, start, batch, directory, state.version)
+def _collect_batch(context: Any, start: float, batch: list[str], directory: Path,
+                   state: _State, mode: LintMode) -> Any:
+    document, child, failure = _run_batch(context, start, batch, directory, state.version, mode)
     if failure is not None:
         return failure
-    _record_problem(context, state, document, child)
+    _record_problem(mode, state, document, child)
     return None
 
 
-def run_lint(context: Any) -> Any:
+def run_lint(context: Any, *, mode: LintMode) -> Any:
     """Run each selected source through the configured lint check."""
     from .checks import _adapter_selection, _class_text
 
@@ -219,8 +225,8 @@ def run_lint(context: Any) -> Any:
         return _failure(context, start, reason)
     state = _State(version)
     with _temporary() as temporary:
-        for batch in _batches(context.check.adapter, selected):
-            failure = _collect_batch(context, start, batch, Path(temporary), state)
+        for batch in _batches(mode, selected):
+            failure = _collect_batch(context, start, batch, Path(temporary), state, mode)
             if failure is not None:
                 return failure
     return _finish(context, start, state.version, state.problems, state.diagnostics)

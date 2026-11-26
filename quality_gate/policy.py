@@ -1062,13 +1062,30 @@ def _config_from_data(
     )
 
 
-def load_config(root: Path, *, validate_headers: bool = True,
-                candidate_root: Path | None = None,
-                parse_candidate_inputs: bool = True) -> Config:
-    path = root / "quality-gate.toml"
+def decode_policy(raw: bytes, label: str) -> dict[str, Any]:
+    """Decode the policy bytes from the caller's selected source."""
     try:
-        with path.open("rb") as stream:
-            data = tomllib.load(stream)
+        return tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise ConfigError(f"{label}: expected valid TOML, got {error}") from error
+
+
+def raw_baselines(data: dict[str, Any]) -> dict[str, str]:
+    """Return string baseline declarations in their original order and spelling."""
+    checks = data.get("checks")
+    if not isinstance(checks, dict):
+        return {}
+    return {
+        name: raw["baseline"]
+        for name, raw in checks.items()
+        if isinstance(raw, dict) and isinstance(raw.get("baseline"), str)
+    }
+
+
+def read_policy(path: Path) -> dict[str, Any]:
+    """Read a policy file from the working tree and decode its contents."""
+    try:
+        raw = path.read_bytes()
     except FileNotFoundError:
         raise ConfigError(
             f"{path}: expected a configuration file, got missing"
@@ -1077,8 +1094,14 @@ def load_config(root: Path, *, validate_headers: bool = True,
         raise ConfigError(
             f"{path}: expected a readable configuration file, got {error}"
         ) from error
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
-        raise ConfigError(f"{path}: expected valid TOML, got {error}") from error
+    return decode_policy(raw, str(path))
+
+
+def load_config(root: Path, *, validate_headers: bool = True,
+                candidate_root: Path | None = None,
+                parse_candidate_inputs: bool = True) -> Config:
+    path = root / "quality-gate.toml"
+    data = read_policy(path)
     return _config_from_data(root, path, data, validate_headers=validate_headers,
                              candidate_root=candidate_root,
                              parse_candidate_inputs=parse_candidate_inputs)

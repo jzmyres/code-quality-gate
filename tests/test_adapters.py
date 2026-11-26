@@ -16,9 +16,13 @@ from unittest import mock
 from support import GATE, FixtureCase, baseline_text, stub_check_result, with_clones
 from test_python_tests import tests_config
 
+import json
+import re
+
+from quality_gate import elisp_lint, elisp_tests, python_crap, trust, worklist
 from quality_gate.files import DiffBaseOverride
 from quality_gate.python_tests import _parse_python_tests
-from quality_gate.runner import Diagnostics
+from quality_gate.runner import Diagnostics, RunResult
 
 sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
@@ -231,6 +235,385 @@ class ArchitectureTests(unittest.TestCase):
                             imported, core,
                             f"{path.relative_to(GATE)} imports quality_gate.{imported} outside the core",
                         )
+
+
+class PolicyAdapterBoundaryTests(FixtureCase):
+    def run_adapter(self, config, identifier, classes, prior=None):
+        return checks.run_check(
+            self.repo, config, config.checks[identifier], list(classes), classes,
+            prefix=identifier, evidence_dir=self.repo, prior=prior,
+        )
+
+    def crap_policy(self):
+        text = COVERAGE_CONFIG.split("[checks.elisp-suite]")[0].replace(
+            'checks = ["python-measure", "elisp-measure"]',
+            'checks = ["python-measure", "other-measure", "verify"]',
+        )
+        self.write_config(text + r"""
+threshold = 0
+
+[classes.left]
+code = true
+description = "First CRAP selection"
+checks = ["python-measure"]
+
+[classes.right]
+code = true
+description = "Second CRAP selection"
+checks = ["other-measure"]
+
+[checks.other-suite]
+adapter = "python_tests"
+tier = 1
+enforcement = "enforced"
+run = ["python3", "-m", "unittest"]
+tests_pattern = 'Ran (\d+) tests'
+
+[checks.other-measure]
+adapter = "python_crap"
+tier = 1
+enforcement = "enforced"
+requires = "other-suite"
+
+[checks.verify]
+adapter = "verification"
+tier = 1
+enforcement = "enforced"
+requires = "python-suite"
+""")
+        return policy.load_config(self.repo)
+
+    def crap_evidence(self, config, suites):
+        coverage_config = self.add_file("coverage.ini", "fixture settings")
+        prior = {}
+        for suite in suites:
+            evidence = self.add_file(suite + ".coverage", suite)
+            prior[suite] = stub_check_result(
+                config.checks[suite], 600, tests_ran=1, tests_skipped=0,
+                evidence_path=evidence,
+                adapter_data={"coverage_config": coverage_config, "coverage_settings": suite},
+            )
+        return prior
+
+    def coverage_double(self, analyses):
+        def coverage(config_file):
+            excluded_by_path = analyses[config_file]
+
+            def analyse(filename):
+                path = Path(filename).relative_to(self.repo).as_posix()
+                excluded = excluded_by_path[path]
+                statements = sorted({1, 2, 3, 4} - set(excluded))
+                return filename, statements, excluded, [], ""
+
+            return SimpleNamespace(
+                load=lambda: None, analysis2=analyse,
+                get_data=lambda: SimpleNamespace(lines=lambda _filename: [1, 2, 3, 4]),
+            )
+
+        return SimpleNamespace(Coverage=coverage, CoverageException=RuntimeError)
+
+    @contextlib.contextmanager
+    def fake_coverage(self, analyses):
+        with (
+            mock.patch.object(python_crap, "import_coverage", return_value=self.coverage_double(analyses)),
+            mock.patch.object(python_crap, "coverage_config_data", side_effect=lambda settings, _: settings),
+        ):
+            yield
+
+    def assert_exclusion_map(self, actual, expected, label):
+        self.assertIsNotNone(actual, label)
+        self.assertEqual(set(actual), set(expected), label)
+        for path, lines in expected.items():
+            self.assertTupleEqual(actual[path], lines, f"{label} {path}")
+
+    def assert_no_cover_findings(self, result, expected):
+        findings = [row for row in result.findings if row.subject.endswith(":no-cover")]
+        subjects = {f"exclusions:{path}:no-cover": path for path in expected}
+        self.assertCountEqual([row.subject for row in findings], subjects)
+        for row in findings:
+            path = subjects[row.subject]
+            lines = expected[path]
+            self.assertEqual(row.value, len(lines), path)
+            self.assertEqual(row.location, f"{path}:{lines[0]}" if lines else path, path)
+            self.assertEqual(
+                [(item.path, item.start_line, item.end_line) for item in row.locations],
+                [(path, line, line) for line in lines], path,
+            )
+
+    def test_crap_and_verification_use_coverage_owned_exclusions(self):
+        config = self.crap_policy()
+        source = (
+            "def example(flag):\n    if flag:\n        return 1\n    return 0\n"
+            "\n# Outside all subjects\n"
+        )
+        classes = {"shared.py": "python", "clean.py": "left", "empty.py": "left", "right.py": "right"}
+        ownership = {path: set() if path == "empty.py" else {1, 2, 3, 4} for path in classes}
+        for path, lines in ownership.items():
+            self.add_file(path, source if lines else "# No measured subjects\n")
+        analyses = {
+            "python-suite": {"shared.py": [6, 3, 3], "clean.py": [6]},
+            "other-suite": {"shared.py": [4], "right.py": [3]},
+        }
+        selections = {"python-measure": {"left", "python"}, "other-measure": {"right", "python"}}
+        prior = self.crap_evidence(config, analyses)
+        expected_union = {}
+        with self.fake_coverage(analyses):
+            for identifier, selected in selections.items():
+                result = self.run_adapter(config, identifier, classes, prior)
+                analysis = analyses[config.checks[identifier].spec.requires]
+                expected = {
+                    path: tuple(sorted(owned & set(analysis[path])))
+                    for path, owned in ownership.items() if owned and classes[path] in selected
+                }
+                self.assert_exclusion_map(result.excluded_lines, expected, identifier)
+                self.assertNotIn("excluded_lines", result.to_json(), identifier)
+                for path, lines in expected.items():
+                    expected_union.setdefault(path, set()).update(lines)
+                prior[identifier] = result
+        failing = prior["python-measure"]
+        self.assertEqual(failing.outcome, "fail", failing.reason)
+        self.assertTrue(all(item.measurement and item.locations for item in failing.findings))
+        stripped = {
+            identifier: dataclasses.replace(
+                prior[identifier],
+                findings=[dataclasses.replace(row, measurement=None, locations=None)
+                          for row in prior[identifier].findings],
+            )
+            for identifier in selections
+        }
+        measured = self.run_adapter(config, "verify", classes, prior | stripped)
+        self.assert_no_cover_findings(
+            measured, {path: tuple(sorted(lines)) for path, lines in expected_union.items()},
+        )
+        unavailable = dataclasses.replace(failing, excluded_lines=None)
+        for prior_results, detail in (
+            (prior | {"python-measure": unavailable}, "reported no measurement"),
+            ({key: value for key, value in prior.items() if key != "python-measure"}, "did not run"),
+        ):
+            with self.subTest(detail=detail):
+                result = self.run_adapter(config, "verify", classes, prior_results)
+                self.assertEqual(result.outcome, "error", result.reason)
+                self.assertIn(f"python-measure {detail}", result.reason)
+
+    def test_crap_discards_partial_analysis(self):
+        source = "def example(flag):\n    if flag:\n        return 1\n    return 0\n"
+        analyses = {"python-suite": {"first.py": [3], "second.py": [2, 3, 4]}}
+        files = list(analyses["python-suite"])
+        for path in files:
+            self.add_file(path, source)
+        evidence = self.add_file("fixture.coverage", "")
+        with self.fake_coverage(analyses):
+            measurement = python_crap.measure_crap(self.repo, files, evidence, "python-suite")
+        self.assertEqual(len(measurement.failures), 1, measurement.failures)
+        self.assertIn("second.py:example: unmeasured", measurement.failures[0])
+        self.assertEqual(measurement.findings, [])
+        self.assertIsNone(measurement.excluded_lines)
+
+    def test_verification_accepts_an_empty_map_or_no_crap_checks(self):
+        config = self.crap_policy()
+        classes = {"empty.py": "python"}
+        self.add_file("empty.py", "# No measured subjects\n")
+        analyses = {"python-suite": {}, "other-suite": {}}
+        prior = self.crap_evidence(config, analyses)
+        with self.fake_coverage(analyses):
+            for identifier in ("python-measure", "other-measure"):
+                result = self.run_adapter(config, identifier, classes, prior)
+                self.assert_exclusion_map(result.excluded_lines, {}, identifier)
+                prior[identifier] = result
+        measured = self.run_adapter(config, "verify", classes, prior)
+        self.assertIsNotNone(measured.ratchet, measured.reason)
+        self.assert_no_cover_findings(measured, {})
+        without_crap = dataclasses.replace(config, checks={
+            name: check for name, check in config.checks.items() if check.adapter != "python_crap"
+        })
+        prior["python-measure"] = dataclasses.replace(
+            prior["python-measure"], excluded_lines={"outside.py": (2,)},
+        )
+        measured = self.run_adapter(without_crap, "verify", classes, prior)
+        self.assertIsNotNone(measured.ratchet, measured.reason)
+        self.assert_no_cover_findings(measured, {})
+
+    def assert_declarations(self, actual, expected):
+        self.assertEqual(set(actual), set(expected))
+        self.assertEqual(list(actual), list(expected), "baseline declaration order")
+        for identifier, value in expected.items():
+            self.assertEqual(actual[identifier], value, identifier)
+
+    def write_debt_policy(self, source, names):
+        text = FLOOR_CONFIG.split("[checks.floor]")[0]
+        declaration = FLOOR_CONFIG[FLOOR_CONFIG.index("[checks.floor]"):]
+        for identifier, spelling in names.items():
+            text += "\n" + declaration.replace("[checks.floor]", f"[checks.{identifier}]").replace(
+                '"floor.toml"', json.dumps(spelling),
+            )
+            self.add_file(spelling, baseline_text([], check=identifier, metric_version="stub/1"))
+        raw = (f"# {source}\n" + text).encode("utf-8")
+        self.config_path.write_bytes(raw)
+        return raw
+
+    def debt_report(self, revision):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = worklist.command_debt(self.repo, revision, True)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_debt_delegation(self, revision, raw, label, names, reader_calls):
+        with (
+            mock.patch.object(policy, "read_policy", wraps=policy.read_policy) as reader,
+            mock.patch.object(policy, "decode_policy", wraps=policy.decode_policy) as decode,
+            mock.patch.object(policy, "raw_baselines", wraps=policy.raw_baselines) as discover,
+        ):
+            code, stdout, stderr = self.debt_report(revision)
+        self.assertEqual(code, 0, stderr)
+        reader.assert_has_calls(reader_calls)
+        self.assertEqual(reader.call_count, len(reader_calls))
+        decode.assert_called_once_with(raw, label)
+        discover.assert_called_once()
+        rows = json.loads(stdout)["checks"]
+        self.assertEqual([row["id"] for row in rows], list(names))
+        self.assert_declarations({row["id"]: row["baseline"] for row in rows}, names)
+
+    def test_policy_sources_share_decoding_and_preserve_baseline_declarations(self):
+        revision_names = {"floor": "./rev//z.toml", "rev-only": "rev/./a.toml"}
+        revision_raw = self.write_debt_policy("requested revision", revision_names)
+        self.commit_all()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        trusted_names = {"floor": "./trusted//z.toml", "trusted-only": "trusted/./a.toml"}
+        trusted_raw = self.write_debt_policy("trusted source", trusted_names)
+        self.add_file("tools.lock.toml", "")
+        self.commit_all()
+        trusted_root = self.trusted_directory("HEAD")
+        working_names = {"floor": "./current//z.toml", "current-only": "current/./a.toml"}
+        working_raw = self.write_debt_policy("working tree", working_names)
+        with (
+            mock.patch.object(adapters, "ADAPTERS", {**adapters.ADAPTERS, FLOOR_STUB.name: FLOOR_STUB}),
+            mock.patch.object(policy, "read_policy", wraps=policy.read_policy) as reader,
+            mock.patch.object(policy, "decode_policy", wraps=policy.decode_policy) as decode,
+        ):
+            config = policy.load_config(self.repo)
+            reader.assert_called_once_with(self.config_path)
+            decode.assert_called_once_with(working_raw, str(self.config_path))
+            self.assertEqual(list(config.checks), list(working_names))
+            decode.reset_mock()
+            with mock.patch.object(policy, "raw_baselines", wraps=policy.raw_baselines) as discover:
+                prepared = trust.prepare_trust(self.repo, str(trusted_root), [])
+                self.addCleanup(prepared.close)
+            decode.assert_called_once_with(trusted_raw, f"{self.config_path} at {trusted_root}")
+            discover.assert_called_once()
+            self.assert_declarations(policy.raw_baselines(discover.call_args.args[0]), trusted_names)
+            staged = prepared.rev_config.path.parent
+            self.assertEqual(prepared.rev_config.path.read_bytes(), trusted_raw)
+            self.assertEqual(
+                {path.relative_to(staged).as_posix() for path in staged.rglob("*.toml")},
+                {"quality-gate.toml", *(Path(name).as_posix() for name in trusted_names.values())},
+            )
+            for identifier, spelling in trusted_names.items():
+                self.assertEqual(
+                    prepared.rev_config.checks[identifier].baseline, staged / spelling, identifier,
+                )
+                self.assertEqual(
+                    (staged / spelling).read_bytes(), (trusted_root / spelling).read_bytes(), identifier,
+                )
+            self.assert_debt_delegation(None, working_raw, str(self.config_path), working_names,
+                                        [mock.call(self.config_path)])
+            self.assert_debt_delegation(sha, revision_raw, f"{sha} ({sha}):quality-gate.toml",
+                                        revision_names, [])
+
+    def test_raw_baselines_leave_malformed_declarations_to_validation(self):
+        names = {"floor": "./baselines//floor.toml"}
+        raw = self.write_debt_policy("raw declarations", names)
+        raw = raw.replace(b"[checks.floor]", b"[checks]\nscalar = false\n\n[checks.floor]")
+        raw += (
+            b'\n[checks.invalid]\nadapter = "floor-stub"\ntier = 1\n'
+            b'enforcement = "enforced"\ncount = 4\nbaseline = 42\n'
+        )
+        self.config_path.write_bytes(raw)
+        data = policy.decode_policy(raw, str(self.config_path))
+        self.assert_declarations(policy.raw_baselines(data), names)
+        with self.assertRaisesRegex(policy.ConfigError, r"checks\.scalar"):
+            policy.load_config(self.repo)
+        self.config_path.write_bytes(raw.replace(b"scalar = false\n", b""))
+        with mock.patch.dict(adapters.ADAPTERS, {FLOOR_STUB.name: FLOOR_STUB}):
+            with self.assertRaisesRegex(policy.ConfigError, r"checks\.invalid\.baseline"):
+                policy.load_config(self.repo)
+
+    def test_invalid_policy_bytes_report_the_selected_source(self):
+        for raw in (b"\xff", b"[invalid"):
+            with self.subTest(raw=raw):
+                self.config_path.write_bytes(raw)
+                self.commit_all()
+                sha = self.git("rev-parse", "HEAD").stdout.strip()
+                trusted_root = self.trusted_directory(sha, name=f"trusted-{sha}")
+                with self.assertRaises(policy.ConfigError) as invalid:
+                    policy.load_config(self.repo)
+                self.assertIn(f"{self.config_path}: expected valid TOML", str(invalid.exception))
+                with self.assertRaises(policy.UsageError) as invalid:
+                    trust.prepare_trust(self.repo, str(trusted_root), [])
+                self.assertIn(
+                    f"{self.config_path} at {trusted_root}: expected valid TOML", str(invalid.exception),
+                )
+                labels = {None: str(self.config_path), sha: f"{sha} ({sha}):quality-gate.toml"}
+                for revision, label in labels.items():
+                    code, stdout, stderr = self.debt_report(revision)
+                    self.assertEqual((code, stdout), (2, ""), stderr)
+                    self.assertIn(f"{label}: expected valid TOML", stderr)
+
+    def lint_child(self, mode, expected_batches, report_mode, *, finding=False):
+        def child(argv, **_kwargs):
+            form = argv[-1]
+            self.assertEqual(form.split(" ", 1)[0], f"(qg-elisp-lint-{mode}", mode)
+            names = [json.loads(value) for value in re.findall(r'"[^"]*"', form)]
+            parts = 2 if mode == "compile" else 1
+            batch = names[:-parts]
+            self.assertEqual(batch, expected_batches.pop(0), mode)
+            report = {
+                "emacs_version": "30.1", "mode": report_mode, "files": batch, "failed": [], "issues": [],
+            }
+            if finding and mode == "compile":
+                report["failed"] = batch
+            if finding and mode == "checkdoc":
+                report["issues"] = [{"file": batch[-1], "line": 3, "message": "missing docstring"}]
+            Path(names[-1]).write_text(json.dumps(report), encoding="utf-8")
+            return RunResult(tuple(argv), "completed", 0, stderr=b"compiler warning")
+
+        return child
+
+    def test_lint_registration_binds_mode_independently_of_descriptor_name(self):
+        compile_descriptor = adapters.ADAPTERS["elisp_compile"]
+        checkdoc_descriptor = adapters.ADAPTERS["elisp_checkdoc"]
+        self.assertIs(compile_descriptor.parse, checkdoc_descriptor.parse)
+        classes = {"first.el": "python", "second.el": "python"}
+        for descriptor, mode, other, batches, diagnostics in (
+            (compile_descriptor, "compile", "checkdoc", [["first.el"], ["second.el"]],
+             ("first.el: compiler warning", "second.el: compiler warning")),
+            (checkdoc_descriptor, "checkdoc", "compile", [list(classes)],
+             ("second.el:3: missing docstring",)),
+        ):
+            with self.subTest(descriptor=descriptor.name), mock.patch.dict(adapters.ADAPTERS):
+                self.assertIs(descriptor.keys, elisp_lint.LINT_KEYS, descriptor.name)
+                alias = adapters.register_adapter(dataclasses.replace(descriptor, name="renamed-lint"))
+                self.write_config(STUB_CONFIG.replace('adapter = "stub"', f'adapter = "{alias.name}"')
+                                  .replace("count = 4", ""))
+                config = policy.load_config(self.repo)
+                probe = RunResult((), "completed", 0, stdout=b"30.1")
+                with mock.patch.object(elisp_tests, "run", return_value=probe) as version_run:
+                    for report_mode, finding, outcome in ((mode, True, "fail"), (mode, False, "pass"),
+                                                          (other, False, "unsupported")):
+                        remaining = list(batches)
+                        with mock.patch.object(elisp_lint, "run", side_effect=self.lint_child(
+                            mode, remaining, report_mode, finding=finding,
+                        )):
+                            result = self.run_adapter(config, "stub", classes)
+                        self.assertEqual(result.outcome, outcome, f"{descriptor.name}: {result.reason}")
+                        if outcome == "unsupported":
+                            self.assertIn(f"valid {descriptor.name} report", result.reason, descriptor.name)
+                            self.assertEqual(remaining, batches[1:], descriptor.name)
+                        else:
+                            self.assertEqual(remaining, [], descriptor.name)
+                        if finding:
+                            for detail in diagnostics:
+                                self.assertIn(detail, result.reason, descriptor.name)
+                    self.assertEqual(version_run.call_count, 3, descriptor.name)
 
 
 class AdapterRegistrationTests(unittest.TestCase):

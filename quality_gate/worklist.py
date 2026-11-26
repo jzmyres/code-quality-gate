@@ -5,11 +5,11 @@ import contextlib
 import json
 import sys
 import tempfile
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from . import policy
 from .checks import (
     CheckResult,
     _baseline_entries,
@@ -527,24 +527,6 @@ def _relative_name(root: Path, name: str, label: str) -> str:
         ) from None
 
 
-def _policy_data(raw: bytes, label: str) -> dict[str, Any]:
-    try:
-        return tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
-        raise UsageError(f"{label}: expected valid TOML, got {error}") from error
-
-
-def _named_baselines(data: dict[str, Any]) -> dict[str, str]:
-    checks = data.get("checks")
-    if not isinstance(checks, dict):
-        return {}
-    return {
-        name: raw["baseline"]
-        for name, raw in checks.items()
-        if isinstance(raw, dict) and isinstance(raw.get("baseline"), str)
-    }
-
-
 def _stage_baseline(
     root: Path, sha: str, label: str, temporary: Path, baseline: str
 ) -> str:
@@ -574,8 +556,8 @@ def _revision_config(
     sha = resolved.stdout_text.strip()
     label = f"{revision} ({sha})"
     raw = _content(root, sha, POLICY_NAME, f"{label}:{POLICY_NAME}")
-    data = _policy_data(raw, f"{label}:{POLICY_NAME}")
-    names = _named_baselines(data)
+    data = policy.decode_policy(raw, f"{label}:{POLICY_NAME}")
+    names = policy.raw_baselines(data)
     checks = cast(dict[str, Any], data.get("checks", {}))
     for name, baseline in names.items():
         checks[name]["baseline"] = _stage_baseline(
@@ -665,17 +647,11 @@ def command_debt(
     try:
         if revision is None:
             path = root / POLICY_NAME
-            try:
-                raw = path.read_bytes()
-            except OSError as error:
-                raise UsageError(
-                    f"{path}: expected a readable configuration file, got {error}"
-                ) from error
-            data = _policy_data(raw, str(path))
+            data = policy.read_policy(path)
             config = _config_from_data(
                 root, path, data, parse_candidate_inputs=False
             )
-            reports = _check_debts(config, _named_baselines(data), None)
+            reports = _check_debts(config, policy.raw_baselines(data), None)
             sha = None
         else:
             with _staging_area() as temporary:

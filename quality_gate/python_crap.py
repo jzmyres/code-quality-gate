@@ -22,6 +22,7 @@ from .runner import Diagnostics, mark_step
 
 if TYPE_CHECKING:
     from .adapters import ParsedSpec
+    from .checks import CheckResult
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,16 @@ class MeasuredFunction:
 class CrapMeasurement:
     findings: list[Finding]
     failures: list[str]
+    excluded_lines: dict[str, tuple[int, ...]] | None
+
+
+@dataclass(frozen=True)
+class _SubjectMeasurement:
+    value: float
+    cc: int
+    statements: int
+    executed: int
+    excluded_lines: tuple[int, ...]
 
 
 def _bool_operands(node: ast.BoolOp) -> int:
@@ -815,29 +826,22 @@ def _crap_result(
     lines: list[int],
     excluded_lines: list[int],
     executed: int,
-) -> tuple[float | None, dict[str, Any] | None, str | None]:
+) -> tuple[_SubjectMeasurement | None, str | None]:
     if not lines:
-        return None, None, "no coverage statements in the measured span"
+        return None, "no coverage statements in the measured span"
     coverage = executed / len(lines)
     crap = function.cc**2 * (1 - coverage) ** 3 + function.cc
-    measurement = {
-        "cc": function.cc,
-        "statements": len(lines),
-        "executed": executed,
-        "excluded_lines": sorted(excluded_lines),
-    }
-    return crap, measurement, None
+    return _SubjectMeasurement(crap, function.cc, len(lines), executed, tuple(sorted(excluded_lines))), None
 
 
 def _measure_lambda(
     function: MeasuredFunction,
     excluded: list[int],
     executed_lines: list[int],
-) -> tuple[float | None, dict[str, Any] | None, str | None]:
+) -> tuple[_SubjectMeasurement | None, str | None]:
     lines = list(function.lines or ())
     if not lines:
         return (
-            None,
             None,
             "lambda body shares the declaration line; put the body on its own "
             "line",
@@ -854,7 +858,7 @@ def _measure_one(
     excluded: list[int],
     missing: list[int],
     executed_lines: list[int],
-) -> tuple[float | None, dict[str, Any] | None, str | None]:
+) -> tuple[_SubjectMeasurement | None, str | None]:
     """Measure whether the tests exercised the function body.
 
     The definition and decorator lines run during import. Only the body's
@@ -872,7 +876,6 @@ def _measure_one(
         )
         if function.node.body[0].lineno == function.node.lineno:
             return (
-                None,
                 None,
                 "body shares the def line; put the body on its own line",
             )
@@ -915,9 +918,10 @@ def _parse_selected(
 def _analyse_functions(
     functions: list[MeasuredFunction], statements: list[int], excluded: list[int],
     missing: list[int], executed_lines: list[int], findings: list[Finding], failures: list[str],
+    excluded_by_file: dict[str, set[int]],
 ) -> None:
     for function in functions:
-        value, measurement, problem = _measure_one(
+        measurement, problem = _measure_one(
             function, statements, excluded, missing, executed_lines
         )
         if problem is not None:
@@ -926,16 +930,25 @@ def _analyse_functions(
                 f"{function.path}:{function.start_line}-{function.end_line})"
             )
             continue
-        assert value is not None and measurement is not None
+        assert measurement is not None
+        excluded_by_file.setdefault(function.path, set()).update(measurement.excluded_lines)
         findings.append(Finding(
-            function.identity, value, f"{function.path}:{function.start_line}-{function.end_line}",
-            measurement, (Location(function.path, function.start_line, function.end_line),),
+            function.identity, measurement.value,
+            f"{function.path}:{function.start_line}-{function.end_line}",
+            {
+                "cc": measurement.cc,
+                "statements": measurement.statements,
+                "executed": measurement.executed,
+                "excluded_lines": list(measurement.excluded_lines),
+            },
+            (Location(function.path, function.start_line, function.end_line),),
         ))
 
 
 def _analyse_file(
     cover: Any, root: Path, relative: str, functions: list[MeasuredFunction],
     findings: list[Finding], failures: list[str],
+    excluded_by_file: dict[str, set[int]],
 ) -> None:
     if not functions:
         return
@@ -943,13 +956,14 @@ def _analyse_file(
     _filename, statements, excluded, missing, _formatted = cover.analysis2(filename)
     _analyse_functions(
         functions, statements, excluded, missing, _executed_lines(cover, filename), findings, failures,
+        excluded_by_file,
     )
 
 
 def _analyse_coverage(
     root: Path, selected: list[str], evidence: Path, settings: str,
     parsed: dict[str, tuple[str, list[MeasuredFunction]]], failures: list[str],
-) -> list[Finding]:
+) -> tuple[list[Finding], dict[str, set[int]]]:
     if not evidence.is_file():
         raise GateError(f"combined coverage data is missing at {evidence}")
     coverage = import_coverage()
@@ -957,16 +971,17 @@ def _analyse_coverage(
         config_file=coverage_config_data(settings, evidence)
     )
     findings: list[Finding] = []
+    excluded_by_file: dict[str, set[int]] = {}
     try:
         cover.load()
         for relative in selected:
             _source, functions = parsed[relative]
-            _analyse_file(cover, root, relative, functions, findings, failures)
+            _analyse_file(cover, root, relative, functions, findings, failures, excluded_by_file)
     except (coverage.CoverageException, OSError) as error:
         raise GateError(
             f"cannot analyse coverage data at {evidence}: {error}"
         ) from error
-    return findings
+    return findings, excluded_by_file
 
 
 def measure_crap(
@@ -978,12 +993,14 @@ def measure_crap(
     """Measure every function and outside-function subject in SELECTED."""
     parsed, failures = _parse_selected(root, selected)
     if failures:
-        return CrapMeasurement([], failures)
-    findings = _analyse_coverage(root, selected, evidence, settings, parsed, failures)
+        return CrapMeasurement([], failures, None)
+    findings, excluded_by_file = _analyse_coverage(root, selected, evidence, settings, parsed, failures)
     if failures:
-        return CrapMeasurement([], failures)
+        return CrapMeasurement([], failures, None)
     findings.sort(key=lambda item: item.subject)
-    return CrapMeasurement(findings, [])
+    return CrapMeasurement(
+        findings, [], {path: tuple(sorted(lines)) for path, lines in excluded_by_file.items()},
+    )
 
 
 def _file_present(path: Path | None) -> bool:
@@ -1026,7 +1043,7 @@ def _crap_measure(
     check: CheckDef,
     start: float,
     prefix: str,
-) -> tuple[Any | None, Any | None]:
+) -> tuple[CrapMeasurement | None, CheckResult | None]:
     from .checks import (
         _ratchet_error,
         _ratchet_result,
@@ -1068,7 +1085,7 @@ def _crap_measure(
     )
 
 
-def _run_python_crap(context: Any) -> Any:
+def _run_python_crap(context: Any) -> CheckResult:
     from .checks import (
         _adapter_selection,
         _class_text,
@@ -1112,7 +1129,7 @@ def _run_python_crap(context: Any) -> Any:
     if failure is not None:
         return failure
     assert measurement is not None
-    return _finish_crap_ratchet(
+    result = _finish_crap_ratchet(
         check,
         measurement.findings,
         prefix,
@@ -1120,3 +1137,6 @@ def _run_python_crap(context: Any) -> Any:
         lambda _entries: Domain.of_files(selected),
         ("functions", "function"),
     )
+    if result.ratchet is not None:
+        result.excluded_lines = measurement.excluded_lines
+    return result

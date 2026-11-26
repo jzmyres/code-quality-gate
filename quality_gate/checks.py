@@ -124,6 +124,7 @@ class CheckResult:
     configuration_error: bool = False
     tool: dict[str, str] | None = None
     report_fields: dict[str, Any] = field(default_factory=dict)
+    excluded_lines: dict[str, tuple[int, ...]] | None = None
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:

@@ -8,11 +8,12 @@
 (require 'checkdoc)
 (require 'json)
 
-(defun qg-elisp-lint--write (result files failed issues)
-  "Write RESULT for FILES, FAILED files and ISSUES as JSON."
+(defun qg-elisp-lint--write (result mode files failed issues)
+  "Write RESULT for lint MODE, FILES, FAILED files and ISSUES as JSON."
   (let ((create-lockfiles nil))
     (with-temp-file result
       (insert (json-encode `((emacs_version . ,emacs-version)
+                             (mode . ,mode)
                              (files . ,(vconcat files))
                              (failed . ,(vconcat failed))
                              (issues . ,(vconcat issues))))))))
@@ -36,7 +37,7 @@ It owns the OUTPUT directory and reads RESULT as JSON."
     (dolist (file files)
       (unless (qg-elisp-lint--compile-file file)
         (push file failed)))
-    (qg-elisp-lint--write result files (nreverse failed) nil)))
+    (qg-elisp-lint--write result "compile" files (nreverse failed) nil)))
 
 (defun qg-elisp-lint--issue (file position text)
   "Describe a checkdoc issue in FILE at POSITION with TEXT."
@@ -58,7 +59,7 @@ The gate calls this in batch Emacs and reads RESULT as JSON."
             (setq current-file file)
             (checkdoc-file file))
         (advice-remove 'checkdoc-error collect)))
-    (qg-elisp-lint--write result files nil (nreverse issues))))
+    (qg-elisp-lint--write result "checkdoc" files nil (nreverse issues))))
 
 (provide 'qg-elisp-lint)
 ;;; qg-elisp-lint.el ends here

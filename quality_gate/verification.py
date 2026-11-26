@@ -18,6 +18,7 @@ from .runner import Diagnostics, mark_step
 
 if TYPE_CHECKING:
     from .adapters import ParsedSpec
+    from .checks import CheckResult
 
 
 @dataclass(frozen=True)
@@ -174,19 +175,14 @@ def test_findings(
 
 
 class _CrapExclusions:
-    """The lines each python_crap check's coverage excluded in measured functions.
-
-    CRAP is the one source of truth for no-cover: verification reads the
-    excluded lines the checks reported, never the source text and never a file
-    selection of its own.
-    """
+    """The union of coverage exclusions from the measured subjects of each Python CRAP check."""
 
     def __init__(self) -> None:
         self.files: dict[str, set[int]] = {}
 
     @classmethod
     def measure(
-        cls, config: Config, prior: dict[str, Any]
+        cls, config: Config, prior: dict[str, CheckResult]
     ) -> "_CrapExclusions":
         exclusions = cls()
         for check in config.checks.values():
@@ -200,17 +196,14 @@ class _CrapExclusions:
             exclusions._add(check.id, result)
         return exclusions
 
-    def _add(self, identifier: str, result: Any) -> None:
-        if result.measurement is None:
+    def _add(self, identifier: str, result: CheckResult) -> None:
+        if result.excluded_lines is None:
             raise GateError(
                 f"no-cover exclusions unreliable: {identifier} reported no "
                 "measurement"
             )
-        for finding in result.findings:
-            if finding.measurement is not None and finding.locations:
-                self.files.setdefault(
-                    finding.locations[0].path, set()
-                ).update(finding.measurement["excluded_lines"])
+        for relative, lines in result.excluded_lines.items():
+            self.files.setdefault(relative, set()).update(lines)
 
     def findings(self) -> list[Finding]:
         findings: list[Finding] = []

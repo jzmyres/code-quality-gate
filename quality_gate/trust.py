@@ -15,15 +15,15 @@ import posixpath
 import stat
 import sys
 import tempfile
-import tomllib
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import policy
 from . import tools as tools_module
 from .files import _type_name, git_argv
 from .payload import PayloadError
-from .policy import Config, ConfigError, GateError, UsageError, load_config
+from .policy import Config, GateError, UsageError, _config_from_data, load_config
 from .ratchet import BaselineEntry, load_baseline, tighter_bound
 from .runner import RunResult, run
 from .tools import Tool, _default_lock_path, _tool_payload_digest, _tools_dir, load_tools
@@ -430,17 +430,6 @@ def _declared_status(item: _Input, allowed: set[str]) -> str:
     return "blocked"
 
 
-def _policy_baselines(data: dict[str, Any]) -> tuple[tuple[str, str], ...]:
-    checks = data.get("checks")
-    if not isinstance(checks, dict):
-        return ()
-    names: list[tuple[str, str]] = []
-    for name, raw in checks.items():
-        if isinstance(raw, dict) and isinstance(raw.get("baseline"), str):
-            names.append((name, raw["baseline"]))
-    return tuple(names)
-
-
 def _safe_join(root: Path, relative: str) -> Path | None:
     path = PurePosixPath(relative)
     if path.is_absolute() or ".." in path.parts or not path.parts:
@@ -452,17 +441,11 @@ def _materialize(
     policy_root: Path,
     root: Path,
     source: _TrustedTree,
-    policy: bytes,
-) -> None:
-    (policy_root / POLICY_NAME).write_bytes(policy)
-    try:
-        data = tomllib.loads(policy.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
-        raise ConfigError(
-            f"{root / POLICY_NAME} at {source.location}: expected valid TOML, got "
-            f"{error}"
-        ) from error
-    for name, baseline in _policy_baselines(data):
+    raw_policy: bytes,
+) -> dict[str, Any]:
+    (policy_root / POLICY_NAME).write_bytes(raw_policy)
+    data = policy.decode_policy(raw_policy, f"{root / POLICY_NAME} at {source.location}")
+    for name, baseline in policy.raw_baselines(data).items():
         target = _safe_join(policy_root, baseline)
         if target is None:
             continue
@@ -475,6 +458,7 @@ def _materialize(
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(raw)
+    return data
 
 
 def _policy_config(
@@ -960,15 +944,17 @@ def _prepare_source(
     allowed: list[str],
 ) -> Trust:
     policy_root = Path(temporary[0].name)
-    policy = _rev_policy_bytes(root, source)
-    _materialize(policy_root, root, source, policy)
+    raw_policy = _rev_policy_bytes(root, source)
+    data = _materialize(policy_root, root, source, raw_policy)
     allowed_paths = {_normalise(path) for path in allowed}
     authorized = (
-        _sha256(policy) != _sha256(_candidate_bytes(root, POLICY_NAME))
+        _sha256(raw_policy) != _sha256(_candidate_bytes(root, POLICY_NAME))
         and POLICY_NAME in allowed_paths
     )
-    rev_config = load_config(
+    rev_config = _config_from_data(
         policy_root,
+        policy_root / POLICY_NAME,
+        data,
         candidate_root=root,
         parse_candidate_inputs=not authorized,
     )

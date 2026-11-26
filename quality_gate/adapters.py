@@ -866,9 +866,9 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "elisp_compile",
-    ("load_path", "emacs", "budget_seconds"),
+    elisp_lint.LINT_KEYS,
     elisp_lint._elisp_lint_spec,
-    elisp_lint.run_lint,
+    partial(elisp_lint.run_lint, mode="compile"),
     budget=_spec_budget,
     parse_candidate_inputs=True,
     file_selection="affected",
@@ -876,9 +876,9 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "elisp_checkdoc",
-    ("load_path", "emacs", "budget_seconds"),
+    elisp_lint.LINT_KEYS,
     elisp_lint._elisp_lint_spec,
-    elisp_lint.run_lint,
+    partial(elisp_lint.run_lint, mode="checkdoc"),
     budget=_spec_budget,
     parse_candidate_inputs=True,
     file_selection="affected",

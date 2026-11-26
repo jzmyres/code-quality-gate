@@ -216,9 +216,9 @@ class ElispLintTests(FixtureCase):
                     self.assertIn(binary if binary.startswith("no-") else "JSON lint report", result.stderr)
 
     def report_wrapper(
-        self, report: str, *, exit_code: int = 0, real: bool = False
+        self, report: str, *, exit_code: int = 0, real: bool = False, suffix: str = ""
     ) -> str:
-        wrapper = self.base / ("real-report-emacs" if real else "fake-report-emacs")
+        wrapper = self.base / (("real-report-emacs" if real else "fake-report-emacs") + suffix)
         if real:
             encoded = json.dumps(report)
             form = f"(progn (require 'json) (defun json-encode (_value) {encoded}))"
@@ -229,7 +229,7 @@ class ElispLintTests(FixtureCase):
                 f'--eval {shlex.quote(form)} "$@"\nexit {exit_code}\n'
             )
         else:
-            report_file = self.base / "fake-report.json"
+            report_file = self.base / f"fake-report{suffix}.json"
             report_file.write_text(report, encoding="utf-8")
             content = (
                 '#!/bin/sh\nif [ "$4" = "(princ emacs-version)" ]; then\n'
@@ -258,7 +258,9 @@ class ElispLintTests(FixtureCase):
             for position, document in enumerate(cases):
                 with self.subTest(adapter=adapter, document=document):
                     option = self.report_wrapper(
-                        json.dumps(document), real=position == 0
+                        json.dumps(document if not document else
+                                   {**document, "mode": adapter.removeprefix("elisp_")}),
+                        real=position == 0,
                     )
                     self.write_config(config((adapter,), {adapter: option}))
                     result, returned = self.run_checks(1)
@@ -266,7 +268,8 @@ class ElispLintTests(FixtureCase):
                     self.assertIn("expected", check["reason"])
                     self.assertIn("got", check["reason"])
                     self.assertIn("src/core.el", result.stderr)
-            option = self.report_wrapper(json.dumps(valid), exit_code=7)
+            report = {**valid, "mode": adapter.removeprefix("elisp_")}
+            option = self.report_wrapper(json.dumps(report), exit_code=7)
             self.write_config(config((adapter,), {adapter: option}))
             result, returned = self.run_checks(1)
             self.assert_check(returned, adapter, "unsupported")
@@ -295,8 +298,14 @@ class ElispLintTests(FixtureCase):
     def lint_report_version(
         self, version: object, *, exit_code: int = 0, real: bool = False
     ) -> None:
-        document = {"emacs_version": version, "files": ["src/core.el"], "failed": [], "issues": []}
-        self.lint_report(json.dumps(document), exit_code=exit_code, real=real)
+        options = {}
+        for adapter in ("elisp_compile", "elisp_checkdoc"):
+            document = {"emacs_version": version, "mode": adapter.removeprefix("elisp_"),
+                        "files": ["src/core.el"], "failed": [], "issues": []}
+            options[adapter] = self.report_wrapper(
+                json.dumps(document), exit_code=exit_code, real=real, suffix=f"-{adapter}",
+            )
+        self.write_config(config(options=options))
 
     def lint_report(
         self, report: str, *, exit_code: int = 0, real: bool = False

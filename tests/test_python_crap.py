@@ -1336,7 +1336,7 @@ class CrapRunTests(unittest.TestCase):
         context = self.context()
         stderr = io.StringIO()
         measurement = python_crap.CrapMeasurement(
-            [], ["first", "second"]
+            [], ["first", "second"], None
         )
         with mock.patch.object(
             python_crap, "measure_crap", return_value=measurement

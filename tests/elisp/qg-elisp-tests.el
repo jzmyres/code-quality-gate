@@ -357,6 +357,7 @@ gate's instrumentation."
              (expand-file-name "compile.json" directory)))
           (let ((report (qg-elisp-tests--read
                          (expand-file-name "compile.json" directory))))
+            (should (equal (alist-get 'mode report) "compile"))
             (should (equal (append (alist-get 'files report) nil)
                            '("clean.el" "warning.el")))
             (should (equal (append (alist-get 'failed report) nil)
@@ -406,6 +407,7 @@ gate's instrumentation."
                           (expand-file-name "issues.json" directory)))
                  (issues (alist-get 'issues report))
                  (issue (aref issues 0)))
+            (should (equal (alist-get 'mode report) "checkdoc"))
             (should (> (length issues) 0))
             (should (equal (alist-get 'file issue) "undocumented.el"))
             (should (> (alist-get 'line issue) 0))
