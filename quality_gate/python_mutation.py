@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import os
 import shutil
 import sys
@@ -26,6 +27,7 @@ from . import module_graph, python_shape
 from .files import DiffBase, diff_base
 from .json_input import load_json
 from .policy import (
+    DEFAULT_PYTHON_IMPORT_ROOTS,
     ConfigError,
     GateError,
     _integer,
@@ -58,6 +60,7 @@ class MutationSpec:
     function_mutants: int
     run_seconds: int
     test_runner: str = "unittest"
+    import_roots: tuple[str, ...] = DEFAULT_PYTHON_IMPORT_ROOTS
 
 
 def _budget(spec: MutationSpec) -> int:
@@ -855,14 +858,14 @@ def _read_pytest_evidence(report: Path, returncode: int | None) -> _PytestEviden
 
 def _run_pytest(
     source_root: Path, copy_root: Path, tests: tuple[str, ...], seconds: float,
-    tools_dir: Path, target: str, *, stage: str, total_budget_cut: bool,
+    tools_dir: Path, target: str, *, stage: str, total_budget_cut: bool, import_roots: tuple[str, ...],
 ) -> _PytestEvidence | None:
     script = Path(__file__).resolve().with_name("pytest_mutation_run.py")
     report = copy_root.with_suffix(".pytest.json")
     result = run(
         [
             sys.executable, "-I", "-B", str(script), str(source_root),
-            str(report), target, *tests,
+            str(report), target, json.dumps(import_roots), *tests,
         ],
         cwd=copy_root, env=_environment(source_root, copy_root, tools_dir),
         budget_seconds=seconds,
@@ -964,6 +967,7 @@ def _pytest_baseline(
     evidence = _run_pytest(
         root, copy_root, tests, allowance, tools_dir, function.path,
         stage="original tests", total_budget_cut=allowance < spec.mutant_seconds,
+        import_roots=spec.import_roots,
     )
     if evidence is None:
         return False
@@ -1107,6 +1111,7 @@ def _run_mutant(
         evidence = _run_pytest(
             root, copy_root, tests, allowance, tools_dir, function.path,
             stage="mutant run", total_budget_cut=allowance < spec.mutant_seconds,
+            import_roots=spec.import_roots,
         )
         outcome = _pytest_outcome(function, baseline, evidence)
     else:
@@ -1301,9 +1306,8 @@ def _run_python_mutation(context: Any) -> CheckResult:
             context.root, functions, test_files, imports.identities(context.inventory_files),
         )
         mark_step("python-mutation execution")
-        records, findings, unfinished = _measure(
-            context, check.spec, functions, tests, start
-        )
+        spec = replace(check.spec, import_roots=context.config.python_import_roots)
+        records, findings, unfinished = _measure(context, spec, functions, tests, start)
         findings.extend(
             _over_budget_finding(function, check.spec)
             for function in unfinished
