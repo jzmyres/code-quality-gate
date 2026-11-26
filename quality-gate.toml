@@ -26,12 +26,12 @@ checks = ["ruff", "clones", "tests", "verification", "source-chars", "comments"]
 [classes.elisp]
 code = true
 description = "Emacs Lisp measurement helpers, measured by the gate's own Elisp checks"
-checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars", "comments"]
+checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars", "comments", "env_surface"]
 
 [classes.elisp-suite]
 code = true
 description = "The ERT suite that exercises the Emacs Lisp helpers"
-checks = ["elisp-compile", "elisp-checkdoc", "source-chars", "comments"]
+checks = ["elisp-compile", "elisp-checkdoc", "source-chars", "comments", "env_surface"]
 
 [classes.config]
 code = false
@@ -246,6 +246,19 @@ enforcement = "enforced"
 adapter = "comments"
 tier = 1
 enforcement = "enforced"
+
+[checks.env_surface]
+adapter = "env_surface"
+tier = 1
+enforcement = "enforced"
+allow = [
+    {name = "HOME", owner = "POSIX"},
+    {name = "PATH", owner = "POSIX"},
+    {name = "TMPDIR", owner = "POSIX"},
+    {prefix = "XDG_", owner = "XDG Base Directory"},
+    {name = "COVERAGE_CORE", owner = "coverage.py"},
+    {name = "PYTHONDONTWRITEBYTECODE", owner = "Python"},
+]
 
 [checks.tests]
 adapter = "python_tests"

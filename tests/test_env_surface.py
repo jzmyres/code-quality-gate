@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import ast
 import os
+import shutil
+import subprocess
 import unittest
 from unittest import mock
 
@@ -315,6 +317,51 @@ class Example:
         rows, errors = env_surface.measure(GATE, files)
         self.assertEqual(errors, [])
         self.assertIn("QG_PYTHON", {row.name for row in rows})
+
+    def test_self_policy_enforces_elisp_environment_surface(self):
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=GATE)
+        paths = os.fsdecode(tracked).split("\0")[:-1]
+        elisp_paths = sorted(path for path in paths if path.endswith(".el"))
+        self.assertTrue(elisp_paths)
+
+        (self.repo / "a.py").unlink()
+        for relative in paths:
+            destination = self.repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(GATE / relative, destination, follow_symlinks=False)
+        self.git("add", "-A", "-f")
+
+        args = ("check", "--only", "env_surface", "--json")
+        result = self.run_qg_process(*args)
+        self.assertEqual(result.returncode, 0, output(result))
+        check = self.check_by_id(self.parse_json(result), "env_surface")
+        self.assertEqual((check["tier"], check["enforcement"], check["outcome"]),
+                         (1, "enforced", "pass"))
+
+        allowed_name = "XDG_QG_ENV_SURFACE_TEST"
+        allowed = set()
+        forbidden = set()
+        for relative in elisp_paths:
+            path = self.repo / relative
+            source = path.read_bytes()
+            line = source.count(b"\n") + 2
+            path.write_bytes(source + f'\n(getenv "{allowed_name}")\n(getenv "OTHER")\n'.encode())
+            allowed.add((relative, line))
+            forbidden.add((relative, line + 1))
+
+        result = self.run_qg_process(*args)
+        self.assertEqual(result.returncode, 1, output(result))
+        check = self.check_by_id(self.parse_json(result), "env_surface")
+        self.assertEqual(check["outcome"], "fail")
+        for name, expected in ((allowed_name, allowed), ("OTHER", forbidden)):
+            actual = {
+                (row["path"], row["line"]) for row in check["measurement"]["findings"]
+                if row["name"] == name and row["access"] == "read"
+            }
+            self.assertSetEqual(expected, actual, f"findings for {name}")
+        for relative, line in sorted(forbidden):
+            with self.subTest(path=relative):
+                self.assertIn(f"{relative}:{line}: read 'OTHER'", result.stderr)
 
 
 if __name__ == "__main__":
