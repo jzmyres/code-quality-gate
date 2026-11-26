@@ -1087,9 +1087,7 @@ def read_policy(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        raise ConfigError(
-            f"{path}: expected a configuration file, got missing"
-        ) from None
+        raise
     except OSError as error:
         raise ConfigError(
             f"{path}: expected a readable configuration file, got {error}"
@@ -1101,7 +1099,12 @@ def load_config(root: Path, *, validate_headers: bool = True,
                 candidate_root: Path | None = None,
                 parse_candidate_inputs: bool = True) -> Config:
     path = root / "quality-gate.toml"
-    data = read_policy(path)
+    try:
+        data = read_policy(path)
+    except FileNotFoundError:
+        raise ConfigError(
+            f"{path}: expected a configuration file, got missing"
+        ) from None
     return _config_from_data(root, path, data, validate_headers=validate_headers,
                              candidate_root=candidate_root,
                              parse_candidate_inputs=parse_candidate_inputs)

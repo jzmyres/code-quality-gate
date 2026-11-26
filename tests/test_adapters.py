@@ -457,6 +457,35 @@ requires = "python-suite"
             code = worklist.command_debt(self.repo, revision, True)
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_missing_policy_preserves_each_callers_diagnostic(self):
+        self.config_path.unlink()
+        with self.assertRaises(FileNotFoundError) as read_error:
+            self.config_path.read_bytes()
+        with self.assertRaises(policy.ConfigError) as load_error:
+            policy.load_config(self.repo)
+        self.assertEqual(
+            str(load_error.exception), f"{self.config_path}: expected a configuration file, got missing",
+        )
+        code, stdout, stderr = self.debt_report(None)
+        self.assertEqual((code, stdout), (2, ""), stderr)
+        self.assertEqual(
+            stderr,
+            f"debt: {self.config_path}: expected a readable configuration file, got {read_error.exception}\n",
+        )
+
+    def test_unreadable_policy_preserves_the_shared_diagnostic(self):
+        self.config_path.unlink()
+        self.config_path.mkdir()
+        with self.assertRaises(IsADirectoryError) as read_error:
+            self.config_path.read_bytes()
+        expected = f"{self.config_path}: expected a readable configuration file, got {read_error.exception}"
+        with self.assertRaises(policy.ConfigError) as load_error:
+            policy.load_config(self.repo)
+        self.assertEqual(str(load_error.exception), expected)
+        code, stdout, stderr = self.debt_report(None)
+        self.assertEqual((code, stdout), (2, ""), stderr)
+        self.assertEqual(stderr, f"debt: {expected}\n")
+
     def assert_debt_delegation(self, revision, raw, label, names, reader_calls):
         with (
             mock.patch.object(policy, "read_policy", wraps=policy.read_policy) as reader,

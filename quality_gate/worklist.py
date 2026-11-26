@@ -647,7 +647,12 @@ def command_debt(
     try:
         if revision is None:
             path = root / POLICY_NAME
-            data = policy.read_policy(path)
+            try:
+                data = policy.read_policy(path)
+            except FileNotFoundError as error:
+                raise UsageError(
+                    f"{path}: expected a readable configuration file, got {error}"
+                ) from error
             config = _config_from_data(
                 root, path, data, parse_candidate_inputs=False
             )
