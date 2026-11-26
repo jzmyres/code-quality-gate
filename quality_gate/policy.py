@@ -130,6 +130,7 @@ class Config:
     module_dirs: tuple[str, ...] | None = None
     shared_base: str | None = None
     python_import_roots: tuple[str, ...] = DEFAULT_PYTHON_IMPORT_ROOTS
+    trusted_policy: bool = False
 
 
 def _config_error(path: Path | str, key: str, expected: str, actual: str) -> ConfigError:

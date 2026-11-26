@@ -521,6 +521,35 @@ def _secrets_result(context: AdapterContext, start: float, child: RunResult, bud
     )
 
 
+def _verified_secrets_result(
+    context: AdapterContext, start: float, scan: secrets.VerifiedScan, budget: int,
+) -> Any:
+    from .checks import _check_result
+
+    child = scan.child
+    reason = child.error
+    if child.execution == "completed" and scan.unresolved:
+        reason = f"Betterleaks reported {scan.unresolved} unresolved finding(s)"
+    return _check_result(
+        context.check, start,
+        "pass" if child.execution == "completed" and scan.unresolved == 0 else "fail",
+        execution=child.execution, reason=reason, diagnostics=child.diagnostics(),
+        budget_seconds=budget, measurement={"verified_sha256_provenance": scan.verified},
+    )
+
+
+def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start: float, budget: int) -> Any:
+    root = context.root.resolve()
+    entries = [entry for entry in enumerate_entries(root) if not entry.gitlink]
+    if context.check.spec and context.config.trusted_policy:
+        verified = secrets.scan_verified(
+            binary, root, directory, entries, budget, context.check.spec, run=run,
+        )
+        return _verified_secrets_result(context, start, verified, budget)
+    child = secrets.scan(binary, root, directory, (entry.path for entry in entries), budget, run=run)
+    return _secrets_result(context, start, child, budget)
+
+
 def _run_secrets(context: AdapterContext) -> Any:
     from .checks import RATCHET_BUDGET_SECONDS, _check_result
 
@@ -535,16 +564,13 @@ def _run_secrets(context: AdapterContext) -> Any:
     try:
         with TemporaryDirectory(prefix="qg-secrets-", dir=context.evidence_dir) as directory:
             mark_step("snapshot and scan of Git-selected files")
-            root = context.root.resolve()
-            selected = [entry.path for entry in enumerate_entries(root) if not entry.gitlink]
-            child = secrets.scan(binary, root, Path(directory), selected, RATCHET_BUDGET_SECONDS, run=run)
+            return _scan_secrets(context, binary, Path(directory), start, RATCHET_BUDGET_SECONDS)
     except (GateError, OSError, ValueError) as error:
         print(f"{context.prefix}: {error}", file=sys.stderr)
         return _check_result(
             context.check, start, "error", execution="error", reason=str(error),
             diagnostics=Diagnostics(error=str(error)),
         )
-    return _secrets_result(context, start, child, RATCHET_BUDGET_SECONDS)
 
 
 def _affected_test_child(
@@ -973,8 +999,10 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "secrets",
-    (),
-    lambda _raw, _root, _path, _key: ParsedSpec(None, "secrets/1", ("static",)),
+    ("sha256_provenance",),
+    lambda raw, _root, path, key: ParsedSpec(
+        secrets.provenance_spec(raw, path, key), "secrets/1", ("static",),
+    ),
     _run_secrets,
     runs_suite=False,
 ))

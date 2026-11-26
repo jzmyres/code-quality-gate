@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import shutil
 import signal
 import socket
 import string
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -17,7 +19,7 @@ from unittest import mock
 from support import BASE_CONFIG, GATE, FixtureCase
 
 from quality_gate import adapters, checks, runner, secrets, tools
-from quality_gate.policy import load_config
+from quality_gate.policy import ConfigError, load_config
 
 DECLARATION = """
 [checks.secrets]
@@ -285,3 +287,171 @@ class SecretsTests(FixtureCase):
         self.assertIs(result, first)
         targets = [call.args[0][call.args[0].index("--") + 1:] for call in launch.call_args_list]
         self.assertEqual(targets, [selected[:-1], selected[-1:]])
+
+    def _provenance_fixture(
+        self, *, declare_in_trusted: bool = True, tracked_payload: bool = True,
+    ) -> tuple[Path, Path, str]:
+        binary = self._require_scanner()
+        payload = struct.pack("<4q", 7, 31, 151, 4)
+        digest = hashlib.sha256(payload).hexdigest()
+        base = BASE_CONFIG + """
+[[rule]]
+pattern = "*.json"
+class = "config"
+reason = "report fixtures"
+
+[[rule]]
+pattern = "*.raw"
+class = "config"
+reason = "payload fixtures"
+""" + DECLARATION
+        declaration = f"""
+[[checks.secrets.sha256_provenance]]
+record = "report.json"
+pointer = "/pack/0/tokens_sha256"
+payload = "pack.raw"
+payload_sha256 = "{digest}"
+"""
+        if declare_in_trusted:
+            self.write_config(base + declaration)
+        else:
+            self.write_config(base)
+        self.add_file("report.json", self._digest_record(digest))
+        if tracked_payload:
+            self.add_file("pack.raw", payload)
+        self.commit_all()
+        trusted = self.trusted_directory("HEAD")
+        self.write_config(base + declaration)
+        if not tracked_payload:
+            self.add_file("pack.raw", payload)
+        return binary, trusted, digest
+
+    @staticmethod
+    def _digest_record(digest: str, **extra: str) -> str:
+        return json.dumps(
+            {"Ω": "π", "pack": [{"tokens_sha256": digest}], **extra}, ensure_ascii=False,
+        )
+
+    def _run_provenance(self, binary: Path, trusted: Path | None, status: int, verified: int | None):
+        trust_args = ["--only", "secrets"] if trusted is None else ["--policy-from", str(trusted)]
+        result = self.run_qg_process(
+            "check", "--json", *trust_args,
+            env={"QG_TOOLS_DIR": str(binary.parent.parent)},
+        )
+        self.assertEqual(result.returncode, status, result.stderr)
+        check = self.check_by_id(self.parse_json(result), "secrets")
+        self.assertEqual((check.get("measurement") or {}).get("verified_sha256_provenance"), verified)
+        return result, check
+
+    def test_trusted_payload_verifies_exact_json_scalar(self) -> None:
+        binary, trusted, digest = self._provenance_fixture()
+        result, check = self._run_provenance(binary, trusted, 0, 1)
+        self.assertEqual(check["diagnostics"]["exit_code"], 3)
+        self.assertNotIn(digest, result.stderr)
+        self.assertNotIn(digest, result.stdout)
+
+        credential = _synthetic_credential()
+        self.add_file("report.json", self._digest_record(digest, padding="0" * 500, credential=credential))
+        result, _ = self._run_provenance(binary, trusted, 1, 1)
+        self.assertIn("RuleID: github-pat", result.stderr)
+        self.assertNotIn("RuleID: generic-api-key", result.stderr)
+        self.assertNotIn(credential, result.stdout + result.stderr)
+
+    def test_nonmatching_payload_and_wrong_pointer_leave_findings(self) -> None:
+        binary, trusted, digest = self._provenance_fixture()
+        self.add_file("report.json", self._digest_record(digest).replace('"pack"', '"other"'))
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+        self.add_file("report.json", self._digest_record(digest))
+        self.add_file("pack.raw", b"different payload")
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_same_digest_in_another_json_scalar_still_fails(self) -> None:
+        binary, trusted, digest = self._provenance_fixture()
+        self.add_file("report.json", json.dumps({
+            "pack": [{"tokens_sha256": digest}, {"tokens_sha256": digest}],
+        }))
+        result, _ = self._run_provenance(binary, trusted, 1, 1)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+        self.assertNotIn(digest, result.stdout + result.stderr)
+
+    def test_duplicate_json_member_cannot_claim_provenance(self) -> None:
+        binary, trusted, digest = self._provenance_fixture()
+        self.add_file("report.json", self._digest_record(digest).replace(
+            '"tokens_sha256"', '"tokens_sha256": "placeholder", "tokens_sha256"',
+        ))
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_untracked_payload_leaves_finding(self) -> None:
+        binary, trusted, _ = self._provenance_fixture(tracked_payload=False)
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_symlinked_payload_leaves_finding(self) -> None:
+        binary, trusted, _ = self._provenance_fixture()
+        payload = self.repo / "pack.raw"
+        payload.rename(self.repo / "original.raw")
+        payload.symlink_to("original.raw")
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_candidate_only_declarations_cannot_verify_a_finding(self) -> None:
+        binary, trusted, _ = self._provenance_fixture(declare_in_trusted=False)
+        for policy_source in (None, trusted):
+            with self.subTest(policy_source=policy_source):
+                result, _ = self._run_provenance(binary, policy_source, 1, None)
+                self.assertRegex(result.stderr, r"(?m)^RuleID:\s+generic-api-key$")
+
+    def test_structured_report_must_be_complete_and_consistent(self) -> None:
+        for code, report in ((0, b"bad"), (3, b"[]"), (0, b"[{}]"), (3, b"[{}]"), (1, b"[]")):
+            with self.subTest(code=code, report=report):
+                child = runner.RunResult((), "completed", code, stdout=report)
+                with self.assertRaisesRegex(ValueError, "Betterleaks"):
+                    secrets.scan_verified(
+                        Path(sys.executable), self.repo, self.evidence, [], 60, (),
+                        run=mock.Mock(return_value=child),
+                    )
+
+    def test_provenance_declarations_reject_invalid_rows(self) -> None:
+        row = {
+            "record": "report.json", "pointer": "/a~1b/~0c",
+            "payload": "data.raw", "payload_sha256": "0" * 64,
+        }
+        valid = secrets.provenance_spec({"sha256_provenance": [row]}, self.config_path, "secrets")
+        self.assertEqual(valid[0].pointer, ("a/b", "~c"))
+        for invalid in (
+            {}, [42], [dict(row, record="report.txt")], [dict(row, payload="report.json")],
+            [dict(row, payload="../data.raw")], [dict(row, payload_sha256="bad")],
+            [dict(row, pointer="/a~2b")], [row, row],
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                secrets.provenance_spec({"sha256_provenance": invalid}, self.config_path, "secrets")
+
+    def test_unattested_match_locations_do_not_verify(self) -> None:
+        digest = hashlib.sha256(b"example source").hexdigest()
+        data = json.dumps({"tokens_sha256": digest}).encode()
+        record = secrets._Record(data, (0,), {digest: [("tokens_sha256",)]})
+        finding = {
+            "RuleID": "generic-api-key", "File": "report.json", "Secret": "REDACTED",
+            "Match": 'tokens_sha256": "REDACTED"', "StartLine": 1, "EndLine": 1,
+            "StartColumn": 3, "EndColumn": len(data) - 1,
+            "Attributes": {"path": "report.json", "resource": "fs.content"},
+        }
+        records = {"report.json": record}
+        self.assertTrue(secrets._eligible_finding(finding, records))
+        for changed in (
+            {"EndLine": 2}, {"EndColumn": len(data) + 1}, {"StartColumn": 1},
+            {"Match": "unrelated"}, {"Tags": ["decoded:base64"]},
+            {"Attributes": {"path": "report.json", "resource": "fs.archive"}},
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(secrets._eligible_finding(dict(finding, **changed), records))
+
+    def test_oversized_record_gets_no_verification(self) -> None:
+        declaration = secrets.Provenance("report.json", ("tokens_sha256",), "pack.raw", "0" * 64)
+        (self.evidence / declaration.record).write_text("{}", encoding="utf-8")
+        with mock.patch.object(secrets, "_MAX_RECORD_BYTES", 1):
+            self.assertEqual(secrets._verified_records(self.evidence, [declaration]), {})

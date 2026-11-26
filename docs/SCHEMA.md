@@ -429,6 +429,50 @@ non-empty reason, and the entry resolves when the count returns to 0. Replacing
 inline `noqa` comments with a file-wide directive therefore still fails unless
 the file-wide subject is covered.
 
+### SHA-256 provenance policy
+
+A `secrets` adapter can declare an array of `sha256_provenance` tables. For
+example, this policy is for a JSON record whose first pack records the digest
+of a four-byte payload containing `abc` and a newline.
+
+```toml
+[checks.secrets]
+adapter = "secrets"
+tier = 1
+enforcement = "enforced"
+
+[[checks.secrets.sha256_provenance]]
+record = "evidence/report.json"
+pointer = "/packs/0/tokens_sha256"
+payload = "evidence/pack.raw"
+payload_sha256 = "edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"
+```
+
+Choose the payload and independently verify its digest before adding the
+declaration to the policy used by `--policy-from`. The payload must be
+Git-tracked and both paths must be exact repository-relative paths to separate
+regular files. The record must be a UTF-8 `.json` file of up to 16 MiB. The
+JSON Pointer uses `~0` and `~1` escapes and zero-based array indices. Each
+record and pointer pair can appear once.
+
+The check hashes the payload's captured raw bytes. Use the exact bytes the
+producer hashed. For example, when a producer hashes the contents of a
+tensor, a serialized tensor container with a header is a different payload.
+Both the policy pin and the selected scalar must equal the recomputed digest.
+
+The pinned scanner scans every selected input under its standard rules. The
+gate uses the report's match and byte coordinates to confirm that the one
+`generic-api-key` finding identifies the declared lowercase digest string in
+the JSON record. A verified finding counts in
+`measurement.verified_sha256_provenance`. Other findings, including findings
+on the same line, retain their normal enforcement. Findings from decoded
+content and archives stay in scope and cannot use a declaration.
+
+A check without `--policy-from` scans without applying these declarations.
+Missing payloads, changed bytes, duplicate JSON member names, and findings
+whose location cannot be verified also leave the scanner finding in place.
+The check rejects a failed scan or an incomplete or invalid scanner report.
+
 ## Tool lock: `tools.lock.toml`
 
 Each top-level table names a pinned tool:
