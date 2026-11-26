@@ -271,7 +271,7 @@ class AffectedScopeTests(FixtureCase):
         evidence = {1: ["tests"], 2: ["properties", "fuzzing"], 3: ["bounded"]}
         expected = [
             (name, tier) for name, definition in fixture["classes"].items() if definition["code"]
-            for tier in fixture["levels"]["required_tiers"]
+            for tier in sorted(set(fixture["levels"]["required_tiers"]))
         ]
         self.assertCountEqual(
             [(row["class"], row["tier"]) for row in document["obligations"]], expected,
@@ -284,12 +284,12 @@ class AffectedScopeTests(FixtureCase):
                 "reason": "partial run",
             }, f"{name} tier {tier}")
         prefix = "check: obligations not evaluated ("
-        summaries = [
-            line.removeprefix(prefix).removesuffix(")").split(", ")
-            for line in output(result).splitlines() if line.startswith(prefix)
-        ]
-        self.assertEqual(len(summaries), 1, output(result))
-        self.assertCountEqual(summaries[0], [f"{name} tier {tier}" for name, tier in expected])
+        summaries = [line for line in output(result).splitlines() if line.startswith(prefix)]
+        pairs = ", ".join(f"{json.dumps(name)} tier {tier}" for name, tier in expected)
+        self.assertEqual(
+            summaries, [f"{prefix}{pairs})"],
+            f"Expected pairs {expected!r}, actual summaries {summaries!r}",
+        )
         return expected
 
     def test_partial_obligations_cover_every_required_pair_on_pass_and_rejection(self):

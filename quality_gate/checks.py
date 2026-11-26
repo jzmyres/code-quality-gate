@@ -1550,7 +1550,7 @@ def _print_decision(
         message = DECISION_MESSAGES.get(decision, "check: passed")
         print(f"{message} ({len(results)} checks)", flush=True)
     unevaluated = [
-        f"{item['class']} tier {item['tier']}"
+        f"{json.dumps(item['class'])} tier {item['tier']}"
         for item in obligations
         if item["status"] == "not_evaluated"
     ]

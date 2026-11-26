@@ -400,7 +400,33 @@ class PartialRunTests(FixtureCase):
             "class": "python", "tier": 1, "status": "not_evaluated", "required": ["tests"],
             "checks": [], "caused_by": None, "reason": "partial run",
         }])
-        self.assertIn("check: obligations not evaluated (python tier 1)", text)
+        self.assertIn('check: obligations not evaluated ("python" tier 1)', text)
+
+    def test_partial_summary_distinguishes_class_boundaries(self) -> None:
+        escaped_name = 'quoted "name" with a backslash \\ and a line break\n café'
+        prefix = "check: obligations not evaluated ("
+        summaries = []
+        for names in (("python tier 1, shell", escaped_name), ("python", "shell", escaped_name)):
+            first_class = json.dumps(names[0], ensure_ascii=False)
+            config = BASE_CONFIG.replace("[classes.python]", f"[classes.{first_class}]")
+            config = config.replace('class = "python"', f"class = {first_class}")
+            for name in names[1:]:
+                config += (
+                    f"\n[classes.{json.dumps(name, ensure_ascii=False)}]\n"
+                    'code = true\ndescription = "Additional source"\nchecks = ["smoke"]\n'
+                )
+            self.write_config(config)
+            result, document = self.run_json("--only", "smoke")
+            self.assertEqual(result.returncode, 0, output(result))
+            expected = [(name, 1) for name in names]
+            self.assertEqual(
+                [(row["class"], row["tier"]) for row in document["obligations"]], expected,
+            )
+            lines = [line for line in result.stderr.splitlines() if line.startswith(prefix)]
+            pairs = ", ".join(f"{json.dumps(name)} tier {tier}" for name, tier in expected)
+            self.assertEqual(lines, [f"{prefix}{pairs})"], result.stderr)
+            summaries.append(lines[0])
+        self.assertNotEqual(*summaries)
 
     def test_only_runs_inventory_hygiene_and_the_named_check(self) -> None:
         self.write_config(_two_check_config())
