@@ -1681,11 +1681,15 @@ enforcement = "enforced"
         (component, _), = cycles
         self.assertEqual(len(component), 23)
         self.assertTrue(all(path.startswith("quality_gate/") for path in component))
-        self.assertEqual(len(suite_edges), 16)
+        self.assertEqual(len(suite_edges), 17)
         self.assertEqual(program_edges, [])
         self.assertIn(
             module_graph.Edge("tests/test_adapters.py", "tests/test_python_tests.py", 17),
             suite_edges,
         )
+        self.assertIn(
+            module_graph.Edge("tests/test_pytest_mutation.py", "tests/test_python_mutation.py", 14),
+            suite_edges,
+        )
         self.assertEqual(measurement["modules"], sorted(modules))
-        self.assertEqual(measurement["value"], 17)
+        self.assertEqual(measurement["value"], 18)

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import module_graph, python_shape
 from .files import DiffBase, diff_base
+from .json_input import load_json
 from .policy import (
     ConfigError,
     GateError,
@@ -56,6 +57,7 @@ class MutationSpec:
     mutant_seconds: int
     function_mutants: int
     run_seconds: int
+    test_runner: str = "unittest"
 
 
 def _budget(spec: MutationSpec) -> int:
@@ -73,6 +75,11 @@ def _python_mutation_spec(
         raise ConfigError(
             f"{path}: {full_key}.scope: expected changed; got {scope!r}"
         )
+    test_runner = _optional_string(raw, "test_runner", "unittest", path, full_key)
+    if test_runner not in ("unittest", "pytest"):
+        raise ConfigError(
+            f"{path}: {full_key}.test_runner: expected unittest or pytest; got {test_runner!r}"
+        )
     spec = MutationSpec(
         scope,
         _string(raw, "base", path, f"{full_key}.base"),
@@ -88,6 +95,7 @@ def _python_mutation_spec(
             raw, "run_seconds", path, f"{full_key}.run_seconds",
             default=DEFAULT_RUN_SECONDS, minimum=1,
         ),
+        test_runner,
     )
     return ParsedSpec(spec, METRIC_VERSION, ("static",), threshold=0)
 
@@ -629,6 +637,12 @@ def _matching_test_paths(
     )
 
 
+def _pytest_test_file_paths(context: Any) -> list[str]:
+    return _matching_test_paths(
+        _fallback_test_paths(context), [("", "test_*.py"), ("", "*_test.py")],
+    )
+
+
 def _test_file_paths(context: Any) -> list[str]:
     discovery = _test_discovery(context)
     directory_rules = [
@@ -802,6 +816,82 @@ def _run_unittest(
     return _result_or_failure(result, failure)
 
 
+@dataclass(frozen=True)
+class _PytestEvidence:
+    collected: tuple[str, ...]
+    executed: tuple[str, ...]
+    assertions: tuple[str, ...]
+
+
+def _pytest_names(receipt: dict[str, Any], key: str) -> tuple[str, ...]:
+    values = receipt.get(key)
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise ValueError(f"invalid {key} in pytest evidence")
+    if len(set(values)) != len(values):
+        raise ValueError(f"duplicate {key} in pytest evidence")
+    return tuple(sorted(values))
+
+
+def _read_pytest_evidence(report: Path, returncode: int | None) -> _PytestEvidence:
+    receipt = load_json(report.read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict):
+        raise ValueError("invalid pytest evidence")
+    errors = _pytest_names(receipt, "errors")
+    if errors:
+        raise ValueError("; ".join(errors[:3]))
+    evidence = _PytestEvidence(
+        _pytest_names(receipt, "collected"),
+        _pytest_names(receipt, "executed"),
+        _pytest_names(receipt, "assertions"),
+    )
+    if not evidence.executed:
+        raise ValueError("pytest executed zero selected tests")
+    if not set(evidence.assertions) <= set(evidence.executed) <= set(evidence.collected):
+        raise ValueError("inconsistent collection and execution in pytest evidence")
+    if returncode != int(bool(evidence.assertions)):
+        raise ValueError(f"pytest exited {returncode} without a verified test outcome")
+    return evidence
+
+
+def _run_pytest(
+    source_root: Path, copy_root: Path, tests: tuple[str, ...], seconds: float,
+    tools_dir: Path, target: str, *, stage: str, total_budget_cut: bool,
+) -> _PytestEvidence | None:
+    script = Path(__file__).resolve().with_name("pytest_mutation_run.py")
+    report = copy_root.with_suffix(".pytest.json")
+    result = run(
+        [
+            sys.executable, "-I", "-B", str(script), str(source_root),
+            str(report), target, *tests,
+        ],
+        cwd=copy_root, env=_environment(source_root, copy_root, tools_dir),
+        budget_seconds=seconds,
+    )
+    subject = f"python-mutation: pytest {stage} for {target}"
+    return _pytest_result(result, report, subject, seconds, total_budget_cut)
+
+
+def _pytest_result(
+    result: RunResult, report: Path, subject: str, seconds: float, total_budget_cut: bool,
+) -> _PytestEvidence | None:
+    execution = execution_outcome(result.execution)
+    if execution.budget:
+        if total_budget_cut:
+            return None
+        raise GateError(f"{subject} timed out after {seconds:g} s")
+    if not execution.completed:
+        raise GateError(f"{subject} could not complete: {result.error or result.execution}")
+    return _verify_pytest_report(result, report, subject)
+
+
+def _verify_pytest_report(result: RunResult, report: Path, subject: str) -> _PytestEvidence:
+    try:
+        return _read_pytest_evidence(report, result.returncode)
+    except (OSError, ValueError) as error:
+        detail = result.stderr_text.strip() or result.stdout_text.strip()
+        raise GateError(f"{subject} could not be verified: {error}\n{detail[-2000:]}") from error
+
+
 def _fresh_copy(source: Path, work: Path, number: int) -> Path:
     destination = work / f"copy-{number:04d}"
     shutil.copytree(
@@ -848,7 +938,7 @@ def _baseline(
     function: python_shape.ShapeFunction, tests: tuple[str, ...],
     root: Path, work: Path, number: int, spec: MutationSpec, start: float,
     tools_dir: Path,
-) -> bool:
+) -> bool | _PytestEvidence:
     remaining = _remaining(start, spec)
     if remaining <= 0:
         return False
@@ -857,12 +947,32 @@ def _baseline(
     if remaining <= 0:
         return False
     allowance = min(spec.mutant_seconds, remaining)
+    if spec.test_runner == "pytest":
+        return _pytest_baseline(function, tests, root, copy_root, allowance, spec, start, tools_dir)
     result = _run_unittest(root, copy_root, tests, allowance, tools_dir)
     if not _baseline_passed(
         function, result, allowance, spec.mutant_seconds
     ):
         return False
     return _remaining(start, spec) > 0
+
+
+def _pytest_baseline(
+    function: python_shape.ShapeFunction, tests: tuple[str, ...], root: Path, copy_root: Path,
+    allowance: float, spec: MutationSpec, start: float, tools_dir: Path,
+) -> bool | _PytestEvidence:
+    evidence = _run_pytest(
+        root, copy_root, tests, allowance, tools_dir, function.path,
+        stage="original tests", total_budget_cut=allowance < spec.mutant_seconds,
+    )
+    if evidence is None:
+        return False
+    if evidence.assertions:
+        raise GateError(
+            f"python-mutation: pytest original tests for {function.identity} failed: "
+            + ", ".join(evidence.assertions[:3])
+        )
+    return evidence if _remaining(start, spec) > 0 else False
 
 
 def _outcome(result: Any, function: python_shape.ShapeFunction) -> str:
@@ -980,6 +1090,7 @@ def _run_mutant(
     function: python_shape.ShapeFunction, mutation: Mutation,
     tests: tuple[str, ...], spec: MutationSpec,
     start: float, root: Path, work: Path, numbers: list[int], tools_dir: Path,
+    baseline: bool | _PytestEvidence = True,
 ) -> tuple[str, bool]:
     if _remaining(start, spec) <= 0:
         return "not run (over budget)", True
@@ -992,12 +1103,34 @@ def _run_mutant(
     if remaining <= 0:
         return "not run (over budget)", True
     allowance = min(spec.mutant_seconds, remaining)
-    result = _run_unittest(root, copy_root, tests, allowance, tools_dir)
-    outcome = _outcome(result, function)
+    if spec.test_runner == "pytest":
+        evidence = _run_pytest(
+            root, copy_root, tests, allowance, tools_dir, function.path,
+            stage="mutant run", total_budget_cut=allowance < spec.mutant_seconds,
+        )
+        outcome = _pytest_outcome(function, baseline, evidence)
+    else:
+        result = _run_unittest(root, copy_root, tests, allowance, tools_dir)
+        outcome = _outcome(result, function)
     over_budget = (
         outcome == "timed out" and allowance < spec.mutant_seconds
     )
     return outcome, over_budget or _remaining(start, spec) <= 0
+
+
+def _pytest_outcome(
+    function: python_shape.ShapeFunction, baseline: bool | _PytestEvidence,
+    evidence: _PytestEvidence | None,
+) -> str:
+    assert isinstance(baseline, _PytestEvidence)
+    if evidence is None:
+        return "timed out"
+    if (evidence.collected, evidence.executed) != (baseline.collected, baseline.executed):
+        raise GateError(
+            f"python-mutation: pytest mutant run for {function.identity} "
+            "collected or executed different tests from the original"
+        )
+    return "killed" if evidence.assertions else "survived"
 
 
 def _run_generated(
@@ -1005,6 +1138,7 @@ def _run_generated(
     tests: tuple[str, ...], spec: MutationSpec,
     start: float, root: Path, work: Path, numbers: list[int],
     records: list[dict[str, Any]], tools_dir: Path,
+    baseline: bool | _PytestEvidence = True,
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     findings: list[Finding] = []
     for position, mutation in enumerate(mutations):
@@ -1015,7 +1149,7 @@ def _run_generated(
             return records, findings, False
         outcome, over_budget = _run_mutant(
             function, mutation, tests, spec, start,
-            root, work, numbers, tools_dir,
+            root, work, numbers, tools_dir, baseline,
         )
         records.append(_record(function, mutation, tests, outcome))
         if over_budget:
@@ -1042,14 +1176,15 @@ def _run_function(
     generated = _generated_mutations(mutations)
     if _remaining(start, spec) <= 0:
         return records + _not_run_records(function, generated, tests), [], False
-    if not _baseline(function, tests, root, work, numbers[0], spec, start, tools_dir):
+    baseline = _baseline(function, tests, root, work, numbers[0], spec, start, tools_dir)
+    if not baseline:
         return records + _not_run_records(function, generated, tests), [], False
     numbers[0] += 1
     if not generated:
         return records, [], True
     return _run_generated(
         function, generated, tests, spec, start,
-        root, work, numbers, records, tools_dir,
+        root, work, numbers, records, tools_dir, baseline,
     )
 
 
@@ -1157,7 +1292,10 @@ def _run_python_mutation(context: Any) -> CheckResult:
         )
         mark_step("python-mutation selection")
         functions = _changed_functions(context, check.spec, base)
-        test_files = _test_file_paths(context)
+        test_files = (
+            _pytest_test_file_paths(context) if check.spec.test_runner == "pytest"
+            else _test_file_paths(context)
+        )
         imports = module_graph.PythonImports.from_repository(context.root, context.config.python_import_roots)
         tests = _tests_by_function(
             context.root, functions, test_files, imports.identities(context.inventory_files),
