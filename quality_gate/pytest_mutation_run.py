@@ -91,16 +91,21 @@ class Evidence:
         }), encoding="utf-8")
 
 
+def _import_path(copy: Path, original: Path, roots: list[str]) -> list[str]:
+    local = [(copy / relative).resolve() for relative in roots]
+    if any(not path.is_relative_to(copy) for path in local):
+        raise ValueError("pytest mutation import root escapes its copy")
+    remaining = (entry for entry in sys.path if not Path(entry).resolve().is_relative_to(original))
+    return list(dict.fromkeys([*map(str, local), str(copy), *remaining]))
+
+
 def _main(argv: list[str]) -> int:
     import pytest
 
-    source, report, relative_target, *tests = argv
+    source, report, relative_target, roots, *tests = argv
     original = Path(source).resolve()
     copy = Path.cwd().resolve()
-    sys.path[:] = [
-        str(copy),
-        *(entry for entry in sys.path if not Path(entry).resolve().is_relative_to(original)),
-    ]
+    sys.path[:] = _import_path(copy, original, json.loads(roots))
     evidence = Evidence({(copy / test).resolve() for test in tests}, pytest.Module, pytest.fail.Exception)
     pytest.hookimpl(hookwrapper=True, tryfirst=True)(Evidence.pytest_runtest_makereport)
     status = pytest.main(

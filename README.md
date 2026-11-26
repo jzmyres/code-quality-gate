@@ -1147,8 +1147,9 @@ runner as
 Use `test_runner = "pytest"` to run ordinary pytest test functions and fixtures. Install pytest
 in the same Python environment that runs the gate. This mode considers `test_*.py` and
 `*_test.py` in the selected test inventory and passes the matching files directly to pytest.
-Pytest reads its configuration from the copy and starts with the copy at the front of Python's
-import path. Both runs must collect tests from the selected copied files, execute at least one
+Pytest reads its configuration from the copy and starts Python's import path with the copied
+`python_import_roots` in policy order, followed by the copy root when it is distinct.
+Both runs must collect tests from the selected copied files, execute at least one
 test, and import the measured module from the copy. The mutant must collect and execute the same
 test IDs as the original. A failed assertion or explicit pytest failure in the test body kills a
 mutant. A verified passing mutant survives. Empty collection, zero execution, collection or import

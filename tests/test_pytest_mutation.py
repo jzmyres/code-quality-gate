@@ -149,7 +149,8 @@ class PytestMutationTests(PytestMutationCase):
         self.base_commit()
         self.commit({
             "src/pkg/app.py": APP + "\nRESULT = flag()\n",
-            "pyproject.toml": '[tool.pytest.ini_options]\npythonpath = ["src"]\n',
+            "conftest.py": "from pkg import app\nfrom root_support import marker\nassert marker\n",
+            "root_support.py": "marker = True\n",
             "tests/test_app.py": (
                 "from pkg import app as helper\n"
                 "def test_result():\n"
@@ -367,7 +368,9 @@ class HookEvidenceTests(unittest.TestCase):
                 mock.patch.object(sys, "path", [str(original)]),
                 mock.patch.dict(sys.modules, modules),
             ):
-                code = pytest_mutation_run._main([str(original), str(report), "pkg.py", "test_file.py"])
+                code = pytest_mutation_run._main(
+                    [str(original), str(report), "pkg.py", '["."]', "test_file.py"],
+                )
                 self.assertEqual(sys.path, [str(copy)])
             self.assertEqual(code, 0)
             self.assertEqual(pytest.main.call_args.args[0], [f"--rootdir={copy}", "--", "./test_file.py"])
@@ -375,6 +378,17 @@ class HookEvidenceTests(unittest.TestCase):
             missing = pytest_mutation_run.Evidence(set(), object, AssertionError)
             missing.write(report, original, target)
             self.assertIn("pytest did not import the measured module from the copy", missing.errors.pop())
+
+    def test_import_root_cannot_escape_its_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            copy = directory / "copy"
+            copy.mkdir()
+            original = directory / "original"
+            original.mkdir()
+            (copy / "src").symlink_to(original, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "import root escapes its copy"):
+                pytest_mutation_run._import_path(copy, original, ["src"])
 
 
 def load_tests(loader, standard_tests, _pattern):
