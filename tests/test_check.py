@@ -5,7 +5,9 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -32,6 +34,7 @@ adapters = importlib.import_module("quality_gate.adapters")
 checks = importlib.import_module("quality_gate.checks")
 cli = importlib.import_module("quality_gate.cli")
 policy = importlib.import_module("quality_gate.policy")
+tools = importlib.import_module("quality_gate.tools")
 
 
 class _SleepSpec:
@@ -202,6 +205,30 @@ def _failing_run_directory_cleanup():
         return original(directory)
 
     return mock.patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup)
+
+
+class RuffRuleTests(unittest.TestCase):
+    def test_self_comparison(self) -> None:
+        command = [
+            str(tools.tool_binary("ruff")), "check", "--no-cache",
+            "--config", "ruff.toml", "--output-format", "json",
+        ]
+        seed = subprocess.run(
+            [*command, "--stdin-filename", "seed.py", "-"],
+            cwd=GATE, input="x = 1\nassert x == x\n", capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(seed.returncode, 1, output(seed))
+        self.assertEqual([item["code"] for item in json.loads(seed.stdout)], ["PLR0124"], output(seed))
+
+        tracked = subprocess.check_output(["git", "ls-files", "-z", "--", "*.py"], cwd=GATE)
+        paths = os.fsdecode(tracked).split("\0")[:-1]
+        self.assertTrue(paths)
+        scan = subprocess.run(
+            [*command, "--select", "PLR0124", "--ignore-noqa", "--", *paths],
+            cwd=GATE, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(scan.returncode, 0, output(scan))
+        self.assertEqual(json.loads(scan.stdout), [], output(scan))
 
 
 class CheckTests(FixtureCase):
