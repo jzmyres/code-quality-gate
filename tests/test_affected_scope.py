@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import tomllib
 
 from support import GATE, PYTHON_TEST_HEADER, FixtureCase, output
 
@@ -106,6 +107,32 @@ requires = "tests"
 
 IMPORTING = "test_importing.Example.test_value"
 OTHER = "test_other.Example.test_value"
+RUNTIME_REASON = "full run: suite runtime inputs are undeclared"
+
+OBLIGATION_CONFIG = CONFIG + """
+[levels]
+required_tiers = [1, 2, 3]
+
+[[not_applicable]]
+class = "test"
+tier = 2
+reason = "The fixture has no property-testing adapter"
+"""
+
+DISCOVERY_IDS = """\
+import json
+import sys
+import unittest
+
+def ids(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from ids(test)
+        else:
+            yield test.id()
+
+print(json.dumps(list(ids(unittest.TestLoader().discover(*sys.argv[1:])))))
+"""
 
 
 class AffectedScopeTests(FixtureCase):
@@ -149,9 +176,7 @@ class AffectedScopeTests(FixtureCase):
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
-        self.assertEqual(suite["executed"], [IMPORTING])
-        self.assertEqual(suite["selection"]["selected"], {IMPORTING: "depends on pkg/b.py"})
-        self.assertIn(OTHER, suite["selection"]["left_out"])
+        self.assert_runtime_suite(suite, [IMPORTING, OTHER])
         lint = self.checked(document, "lint")
         self.assertEqual(lint["diagnostics"]["argv"][-2:], ["pkg/a.py", "pkg/b.py"])
         chars = self.checked(document, "chars")
@@ -159,11 +184,16 @@ class AffectedScopeTests(FixtureCase):
         for name in ("inventory", "hygiene"):
             self.assertEqual(self.checked(document, name)["selection"]["reason"], "full run")
 
-    def test_changed_test_runs_itself(self):
+    def assert_runtime_suite(self, suite, names):
+        self.assertEqual(suite["executed"], names)
+        self.assertEqual(suite["selection"]["selected"], dict.fromkeys(names, RUNTIME_REASON))
+        self.assertEqual(suite["selection"]["left_out"], {})
+
+    def test_changed_test_runs_the_full_suite(self):
         self.commit_all()
         self.write_test("other", body="        self.assertEqual(1, 1)\n")
         _, document = self.affected()
-        self.assertEqual(self.checked(document)["executed"], [OTHER])
+        self.assert_runtime_suite(self.checked(document), [IMPORTING, OTHER])
         lint = self.checked(document, "lint")
         self.assertEqual(lint["execution"], "not_run")
         self.assertEqual(lint["outcome"], "not_run")
@@ -177,19 +207,54 @@ class AffectedScopeTests(FixtureCase):
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
-        self.assertEqual(suite["executed"], ["test_consumer.Example.test_value", OTHER])
-        self.assertEqual(suite["selection"]["selected"]["test_consumer.Example.test_value"],
-                         "depends on tests/test_other.py")
-        self.assertIn(IMPORTING, suite["selection"]["left_out"])
+        self.assert_runtime_suite(suite, ["test_consumer.Example.test_value", IMPORTING, OTHER])
 
-    def test_imported_case_is_selected_only_in_its_changed_discovery_module(self):
+    def test_imported_case_runs_in_both_discovery_modules(self):
         self.add_file("tests/test_other.py", "from test_importing import Example\n")
         self.change("tests/test_other.py", "from test_importing import Example\nVALUE = 2\n")
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
-        self.assertEqual(suite["executed"], [f"{IMPORTING} (discovery occurrence 2)"])
-        self.assertIn(f"{IMPORTING} (discovery occurrence 1)", suite["selection"]["left_out"])
+        self.assert_runtime_suite(
+            suite, [f"{IMPORTING} (discovery occurrence {position})" for position in (1, 2)],
+        )
+
+    def test_runtime_read_of_graph_node_rejects_and_runs_every_discovery_occurrence(self):
+        start, pattern = "tests", "test_*.py"
+        configured = json.dumps(["{python}", str(SHARD_RUNNER), "-s", start, "-p", pattern, "-j", "1"])
+        self.write_config(CONFIG.replace(SHARD_COMMAND, configured))
+        self.add_file("tests/test_alias.py", "from test_importing import Example\n")
+        self.write_test("other", "from pathlib import Path\n",
+                       "        self.assertEqual(Path('pkg/a.py').read_text(), 'value = 1\\n')\n")
+        self.commit_all()
+        base, baseline = self.run_gate()
+        self.assertEqual(base.returncode, 0, output(base))
+        self.assertEqual(self.checked(baseline)["measurement"], {"tests": 3})
+
+        self.add_file("pkg/a.py", "value = 2\n")
+        result, document = self.affected()
+        suite = self.checked(document)
+
+        discovery_script = self.base / "discover.py"
+        discovery_script.write_text(DISCOVERY_IDS, encoding="utf-8")
+        discovery = subprocess.run(
+            [*self.python_prefix(), str(discovery_script), start, pattern], cwd=self.repo,
+            env=self.default_tool_env(), capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(discovery.returncode, 0, output(discovery))
+        expected = json.loads(discovery.stdout)
+        for occurrences in (suite["selection"]["selected"], suite["executed"]):
+            self.assertCountEqual(
+                [name.partition(" (discovery occurrence ")[0] for name in occurrences], expected,
+            )
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["changed_paths"], ["pkg/a.py"])
+        self.assertEqual(suite["outcome"], "fail")
+        self.assertEqual(suite["selection"]["reason"], RUNTIME_REASON)
+        self.assertEqual([row["subject"] for row in suite["findings"]], [OTHER])
+        self.assertEqual(suite["selection"]["left_out"], {})
+        self.assertEqual(suite["not_executed"], {})
 
     def test_runtime_read_of_non_graph_file_runs_suite_in_full(self):
         self.write_test("other", "from pathlib import Path\n",
@@ -201,12 +266,107 @@ class AffectedScopeTests(FixtureCase):
         self.assertEqual(suite["executed"], [IMPORTING, OTHER])
         self.assertIn("unplaced file README.md", suite["selection"]["reason"])
 
+    def assert_unevaluated_pairs(self, result, document, policy):
+        fixture = tomllib.loads(policy)
+        evidence = {1: ["tests"], 2: ["properties", "fuzzing"], 3: ["bounded"]}
+        expected = [
+            (name, tier) for name, definition in fixture["classes"].items() if definition["code"]
+            for tier in fixture["levels"]["required_tiers"]
+        ]
+        self.assertCountEqual(
+            [(row["class"], row["tier"]) for row in document["obligations"]], expected,
+        )
+        for row in document["obligations"]:
+            name, tier = row["class"], row["tier"]
+            self.assertEqual(row, {
+                "class": name, "tier": tier, "status": "not_evaluated",
+                "required": evidence[tier], "checks": [], "caused_by": None,
+                "reason": "partial run",
+            }, f"{name} tier {tier}")
+        prefix = "check: obligations not evaluated ("
+        summaries = [
+            line.removeprefix(prefix).removesuffix(")").split(", ")
+            for line in output(result).splitlines() if line.startswith(prefix)
+        ]
+        self.assertEqual(len(summaries), 1, output(result))
+        self.assertCountEqual(summaries[0], [f"{name} tier {tier}" for name, tier in expected])
+        return expected
+
+    def test_partial_obligations_cover_every_required_pair_on_pass_and_rejection(self):
+        self.write_config(OBLIGATION_CONFIG)
+        self.commit_all()
+        for fails in (False, True):
+            self.write_test("other", body=f"        self.assertFalse({fails!r})\n")
+            for args in (("--base", "HEAD"), ("--base", "HEAD", "--only", "tests"), ("--only", "tests")):
+                with self.subTest(args=args, fails=fails):
+                    result, document = self.run_gate(*args)
+                    self.assertEqual(result.returncode, int(fails), output(result))
+                    self.assertEqual(document["decision"], "rejected" if fails else "partial")
+                    self.assert_unevaluated_pairs(result, document, OBLIGATION_CONFIG)
+
+        self.write_test("other")
+        result, document = self.run_gate()
+        self.assertEqual(result.returncode, 1, output(result))
+        fixture = tomllib.loads(OBLIGATION_CONFIG)
+        exemptions = {(row["class"], row["tier"]) for row in fixture["not_applicable"]}
+        expected = [
+            (name, tier, "exempted" if (name, tier) in exemptions else
+             "satisfied" if tier == 1 else "unsatisfied")
+            for name, definition in fixture["classes"].items() if definition["code"]
+            for tier in fixture["levels"]["required_tiers"]
+        ]
+        self.assertCountEqual([
+            (row["class"], row["tier"], row["status"]) for row in document["obligations"]
+        ], expected)
+        self.assertNotIn("obligations not evaluated", output(result))
+
+    def test_trusted_affected_obligations_use_the_effective_policy(self):
+        self.write_config(OBLIGATION_CONFIG)
+        self.commit_all()
+        trusted = self.trusted_directory("HEAD")
+        self.add_file("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--policy-from", str(trusted))
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["decision"], "partial")
+        self.assert_unevaluated_pairs(result, document, OBLIGATION_CONFIG)
+
+        self.write_config(CONFIG)
+        result, document = self.affected("--policy-from", str(trusted))
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "blocked")
+        self.assert_unevaluated_pairs(result, document, OBLIGATION_CONFIG)
+
     def test_unknown_base_names_revision(self):
         self.commit_all()
         result, document = self.run_gate("--base", "qg-unknown-revision")
         self.assertEqual(result.returncode, 2, output(result))
         self.assertIn("--base 'qg-unknown-revision': expected an existing commit, got no such revision",
                       document["error"])
+        self.assertEqual(document["obligations"], [])
+        self.assertEqual(document["checks"], [])
+
+    def test_failed_untracked_enumeration_is_a_preflight_usage_error(self):
+        self.commit_all()
+        environment = self.default_tool_env() | self.fake_git_failing_ls_files() | {"QG_AGENT": "0"}
+        result, document = self.run_json("--base", "HEAD", env=environment)
+        self.assertEqual(result.returncode, 2, output(result))
+        self.assertEqual(document["decision"], "error")
+        self.assertIn("--base 'HEAD': changed-file selection failed", document["error"])
+        self.assertIn("simulated enumeration failure", document["error"])
+        self.assertEqual(document["checks"], [])
+        self.assertEqual(document["obligations"], [])
+
+    def test_clean_diff_omits_ordinary_unittest_invocations(self):
+        self.commit_all()
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document)
+        self.assertEqual(suite["outcome"], "not_run")
+        self.assertEqual(suite["executed"], [])
+        self.assertEqual(suite["selection"]["selected"], {})
+        self.assertCountEqual(suite["selection"]["left_out"], [IMPORTING, OTHER])
+        report = self.discover_shards(["-s", "tests"])
+        self.assertEqual(report["selection"], suite["selection"])
 
     def test_full_run_keeps_configured_pattern_and_json_shape(self):
         command = [*UNITTEST_DISCOVER, "tests", "-p", "test_other.py"]
@@ -243,6 +403,35 @@ class AffectedScopeTests(FixtureCase):
         self.assertEqual(lint["diagnostics"]["argv"][-3:], ["pkg/__init__.py", "pkg/a.py", "pkg/renamed.py"])
         self.assertIn("unplaced file pkg/b.py", lint["selection"]["reason"])
 
+    def test_untracked_only_diff_measures_added_tree_shape_helpers(self):
+        self.write_config(SHAPE_CONFIG.replace('scope = "changed"\nbase = "HEAD"\ncrap_check',
+                                               'scope = "tree"\nbase = "HEAD"\ncrap_check'))
+        self.add_file(".gitignore", "__pycache__/\nignored.py\n")
+        self.commit_all()
+        base, _ = self.affected("--only", "shape")
+        self.assertEqual(base.returncode, 0, output(base))
+
+        created = {
+            "pkg/new.py": "def added_helper():\n    return 1\n",
+            "pkg/second.py": "value = 2\n",
+        }
+        for path, contents in created.items():
+            self.add_file(path, contents)
+        self.add_file("ignored.py", "def ignored_helper():\n    return 0\n")
+        result, document = self.affected()
+        self.assertCountEqual(document["changed_paths"], created.keys())
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(self.checked(document, "lint")["selection"]["selected"],
+                         dict.fromkeys(created, "changed"))
+        self.assert_runtime_suite(self.checked(document), [IMPORTING, OTHER])
+        shape = self.checked(document, "shape")
+        self.assertEqual(shape["outcome"], "fail")
+        self.assertEqual(shape["measurement"]["added"], 1)
+        self.assertEqual(
+            [(row["measurement"]["rule"], row["measurement"]["file"]) for row in shape["findings"]],
+            [("UNCALLED", "pkg/new.py")],
+        )
+
     def test_committed_and_staged_changes_survive_unstaged_reverts(self):
         from quality_gate.files import affected_diff
 
@@ -252,9 +441,10 @@ class AffectedScopeTests(FixtureCase):
         self.add_file("pkg/b.py", "import pkg.a\nvalue = 2\n")
         self.git("add", "pkg/b.py")
         self.add_file("pkg/b.py", "import pkg.a\n")
-        base, changed = affected_diff(self.repo, "HEAD^")
-        self.assertEqual(base.commit, self.git("rev-parse", "HEAD^").stdout.strip())
-        self.assertEqual(changed, {"pkg/a.py", "pkg/b.py"})
+        diff = affected_diff(self.repo, "HEAD^")
+        self.assertEqual(diff.base.commit, self.git("rev-parse", "HEAD^").stdout.strip())
+        self.assertEqual(diff.changed_paths, {"pkg/a.py", "pkg/b.py"})
+        self.assertEqual(diff.untracked_paths, set())
         result, document = self.run_gate("--base", "HEAD^")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(self.checked(document, "lint")["selection"]["selected"],
@@ -329,7 +519,7 @@ class AffectedScopeTests(FixtureCase):
         self.assertEqual(crap["outcome"], "fail")
         self.assertEqual(crap["selection"]["selected"], {"pkg/unimported.py": "changed"})
         self.assertGreater(crap["measurement"]["functions"], 0)
-        self.assertIn("coverage required", self.checked(document)["selection"]["reason"])
+        self.assertEqual(self.checked(document)["selection"]["reason"], RUNTIME_REASON)
 
     def test_crap_schedules_coverage_when_affected_file_discovers_zero_cases(self):
         self.enable_crap()
@@ -378,7 +568,7 @@ class AffectedScopeTests(FixtureCase):
         self.assertIn(skipped, suite["selection"]["selected"])
         self.assertEqual(suite["skipped"], [skipped])
         self.assertNotIn(skipped, suite["executed"])
-        report = self.discover_shards(["-s", "tests", "-j", "1"], {})
+        report = self.discover_shards(["-s", "tests", "-j", "1"])
         self.assertIn(skipped, report["selection"]["selected"])
         self.assertEqual(report["skipped"], [skipped])
 
@@ -411,7 +601,8 @@ def load_tests(loader, suite, pattern):
         self.assertIn(second, suite["executed"])
         self.assertEqual(suite["not_executed"], {})
 
-    def test_only_selected_test_skipped_with_or_without_policy_pattern(self):
+    def test_all_discovered_tests_skipped_with_or_without_policy_pattern(self):
+        self.add_file("tests/test_importing.py", "")
         self.commit_all()
         self.write_test("other", decorator="    @unittest.skip('disabled')\n")
         for pattern in ("", r"skipped_pattern = 'skipped=(\d+)'"):
@@ -424,7 +615,7 @@ def load_tests(loader, suite, pattern):
                 self.assertEqual(suite["outcome"], "fail")
                 self.assertEqual(suite["measurement"], {"tests": 0})
                 self.assertEqual(suite["skipped"], [OTHER])
-                self.assertIn(IMPORTING, suite["selection"]["left_out"])
+                self.assertEqual(suite["selection"]["left_out"], {})
                 self.assertNotIn("Ran 1 test", result.stderr)
                 self.assertNotIn("Ran 1 test", suite["diagnostics"]["output_tail"])
                 self.assertIn(f"skipped {OTHER}: disabled", result.stderr)
@@ -434,13 +625,90 @@ def load_tests(loader, suite, pattern):
         result, document = self.affected()
         suite = self.checked(document)
         self.assertEqual(suite["outcome"], "fail")
-        self.assertEqual(suite["executed"], [])
-        self.assertEqual(suite["measurement"], {"tests": 0})
+        self.assertEqual(suite["executed"], [IMPORTING])
+        self.assertEqual(suite["measurement"], {"tests": 1})
         self.assertIn("ImportError: fixture discovery error", suite["discovery_errors"][0])
         self.assertIn("ImportError: fixture discovery error", result.stderr)
         self.assertIn("Traceback (most recent call last)", result.stderr)
         self.assertNotIn("Ran 1 test", result.stderr)
         self.assertNotIn("Ran 1 test", suite["diagnostics"]["output_tail"])
+
+    def test_clean_diff_still_reports_discovery_errors(self):
+        self.add_file("tests/test_other.py", "raise ImportError('fixture discovery error')\n")
+        self.commit_all()
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 1, output(result))
+        suite = self.checked(document)
+        self.assertEqual(document["changed_paths"], [])
+        self.assertEqual(suite["executed"], [])
+        self.assertIn("ImportError: fixture discovery error", suite["discovery_errors"][0])
+        self.assertIn("fixture discovery error", result.stderr)
+
+    def test_clean_diff_runs_source_less_discoveries(self):
+        self.write_test("other", "del __file__\n")
+        self.commit_all()
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document)
+        self.assertEqual(
+            suite["selection"]["reason"], "full run: discovery returned a test without a source file",
+        )
+        self.assertEqual(suite["executed"], [IMPORTING, OTHER])
+        report = self.discover_shards(["-s", "tests"])
+        self.assertEqual(report["selection"], suite["selection"])
+
+    def test_completed_suite_accounts_for_class_and_module_setup_skips(self):
+        self.add_file(
+            "tests/test_class_skip.py",
+            "import unittest\nclass Cases(unittest.TestCase):\n"
+            "    @classmethod\n    def setUpClass(cls):\n        raise unittest.SkipTest('class setup')\n"
+            "    def test_class_skip(self):\n        self.fail('not reachable')\n",
+        )
+        self.add_file(
+            "tests/test_module_skip.py",
+            "import unittest\ndef setUpModule():\n    raise unittest.SkipTest('module setup')\n"
+            "class Cases(unittest.TestCase):\n    def test_module_skip(self):\n"
+            "        self.fail('not reachable')\n",
+        )
+        self.change("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 0, output(result))
+        suite = self.checked(document)
+        self.assertEqual(suite["executed"], [IMPORTING, OTHER])
+        skipped = [
+            "test_class_skip.Cases.test_class_skip", "test_module_skip.Cases.test_module_skip",
+        ]
+        self.assertCountEqual(suite["skipped"], skipped)
+        self.assertEqual(suite["not_executed"], {})
+        report = self.discover_shards(["-s", "tests"], fallback=RUNTIME_REASON)
+        self.assertCountEqual(report["skipped"], skipped)
+
+    def test_completed_suite_rejects_silent_omission(self):
+        self.add_file("tests/test_incomplete.py", """\
+import unittest
+
+class Incomplete(unittest.TestSuite):
+    def run(self, result, debug=False):
+        next(iter(self))(result)
+
+class Cases(unittest.TestCase):
+    def test_first(self):
+        pass
+
+    def test_omitted(self):
+        pass
+
+def load_tests(loader, suite, pattern):
+    return Incomplete(loader.loadTestsFromTestCase(Cases))
+""")
+        self.change("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "tests")
+        self.assertEqual(result.returncode, 1, output(result))
+        suite = self.checked(document)
+        omitted = "test_incomplete.Cases.test_omitted"
+        self.assertEqual(suite["outcome"], "fail")
+        self.assertIn(omitted, suite["reason"])
+        self.assertEqual(list(suite["not_executed"]), [omitted])
 
     def test_passing_subtest_counts_even_with_a_skipped_subtest(self):
         self.commit_all()
@@ -451,8 +719,8 @@ def load_tests(loader, suite, pattern):
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
-        self.assertEqual(suite["measurement"], {"tests": 1})
-        self.assertEqual(suite["executed"], [OTHER])
+        self.assertEqual(suite["measurement"], {"tests": 2})
+        self.assertEqual(suite["executed"], [IMPORTING, OTHER])
         self.assertEqual(suite["skipped"], [])
 
     def test_opaque_suites_keep_full_run_verdict_counts_and_verification_findings(self):
@@ -517,8 +785,7 @@ def load_tests(loader, suite, pattern):
         result, document = self.affected("--only", "tests")
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document)
-        self.assertEqual(suite["executed"], ["test_linked.Cases.test_linked"])
-        self.assertEqual(suite["selection"]["selected"], {"test_linked.Cases.test_linked": "changed"})
+        self.assert_runtime_suite(suite, [IMPORTING, "test_linked.Cases.test_linked", OTHER])
 
     def test_interrupted_suite_keeps_selection_and_completed_invocations(self):
         self.write_config(CONFIG + "budget_seconds = 3\n")
@@ -537,11 +804,16 @@ def load_tests(loader, suite, pattern):
                 suite = self.checked(document)
                 later = "test_later.Example.test_value"
                 self.assertEqual(suite["execution"], execution)
-                self.assertEqual(suite["selection"]["selected"], {IMPORTING: "changed", later: "changed"})
-                self.assertIn(OTHER, suite["selection"]["left_out"])
+                self.assertEqual(suite["selection"]["selected"], dict.fromkeys(
+                    [IMPORTING, later, OTHER], RUNTIME_REASON,
+                ))
+                self.assertEqual(suite["selection"]["left_out"], {})
                 self.assertEqual(suite["executed"], [IMPORTING])
                 self.assertEqual(suite["measurement"], {"tests": 1})
-                self.assertEqual(suite["not_executed"], {later: "invocation interrupted"})
+                self.assertEqual(suite["not_executed"], {
+                    later: "invocation interrupted",
+                    OTHER: "the run did not invoke this selected test",
+                })
 
     def test_hook_failure_is_attributed_to_its_discovery_occurrence(self):
         self.write_repeated_hook('self.fail("first occurrence")')
@@ -621,7 +893,7 @@ reason = "External package consumer"
         lint = self.checked(document, "lint")
         self.assertEqual(lint["diagnostics"]["argv"][-2:], ["pkg/consumer.sh", "pkg/source.sh"])
         self.assertEqual(lint["selection"]["selected"]["pkg/consumer.sh"], "depends on pkg/source.sh")
-        self.assertEqual(self.checked(document)["outcome"], "not_run")
+        self.assert_runtime_suite(self.checked(document), [IMPORTING, OTHER])
         config = load_config(self.repo)
         files, classes, violations = validate_inventory(self.repo, config)
         self.assertEqual(violations, [])
@@ -647,7 +919,7 @@ reason = "External package consumer"
         _, document = self.affected()
         self.assertEqual(self.checked(document)["outcome"], "fail")
         self.assertEqual(self.checked(document)["executed"], [])
-        self.assertIn("coverage required", self.checked(document)["selection"]["reason"])
+        self.assertEqual(self.checked(document)["selection"]["reason"], RUNTIME_REASON)
         crap = self.checked(document, "crap")
         self.assertEqual(crap["outcome"], "unsupported")
         self.assertEqual(crap["reason"], "coverage unreliable: tests did not pass")
@@ -659,7 +931,7 @@ reason = "External package consumer"
         self.add_file("pkg/a.py", "def changed():\n    return 2\n")
         self.write_test("importing", "import pkg.b\n", body="        self.fail('bad change')\n")
         _, document = self.affected()
-        self.assertEqual(self.checked(document)["executed"], [IMPORTING])
+        self.assertEqual(self.checked(document)["executed"], [IMPORTING, OTHER])
         crap = self.checked(document, "crap")
         self.assertEqual(crap["outcome"], "unsupported")
         self.assertEqual(crap["reason"], "coverage unreliable: tests did not pass")
@@ -675,15 +947,14 @@ reason = "External package consumer"
         result, document = self.affected()
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual(self.checked(document)["executed"], [OTHER])
-        self.assertEqual(self.discover_shards(argv, {"tests/test_other.py": "changed"})["executed"], [OTHER])
+        self.assertEqual(self.discover_shards(argv, fallback=RUNTIME_REASON)["executed"], [OTHER])
 
-    def discover_shards(self, argv, paths):
+    def discover_shards(self, argv, *, fallback=None):
         from quality_gate.adapters import _read_affected_report
 
         plan = self.base / "plan.json"
         plan.write_text(json.dumps({
-            "argv": argv, "full": None, "coverage": False,
-            "paths": paths,
+            "argv": argv, "full": None, "fallback": fallback,
         }), encoding="utf-8")
         child = subprocess.run(
             [*self.python_prefix(), str(SHARD_RUNNER), "--affected", str(plan)],
@@ -741,16 +1012,45 @@ suite = "tests/ert.el"
         )
         self.assert_changed_elisp_suite_runs()
 
+    def test_ert_runtime_read_of_graph_node_rejects(self):
+        self.write_elisp_config()
+        before = "(defvar calc-value 1)\n"
+        self.add_file("lisp/calc.el", before)
+        self.add_file(
+            "tests/suite.el",
+            "(require 'ert)\n"
+            "(ert-deftest reads-calc-as-data ()\n"
+            "  (with-temp-buffer\n"
+            '    (insert-file-contents "lisp/calc.el")\n'
+            f"    (should (equal (buffer-string) {json.dumps(before)}))))\n"
+            "(ert-run-tests-batch-and-exit)\n",
+        )
+        self.commit_all()
+        base, baseline = self.run_gate("--only", "elisp")
+        self.assertEqual(base.returncode, 0, output(base))
+        self.assertEqual(self.checked(baseline, "elisp")["measurement"], {"tests": 1})
+
+        self.add_file("lisp/calc.el", "(defvar calc-value 2)\n")
+        result, document = self.affected("--only", "elisp")
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["decision"], "rejected")
+        self.assertEqual(document["changed_paths"], ["lisp/calc.el"])
+        suite = self.checked(document, "elisp")
+        self.assertEqual(suite["selection"]["selected"], {"tests/suite.el": RUNTIME_REASON})
+        self.assertEqual(suite["outcome"], "fail")
+        self.assertEqual(suite["measurement"], {"tests": 1})
+        self.assertEqual([row["subject"] for row in suite["findings"]], ["reads-calc-as-data"])
+
     def assert_changed_elisp_suite_runs(self):
         result, document = self.affected("--only", "elisp")
         self.assertEqual(result.returncode, 0, output(result))
         suite = self.checked(document, "elisp")
-        self.assertEqual(suite["selection"]["selected"], {"tests/suite.el": "changed"})
+        self.assertEqual(suite["selection"]["selected"], {"tests/suite.el": RUNTIME_REASON})
         self.assertEqual(suite["measurement"], {"tests": 1})
 
     def test_elisp_crap_remains_unsupported_for_empty_ert_suite(self):
         suite = self.check_elisp_crap_without_executed_tests("")
-        self.assertIn("coverage required", suite["selection"]["reason"])
+        self.assertEqual(suite["selection"]["reason"], RUNTIME_REASON)
 
     def test_elisp_crap_remains_unsupported_for_all_skipped_ert_suite(self):
         suite = self.check_elisp_crap_without_executed_tests(

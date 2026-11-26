@@ -193,6 +193,7 @@ def _obligation_entry(
     class_def: Any,
     by_id: dict[str, Any],
     reasons: dict[tuple[str, int], str],
+    *, partial: bool,
 ) -> dict[str, Any]:
     required = TIER_EVIDENCE[tier]
     entry: dict[str, Any] = {
@@ -204,6 +205,9 @@ def _obligation_entry(
         "caused_by": None,
         "reason": None,
     }
+    if partial:
+        entry.update(status="not_evaluated", reason="partial run")
+        return entry
     if (class_name, tier) in reasons:
         entry["status"] = "exempted"
         entry["reason"] = reasons[(class_name, tier)]
@@ -219,17 +223,26 @@ def _obligation_entry(
     return entry
 
 
-def obligations(config: Any, results: Iterable[Any]) -> list[dict[str, Any]]:
-    """One assurance obligation per code class and required tier."""
+def _obligation_inputs(
+    config: Any, results: Iterable[Any], partial: bool,
+) -> tuple[dict[str, Any], dict[tuple[str, int], str]]:
+    if partial:
+        return {}, {}
     by_id = {result.id: result for result in results}
     reasons = {
         (entry.class_name, entry.tier): entry.reason
         for entry in config.not_applicable
     }
+    return by_id, reasons
+
+
+def obligations(config: Any, results: Iterable[Any], *, partial: bool = False) -> list[dict[str, Any]]:
+    """One assurance obligation per code class and required tier."""
+    by_id, reasons = _obligation_inputs(config, results, partial)
     tiers = sorted(set(config.required_tiers))
     return [
         _obligation_entry(
-            config, class_name, tier, class_def, by_id, reasons
+            config, class_name, tier, class_def, by_id, reasons, partial=partial,
         )
         for class_name, class_def in config.classes.items()
         if class_def.code

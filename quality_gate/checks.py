@@ -842,9 +842,8 @@ class CheckSelection:
     left_out: dict[str, str]
     reason: str
     skip: bool = False
-    test_paths: dict[str, str] | None = None
     full_suite: str | None = None
-    coverage: bool = False
+    suite_fallback: str | None = None
 
     def report(self) -> dict[str, Any]:
         return {"selected": self.selected, "left_out": self.left_out, "reason": self.reason}
@@ -854,6 +853,7 @@ DEPENDENT_FILE_ADAPTERS = frozenset({"elisp_compile", "elisp_checkdoc"})
 CRAP_ADAPTERS = frozenset({"python_crap", "elisp_crap"})
 CHANGED_FILE_ADAPTERS = CRAP_ADAPTERS | {"source_chars", "comments"}
 OUTSIDE_SCOPE = "no changed file affects this input"
+RUNTIME_SUITE_REASON = "full run: suite runtime inputs are undeclared"
 
 
 def _command_suite(check: CheckDef) -> bool:
@@ -866,7 +866,7 @@ def _per_file(check: CheckDef) -> bool:
     )
 
 
-def _global_input(config: Config, classes: dict[str, str], changed: set[str]) -> str | None:
+def _global_input(config: Config, classes: dict[str, str], changed: frozenset[str]) -> str | None:
     for path in sorted(changed):
         if path in {"quality-gate.toml", "tools.lock.toml"}:
             return f"full run: configuration input {path} changed"
@@ -877,14 +877,14 @@ def _global_input(config: Config, classes: dict[str, str], changed: set[str]) ->
 
 def _selection_inputs(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str], contract_graph: GraphExtraction | None,
+    evidence_dir: Path, changed: frozenset[str], contract_graph: GraphExtraction | None,
 ) -> tuple[dict[str, str], dict[str, str], str | None]:
     full = _global_input(config, classes, changed)
     if full or not changed:
         return {}, {}, full
     try:
         nodes, expanded, affected = affected_graph(
-            root, config, files, classes, evidence_dir, changed, contract_graph,
+            root, config, files, classes, evidence_dir, set(changed), contract_graph,
         )
     except (GateError, ValueError) as error:
         return {}, {}, f"full run: module graph unavailable ({error})"
@@ -930,20 +930,17 @@ def _elisp_suite_scope(path: str, reason: str | None) -> CheckSelection:
     return CheckSelection({path: reason}, {}, reason)
 
 
-def _elisp_suite_reason(root: Path, path: str, affected: dict[str, str]) -> str | None:
-    target = os.path.relpath((root / path).resolve(), root)
-    return affected.get(path) or affected.get(target)
-
-
 def _check_selection(
-    root: Path, check: CheckDef, inputs: list[str], expanded: dict[str, str], affected: dict[str, str],
-    full: str | None,
+    check: CheckDef, inputs: list[str], expanded: dict[str, str], affected: dict[str, str],
+    full: str | None, suite_fallback: str | None,
 ) -> CheckSelection:
     if check.adapter == "elisp_tests":
         path = Path(check.spec.suite).as_posix()
-        return _elisp_suite_scope(path, full or _elisp_suite_reason(root, path, affected))
+        return _elisp_suite_scope(path, full or suite_fallback)
     if check.adapter == "python_tests":
-        return CheckSelection({}, {}, full or "full run", test_paths=affected, full_suite=full)
+        return CheckSelection(
+            {}, {}, full or "full run", full_suite=full, suite_fallback=suite_fallback,
+        )
     if _command_suite(check):
         reason = "full run: command adapter suite is opaque"
         return CheckSelection({}, {}, reason)
@@ -959,22 +956,23 @@ def _require_coverage(
     if selections[suite].skip:
         reason = f"full run: coverage required by {check.id}"
         selections[suite] = _elisp_suite_scope(Path(config.checks[suite].spec.suite).as_posix(), reason)
-    selections[suite].coverage = True
 
 
 def _affected_selection(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str], checks: list[CheckDef], contract_graph: GraphExtraction | None,
+    evidence_dir: Path, changed: frozenset[str], checks: list[CheckDef],
+    contract_graph: GraphExtraction | None,
 ) -> dict[str, CheckSelection]:
     expanded, affected, full = _selection_inputs(
         root, config, files, classes, evidence_dir, changed, contract_graph,
     )
     forced = _forced_inputs(config, checks)
+    suite_fallback = RUNTIME_SUITE_REASON if changed else None
     selections = {}
     for check in checks:
         inputs = _select_files(config, check, files, classes)[0]
         selections[check.id] = _check_selection(
-            root, check, inputs, expanded, affected, full or forced.get(check.id),
+            check, inputs, expanded, affected, full or forced.get(check.id), suite_fallback,
         )
     for check in checks:
         _require_coverage(check, config, selections)
@@ -1008,7 +1006,7 @@ def _run_selected_check(
 
 def _scope_selections(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str] | None, checks: list[CheckDef], inventory_code: int,
+    evidence_dir: Path, changed: frozenset[str] | None, checks: list[CheckDef], inventory_code: int,
     contract_graph: GraphExtraction | None,
 ) -> dict[str, CheckSelection]:
     if changed is None or not checks:
@@ -1188,16 +1186,14 @@ def _run_module_contracts(
 
 def _policy_results(
     root: Path, config: Config, files: list[str], classes: dict[str, str], inventory_code: int,
-    selected_checks: list[CheckDef], changed: set[str] | None, affected_base: DiffBase | None,
+    selected_checks: list[CheckDef], base_override: DiffBaseOverride | None,
     directory: Path, module_contracts: bool,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     prior: dict[str, CheckResult] = {}
     contract_graph = None
-    base_override = (
-        resolve_diff_base(root) if changed is None
-        else DiffBaseOverride(base=affected_base, changed_paths=frozenset(changed))
-    )
+    if base_override is None:
+        base_override = resolve_diff_base(root)
     if module_contracts:
         evidence_dir = directory / "module-contracts"
         evidence_dir.mkdir()
@@ -1206,7 +1202,8 @@ def _policy_results(
         )
         results.append(result)
     selections = _scope_selections(
-        root, config, files, classes, directory, changed, selected_checks, inventory_code, contract_graph,
+        root, config, files, classes, directory, base_override.changed_paths,
+        selected_checks, inventory_code, contract_graph,
     )
     for check in selected_checks:
         selection = selections.get(check.id)
@@ -1230,9 +1227,8 @@ def _run_policy_checks(
     classes: dict[str, str],
     inventory_code: int,
     selected_ids: list[str] | None = None,
-    changed: set[str] | None = None,
-    affected_base: DiffBase | None = None,
     *,
+    base_override: DiffBaseOverride | None = None,
     module_contracts: bool = False,
 ) -> list[CheckResult]:
     selected = list(config.checks) if selected_ids is None else selected_ids
@@ -1243,8 +1239,8 @@ def _run_policy_checks(
     try:
         try:
             results = _policy_results(
-                root, config, files, classes, inventory_code, selected_checks, changed,
-                affected_base, Path(run_directory.name), module_contracts,
+                root, config, files, classes, inventory_code, selected_checks,
+                base_override, Path(run_directory.name), module_contracts,
             )
         except BaseException:
             _remove_run_directory(run_directory, report=True)
@@ -1556,6 +1552,13 @@ def _print_decision(
     else:
         message = DECISION_MESSAGES.get(decision, "check: passed")
         print(f"{message} ({len(results)} checks)", flush=True)
+    unevaluated = [
+        f"{item['class']} tier {item['tier']}"
+        for item in obligations
+        if item["status"] == "not_evaluated"
+    ]
+    if unevaluated:
+        print(f"check: obligations not evaluated ({', '.join(unevaluated)})", flush=True)
 
 
 
@@ -1585,7 +1588,7 @@ def _finalize_check(
 ) -> tuple[int, dict[str, Any]]:
     partial = selected is not None or affected_base is not None
     _assign_causes(config, results)
-    obligations = [] if partial else gate_result.obligations(config, results)
+    obligations = gate_result.obligations(config, results, partial=partial)
     prune_document = _perform_prune(config, prune_ids, results)
     decision, configuration_error = _check_decision(results, obligations, partial)
     _print_decision(decision, configuration_error, results, obligations)
@@ -1624,16 +1627,16 @@ def _selected_check_ids(config: Config, only_ids: list[str] | None) -> list[str]
 
 
 def _report_affected_scope(
-    document: dict[str, Any], files: list[str], changed: set[str] | None, inventory_code: int,
+    document: dict[str, Any], files: list[str], diff: DiffBaseOverride | None, inventory_code: int,
 ) -> None:
-    if changed is None:
+    if diff is None or diff.changed_paths is None:
         return
     selected = dict.fromkeys(files, "full run") if inventory_code == 0 else {}
     selection = CheckSelection(selected, {}, "full run").report()
     for result in document["checks"]:
         if result["kind"] in BUILTIN_RESULT_KINDS:
             result["selection"] = selection
-    document["changed_paths"] = sorted(changed)
+    document["changed_paths"] = sorted(diff.changed_paths)
 
 
 def _check_command(
@@ -1648,18 +1651,18 @@ def _check_command(
     if problem is not None:
         return _prune_option_error(root, config, prune_ids, problem)
     selected = _selected_check_ids(config, only_ids)
-    base, changed = (None, None) if affected_base is None else affected_diff(root, affected_base)
+    diff = affected_diff(root, affected_base) if affected_base is not None else None
     inventory, files, classes, code = _inventory_check(root, config)
     results = [inventory, _hygiene_check(root, config)]
     configured = None if selected is None else [name for name in selected if name in config.checks]
     results.extend(
         _run_policy_checks(
-            root, config, files, classes, code, configured, changed, base,
+            root, config, files, classes, code, configured, base_override=diff,
             module_contracts=config.module_contracts,
         )
     )
     exit_code, document = _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
-    _report_affected_scope(document, files, changed, code)
+    _report_affected_scope(document, files, diff, code)
     return exit_code, document
 
 

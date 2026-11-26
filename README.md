@@ -1361,32 +1361,33 @@ graph for the full owned-code tree on every scope, including an empty affected d
 cover Python, Emacs Lisp and shell. Emacs preparation and reader errors block the contract.
 `worklist` runs its selected configured checks and omits `module-contracts`.
 
-`check --base REV` is an affected-scope run for branch feedback. It uses `REV...HEAD` plus
-staged and unstaged tracked changes, including deletions and both sides of renames. Inventory,
+`check --base REV` is an affected-scope run for branch feedback. Its path set is the union of
+merge-base-to-`HEAD`, staged, and unstaged tracked changes, including deletions and both sides of
+renames, plus every untracked path that Git lists for inventory under standard exclusions. Inventory,
 hygiene and any enabled module contracts run in full. For every per-file check, a changed or
 deleted package initializer counts as a change to every module in its package. Lint and compilation
-also receive the transitive module
-graph dependents of those inputs. Any changed tracked path outside the module graph expands every
-per-file check to its full input class, including changes to configuration, tool pins, data, and
-documentation.
+also receive the transitive module graph dependents of those inputs. Any changed path outside the
+module graph expands every per-file check to its full input class, including changes to
+configuration, tool pins, data, and documentation.
 
-The gate's unittest shard runner selects changed test files and tests that reach changed modules
-through the graph. A path outside the graph or a `load_tests` hook expands discovery to a full suite.
-Test selection matches both a tracked symlink's path and its resolved target. Command-adapter
-suites and custom Python test commands run their full configured command and retain the full run's
-policy verdict, test counts, and diagnostics. Their selection records the full-run reason.
+Every selected suite that reaches execution runs in full on a nonempty affected diff. The module
+graph records extractable dependencies and cannot account for test runtime inputs such as files read as
+data. The unittest shard runner uses the configured discovery arguments. On an empty diff it still
+reports discovery errors and runs the full suite when discovery uses `load_tests` or returns a test
+without a source file. Command-adapter suites and custom Python test commands run their full
+configured command and retain the full run's policy verdict, test counts, and diagnostics.
 
-Verification runs with its full prerequisites. CRAP requests a coverage run for changed inputs even
-when discovery selects no tests. If the prerequisite suite fails, CRAP reports `unsupported`.
+Verification runs with its full prerequisites. CRAP schedules its prerequisite coverage suite for
+changed inputs. If that suite fails, CRAP reports `unsupported`.
 The JSON records `"scope": "affected"`, the `base` revision, the union of `changed_paths`,
-and each check's selection and reasons. Python shape uses that same path union and reports which
-files it measured. Tests selected by discovery, left out by scope, and actually executed are
-reported separately. Unittest selection and completed invocations are retained if the run times
-out or is terminated by a signal.
+and each check's selection and reasons. Selection, affected module contracts, and Python shape use
+that same union. Python shape reports which files it measured and treats untracked paths as whole
+new files for added-helper analysis. Unittest reports selected discovery occurrences, any left out
+on an empty diff, and invocation results separately. Selection and completed invocations are
+retained if the run times out or is terminated by a signal.
 
-The graph cannot see a test's runtime read of a graph-node file as data or a check command's import
-of a module as its rules. A landing accepts only a full `python3 -I qg.py check` result, without
-`--base`.
+Attempt consumers requiring full assurance must use an unscoped `check` result with decision
+`accepted` or `accepted_with_exceptions`.
 
 A rejected run's stderr summary lists only its **root** failures. A failure is a consequence when the
 gate itself can name its cause: an unsatisfied check whose dependency is unsatisfied, or an
@@ -1402,11 +1403,10 @@ The summary line `check: failed (...)` names the roots in the usual order. When 
 summary spells it and `CAUSE` is a root check id. A consequence still rejects and still exits 1.
 
 `check --only CHECK [CHECK ...]` runs inventory, hygiene and module contracts if enabled, then the
-selected checks and their requirements in policy order. Nothing else runs. An unknown or repeated
-check id is a usage error (exit 2) naming it, before any check runs. A partial run never prunes and
-never runs under a trusted directory: `--only` with `--prune` or with `--policy-from` is a usage
-error (exit 2) naming both options, before any check runs. A partial run is never a verdict on the
-tree; use the full `check` for that.
+selected checks and their requirements in policy order. Combine it with `--base` to use affected
+scope for those checks. An unknown or repeated check id is a usage error (exit 2) naming it,
+before any check runs. Combining `--only` with `--prune` or `--policy-from` is a usage error
+(exit 2) naming both options before any check runs.
 
 `QG_AGENT=1` marks an agent sandbox. `check` selects the whole policy by default, or the
 `--only` check IDs and their requirements. If any selected adapter declares `runs_suite`,
@@ -1475,9 +1475,9 @@ Termination and reaping can add a small amount of time after the budget. Check o
 up to 1 MiB; later bytes are counted and discarded. A consumer therefore never has to parse stderr to
 learn why a check failed.
 
-A partial run's `selected` lists the check ids that ran, in policy order, prerequisites included. It
-has no `selected` key on a full run. A partial run evaluates no obligations, so its `obligations` is
-empty.
+A `--only` result's `selected` lists the selected check ids in policy order, including
+prerequisites. Every finalized partial run lists all unevaluated class and tier pairs in its
+`obligations` array and text summary, including when a check rejects the run.
 
 A finding has `subject`, its raw `value`, `bound` (or null when no baseline entry exists), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`, `locations` and `expired`; baseline
@@ -1567,9 +1567,13 @@ Each result's `location_coverage` is `complete`, `partial` or `none`. A finding'
 array of `{path, start_line, end_line}` ranges, or null when its locations are incomplete.
 `covered_by_baseline` describes the whole-tree ratchet.
 
-`obligations` has one entry per code class and required tier with `class`, `tier`, `status`
-(`satisfied`, `exempted` or `unsatisfied`), `required` (the evidence names the tier demands), `checks`
-(the checks that counted), `caused_by` (see below) and `reason` (for an exemption; otherwise null).
+`obligations` has one entry per effective policy code class and required tier with `class`, `tier`,
+`status`, `required` (the evidence names the tier demands), `checks`, `caused_by`, and `reason`.
+On a full run, the status is `satisfied`, `exempted`, or `unsatisfied`, `checks` lists the checks
+that counted, and `reason` is the exemption's reason or null. On a partial run, every pair including
+configured exemptions has `status: "not_evaluated"`, the tier's `required` evidence names,
+`checks: []`, `caused_by: null`, and `reason: "partial run"`. Preflight error documents have an
+empty `obligations` array.
 Tier 1 needs a satisfied
 enforced check producing `tests` evidence with at least one executed test, so a lint-only class leaves
 tier 1 unsatisfied and rejects. Tier 2 needs `properties` or `fuzzing`; tiers 3 and 4 reserve
@@ -1593,11 +1597,11 @@ The decision is `error` (exit 2) for invalid policy, usage or configuration, whe
 its limit, when the run directory cannot be removed, or when a test check cannot remove its temporary
 suite directory, `rejected` (exit 1) when
 inventory, hygiene, module contracts, any enforced check or any obligation is not satisfied,
-`partial` (exit 0) when a `--only` run's built-ins and every enforced check that ran are satisfied, and
-`accepted_with_exceptions` (exit 0) when every obligation and enforced check is satisfied but at least
-one finding passes only through a baseline entry or an advisory check does not pass, and `accepted`
-(exit 0) otherwise. A partial run evaluates no obligations, so its rejection depends only on the checks
-that ran. With `--json`,
+`partial` (exit 0) when a run scoped by `--base` or `--only` satisfies its built-ins and enforced
+checks, and `accepted_with_exceptions` (exit 0) when every obligation and enforced check is
+satisfied but at least one finding passes only through a baseline entry or an advisory check does
+not pass, and `accepted` (exit 0) otherwise. A partial run evaluates no obligations, so its
+rejection depends only on the checks that ran. With `--json`,
 usage errors (unknown options, bad arguments) still write one error document with `decision = "error"`
 and exit 2. An argument containing NUL is a configuration error.
 

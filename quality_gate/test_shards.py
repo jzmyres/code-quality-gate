@@ -116,14 +116,13 @@ class AffectedLoader(unittest.TestLoader):
     def __init__(self):
         super().__init__()
         self.used_hook = False
-        self.paths = {}
+        self.sourced_cases = set()
 
     def loadTestsFromModule(self, module, *args, **kwargs):
         self.used_hook |= getattr(module, "load_tests", None) is not None
         suite = super().loadTestsFromModule(module, *args, **kwargs)
-        if not self.used_hook:
-            paths = _discovery_paths(module)
-            self.paths.update((id(test), paths) for test in _discovered_cases(suite))
+        if not self.used_hook and getattr(module, "__file__", None) is not None:
+            self.sourced_cases.update(id(test) for test in _discovered_cases(suite))
         return suite
 
 
@@ -133,13 +132,6 @@ def _discovered_cases(suite):
             yield from _discovered_cases(test)
         else:
             yield test
-
-
-def _discovery_paths(module):
-    filename = getattr(module, "__file__", None)
-    if filename is None:
-        return None
-    return os.path.relpath(filename), os.path.relpath(Path(filename).resolve())
 
 
 class AffectedResult(unittest.TextTestResult):
@@ -164,6 +156,8 @@ class AffectedResult(unittest.TextTestResult):
         self.current = names.popleft() if names else None
         if self.current is not None:
             self.record("started", self.current)
+        elif not isinstance(test, unittest.loader._FailedTest):
+            self.record("unexpected", test.id())
         super().startTest(test)
 
     def addSkip(self, test, reason):
@@ -217,81 +211,64 @@ def _case_names(cases):
     ]
 
 
-def _case_occurrences(cases, names, selected):
+def _case_occurrences(cases, names):
     occurrences = {}
     for test, name in zip(cases, names, strict=True):
-        if name in selected:
-            occurrences.setdefault(id(test), deque()).append(name)
+        occurrences.setdefault(id(test), deque()).append(name)
     return occurrences
 
 
-def _suite_reason(full, loader, cases):
+def _suite_reason(plan, loader, cases):
     if loader.used_hook:
         return "full run: unittest discovery used load_tests"
-    if full is not None:
-        return full
-    if any(loader.paths.get(id(test)) is None for test in cases):
+    if plan["full"] is not None:
+        return plan["full"]
+    if any(id(test) not in loader.sourced_cases for test in cases):
         return "full run: discovery returned a test without a source file"
-    return None
+    return plan["fallback"]
+
+
+def _record_fixture_skips(result, cases):
+    """Record occurrences blocked by a setup skip reported against a fixture holder."""
+    fixtures = {test.id() for test, _ in result.skipped if isinstance(test, unittest.suite._ErrorHolder)}
+    for test in cases:
+        cls = type(test)
+        if {f"setUpModule ({cls.__module__})", f"setUpClass ({unittest.util.strclass(cls)})"} & fixtures:
+            for name in result.occurrences.pop(id(test), ()):
+                result.record("skipped", name)
 
 
 def _real_cases(tests):
     return [test for test in tests if not isinstance(test, unittest.loader._FailedTest)]
 
 
-def _discovery_reason(paths, affected):
-    discovered, resolved = paths
-    return affected.get(discovered) or affected.get(resolved)
-
-
-def _affected_cases(cases, names, loader, plan):
-    full = _suite_reason(plan["full"], loader, cases)
-    if full is not None:
-        return dict.fromkeys(names, full), full
-    paths = plan["paths"]
-    reasons = {
-        name: _discovery_reason(loader.paths[id(test)], paths)
-        for test, name in zip(cases, names, strict=True)
-    }
-    if plan["coverage"] and not any(reasons.values()):
-        full = "full run: coverage required for changed inputs"
-        return dict.fromkeys(reasons, full), full
-    return reasons, None
-
-
-def _selection_report(reasons, full):
-    selected = {name: reason for name, reason in reasons.items() if reason is not None}
-    left_out = dict.fromkeys(sorted(reasons.keys() - selected.keys()), "no changed file affects this test")
-    return {
-        "selected": selected, "left_out": left_out,
-        "reason": full or ("affected tests" if selected else "no affected tests discovered"),
-    }
-
-
-def _selected_suite(tests, names, selected):
-    remaining = iter(names)
-    return unittest.TestSuite(
-        test for test in tests
-        if isinstance(test, unittest.loader._FailedTest) or next(remaining) in selected
-    )
+def _selection_report(names, full):
+    if full is None:
+        return {
+            "selected": {},
+            "left_out": dict.fromkeys(names, "no changed file affects this test"),
+            "reason": "no affected tests discovered",
+        }
+    return {"selected": dict.fromkeys(names, full), "left_out": {}, "reason": full}
 
 
 def _run_affected_suite(suite, loader, plan, journal):
     tests = list(_discovered_cases(suite))
     cases = _real_cases(tests)
     names = _case_names(cases)
-    reasons, full = _affected_cases(cases, names, loader, plan)
-    selection = _selection_report(reasons, full)
+    full = _suite_reason(plan, loader, cases)
     report = {
-        "selection": selection,
+        "selection": _selection_report(names, full),
         "discovery_errors": loader.errors,
-        "omitted": not (full or selection["selected"] or loader.errors),
+        "omitted": full is None and not loader.errors,
     }
     print(json.dumps(report), file=journal, flush=True)
     if full is None:
-        suite = _selected_suite(tests, names, selection["selected"])
-    occurrences = _case_occurrences(cases, names, selection["selected"])
-    return AffectedRunner().run(suite, occurrences=occurrences, journal=journal)
+        suite = unittest.TestSuite(test for test in tests if isinstance(test, unittest.loader._FailedTest))
+        return AffectedRunner().run(suite, occurrences={}, journal=journal)
+    result = AffectedRunner().run(suite, occurrences=_case_occurrences(cases, names), journal=journal)
+    _record_fixture_skips(result, cases)
+    return result
 
 
 def _run_affected(path):

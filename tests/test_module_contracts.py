@@ -858,6 +858,20 @@ class SharedSurfaceTests(FixtureCase):
         document = self.assert_shared_entry_point("--base", "HEAD")
         self.assertEqual(document["changed_paths"], ["MOVED.md", "README.md", "app/main.py"])
 
+    def test_affected_shared_entry_point_includes_an_untracked_owned_feature(self) -> None:
+        feature = "app/new.py"
+        protected = "README.md"
+        self.add_file(feature, "value = 2\n")
+        self.contract(0, "--base", "HEAD")
+        self.add_file(protected, "# changed\n")
+        _, document, findings = self.contract(1, "--base", "HEAD")
+        self.assertCountEqual(document["changed_paths"], [protected, feature])
+        self.assertEqual(
+            [(row["rule"], row["module"], row["file"], row["protected_path"]) for row in findings],
+            [("shared-entry-point", "app", feature, protected)],
+        )
+        self.contract(0)
+
     def test_protected_deletion_reports_the_pair_when_its_inventory_rule_is_unmatched(self) -> None:
         (self.repo / "README.md").unlink()
         self.change_feature()

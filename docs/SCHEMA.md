@@ -537,13 +537,14 @@ uses only resolved graph edges, so an unresolved operand produces no capability 
 violations are checked across the full graph, regardless of the diff, `shared_base`, allowed
 dependencies or module entry points. A call can violate both the interface and capability rules.
 
-With `shared_base` enabled, `--base` takes precedence and supplies its affected-scope diff
-from the merge base. Otherwise, the check compares the run's resolved `QG_DIFF_BASE` commit
-to `HEAD` when set, or the configured `shared_base` revision to `HEAD` when unset. Use
-`shared_base = "HEAD"` to check staged and unstaged edits on a plain local run. Each diff
-includes committed, staged and unstaged changes. Rename detection is disabled so the diff
-includes both names of a rename. Invalid bases and unreadable diffs are command errors even
-when inventory reports violations.
+With `shared_base` enabled, `--base` takes precedence and supplies the same affected path union
+used for check selection, Python shape, and `changed_paths`. Without `--base`, the check compares the
+run's resolved `QG_DIFF_BASE` commit to `HEAD` when set, or the configured `shared_base` revision to
+`HEAD` when unset. Use `shared_base = "HEAD"` to check staged and unstaged tracked edits on a
+plain local run. Both forms include committed, staged, and unstaged tracked changes, with rename
+detection disabled to include both names. The affected union also includes the inventory's standard
+exclusion listing of untracked paths. Invalid bases and failed Git enumeration are command errors
+even when inventory reports violations.
 
 For opted-in policies, Git must report each declared protected path as a regular file in the
 selected base commit's tree. Directories, symlinks, gitlinks and missing entries in that tree
@@ -648,10 +649,19 @@ Top-level keys:
   `rejected`, `blocked` or `error`.
 * `checks` - `inventory`, `hygiene`, `module-contracts` if enabled, and the remaining
   configured checks that ran, in that order.
-* `obligations` - one entry per code class and required tier; empty on a
-  partial run.
+* `obligations` - one entry per effective policy code class and required tier.
+  In finalized partial runs, every pair, including each configured exemption,
+  has `status: "not_evaluated"`, the tier's evidence names in `required`,
+  `checks: []`, `caused_by: null`, and `reason: "partial run"`.
+  Preflight error documents have an empty array.
 * `selected` - present only on a `check --only` result. Lists the requested check IDs and
   prerequisites in policy order, with `module-contracts` first when requested by ID.
+* `scope`, `base`, `changed_paths` - present on finalized `check --base REV` results,
+  including trusted runs. Scope is `affected`, base is the requested revision, and
+  changed paths are the sorted union of merge-base-to-HEAD, index, and worktree
+  comparisons and every inventory-visible untracked path. Both names of a rename are included.
+  For a nonempty union, each selected test suite that reaches execution runs the full
+  configured command or discovery suite. The graph remains an input to per-file selection.
 * `prune` - the prune request, whether it was performed and its refusal
   reason.
 * `trust` - present only on a `--policy-from` result; see below.
@@ -855,12 +865,13 @@ is spelled as the summary spells it: a check id or `obligation CLASS tier
 TIER`. A consequence still rejects and still exits 1.
 
 The decision is `rejected` when inventory, hygiene or module contracts fail, when an enforced
-check is not satisfied, or when any obligation is `unsatisfied`. A
-`check --only` run evaluates no obligations; it is `rejected` when a built-in
-or any enforced check that ran is not satisfied, and `partial` (exit
-0) otherwise. `accepted_with_exceptions` means every obligation and enforced
-check is satisfied, but a baseline exception or a non-passing advisory check
-exists.
+check is not satisfied, or when any evaluated obligation is `unsatisfied`. A run scoped by
+`--base`, `--only`, or both skips obligation evaluation. Its result is `rejected` when a built-in
+or any enforced check that ran is unsatisfied and `partial` (exit 0) otherwise. The text summary
+lists the unevaluated class and tier pairs for both decisions. `accepted_with_exceptions` means
+every obligation and enforced check is satisfied, but a baseline exception or a non-passing
+advisory check exists. Attempt consumers requiring full assurance must use an unscoped result with
+`decision` equal to `accepted` or `accepted_with_exceptions`.
 `blocked` (exit 1, trust runs only) means an unauthorized protected input
 differs from the trusted directory: the policy, the tools lock or another
 protected path, or a baseline whose candidate entries are not all at least as

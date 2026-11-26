@@ -344,7 +344,10 @@ def _hunks(raw: bytes) -> tuple[set[str], dict[str, set[int]]]:
     return paths, added
 
 
-def _diff_lines(root: Path, base: str, *, changed_paths: frozenset[str] | None = None) -> Diff:
+def _diff_lines(
+    root: Path, base: str, *, changed_paths: frozenset[str] | None = None,
+    untracked: frozenset[str] = frozenset(),
+) -> Diff:
     """The added line numbers of every changed path, and new whole files."""
     raw = _git(
         root,
@@ -358,7 +361,6 @@ def _diff_lines(root: Path, base: str, *, changed_paths: frozenset[str] | None =
         "python-shape diff",
     )
     paths, added = _hunks(raw)
-    untracked = frozenset()
     if changed_paths is None:
         untracked = frozenset(_untracked_files(root, "python-shape untracked-file selection"))
         changed_paths = frozenset(paths) | untracked
@@ -546,7 +548,7 @@ def _measured_paths(
 
 def _shape_input(
     context: Any, spec: ShapeSpec, limit: float, base: DiffBase,
-    *, changed: frozenset[str] | None = None,
+    *, changed: frozenset[str] | None = None, untracked: frozenset[str] = frozenset(),
 ) -> ShapeInput:
     """One parse of the measured files, and the indexes every rule reads.
 
@@ -555,9 +557,9 @@ def _shape_input(
     """
     tree = spec.scope == "tree"
     if changed is not None and not tree:
-        diff = Diff(changed, {}, frozenset())
+        diff = Diff(changed, {}, untracked)
     else:
-        diff = _diff_lines(context.root, base.commit, changed_paths=changed)
+        diff = _diff_lines(context.root, base.commit, changed_paths=changed, untracked=untracked)
     scoped = _measured_paths(context, spec, diff)
     indexes = {
         path: _file_index(path, _read_source(context.root, path))
@@ -1089,7 +1091,8 @@ def _run_python_shape(context: Any) -> Any:
         base = diff_base(context.root, check.spec.base, resolved=override)
         mark_step("python-shape analysis")
         changed = override.changed_paths if override is not None else None
-        data = _shape_input(context, check.spec, limit, base, changed=changed)
+        untracked = override.untracked_paths if override is not None else frozenset()
+        data = _shape_input(context, check.spec, limit, base, changed=changed, untracked=untracked)
     except GateError as error:
         return _configuration_error(check, start, context.prefix, error)
     omitted = _shape_selection(context, data, start)

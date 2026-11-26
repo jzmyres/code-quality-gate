@@ -395,6 +395,13 @@ class CheckTests(FixtureCase):
 
 
 class PartialRunTests(FixtureCase):
+    def assert_unevaluated_python_tier(self, document: dict, text: str) -> None:
+        self.assertEqual(document["obligations"], [{
+            "class": "python", "tier": 1, "status": "not_evaluated", "required": ["tests"],
+            "checks": [], "caused_by": None, "reason": "partial run",
+        }])
+        self.assertIn("check: obligations not evaluated (python tier 1)", text)
+
     def test_only_runs_inventory_hygiene_and_the_named_check(self) -> None:
         self.write_config(_two_check_config())
         result, document = self.run_json("--only", "smoke")
@@ -406,7 +413,7 @@ class PartialRunTests(FixtureCase):
         self.assertNotIn("check: lint (command)", text)
         self.assertEqual(document["decision"], "partial")
         self.assertEqual(document["selected"], ["smoke"])
-        self.assertEqual(document["obligations"], [])
+        self.assert_unevaluated_python_tier(document, text)
         self.assertIn("check: partial run passed (3 checks)", text)
 
     def test_only_runs_selected_checks_in_policy_order(self) -> None:
@@ -444,7 +451,7 @@ class PartialRunTests(FixtureCase):
         self.assertEqual(result.returncode, 1, text)
         self.assertEqual(document["decision"], "rejected")
         self.assertEqual(document["selected"], ["lint"])
-        self.assertEqual(document["obligations"], [])
+        self.assert_unevaluated_python_tier(document, text)
 
     def test_a_selected_check_runs_its_prerequisite_first(self) -> None:
         self.write_config(_prerequisite_config())

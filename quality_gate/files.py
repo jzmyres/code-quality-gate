@@ -205,11 +205,12 @@ def _verified_commit(root: Path, value: str) -> tuple[str | None, str]:
 
 @dataclass(frozen=True)
 class DiffBaseOverride:
-    """A run's QG_DIFF_BASE, resolved once before its adapters run."""
+    """A run's resolved diff base and any shared affected path selection."""
 
     base: DiffBase | None = None
     error: ConfigError | None = None
     changed_paths: frozenset[str] | None = None
+    untracked_paths: frozenset[str] = frozenset()
 
     def for_scope(
         self, root: Path, policy_base: str, *, override: bool = True
@@ -308,7 +309,7 @@ def changed_paths(root: Path, commit: str, operation: str) -> set[str]:
     return names
 
 
-def affected_diff(root: Path, revision: str) -> tuple[DiffBase, set[str]]:
+def affected_diff(root: Path, revision: str) -> DiffBaseOverride:
     commit, problem = _verified_commit(root, revision)
     if commit is None:
         raise UsageError(f"check: --base {revision!r}: expected an existing commit, {problem}")
@@ -316,9 +317,13 @@ def affected_diff(root: Path, revision: str) -> tuple[DiffBase, set[str]]:
     try:
         merge_base = _git(root, ["merge-base", commit, "HEAD"], operation).decode().strip()
         names = changed_paths(root, merge_base, operation)
+        untracked = frozenset(_untracked_files(root, operation))
     except GateError as error:
         raise UsageError(str(error)) from error
-    return DiffBase(merge_base, "--base"), names
+    return DiffBaseOverride(
+        base=DiffBase(merge_base, "--base"), changed_paths=untracked.union(names),
+        untracked_paths=untracked,
+    )
 
 
 def _untracked_files(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
@@ -555,6 +556,13 @@ def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | No
         return "fail", f"command exited {returncode}"
     if report["omitted"]:
         return "not_run", report["selection"]["reason"]
+    expected = Counter(report["selection"]["selected"].keys())
+    completed = Counter([*report["executed"], *report["skipped"]])
+    mismatched = sorted((expected - completed).keys() | (completed - expected).keys())
+    mismatched.extend(report["unexpected"])
+    if mismatched:
+        names = ", ".join(mismatched)
+        return "fail", f"unittest did not record one completion per selected occurrence: {names}"
     if not report["executed"]:
         return "fail", "no test executed"
     return "pass", None
@@ -563,7 +571,7 @@ def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | No
 def _read_affected_report(path: Path) -> dict:
     with path.open(encoding="utf-8") as journal:
         report = load_json(journal.readline())
-        records = {event: [] for event in ("started", "executed", "skipped", "failed")}
+        records = {event: [] for event in ("started", "executed", "skipped", "failed", "unexpected")}
         for line in journal:
             if line.endswith("\n"):
                 event, name = load_json(line)
@@ -605,6 +613,7 @@ def _affected_test_check(check: Any, start: float, child: Any, report: dict, fai
     )
     executed, skipped = len(report["executed"]), len(report["skipped"])
     report.pop("omitted")
+    report.pop("unexpected")
     findings = _unittest_findings(sorted(set(report.pop("failed"))))
     fields = {
         "reason": reason, "diagnostics": child.diagnostics(), "budget_seconds": check.spec.budget_seconds,
@@ -631,8 +640,7 @@ def _affected_test_plan(context: AdapterContext, argv: tuple[str, ...]) -> Path:
     assert selection is not None
     plan = context.evidence_dir / "discovery.json"
     plan.write_text(json.dumps({
-        "argv": argv, "paths": selection.test_paths,
-        "full": selection.full_suite, "coverage": selection.coverage,
+        "argv": argv, "full": selection.full_suite, "fallback": selection.suite_fallback,
     }), encoding="utf-8")
     return plan
 
