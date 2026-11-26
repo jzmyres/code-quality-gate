@@ -8,6 +8,7 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from collections import Counter
@@ -22,7 +23,7 @@ from . import (
     module_graph, python_crap, python_mutation, secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .files import DiffBaseOverride, InventoryClasses, enumerate_entries, source_languages
+from .files import DiffBaseOverride, InventoryClasses, _parent_fd, enumerate_entries, source_languages
 from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -40,6 +41,7 @@ from .policy import (
     _string,
     _string_list,
     _unique,
+    _validate_exact_path,
 )
 from .runner import Diagnostics, RunResult, RunTimeout, execution_outcome, mark_step, remaining_budget, run
 from .tools import tool_binary
@@ -510,6 +512,49 @@ def _run_comments(context: AdapterContext) -> Any:
     )
 
 
+_PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
+
+
+def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
+    if not pointer.startswith("/") or re.search(r"~(?:[^01]|$)", pointer):
+        raise _config_error(path, where, "a non-root JSON Pointer", "invalid syntax")
+    return tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:])
+
+
+def _parse_provenance(row: Any, path: Path, where: str) -> secrets.Provenance:
+    if not isinstance(row, dict):
+        raise _config_error(path, where, "a table", type(row).__name__)
+    _check_keys(row, _PROVENANCE_FIELDS, path, where)
+    record, pointer, payload, digest = (
+        _string(row, field, path, f"{where}.{field}") for field in _PROVENANCE_FIELDS
+    )
+    _validate_exact_path(path, f"{where}.record", record)
+    _validate_exact_path(path, f"{where}.payload", payload)
+    if not record.endswith(".json") or record == payload:
+        raise _config_error(path, where, "a .json record and a separate payload", "invalid paths")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise _config_error(path, f"{where}.payload_sha256", "64 lowercase hex digits", "invalid value")
+    return secrets.Provenance(record, _read_pointer(pointer, path, f"{where}.pointer"), payload, digest)
+
+
+def _secrets_provenance(raw: dict[str, Any], path: Path, key: str) -> tuple[secrets.Provenance, ...]:
+    name = f"{key}.sha256_provenance"
+    rows = raw.get("sha256_provenance", [])
+    if not isinstance(rows, list):
+        raise _config_error(path, name, "an array of tables", type(rows).__name__)
+    declarations = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for index, row in enumerate(rows):
+        where = f"{name}[{index}]"
+        declaration = _parse_provenance(row, path, where)
+        _unique(
+            seen, (declaration.record, declaration.pointer), path, where,
+            "a unique record and pointer", "duplicate", _config_error,
+        )
+        declarations.append(declaration)
+    return tuple(declarations)
+
+
 def _secrets_result(context: AdapterContext, start: float, child: RunResult, budget: int) -> Any:
     from .checks import _check_result
 
@@ -519,6 +564,43 @@ def _secrets_result(context: AdapterContext, start: float, child: RunResult, bud
         context.check, start, "pass" if passed else "fail", execution=child.execution,
         reason=reason, diagnostics=child.diagnostics(), budget_seconds=budget,
     )
+
+
+def _verified_secrets_result(
+    context: AdapterContext, start: float, scan: secrets.VerifiedScan, budget: int,
+) -> Any:
+    from .checks import _check_result
+
+    child = scan.child
+    reason = child.error
+    if child.execution == "completed" and scan.unresolved:
+        reason = f"Betterleaks reported {scan.unresolved} unresolved finding(s)"
+    return _check_result(
+        context.check, start,
+        "pass" if child.execution == "completed" and scan.unresolved == 0 else "fail",
+        execution=child.execution, reason=reason, diagnostics=child.diagnostics(),
+        budget_seconds=budget, measurement={"verified_sha256_provenance": scan.verified},
+    )
+
+
+def _secrets_paths(root: Path) -> tuple[list[str], set[str]]:
+    entries = enumerate_entries(root)
+    selected = [entry.path for entry in entries if not entry.gitlink]
+    tracked = {entry.path for entry in entries if entry.mode in ("100644", "100755")}
+    return selected, tracked
+
+
+def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start: float, budget: int) -> Any:
+    root = context.root.resolve()
+    selected, tracked = _secrets_paths(root)
+    if context.check.spec and context.config.trusted_policy:
+        verified = secrets.scan_verified(
+            binary, root, directory, selected, budget, context.check.spec,
+            tracked=tracked, open_parent=_parent_fd, run=run,
+        )
+        return _verified_secrets_result(context, start, verified, budget)
+    child = secrets.scan(binary, root, directory, selected, budget, open_parent=_parent_fd, run=run)
+    return _secrets_result(context, start, child, budget)
 
 
 def _run_secrets(context: AdapterContext) -> Any:
@@ -535,16 +617,13 @@ def _run_secrets(context: AdapterContext) -> Any:
     try:
         with TemporaryDirectory(prefix="qg-secrets-", dir=context.evidence_dir) as directory:
             mark_step("snapshot and scan of Git-selected files")
-            root = context.root.resolve()
-            selected = [entry.path for entry in enumerate_entries(root) if not entry.gitlink]
-            child = secrets.scan(binary, root, Path(directory), selected, RATCHET_BUDGET_SECONDS, run=run)
+            return _scan_secrets(context, binary, Path(directory), start, RATCHET_BUDGET_SECONDS)
     except (GateError, OSError, ValueError) as error:
         print(f"{context.prefix}: {error}", file=sys.stderr)
         return _check_result(
             context.check, start, "error", execution="error", reason=str(error),
             diagnostics=Diagnostics(error=str(error)),
         )
-    return _secrets_result(context, start, child, RATCHET_BUDGET_SECONDS)
 
 
 def _affected_test_child(
@@ -973,8 +1052,10 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "secrets",
-    (),
-    lambda _raw, _root, _path, _key: ParsedSpec(None, "secrets/1", ("static",)),
+    ("sha256_provenance",),
+    lambda raw, _root, path, key: ParsedSpec(
+        _secrets_provenance(raw, path, key), "secrets/1", ("static",),
+    ),
     _run_secrets,
     runs_suite=False,
 ))

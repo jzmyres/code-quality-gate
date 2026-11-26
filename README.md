@@ -356,8 +356,10 @@ the check unsupported.
 
 Betterleaks prints redacted findings to stderr with the repository-relative
 path, line, and rule. Gate checks print paths, so a credential in a filename
-is visible. Fix findings, including false positives, by changing the file.
-The check has no exceptions.
+is visible. A trusted policy may declare a JSON digest field backed by a
+tracked payload. The gate recomputes the digest from the captured payload
+and verifies that the finding identifies that exact field. See the
+[SHA-256 provenance policy](docs/SCHEMA.md#sha-256-provenance-policy).
 
 ### Source comments
 
