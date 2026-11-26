@@ -141,17 +141,28 @@ class PytestMutationTests(PytestMutationCase):
         )
         self.assert_pytest_error("original tests", "imported from the source checkout")
 
-    def test_pytest_config_can_bind_a_relative_import_root(self) -> None:
-        self.write_config(mutation_config(test_runner="pytest", function_mutants=1))
+    def test_pytest_selects_aliased_imports_from_configured_root(self) -> None:
+        self.write_config(
+            'python_import_roots = ["src"]\n'
+            + mutation_config(test_runner="pytest", function_mutants=1)
+        )
         self.base_commit()
         self.commit({
-            "src/pkg/app.py": APP,
+            "src/pkg/app.py": APP + "\nRESULT = flag()\n",
             "pyproject.toml": '[tool.pytest.ini_options]\npythonpath = ["src"]\n',
-            "tests/test_app.py": IMPORT + "def test_flag():\n    assert flag()\n",
+            "tests/test_app.py": (
+                "from pkg import app as helper\n"
+                "def test_result():\n"
+                "    assert helper.RESULT is True\n"
+            ),
         })
         result, _document, check = self.run_mutation()
         self.assertEqual(result.returncode, 0, output(result))
-        self.assertIn("killed", {row["outcome"] for row in self.mutants(check)})
+        self.assertEqual(check["measurement"]["test_files"], ["tests/test_app.py"])
+        self.assertEqual(
+            [(row["subject"], row["tests"]) for row in self.mutants(check) if row["outcome"] == "killed"],
+            [("src/pkg/app.py:flag", ["tests/test_app.py"])],
+        )
 
     def test_mutant_timeout_cannot_kill(self) -> None:
         self.prepare("def test_flag():\n    assert flag()\n", mutant_seconds=2)

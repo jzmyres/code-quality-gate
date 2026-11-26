@@ -16,6 +16,7 @@ DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_BUDGET_SECONDS = 600
 DEFAULT_TESTS_BUDGET_SECONDS = 900
 DEFAULT_CRAP_THRESHOLD = 6.0
+DEFAULT_PYTHON_IMPORT_ROOTS = (".",)
 SUPPORTED_SCHEMA = 2
 MODULE_CONTRACTS_ID = "module-contracts"
 COMMON_CHECK_KEYS = ("adapter", "tier", "enforcement", "direction")
@@ -23,6 +24,7 @@ TOP_LEVEL_KEYS = (
     "schema",
     "code",
     "module_dirs",
+    "python_import_roots",
     "classes",
     "rule",
     "hygiene",
@@ -127,6 +129,7 @@ class Config:
     protect_paths: tuple[str, ...] = ()
     module_dirs: tuple[str, ...] | None = None
     shared_base: str | None = None
+    python_import_roots: tuple[str, ...] = DEFAULT_PYTHON_IMPORT_ROOTS
 
 
 def _config_error(path: Path | str, key: str, expected: str, actual: str) -> ConfigError:
@@ -1013,6 +1016,22 @@ def _parse_module_dirs(data: dict[str, Any], path: Path) -> tuple[str, ...] | No
     return tuple(directories)
 
 
+def _parse_python_import_roots(data: dict[str, Any], path: Path) -> tuple[str, ...]:
+    key = "python_import_roots"
+    if key not in data:
+        return DEFAULT_PYTHON_IMPORT_ROOTS
+    roots = _string_list(data, key, path, key)
+    if not roots:
+        raise _config_error(path, key, "a non-empty list of directories", "an empty list")
+    seen: set[str] = set()
+    for index, directory in enumerate(roots):
+        item = f"{key}[{index}]"
+        if directory != ".":
+            _validate_exact_path(path, item, directory)
+        _unique(seen, directory, path, item, "a unique directory", f"duplicate {directory!r}", _config_error)
+    return roots
+
+
 def _config_from_data(
     root: Path, path: Path, data: dict[str, Any], *, validate_headers: bool = True,
     candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
@@ -1059,6 +1078,7 @@ def _config_from_data(
         module_contracts=module_contracts,
         capabilities=_parse_capabilities(data, path, modules, module_contracts),
         shared_base=shared_base,
+        python_import_roots=_parse_python_import_roots(data, path),
     )
 
 

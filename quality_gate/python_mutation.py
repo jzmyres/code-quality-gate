@@ -22,7 +22,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from . import python_shape
+from . import module_graph, python_shape
 from .files import DiffBase, diff_base
 from .json_input import load_json
 from .policy import (
@@ -655,10 +655,6 @@ def _test_file_paths(context: Any) -> list[str]:
     )
 
 
-def _module_name(relative: str) -> str:
-    return relative.removesuffix(".py").replace("/", ".")
-
-
 def _imported_from(node: ast.ImportFrom) -> set[str]:
     """The module names one 'from' import makes available."""
     base = node.module or ""
@@ -699,7 +695,7 @@ def _test_references(
 
 def _tests_by_function(
     root: Path, functions: list[python_shape.ShapeFunction],
-    test_files: list[str],
+    test_files: list[str], module_names: dict[str, frozenset[str]],
 ) -> dict[str, tuple[str, ...]]:
     references = {
         relative: _test_references(
@@ -711,7 +707,7 @@ def _tests_by_function(
         function.identity: tuple(
             relative for relative, (names, modules) in references.items()
             if function.final_name in names
-            or _module_name(function.path) in modules
+            or not module_names[function.path].isdisjoint(modules)
         )
         for function in functions
     }
@@ -1300,7 +1296,10 @@ def _run_python_mutation(context: Any) -> CheckResult:
             _pytest_test_file_paths(context) if check.spec.test_runner == "pytest"
             else _test_file_paths(context)
         )
-        tests = _tests_by_function(context.root, functions, test_files)
+        imports = module_graph.PythonImports.from_repository(context.root, context.config.python_import_roots)
+        tests = _tests_by_function(
+            context.root, functions, test_files, imports.identities(context.inventory_files),
+        )
         mark_step("python-mutation execution")
         records, findings, unfinished = _measure(
             context, check.spec, functions, tests, start
@@ -1309,7 +1308,7 @@ def _run_python_mutation(context: Any) -> CheckResult:
             _over_budget_finding(function, check.spec)
             for function in unfinished
         )
-    except (GateError, OSError) as error:
+    except (GateError, OSError, ValueError) as error:
         result = _ratchet_error(check, start, context.prefix, error)
         result.configuration_error = True
         result.budget_seconds = check.spec.run_seconds

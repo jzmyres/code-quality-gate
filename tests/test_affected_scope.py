@@ -184,6 +184,19 @@ class AffectedScopeTests(FixtureCase):
         for name in ("inventory", "hygiene"):
             self.assertEqual(self.checked(document, name)["selection"]["reason"], "full run")
 
+    def test_src_layout_change_selects_absolute_importer(self):
+        (self.repo / "src").mkdir()
+        (self.repo / "pkg").rename(self.repo / "src/pkg")
+        self.add_file("src/pkg/b.py", "from pkg import a as provider\n")
+        self.write_config('python_import_roots = ["src"]\n' + CONFIG.replace('"pkg/*"', '"src/pkg/*"'))
+        self.change("src/pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "lint")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.checked(document, "lint")["selection"]["selected"], {
+            "src/pkg/a.py": "changed",
+            "src/pkg/b.py": "depends on src/pkg/a.py",
+        })
+
     def assert_runtime_suite(self, suite, names):
         self.assertEqual(suite["executed"], names)
         self.assertEqual(suite["selection"]["selected"], dict.fromkeys(names, RUNTIME_REASON))

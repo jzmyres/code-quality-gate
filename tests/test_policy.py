@@ -182,6 +182,25 @@ class PolicyTests(FixtureCase):
             "duplicate 'lib'",
         )
 
+    def test_python_import_roots_default_to_the_repository_root(self) -> None:
+        self.assertEqual(policy.load_config(self.repo).python_import_roots, (".",))
+        self.write_config('python_import_roots = ["src", ".", "vendor/lib"]\n' + BASE_CONFIG)
+        self.assertEqual(policy.load_config(self.repo).python_import_roots, ("src", ".", "vendor/lib"))
+
+    def test_python_import_roots_are_unique_canonical_paths(self) -> None:
+        for value, key in (
+            ('"src"', "python_import_roots"),
+            ('[]', "python_import_roots"),
+            ('[1]', "python_import_roots[0]"),
+            ('[""]', "python_import_roots[0]"),
+            ('["/src"]', "python_import_roots[0]"),
+            ('["src/../lib"]', "python_import_roots[0]"),
+            ('["src/*"]', "python_import_roots[0]"),
+            ('["src", "src"]', "python_import_roots[1]"),
+        ):
+            with self.subTest(value=value):
+                self.config_error(f"python_import_roots = {value}\n" + BASE_CONFIG, key, "expected")
+
     def test_unknown_class_key(self) -> None:
         self.config_error(
             BASE_CONFIG.replace(

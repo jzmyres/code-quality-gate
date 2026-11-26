@@ -313,6 +313,7 @@ def _extract_graph(
         raise ValueError("module graph dependency extraction deadline exceeded")
     modules, edges, _ = module_graph.dependencies(
         context.root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
+        python_import_roots=context.config.python_import_roots,
     )
     return GraphExtraction(inputs, modules, edges)
 
@@ -380,6 +381,7 @@ def _run_module_graph(context: AdapterContext) -> Any:
             context.root, python_modules, check.spec, elisp=elisp, shell_modules=shell_modules,
             parse_shell=GRAPH_SHELL_PARSER,
             test_sources=test_sources,
+            python_import_roots=context.config.python_import_roots,
         )
     except (GateError, ValueError) as error:
         return _ratchet_error(check, start, context.prefix, error)

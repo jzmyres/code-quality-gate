@@ -142,6 +142,8 @@ reason = "Python source"
 Rules:
 
 * `schema = 2` is mandatory. Unknown keys are configuration errors.
+* Optional top-level `python_import_roots` configures Python import analysis. See
+  [Python import roots](#python-import-roots).
 * `[checks.module-contracts]` enables the built-in and requires `[modules]`. The shared loader
   applies that requirement to standalone commands and historical `debt --revision` reads.
   Existing policies can omit both tables.
@@ -241,6 +243,25 @@ Rules:
   `check --policy-from DIR`; without that option it is parsed and ignored. The
   list used by a trust run always comes from `DIR`.
 
+### Python import roots
+
+Set the top-level key `python_import_roots = ["src"]` when `src/pkg/mod.py` is imported as
+`pkg.mod`. It takes a nonempty ordered array of unique, canonical repository-relative directory
+paths. Use `.` for the repository root. It defaults to `["."]`. Roots must exist as directories
+without symlink components when the analysis runs.
+
+The module graph, module contracts, and affected dependency selection search those directories
+in order for absolute imports and then search the importing file's directory. A relative import
+starts from the package containing the importing file under its most specific configured root.
+Python mutation uses names relative to the same roots to associate test imports with changed
+production functions. This setting controls static analysis. Test imports at run time use the
+suite's own setup.
+
+A package initializer has its package's dotted name and its explicit `.__init__` import name.
+A file can also have multiple dotted names when configured roots overlap. Graph extraction and
+mutation fail when two files in their inputs provide the same dotted name. If affected selection
+cannot extract the graph, it selects full inputs according to the affected-scope rules.
+
 ### Python module graph policy
 
 The `module_graph` adapter requires `classes`, a nonempty array of inventory class
@@ -248,10 +269,8 @@ names. It reads the Python files in those classes. The optional `suites` array
 contains case-sensitive `fnmatch` patterns for repository-relative paths. It defaults
 to an empty array. The adapter uses a fixed maximum threshold of zero findings.
 
-For each import, the adapter searches the repository root followed by the importing
-file's directory. Relative imports resolve from the importing file's package. A
-`from P import N` edge points to `P.N` when that module is in scope and otherwise
-points to `P` when it is in scope. Only edges between measured files are recorded.
+A `from P import N` edge points to `P.N` when that module is in scope and otherwise points to
+`P` when it is in scope. Only edges between measured files are recorded.
 
 ### Environment access policy
 
