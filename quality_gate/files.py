@@ -661,6 +661,14 @@ _RULE_CHECKS = (
     ),
 )
 
+
+def matching_rules(relative: str, rules: tuple[Rule, ...]) -> list[tuple[int, Rule]]:
+    return [
+        (index, rule) for index, rule in enumerate(rules)
+        if fnmatch.fnmatchcase(relative, rule.pattern)
+    ]
+
+
 @dataclass
 class _InventoryValidator:
     root: Path
@@ -723,11 +731,9 @@ class _InventoryValidator:
     def _classify_files(self) -> None:
         for entry in self.entries:
             relative = entry.path
-            hits = []
-            for index, rule in enumerate(self.config.rules):
-                if fnmatch.fnmatchcase(relative, rule.pattern):
-                    hits.append((index, rule))
-                    self.matched[index] += 1
+            hits = matching_rules(relative, self.config.rules)
+            for index, _rule in hits:
+                self.matched[index] += 1
             patterns = ", ".join(
                 repr(rule.pattern) for _index, rule in hits
             )

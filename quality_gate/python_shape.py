@@ -25,10 +25,12 @@ from typing import TYPE_CHECKING, Any
 
 from .files import (
     DiffBase, _git, _split_nul, _untracked_files, diff_base, is_python_blob, is_python_program,
+    matching_rules,
 )
 from .policy import (
     ConfigError,
     GateError,
+    Rule,
     _integer,
     _number,
     _optional_string,
@@ -287,20 +289,23 @@ def _inside_test(node: ast.AST, in_test: bool) -> bool:
 def _parse_tree(relative: str, source: str) -> ast.Module:
     try:
         return ast.parse(source, filename=relative)
-    except SyntaxError as error:
+    except (SyntaxError, RecursionError) as error:
         raise GateError(f"cannot parse {relative}: {error}") from error
 
 
 def _file_index(relative: str, source: str) -> FileIndex:
     tree = _parse_tree(relative, source)
     functions: list[ShapeFunction] = []
-    _collect_definitions(tree.body, "", relative, functions)
-    identities = {id(item.node): item.identity for item in functions}
     calls: list[CallSite] = []
-    _walk_calls(tree, None, relative, identities, calls)
     tests: set[str] = set()
-    if _is_test_path(relative):
-        _test_functions(tree.body, False, tests)
+    try:
+        _collect_definitions(tree.body, "", relative, functions)
+        identities = {id(item.node): item.identity for item in functions}
+        _walk_calls(tree, None, relative, identities, calls)
+        if _is_test_path(relative):
+            _test_functions(tree.body, False, tests)
+    except RecursionError as error:
+        raise GateError(f"cannot index {relative}: {error}") from error
     return FileIndex(tuple(functions), tuple(calls), frozenset(tests))
 
 
@@ -390,14 +395,16 @@ class _BaseSources:
         self.root = root
         self.base = base
         self.indexes: dict[str, FileIndex] = {}
-        self.python_indexes: dict[str, FileIndex | None] = {}
         entries = _split_nul(_git(
             root, ["ls-tree", "-r", "-z", base, "--"], "python-shape base tree",
         ))
-        self.modes = {}
+        self.paths: set[str] = set()
+        self.regular_paths: set[str] = set()
         for entry in entries:
             metadata, _, path = entry.partition("\t")
-            self.modes[path] = metadata.split(" ", 1)[0]
+            self.paths.add(path)
+            if metadata.startswith("100"):
+                self.regular_paths.add(path)
 
     def blob(self, relative: str) -> bytes:
         return _git(
@@ -418,21 +425,21 @@ class _BaseSources:
         self.indexes[relative] = index
         return index
 
-    def python_index(self, relative: str) -> FileIndex | None:
-        if not self.modes.get(relative, "").startswith("100"):
+    def python_index(
+        self, relative: str, rules: tuple[Rule, ...], classes: set[str],
+    ) -> FileIndex | None:
+        if relative not in self.regular_paths:
             return None
-        if relative not in self.python_indexes:
-            data = self.blob(relative)
-            self.python_indexes[relative] = (
-                self.index(relative, data) if is_python_blob(relative, data) else None
-            )
-        return self.python_indexes[relative]
+        hits = matching_rules(relative, rules)
+        if len(hits) == 1 and hits[0][1].class_name in classes:
+            return self.index(relative)
+        data = self.blob(relative)
+        return self.index(relative, data) if is_python_blob(relative, data) else None
 
-    def definitions(self, relative: str, *, python_only: bool = False) -> dict[str, ShapeFunction]:
-        if relative not in self.modes:
+    def definitions(self, relative: str) -> dict[str, ShapeFunction]:
+        if relative not in self.paths:
             return {}
-        index = self.python_index(relative) if python_only else self.index(relative)
-        return {function.identity: function for function in index.functions} if index else {}
+        return {function.identity: function for function in self.index(relative).functions}
 
     def definitions_for(self, paths: list[str]) -> dict[str, dict[str, ShapeFunction]]:
         return {path: self.definitions(path) for path in paths}
@@ -445,10 +452,12 @@ def _base_functions(
     return _BaseSources(root, base).definitions_for(paths)
 
 
-def _base_calls(sources: _BaseSources) -> dict[str, tuple[CallSite, ...]]:
+def _base_calls(
+    sources: _BaseSources, rules: tuple[Rule, ...], classes: set[str],
+) -> dict[str, tuple[CallSite, ...]]:
     indexes = [
         index for path in _base_caller_paths(sources.root, sources.base)
-        if not _is_test_path(path) and (index := sources.python_index(path)) is not None
+        if not _is_test_path(path) and (index := sources.python_index(path, rules, classes)) is not None
     ]
     names = {site.name for index in indexes for site in index.calls}
     calls, _tests = _uses(indexes, names)
@@ -499,12 +508,15 @@ def _changed_functions(
     changed: list[ShapeFunction] = []
     for relative, index in indexes.items():
         previous = before.get(relative, {})
-        changed.extend(
-            function for function in index.functions
-            if function.identity not in previous
-            or ast.dump(previous[function.identity].node)
-            != ast.dump(function.node)
-        )
+        try:
+            changed.extend(
+                function for function in index.functions
+                if function.identity not in previous
+                or ast.dump(previous[function.identity].node)
+                != ast.dump(function.node)
+            )
+        except RecursionError as error:
+            raise GateError(f"cannot compare definitions in {relative}: {error}") from error
     return tuple(changed)
 
 
@@ -535,31 +547,14 @@ def _added_functions(
 
 
 def _scan_files(
-    context: Any, scoped: list[str], names: set[str]
+    context: Any, scoped: list[str], selected: set[str],
 ) -> dict[str, FileIndex]:
-    """The files outside the measured scope that may mention a candidate name.
-
-    Every Python file the check selects counts, whatever its name: a helper
-    called from a selected program without the .py suffix has two call sites.
-    """
-    if not names:
-        return {}
     measured = set(scoped)
-    indexes: dict[str, FileIndex] = {}
-    for relative in dict.fromkeys(context.inventory_files):
-        if relative in measured or not is_python_program(
-            context.root, relative
-        ):
-            continue
-        source = _read_source(context.root, relative)
-        if _mentions_name(source, names):
-            indexes[relative] = _file_index(relative, source)
-    return indexes
-
-
-def _mentions_name(source: str, names: set[str]) -> bool:
-    """A non-ASCII identifier can match a different spelling after parsing."""
-    return not source.isascii() or any(name in source for name in names)
+    return {
+        path: _file_index(path, _read_source(context.root, path))
+        for path in dict.fromkeys(context.inventory_files)
+        if path not in measured and (path in selected or is_python_program(context.root, path))
+    }
 
 
 def _uses(
@@ -589,20 +584,20 @@ def _selected_functions(
     )
 
 
-def _production_paths(context: Any) -> list[str]:
+def _production_paths(selected: list[str]) -> list[str]:
+    return [relative for relative in selected if not _is_test_path(relative)]
+
+
+def _measured_paths(
+    context: Any, spec: ShapeSpec, diff: Diff,
+) -> list[str]:
+    """A tree run measures every selected file; a changed run the changed ones."""
     from .checks import _select_files
 
     selected, _class_names = _select_files(
         context.config, context.check, context.files, context.classes
     )
-    return [relative for relative in selected if not _is_test_path(relative)]
-
-
-def _measured_paths(
-    context: Any, spec: ShapeSpec, diff: Diff
-) -> list[str]:
-    """A tree run measures every selected file; a changed run the changed ones."""
-    return _scoped_paths(_production_paths(context), spec, diff)
+    return _scoped_paths(_production_paths(selected), spec, diff)
 
 
 def _scoped_paths(production: list[str], spec: ShapeSpec, diff: Diff) -> list[str]:
@@ -627,11 +622,11 @@ def _orphaned_functions(
     tests: frozenset[str],
 ) -> tuple[ShapeFunction, ...]:
     orphans = []
-    for path in sorted(indexes.keys() & production):
+    for path in sorted(indexes.keys() & production & sources.regular_paths):
         possible = _orphan_candidates(indexes[path], prior_calls, calls, tests)
         if not possible:
             continue
-        previous = sources.definitions(path, python_only=True)
+        previous = sources.definitions(path)
         for function in possible:
             before = previous.get(function.identity)
             if before is not None and _called_outside(prior_calls, before):
@@ -663,23 +658,29 @@ def _shape_input(
     *, changed: frozenset[str] | None = None, untracked: frozenset[str] = frozenset(),
 ) -> ShapeInput:
     """Build the current and historical indexes shared by the rules."""
+    from .checks import _select_files
+
     diff = _shape_diff(context.root, spec, base, changed, untracked)
-    production = _production_paths(context)
-    scoped = _scoped_paths(production, spec, diff)
+    selected, classes = _select_files(
+        context.config, context.check, context.inventory_files, context.classes,
+    )
+    inputs = sorted(set(selected).intersection(context.files))
+    scoped = _scoped_paths(_production_paths(inputs), spec, diff)
     indexes = {
         path: _file_index(path, _read_source(context.root, path))
         for path in dict.fromkeys(scoped)
     }
     sources = _BaseSources(context.root, base.commit)
-    prior_calls = _base_calls(sources) if spec.scope == "changed" else {}
+    prior_calls = _base_calls(sources, context.config.rules, set(classes)) if spec.scope == "changed" else {}
     base_functions = sources.definitions_for(sorted(diff.paths.intersection(scoped)))
     functions, added, candidates = _shape_functions(spec, diff, indexes, base_functions)
     before = _base_complexities(base_functions)
     names = {function.final_name for function in candidates} | prior_calls.keys()
-    indexes.update(_scan_files(context, scoped, names))
+    if names:
+        indexes.update(_scan_files(context, scoped, set(selected)))
     calls, tests = _uses(list(indexes.values()), names)
     orphans = (
-        _orphaned_functions(indexes, production, sources, prior_calls, calls, tests)
+        _orphaned_functions(indexes, _production_paths(selected), sources, prior_calls, calls, tests)
         if prior_calls else ()
     )
     return ShapeInput(

@@ -900,7 +900,7 @@ finding has value `1`, so any finding fails the check. The five rules are:
   strings to `S`, and keeps keywords and operators; an f-string's data is not structure. The upper
   bound keeps the rule in the gap the 50-token clone check does not cover.
 * **UNCALLED**, never called. A function with no outside production call and no direct test fails
-  in changed scope if it was added or lost its last outside production call since the base.
+  in changed scope if it is an added definition or had an outside production call at the resolved base.
   A finding points to the current definition, even if the change only deletes a caller.
   Dead code, a handler registered by a decorator such as `singledispatch`, a
   method reached only through `getattr(obj, "handle")`, a descriptor-table entry, a keyword argument
@@ -909,7 +909,7 @@ finding has value `1`, so any finding fails the check. The five rules are:
   in its one owner. Its known limit is the one the other rules share: a call by an unrelated name that
   happens to be spelled the same counts as a call, as it does for the other rules.
 
-A test file is a path with a `tests/` component, a `test_*.py` name or a `*_test.py` name. Test
+A test file is a path with a `tests/` component, a name that starts with `test_` or a `*_test.py` name. Test
 files are excluded from every rule's scope, and a function is a "direct test" of a name only when a
 test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` class) names it.
 
@@ -917,16 +917,20 @@ test function (a `test*` function, or one inside a `Test*`, `*Test` or `*Tests` 
 in a selected changed file qualifies if it is new or differs from the base definition at the same
 path and qualified name, compared after `ast.dump` with decorators included. This selects a
 deletion inside a function and skips a moved unchanged definition. PTW-SU, SCC and LTC judge
-added functions (a new qualified name). UNCALLED also checks surviving selected production
-definitions whose last outside production call was removed, matching each definition to the same
-path and qualified name in the resolved base. A relocated or rewritten call still counts when the
-current Python AST matches the called name, including in inventoried untracked sources.
+added functions (a new qualified name). UNCALLED checks those added functions and surviving
+selected production definitions whose last outside production call was removed. It matches each
+surviving definition to the same path and qualified name in the resolved Git base and uses each
+revision's own definition span. A relocated or rewritten call still counts when the current Python
+AST matches the called name.
 `scope = "tree"` evaluates every function of the selected production files, so an untouched function
 can fail SCC, LTC or UNCALLED there. CPF is not a tree property, so it compares against `base` in
-both scopes (a clean tree with `base = "HEAD"` has no CPF finding). A helper's production call
-sites are counted in every enumerated Python file outside test files, with or without a `.py`
-suffix, so a caller outside the check's own scope still counts. Python embedded in a shell script is
-not read. A missing or invalid input is a configuration error, never a skipped rule: unknown keys,
+both scopes (a clean tree with `base = "HEAD"` has no CPF finding). Current call evidence includes
+inventoried files selected by the shape check's policy and files recognized as Python by their
+`.py` suffix or shebang. This includes inventoried untracked sources. Historical call evidence
+uses the resolved Git base's regular blobs at changed or deleted paths. The current policy and
+Python recognition by the base path's suffix or blob's shebang each qualify a historical caller.
+Both revisions exclude test-file calls from production evidence. A missing or invalid input is
+a configuration error, never a skipped rule: unknown keys,
 a `scope` other than `changed` or `tree`, a missing or non-existent `base`, `max_chain` below 1,
 `clone_min_tokens` outside 20-49,
 `clone_similarity` outside 0.5-1.0, and a `crap_check` naming no check or a check that is not a
@@ -1058,7 +1062,8 @@ table:
     run_seconds = 300                     # optional; the whole check
 
 `python_mutation` refuses a change whose tests survive a mutation of a function the diff adds or
-changes. It uses the changed-definition selection shared with `python_shape` under `scope = "changed"`.
+changes. It uses the changed-definition selection shared with `python_shape` under `scope = "changed"`,
+which supplies CPF's changed definitions and the added definitions for the shape rules.
 In the selected files the diff touches, it evaluates each production function or method whose
 definition is new or differs from the base definition at the same path and qualified name.
 Definitions are compared after `ast.dump`, decorators included, so a moved unchanged function is

@@ -1015,15 +1015,21 @@ class UncalledTests(ShapeCase):
 
     def test_orphan_from_deleted_caller_and_same_file_span(self) -> None:
         notes = "pkg/notes.py"
+        archive = "pkg/archive"
         shifted = "pkg/shifted.py"
         removed = "pkg/removed.py"
         deleted_caller = "pkg/legacy"
-        surviving_caller = "pkg/still.py"
-        moved_caller = "pkg/moved.py"
+        policy_caller = "pkg/commands-old"
+        surviving_caller = "pkg/commands-still"
+        moved_caller = "pkg/commands-moved"
+        normalized_caller = "pkg/normalized.py"
+        test_path = "tests/test_notes"
         definitions = {
-            f"{notes}:Archive.archive_note": True,
+            f"{archive}:Archive.archive_note": True,
+            f"{notes}:from_policy": True,
             f"{notes}:retained": True,
             f"{notes}:relocated": True,
+            f"{notes}:normalized": True,
             f"{notes}:covered": True,
             f"{notes}:already_unused": True,
             f"{shifted}:shifted": True,
@@ -1032,12 +1038,19 @@ class UncalledTests(ShapeCase):
         }
         self_calls = {f"{shifted}:shifted", f"{shifted}:recursive_only"}
         before = {
-            deleted_caller: ("archive_note", "retained", "relocated", "covered", "removed"),
+            deleted_caller: ("archive_note", "retained", "relocated", "normalized", "covered", "removed"),
+            policy_caller: ("from_policy",),
             surviving_caller: ("retained", "relocated"),
+            normalized_caller: ("normalized",),
             shifted: ("shifted",),
         }
-        deletion_only = {surviving_caller: before[surviving_caller], shifted: before[shifted]}
-        after_move = {surviving_caller: ("retained",), moved_caller: ("relocated",)}
+        deletion_only = {
+            path: calls for path, calls in before.items() if path not in (deleted_caller, policy_caller)
+        }
+        after_move = {
+            surviving_caller: ("retained",), moved_caller: ("relocated",),
+            normalized_caller: before[normalized_caller],
+        }
         direct_tests = {"covered"}
         prior_names = set().union(*before.values())
         expected = []
@@ -1050,11 +1063,9 @@ class UncalledTests(ShapeCase):
                 and name not in direct_tests
             })
 
-        self.write_config(shape_config(extra=(
-            "\n[[rule]]\n"
-            f'pattern = "{deleted_caller}*"\n'
-            'class = "python"\n'
-            'reason = "a suffixless Python program"\n'
+        self.write_config(shape_config(extra="".join(
+            f'\n[[rule]]\npattern = "{pattern}"\nclass = "python"\nreason = "suffixless Python"\n'
+            for pattern in (f"{deleted_caller}*", "pkg/commands-*", archive, test_path)
         )))
         sources = {f"{deleted_caller}-stub": "#!/usr/bin/env python3\n"}
         for identity in definitions:
@@ -1067,23 +1078,28 @@ class UncalledTests(ShapeCase):
             sources[path] = sources.get(path, "") + definition
         for path, calls in before.items():
             prefix = "#!/usr/bin/env python3\n" if path == deleted_caller else ""
-            sources[path] = prefix + "".join(f"{name}()\n" for name in calls) + sources.get(path, "")
-        sources["tests/test_notes.py"] = (
+            spellings = (
+                [name.replace("z", "\uff5a") for name in calls] if path == normalized_caller else calls
+            )
+            sources[path] = prefix + "".join(f"{name}()\n" for name in spellings) + sources.get(path, "")
+        sources[test_path] = (
             "def test_covered():\n" + "".join(f"    {name}()\n" for name in sorted(direct_tests))
             + "\narchive_note()\n"
         )
         self.base_commit(sources)
-        self.git("rm", "--", deleted_caller, removed)
+        self.git("rm", "--", deleted_caller, policy_caller, removed)
         self.commit_all("remove the legacy caller and an obsolete definition")
 
         locations = {
-            f"{notes}:Archive.archive_note": (notes, 2, 3),
+            f"{archive}:Archive.archive_note": (archive, 2, 3),
+            f"{notes}:from_policy": (notes, 1, 2),
             f"{shifted}:shifted": (shifted, 1, 3),
         }
         for moved, identities in enumerate(expected):
             if moved:
                 for path, calls in after_move.items():
-                    self.add_file(path, "".join(f"{name.replace('d', '\uff44')}()\n" for name in calls))
+                    if calls != deletion_only.get(path):
+                        self.add_file(path, "".join(f"{name}()\n" for name in calls))
                 definition = sources[shifted].removeprefix("shifted()\n")
                 definition = definition.replace("def recursive_only", "\n\n\ndef recursive_only")
                 self.add_file(shifted, definition.replace("    return", "\n    return", 1))
@@ -1111,9 +1127,10 @@ class UncalledTests(ShapeCase):
                     if override:
                         base["source"] = "--base"
                         selected = check["selection"]["selected"]
+                        self.assertEqual(selected[archive], "lost its last production call")
                         self.assertEqual(selected[notes], "lost its last production call")
                         if not moved:
-                            self.assertEqual(set(selected), {notes})
+                            self.assertEqual(set(selected), {archive, notes})
                     self.assertEqual(check["measurement"]["base"], base)
 
     def test_a_dispatch_table_of_uncalled_functions_is_refused(self) -> None:
@@ -2051,19 +2068,20 @@ class HelperInputTests(ShapeCase):
         )
         self.assertEqual([function.name for function in added], ["second"])
 
-    def test_scan_files_reads_python_programs_only(self) -> None:
+    def test_scan_files_reads_selected_and_recognized_python(self) -> None:
         self.add_file("pkg/app.py", "VALUE = 0\n")
         self.add_file(
             "pkg/helper", "#!/usr/bin/env python3\nprint(render_json())\n"
         )
         self.add_file("pkg/shell", "#!/bin/sh\nrender_json()\n")
+        self.add_file("pkg/command", "render_json()\n")
         context = SimpleNamespace(
             root=self.repo,
             files=["pkg/app.py"],
-            inventory_files=["pkg/app.py", "pkg/helper", "pkg/shell"],
+            inventory_files=["pkg/app.py", "pkg/helper", "pkg/shell", "pkg/command"],
         )
-        indexes = _scan_files(context, context.files, {"render_json"})
-        self.assertEqual(set(indexes), {"pkg/helper"})
+        indexes = _scan_files(context, context.files, {"pkg/app.py", "pkg/command"})
+        self.assertEqual(set(indexes), {"pkg/helper", "pkg/command"})
 
     def shape_context(self, paths: list[str]) -> SimpleNamespace:
         config = policy.load_config(self.repo)
@@ -2078,7 +2096,7 @@ class HelperInputTests(ShapeCase):
         first = "def first():\n    return 1\n\n"
         before = first + "first()\n"
         after = first + "def second():\n    return 2\n\nsecond()\n"
-        other_source = "def untouched():\n    return second\n"
+        other_source = "def untouched():\n    return 3\n"
         self.base_commit({path: before, other: other_source})
         self.add_file(path, after)
         context = self.shape_context([path, path, other, other])
@@ -2109,11 +2127,52 @@ class HelperInputTests(ShapeCase):
         with self.assertRaisesRegex(policy.GateError, r"cannot parse pkg/broken\.py"):
             _shape_input(self.shape_context([]), SHAPE_SPEC, 6, base)
 
+    def test_orphan_deleted_base_source_exhausts_index_recursion(self) -> None:
+        path = "pkg/deep.py"
+        source = "+".join(["0"] * 1500) + "\n"
+        self.assertIsInstance(ast.parse(source), ast.Module)
+        self.base_commit({path: source})
+        self.git("rm", "--", path)
+        base = DiffBase(self.git("rev-parse", "HEAD").stdout.strip(), "base")
+        with self.assertRaisesRegex(policy.GateError, r"pkg/deep\.py.*recursion"):
+            _shape_input(self.shape_context([]), SHAPE_SPEC, 6, base)
+
+    def test_orphan_definition_comparison_recursion_names_the_path(self) -> None:
+        path = "pkg/app.py"
+        self.base_commit({path: "def first():\n    return 1\n\nfirst()\n"})
+        self.add_file(path, "def first():\n    return 2\n")
+        base = DiffBase(self.git("rev-parse", "HEAD").stdout.strip(), "base")
+        with mock.patch.object(ast, "dump", side_effect=RecursionError("definition recursion")):
+            with self.assertRaisesRegex(policy.GateError, r"pkg/app\.py.*recursion"):
+                _shape_input(self.shape_context([path]), SHAPE_SPEC, 6, base)
+
     def test_orphan_base_blob_classification_uses_the_bounded_shebang(self) -> None:
         prefix = b"#!/usr/bin/env "
         self.assertTrue(is_python_blob("pkg/legacy", prefix + b"python3\n"))
         self.assertFalse(is_python_blob("pkg/legacy", prefix + b" " * SHEBANG_LIMIT + b"python3\n"))
         self.assertTrue(is_python_blob("pkg/legacy.py", b""))
+
+    def test_orphan_base_index_classifies_regular_blobs(self) -> None:
+        self.write_config(shape_config(extra=(
+            '\n[[rule]]\npattern = "pkg/policy"\nclass = "python"\nreason = "suffixless Python"\n'
+        )))
+        (self.repo / "pkg").mkdir()
+        (self.repo / "pkg/link.py").symlink_to("policy")
+        self.base_commit({
+            "pkg/policy": "policy_call()\n",
+            "pkg/legacy": "#!/usr/bin/env python3\nlegacy_call()\n",
+            "pkg/shell": '#!/bin/sh\ncase "$1" in\nesac\n',
+        })
+        sources = python_shape._BaseSources(self.repo, "HEAD")
+        rules = policy.load_config(self.repo).rules
+        for path, name in (("pkg/policy", "policy_call"), ("pkg/legacy", "legacy_call")):
+            with self.subTest(path=path):
+                index = sources.python_index(path, rules, {"python"})
+                self.assertIsNotNone(index)
+                self.assertEqual([site.name for site in index.calls], [name])
+        for path in ("pkg/shell", "pkg/link.py", "pkg/missing.py"):
+            with self.subTest(path=path):
+                self.assertIsNone(sources.python_index(path, rules, {"python"}))
 
 
 SHIPPED_POLICY = (GATE / "quality-gate.toml").read_text(encoding="utf-8")
