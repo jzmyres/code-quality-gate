@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import tempfile
 import tomllib
@@ -21,6 +22,7 @@ from support import (
 sys.path.insert(0, str(GATE))
 clones = importlib.import_module("quality_gate.clones")
 policy = importlib.import_module("quality_gate.policy")
+runner = importlib.import_module("quality_gate.runner")
 
 ELISP_SOURCE = """\
 ;;; sample.el --- file summary -*- lexical-binding: t; -*-
@@ -39,6 +41,7 @@ ELISP_SOURCE = """\
 
 IGNORE_START = "jscpd:ignore-" + "start"
 IGNORE_END = "jscpd:ignore-" + "end"
+EMPTY_SCAN = b"ERROR: jscpd analyzed no files (--fail-on-empty)"
 
 DUPLICATE_FUNCTION = """\
 def summarize_files(paths):
@@ -377,6 +380,7 @@ class CloneGateTests(FixtureCase):
         self.add_file("quality-gate-clones.toml", baseline_text([], check="clones"))
         self.add_file("a.py", "")
         self.add_file("short.py", "value = 1\n")
+        self.add_file("dense.py", unique_assignments("dense").strip().replace("\n", "; "))
         result = self.run_qg("check", env=self.default_tool_env())
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("clones: 0 clones", result.stdout)
@@ -936,6 +940,97 @@ class CloneOutcomeTests(unittest.TestCase):
             ),
             "error",
         )
+
+    def test_empty_jscpd_run_requires_both_reports_and_the_expected_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sarif = Path(temporary) / "report.sarif"
+            statistics = Path(temporary) / "report.json"
+            exit_result = runner.RunResult((), "completed", 1, stderr=EMPTY_SCAN)
+            self.assertFalse(clones._empty_jscpd_run(exit_result, sarif, statistics))
+            sarif.touch()
+            self.assertFalse(clones._empty_jscpd_run(exit_result, sarif, statistics))
+            statistics.touch()
+            self.assertTrue(clones._empty_jscpd_run(exit_result, sarif, statistics))
+            cases = [
+                ("budget", 1, EMPTY_SCAN),
+                ("error", 1, EMPTY_SCAN),
+                ("completed", 0, EMPTY_SCAN),
+                ("completed", 1, b"other scanner failure"),
+                ("completed", 1, EMPTY_SCAN + b"\na reporter failed"),
+            ]
+            for execution, code, stderr in cases:
+                with self.subTest(execution=execution, code=code, stderr=stderr):
+                    result = runner.RunResult((), execution, code, stderr=stderr)
+                    self.assertFalse(clones._empty_jscpd_run(result, sarif, statistics))
+
+    def test_empty_jscpd_exit_with_nonzero_source_count_is_unsupported(self) -> None:
+        def contradictory_run(command: list[str], **_options: object) -> object:
+            directory = Path(command[command.index("--output") + 1])
+            (directory / "jscpd-report.sarif").write_text(
+                json.dumps(sarif_report([])), encoding="utf-8",
+            )
+            (directory / "jscpd-report.json").write_text(
+                json.dumps({"statistics": {"total": {"sources": 1}}}), encoding="utf-8",
+            )
+            return runner.RunResult(tuple(command), "completed", 1, stderr=EMPTY_SCAN)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(clones, "run", side_effect=contradictory_run) as run:
+                with self.assertRaisesRegex(clones.CloneEvidenceError, r"jscpd failed \(exit 1\)") as error:
+                    clones._run_jscpd(Path(temporary), Path("jscpd"), {"a.py": "python"}, 50, 1024)
+            run.assert_called_once()
+        self.assertEqual(error.exception.diagnostics.exit_code, 1)
+
+
+class EligibilityInventoryTests(unittest.TestCase):
+    report = Path("jscpd-complexity.json")
+
+    def test_eligibility_row_requires_a_path_and_nonnegative_integer_tokens(self) -> None:
+        row = {"path": "/repo/a.py", "format": "python", "tokens": 0}
+        self.assertEqual(clones._eligibility_row(row, self.report), ("/repo/a.py", 0, "python"))
+        with self.assertRaisesRegex(policy.UnsupportedError, "row is not an object"):
+            clones._eligibility_row([], self.report)
+        for changes in ({"path": 1}, {"tokens": False}, {"tokens": "2"}, {"tokens": -1}):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(policy.UnsupportedError, "invalid source eligibility row"):
+                    clones._eligibility_row(row | changes, self.report)
+
+    def test_eligibility_tokens_require_unique_selected_paths_with_matching_formats(self) -> None:
+        expected = {"/repo/a.py": "python", "/repo/b.sh": "bash"}
+        python = {"path": "/repo/a.py", "format": "python", "tokens": 1}
+        bash = {"path": "/repo/b.sh", "format": "bash", "tokens": 8}
+        self.assertEqual(
+            clones._eligibility_tokens([bash, python], expected, self.report),
+            {"/repo/b.sh": 8, "/repo/a.py": 1},
+        )
+        cases = [
+            (python, "invalid source eligibility row"),
+            (bash | {"path": "/other/b.sh"}, "unexpected source.* /other/b.sh"),
+            (bash | {"format": "python"}, "unexpected source.* /repo/b.sh"),
+        ]
+        for row, message in cases:
+            with self.subTest(row=row):
+                with self.assertRaisesRegex(policy.UnsupportedError, message):
+                    clones._eligibility_tokens([python, row], expected, self.report)
+
+    def test_eligibility_summary_requires_both_reported_and_inventoried_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / self.report
+            row = {"path": str((root / "a.py").resolve()), "format": "python", "tokens": 0}
+            cases = [
+                (False, [row], "missing source eligibility inventory"),
+                (1, None, "missing source eligibility inventory"),
+                (1, [], "did not account for every selected input"),
+                (0, [row], "did not account for every selected input"),
+            ]
+            for total, files, message in cases:
+                with self.subTest(total=total, files=files):
+                    report.write_text(
+                        json.dumps({"summary": {"totalFiles": total, "files": files}}), encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(policy.UnsupportedError, message):
+                        clones._input_summary(report, root, {"a.py": "python"})
 
 
 class SarifLocationTests(unittest.TestCase):

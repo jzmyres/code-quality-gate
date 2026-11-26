@@ -21,7 +21,7 @@ from .policy import (
     _integer,
 )
 from .ratchet import Domain, Finding, Location, RatchetResult
-from .runner import Diagnostics, execution_outcome, mark_step, run
+from .runner import Diagnostics, RunResult, execution_outcome, mark_step, run
 from .tools import tool_binary
 
 
@@ -454,6 +454,28 @@ def _eligibility_command(command: list[str], output: Path, count: int) -> list[s
             *command[command.index("--"):]]
 
 
+def _eligibility_row(row: object, report: Path) -> tuple[str, int, object]:
+    item = _required_object(row, report, "source eligibility row is not an object")
+    path, count = item.get("path"), item.get("tokens")
+    if not isinstance(path, str) or type(count) is not int or count < 0:
+        raise _no_completed(report, "invalid source eligibility row")
+    return path, count, item.get("format")
+
+
+def _eligibility_tokens(
+    files: list[Any], expected: dict[str, str], report: Path,
+) -> dict[str, int]:
+    tokens: dict[str, int] = {}
+    for row in files:
+        path, count, source_format = _eligibility_row(row, report)
+        if path in tokens:
+            raise _no_completed(report, "invalid source eligibility row")
+        if path not in expected or expected[path] != source_format:
+            raise _no_completed(report, f"unexpected source in eligibility inventory: {path}")
+        tokens[path] = count
+    return tokens
+
+
 def _input_summary(report: Path, root: Path, inputs: dict[str, str]) -> dict[str, int]:
     data = _required_object(_read_report(report), report, "expected a JSON object")
     summary = _required_object(data.get("summary"), report, "summary is not an object")
@@ -461,15 +483,7 @@ def _input_summary(report: Path, root: Path, inputs: dict[str, str]) -> dict[str
     if not isinstance(files, list) or type(summary.get("totalFiles")) is not int:
         raise _no_completed(report, "missing source eligibility inventory")
     expected = {str((root / path).resolve()): source_format for path, source_format in inputs.items()}
-    tokens = {}
-    for row in files:
-        item = _required_object(row, report, "source eligibility row is not an object")
-        path, count = item.get("path"), item.get("tokens")
-        if not isinstance(path, str) or path in tokens or type(count) is not int or count < 0:
-            raise _no_completed(report, "invalid source eligibility row")
-        if path not in expected or expected[path] != item.get("format"):
-            raise _no_completed(report, f"unexpected source in eligibility inventory: {path}")
-        tokens[path] = count
+    tokens = _eligibility_tokens(files, expected, report)
     if summary["totalFiles"] != len(inputs) or len(tokens) != len(inputs):
         raise _no_completed(report, "eligibility scan did not account for every selected input")
     return tokens
@@ -489,6 +503,17 @@ def _count_eligible(
     tokens = _input_summary(output / "jscpd-complexity.json", root, inputs)
     return sum(tokens[str((root / path).resolve())] >= min_tokens
                and _physical_lines(root / path) >= MIN_LINES for path in inputs)
+
+
+def _empty_jscpd_run(result: RunResult, sarif: Path, json_report: Path) -> bool:
+    return (
+        execution_outcome(result.execution).completed
+        and result.returncode == 1
+        and "jscpd analyzed no files (--fail-on-empty)" in result.stderr_text
+        and "a reporter failed" not in result.stderr_text
+        and sarif.is_file()
+        and json_report.is_file()
+    )
 
 
 def _run_jscpd(
@@ -513,12 +538,7 @@ def _run_jscpd(
         diagnostics = result.diagnostics()
         sarif = output / "jscpd-report.sarif"
         json_report = output / "jscpd-report.json"
-        empty = (
-            result.returncode == 1
-            and "jscpd analyzed no files (--fail-on-empty)" in result.stderr_text
-            and "a reporter failed" not in result.stderr_text
-            and sarif.is_file() and json_report.is_file()
-        )
+        empty = _empty_jscpd_run(result, sarif, json_report)
         if not empty:
             _raise_jscpd_failure(result, diagnostics)
         try:
