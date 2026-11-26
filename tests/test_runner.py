@@ -187,7 +187,6 @@ class ReadChunkTests(unittest.TestCase):
         )
         self.assertEqual(result.execution, "budget")
         self.assertEqual(result.returncode, -signal.SIGKILL)
-        self.assertIsNone(result.error)
         self.assertGreater(result.output_bytes, runner.CAPTURE_LIMIT)
         self.assertTrue(result.output_truncated)
         self.assertLess(time.monotonic() - start, 8.0)
@@ -665,10 +664,20 @@ class UnconfirmedCleanupTests(unittest.TestCase):
 
     def test_a_group_that_survives_sigkill_reports_unconfirmed_cleanup(self) -> None:
         program = "import time; time.sleep(30)"
+        real_reap = runner._reap
+        signals_before_reap: list[signal.Signals] = []
+
+        def reap(process: subprocess.Popen[bytes]) -> bool:
+            signals_before_reap.extend(
+                call.args[1] for call in signal_group.call_args_list if call.args[0] == process.pid
+            )
+            return real_reap(process)
+
         with (
             mock.patch.object(runner, "_group_alive", return_value=True),
             mock.patch.object(runner, "_signal_group", wraps=runner._signal_group)
             as signal_group,
+            mock.patch.object(runner, "_reap", side_effect=reap),
         ):
             start = time.monotonic()
             result = runner.run(
@@ -681,7 +690,9 @@ class UnconfirmedCleanupTests(unittest.TestCase):
         self.assertEqual(result.execution, "error")
         self.assertTrue(result.timed_out)
         self.assertEqual(result.error, runner.CLEANUP_ERROR)
-        signal_group.assert_any_call(mock.ANY, signal.SIGKILL)
+        self.assertIn(signal.SIGTERM, signals_before_reap)
+        after_sigterm = signals_before_reap.index(signal.SIGTERM) + 1
+        self.assertIn(signal.SIGKILL, signals_before_reap[after_sigterm:])
 
 
 if __name__ == "__main__":

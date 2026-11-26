@@ -1079,8 +1079,7 @@ operator's complement and its display text. Each mutant is produced by applying 
 module's syntax tree and printing it with `ast.unparse`, then compiled with
 `compile(source, PATH, "exec")`; a mutant that does not compile is not generated. Messages keep
 the original line numbers and show the changed expression (`ast.unparse` of the changed node)
-substituted into the original source line it came from. Lines are split only on `
-`, and the
+substituted into the original source line it came from. Lines are split only on `\n`, and the
 target's span uses its UTF-8 byte offsets, so non-ASCII text, a form feed, or a Unicode line
 separator inside a string before the target cannot shift the shown line. A deleted statement is
 shown as `deleted: <first line of the statement's own source segment>`. At most
@@ -1130,9 +1129,11 @@ gone only when reading it raises `FileNotFoundError` or `ProcessLookupError`; an
 read a record is a check error naming the pid and the failure. Where the subreaper is unavailable,
 or the process table cannot be enumerated to confirm the adopted descendants stopped, the check is
 an error naming why, never a pass or a completed run.
-Runner tests check that a noisy timeout ends with SIGKILL and no cleanup error, that a group whose
-absence cannot be confirmed reports a cleanup error after SIGKILL, and that a permission failure
-reading a process record propagates from the reader.
+Runner tests check that a noisy timeout ends with SIGKILL and returns `execution == "budget"`.
+That outcome establishes that cleanup succeeded because a cleanup failure takes precedence over a
+timeout. When the group's absence cannot be confirmed, a separate test checks that the drain sends
+SIGKILL before handing off to cleanup, which then reports the error. The tests also check that a
+permission failure reading a process record propagates from the reader.
 
 `mutant_seconds` bounds one mutant's test run (default 10), `function_mutants` bounds the generated
 mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering
