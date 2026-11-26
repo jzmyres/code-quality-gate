@@ -183,7 +183,8 @@ Rules:
   is a configuration error.
 * `python_mutation` requires `base` and has no `baseline` key. `scope`, when present, is
   `changed`; `mutant_seconds` (default 10), `function_mutants` (default 20) and
-  `run_seconds` (default 300) are positive integers.
+  `run_seconds` (default 300) are positive integers. `test_runner` is `unittest` by default.
+  Set it to `pytest` to require verified collection and test execution in both copied trees.
 * `python_shape` requires `base` and `crap_check`, and has no `baseline` key. `scope`
   is `changed` or `tree`; `crap_check` names a `python_crap` check whose `threshold`
   is CPF's limit; `max_chain` is an integer of at least 1; `clone_min_tokens` is 20-49;

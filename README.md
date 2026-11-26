@@ -1057,6 +1057,7 @@ table:
     enforcement = "enforced"
     scope = "changed"                     # only changed
     base = "HEAD"                         # required; the diff base
+    test_runner = "unittest"              # optional; use "pytest" for pytest tests
     mutant_seconds = 10                   # optional; one mutant's test run
     function_mutants = 3                  # this repository's policy
     run_seconds = 300                     # optional; the whole check
@@ -1128,9 +1129,19 @@ value is a path the gate does not set itself, and no
 other variable is inherited, so no inherited path or relative traversal can reach the source
 tree. The baseline runs once for every changed function that has tests, whether or not any
 mutant is generated. A baseline that fails in this environment is a check error naming the
-failing test and saying the mutation environment is allowlisted, never a pass. The selected test
-files run in that copy with the bounded runner as
+failing test, never a pass. By default, the selected test files run in that copy with the bounded
+runner as
 `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
+
+Use `test_runner = "pytest"` to run ordinary pytest test functions and fixtures. Install pytest
+in the same Python environment that runs the gate. This mode considers `test_*.py` and
+`*_test.py` in the selected test inventory and passes the matching files directly to pytest.
+Pytest reads its configuration from the copy and starts with the copy at the front of Python's
+import path. Both runs must collect tests from the selected copied files, execute at least one
+test, and import the measured module from the copy. The mutant must collect and execute the same
+test IDs as the original. A failed assertion or explicit pytest failure in the test body kills a
+mutant. A verified passing mutant survives. Empty collection, zero execution, collection or import
+errors, fixture errors and per-mutant timeouts invalidate the check.
 
 Each run makes the check process a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)` on Linux). After
 the mutant's process group is stopped, every remaining descendant the check adopted is stopped and
@@ -1149,12 +1160,11 @@ also check that a permission failure reading a process record propagates from th
 mutants per function (default 20), and `run_seconds` bounds the whole check (default 300), covering
 generation, copying, test runs and cleanup. The deadline is checked after every copy, run, cleanup
 and temporary-directory removal, the last removal included, and each run gets the time remaining
-after its copy. A mutant that exceeds its run is `timed out` and counts as killed only when the
-original tests passed within `mutant_seconds`; if the original tests fail or exceed their own time,
-the check is an error, never a pass. A check whose total time reaches `run_seconds` stops, reports
-every function it did not finish as an `over budget` finding, and records every generated mutant
-that did not run as `not run (over budget)`; it never passes. An invalid `base` is a check error,
-never a pass.
+after its copy. In unittest mode, a mutant that exceeds its run is `timed out` and counts as killed
+only when the original tests passed within `mutant_seconds`. If the original tests fail or exceed
+their own time, the check is an error. A check whose total time reaches `run_seconds` stops and
+reports an `over budget` finding for each unfinished function. It records each generated mutant
+that did not run as `not run (over budget)`. An invalid `base` is a check error.
 
 A surviving mutant is one finding, value `1` against threshold `0`, with the exact message:
 

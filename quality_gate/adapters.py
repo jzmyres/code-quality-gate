@@ -908,7 +908,7 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "python_mutation",
-    ("scope", "base", "mutant_seconds", "function_mutants", "run_seconds"),
+    ("scope", "base", "mutant_seconds", "function_mutants", "run_seconds", "test_runner"),
     python_mutation._python_mutation_spec,
     python_mutation._run_python_mutation,
     location_coverage="complete",

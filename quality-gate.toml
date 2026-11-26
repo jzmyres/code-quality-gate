@@ -150,6 +150,7 @@ files = [
     "quality_gate/python_mutation.py",
     "quality_gate/python_shape.py",
     "quality_gate/python_tests.py",
+    "quality_gate/pytest_mutation_run.py",
     "quality_gate/test_shards.py",
     "quality_gate/variant_dispatch.py",
 ]
@@ -159,6 +160,7 @@ entry_points = [
     "quality_gate/python_mutation.py",
     "quality_gate/python_shape.py",
     "quality_gate/python_tests.py",
+    "quality_gate/pytest_mutation_run.py",
     "quality_gate/variant_dispatch.py",
 ]
 allowed_dependencies = ["core"]
