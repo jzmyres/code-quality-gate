@@ -350,6 +350,8 @@ class CloneGateTests(FixtureCase):
         )
         (self.repo / "a.py").unlink()
         self.add_file("first.py", DUPLICATE_FUNCTION)
+        self.add_file("empty.py", "")
+        self.add_file("short.py", "value = 1\n")
         self.add_file(
             "second.py",
             "def count_bytes(entries):\n"
@@ -368,6 +370,15 @@ class CloneGateTests(FixtureCase):
         result = self.run_qg("check", env=self.default_tool_env())
         text = output(result)
         self.assertEqual(result.returncode, 0, text)
+        self.assertIn("clones: 0 clones", result.stdout)
+
+    def test_real_scan_can_prove_all_inputs_are_below_the_minimum(self) -> None:
+        self.write_config(with_clones())
+        self.add_file("quality-gate-clones.toml", baseline_text([], check="clones"))
+        self.add_file("a.py", "")
+        self.add_file("short.py", "value = 1\n")
+        result = self.run_qg("check", env=self.default_tool_env())
+        self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("clones: 0 clones", result.stdout)
 
     def test_absent_baseline_with_clone_fails(self) -> None:

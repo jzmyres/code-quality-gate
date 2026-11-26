@@ -6,6 +6,7 @@ import sys
 import tempfile
 import urllib.parse
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_MIN_TOKENS = 50
+MIN_LINES = 5
 _JSCPD_FORMAT_BY_LANGUAGE = {
     language: language for language in SOURCE_LANGUAGE_BY_SUFFIX.values()
 }
@@ -336,7 +338,7 @@ def _selected_skipped(formats: dict[str, str], data: dict[str, Any]) -> list[str
     return sorted(candidates or formats)
 
 
-def _parse_jscpd_json(report: Path, formats: dict[str, str]) -> None:
+def _jscpd_sources(report: Path) -> tuple[int, dict[str, Any]]:
     data = _required_object(
         _read_report(report), report, "expected a JSON object"
     )
@@ -353,6 +355,11 @@ def _parse_jscpd_json(report: Path, formats: dict[str, str]) -> None:
         raise _no_completed(
             report, "statistics.total.sources is not an integer"
         )
+    return sources, data
+
+
+def _parse_jscpd_json(report: Path, formats: dict[str, str]) -> None:
+    sources, data = _jscpd_sources(report)
     if sources != len(formats):
         skipped = _selected_skipped(formats, data)
         raise _no_completed(
@@ -377,7 +384,7 @@ def _jscpd_command(
         "--min-tokens",
         str(min_tokens),
         "--min-lines",
-        "5",
+        str(MIN_LINES),
         "--max-size",
         str(max_bytes),
         "--ignore",
@@ -436,6 +443,54 @@ def _raise_jscpd_failure(result: Any, diagnostics: Diagnostics) -> None:
         )
 
 
+def _eligibility_command(command: list[str], output: Path, count: int) -> list[str]:
+    flags = command[:command.index("--")]
+    for name, value in (
+        ("--min-tokens", "0"), ("--min-lines", "0"),
+        ("--reporters", "json"), ("--output", str(output)),
+    ):
+        flags[flags.index(name) + 1] = value
+    return [*flags, "--complexity", "--absolute", "--summary-top", str(count),
+            *command[command.index("--"):]]
+
+
+def _input_summary(report: Path, root: Path, inputs: dict[str, str]) -> dict[str, int]:
+    data = _required_object(_read_report(report), report, "expected a JSON object")
+    summary = _required_object(data.get("summary"), report, "summary is not an object")
+    files = summary.get("files")
+    if not isinstance(files, list) or type(summary.get("totalFiles")) is not int:
+        raise _no_completed(report, "missing source eligibility inventory")
+    expected = {str((root / path).resolve()): source_format for path, source_format in inputs.items()}
+    tokens = {}
+    for row in files:
+        item = _required_object(row, report, "source eligibility row is not an object")
+        path, count = item.get("path"), item.get("tokens")
+        if not isinstance(path, str) or path in tokens or type(count) is not int or count < 0:
+            raise _no_completed(report, "invalid source eligibility row")
+        if path not in expected or expected[path] != item.get("format"):
+            raise _no_completed(report, f"unexpected source in eligibility inventory: {path}")
+        tokens[path] = count
+    if summary["totalFiles"] != len(inputs) or len(tokens) != len(inputs):
+        raise _no_completed(report, "eligibility scan did not account for every selected input")
+    return tokens
+
+
+def _physical_lines(path: Path) -> int:
+    raw = path.read_bytes()
+    return raw.count(b"\n") + int(bool(raw) and not raw.endswith(b"\n"))
+
+
+def _count_eligible(
+    command: list[str], root: Path, output: Path, inputs: dict[str, str], min_tokens: int
+) -> int:
+    mark_step("jscpd input eligibility")
+    child = run(_eligibility_command(command, output, len(inputs)), cwd=root, budget_seconds=600)
+    _raise_jscpd_failure(child, child.diagnostics())
+    tokens = _input_summary(output / "jscpd-complexity.json", root, inputs)
+    return sum(tokens[str((root / path).resolve())] >= min_tokens
+               and _physical_lines(root / path) >= MIN_LINES for path in inputs)
+
+
 def _run_jscpd(
     root: Path,
     binary: Path,
@@ -456,18 +511,25 @@ def _run_jscpd(
         mark_step("jscpd")
         result = run(command, cwd=root, budget_seconds=600)
         diagnostics = result.diagnostics()
-        _raise_jscpd_failure(result, diagnostics)
         sarif = output / "jscpd-report.sarif"
         json_report = output / "jscpd-report.json"
-        if not sarif.is_file() or not json_report.is_file():
-            raise CloneEvidenceError(
-                f"jscpd wrote no report at {sarif} or {json_report}",
-                diagnostics=diagnostics,
-            )
+        empty = (
+            result.returncode == 1
+            and "jscpd analyzed no files (--fail-on-empty)" in result.stderr_text
+            and "a reporter failed" not in result.stderr_text
+            and sarif.is_file() and json_report.is_file()
+        )
+        if not empty:
+            _raise_jscpd_failure(result, diagnostics)
         try:
             mark_step("clone report analysis")
-            clones = _parse_reports(json_report, sarif, root, formats, aliases)
-        except UnsupportedError as error:
+            clones = _parse_reports(
+                json_report, sarif, root, formats, aliases,
+                eligible=lambda: _count_eligible(command, root, output, inputs, min_tokens),
+            )
+            if empty and (clones or _jscpd_sources(json_report)[0] != 0):
+                _raise_jscpd_failure(result, diagnostics)
+        except (OSError, UnsupportedError) as error:
             raise CloneEvidenceError(
                 str(error),
                 diagnostics=diagnostics,
@@ -539,10 +601,30 @@ def _write_clone_config(config: Path, inputs: dict[str, str]) -> None:
 
 def _parse_reports(
     json_report: Path, sarif: Path, root: Path, formats: dict[str, str],
-    aliases: dict[str, str],
+    aliases: dict[str, str], *, eligible: Callable[[], int],
 ) -> list[Clone]:
-    _parse_jscpd_json(json_report, formats)
+    if not sarif.is_file() or not json_report.is_file():
+        raise _no_completed(json_report, f"jscpd wrote no report at {sarif} or {json_report}")
+    _prove_source_count(json_report, formats, eligible)
     return _parse_sarif(sarif, root, aliases)
+
+
+def _prove_source_count(
+    json_report: Path, formats: dict[str, str], eligible: Callable[[], int]
+) -> None:
+    sources, _ = _jscpd_sources(json_report)
+    if sources == len(formats):
+        return
+    try:
+        expected = eligible()
+    except (OSError, UnsupportedError) as error:
+        try:
+            _parse_jscpd_json(json_report, formats)
+        except UnsupportedError as original:
+            raise UnsupportedError(f"{original}; eligibility scan failed: {error}") from error
+        raise
+    if sources != expected:
+        _parse_jscpd_json(json_report, formats)
 
 
 def _clone_findings(clones: list[Clone], files: list[str]) -> list[Finding]:
