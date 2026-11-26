@@ -12,19 +12,14 @@ from itertools import batched
 from pathlib import Path
 from typing import Any
 
-from .files import GitFile, _parent_fd
 from .json_input import load_json
-from .policy import _check_keys, _config_error, _string, _unique, _validate_exact_path
-from .runner import RunResult
 
 _MAX_FILES_PER_INVOCATION = 24
 _FINDINGS_EXIT = 3
 _MAX_RECORD_BYTES = 16 << 20
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-# Betterleaks v1.10.1 locates the entire regex match, including the key suffix.
 _ASSIGNMENT = re.compile(rb'[A-Za-z0-9_.-]+"[ \t]*:[ \t]*"([0-9a-f]{64})"')
 _MARKER = "verified-provenance-position"
-_PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
+_OpenParent = Callable[[Path, str], int]
 
 
 @dataclass(frozen=True)
@@ -33,46 +28,6 @@ class Provenance:
     pointer: tuple[str, ...]
     payload: str
     payload_sha256: str
-
-
-def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
-    if not pointer.startswith("/") or re.search(r"~(?:[^01]|$)", pointer):
-        raise _config_error(path, where, "a non-root JSON Pointer", "invalid syntax")
-    return tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:])
-
-
-def _parse_provenance(row: Any, path: Path, where: str) -> Provenance:
-    if not isinstance(row, dict):
-        raise _config_error(path, where, "a table", type(row).__name__)
-    _check_keys(row, _PROVENANCE_FIELDS, path, where)
-    record, pointer, payload, digest = (
-        _string(row, field, path, f"{where}.{field}") for field in _PROVENANCE_FIELDS
-    )
-    _validate_exact_path(path, f"{where}.record", record)
-    _validate_exact_path(path, f"{where}.payload", payload)
-    if not record.endswith(".json") or record == payload:
-        raise _config_error(path, where, "a .json record and a separate payload", "invalid paths")
-    if not _SHA256.fullmatch(digest):
-        raise _config_error(path, f"{where}.payload_sha256", "64 lowercase hex digits", "invalid value")
-    return Provenance(record, _read_pointer(pointer, path, f"{where}.pointer"), payload, digest)
-
-
-def provenance_spec(raw: dict[str, Any], path: Path, key: str) -> tuple[Provenance, ...]:
-    name = f"{key}.sha256_provenance"
-    rows = raw.get("sha256_provenance", [])
-    if not isinstance(rows, list):
-        raise _config_error(path, name, "an array of tables", type(rows).__name__)
-    declarations = []
-    seen: set[tuple[str, tuple[str, ...]]] = set()
-    for index, row in enumerate(rows):
-        where = f"{name}[{index}]"
-        declaration = _parse_provenance(row, path, where)
-        _unique(
-            seen, (declaration.record, declaration.pointer), path, where,
-            "a unique record and pointer", "duplicate", _config_error,
-        )
-        declarations.append(declaration)
-    return tuple(declarations)
 
 
 def _copy_regular(parent: int, name: str, destination: Path, relative: str) -> None:
@@ -84,9 +39,9 @@ def _copy_regular(parent: int, name: str, destination: Path, relative: str) -> N
             shutil.copyfileobj(source, target)
 
 
-def _copy_input(root: Path, destination: Path, relative: str) -> bool | None:
+def _copy_input(root: Path, destination: Path, relative: str, open_parent: _OpenParent) -> bool | None:
     """Capture a file without following links. Return whether the source was regular."""
-    parent = _parent_fd(root, relative)
+    parent = open_parent(root, relative)
     name = Path(relative).name
     try:
         mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
@@ -104,13 +59,15 @@ def _copy_input(root: Path, destination: Path, relative: str) -> bool | None:
         os.close(parent)
 
 
-def _snapshot(root: Path, directory: Path, selected: Iterable[str]) -> dict[str, bool]:
+def _snapshot(
+    root: Path, directory: Path, selected: Iterable[str], open_parent: _OpenParent,
+) -> dict[str, bool]:
     paths = {}
     for relative in selected:
         parent = (root / relative).parent
         if parent.resolve() != parent:
             continue
-        regular = _copy_input(root, directory / relative, relative)
+        regular = _copy_input(root, directory / relative, relative, open_parent)
         if regular is not None:
             paths[relative] = regular
     return paths
@@ -126,9 +83,9 @@ def _scanner_argv(binary: Path) -> list[str]:
 
 def scan(
     binary: Path, root: Path, directory: Path, selected: Iterable[str], budget: float,
-    *, run: Callable[..., Any],
+    *, open_parent: _OpenParent, run: Callable[..., Any],
 ) -> Any:
-    paths = sorted(_snapshot(root, directory, selected))
+    paths = sorted(_snapshot(root, directory, selected, open_parent))
     argv = [*_scanner_argv(binary), "--verbose", "--legacy-print", "--"]
     failed = None
     for targets in batched(paths or ["."], _MAX_FILES_PER_INVOCATION):
@@ -221,6 +178,7 @@ def _matched_span(finding: dict[str, Any], record: _Record) -> tuple[int, int] |
 def _matched_digest(
     finding: dict[str, Any], data: bytes, span: tuple[int, int] | None,
 ) -> tuple[int, int, str] | None:
+    """Extract the digest from the full match, which includes the key suffix."""
     if span is None:
         return None
     start, end = span
@@ -236,12 +194,12 @@ def _matched_digest(
 
 
 def _proves_pointer(record: _Record, start: int, end: int, digest: str) -> bool:
+    """Bind the matched bytes to the pointer by substituting a marker in memory."""
     pointers = record.pointers.get(digest)
     if not pointers:
         return False
     try:
         original = load_json(record.data.decode("utf-8"))
-        # Prove which pointer refers to these bytes even when the same digest occurs elsewhere.
         marked_bytes = record.data[:start] + _MARKER.encode("ascii") + record.data[end:]
         marked = load_json(marked_bytes.decode("utf-8"))
     except (ValueError, RecursionError):
@@ -275,7 +233,7 @@ def _eligible_finding(finding: dict[str, Any], records: dict[str, _Record]) -> b
     return digest is not None and _proves_pointer(record, *digest)
 
 
-def _decode_report(child: RunResult) -> list[Any]:
+def _decode_report(child: Any) -> list[Any]:
     if child.output_truncated:
         raise ValueError("Betterleaks report was truncated")
     try:
@@ -295,7 +253,7 @@ def _finding_metadata(finding: Any) -> bool:
     )
 
 
-def _report(child: RunResult) -> list[dict[str, Any]]:
+def _report(child: Any) -> list[dict[str, Any]]:
     if child.returncode not in (0, _FINDINGS_EXIT):
         raise ValueError(f"Betterleaks scan failed with exit {child.returncode}")
     findings = _decode_report(child)
@@ -304,7 +262,7 @@ def _report(child: RunResult) -> list[dict[str, Any]]:
     return findings
 
 
-def _report_findings(child: RunResult, records: dict[str, _Record]) -> tuple[int, int]:
+def _report_findings(child: Any, records: dict[str, _Record]) -> tuple[int, int]:
     findings = _report(child)
     verified = 0
     for finding in findings:
@@ -321,19 +279,19 @@ def _report_findings(child: RunResult, records: dict[str, _Record]) -> tuple[int
 
 @dataclass(frozen=True)
 class VerifiedScan:
-    child: RunResult
+    child: Any
     unresolved: int
     verified: int
 
 
 def scan_verified(
-    binary: Path, root: Path, directory: Path, entries: list[GitFile], budget: float,
-    declarations: tuple[Provenance, ...], *, run: Callable[..., RunResult],
+    binary: Path, root: Path, directory: Path, selected: Iterable[str], budget: float,
+    declarations: tuple[Provenance, ...], *,
+    tracked: set[str], open_parent: _OpenParent, run: Callable[..., Any],
 ) -> VerifiedScan:
-    paths = _snapshot(root, directory, (entry.path for entry in entries))
-    tracked = {entry.path for entry in entries if entry.mode in ("100644", "100755")}
-    selected = _selected_provenance(paths, tracked, declarations)
-    records = _verified_records(directory, _pinned_payloads(directory, selected))
+    paths = _snapshot(root, directory, selected, open_parent)
+    candidates = _selected_provenance(paths, tracked, declarations)
+    records = _verified_records(directory, _pinned_payloads(directory, candidates))
     argv = [
         *_scanner_argv(binary), f"--exit-code={_FINDINGS_EXIT}",
         "--report-format=json", "--report-path=-", "--",
@@ -343,7 +301,7 @@ def scan_verified(
 
 def _scan_reports(
     argv: list[str], directory: Path, paths: list[str], records: dict[str, _Record], budget: float,
-    run: Callable[..., RunResult],
+    run: Callable[..., Any],
 ) -> VerifiedScan:
     unresolved = verified = 0
     with_findings = None

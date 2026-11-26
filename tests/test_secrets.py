@@ -18,7 +18,7 @@ from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase
 
-from quality_gate import adapters, checks, runner, secrets, tools
+from quality_gate import adapters, checks, files, runner, secrets, tools
 from quality_gate.policy import ConfigError, load_config
 
 DECLARATION = """
@@ -281,7 +281,8 @@ class SecretsTests(FixtureCase):
         stderr = io.BytesIO()
         with contextlib.redirect_stderr(io.TextIOWrapper(stderr, encoding="utf-8")):
             result = secrets.scan(
-                Path(sys.executable), self.repo, self.evidence, selected, 600, run=launch,
+                Path(sys.executable), self.repo, self.evidence, selected, 600,
+                open_parent=files._parent_fd, run=launch,
             )
             self.assertEqual(stderr.getvalue(), first.stdout + first.stderr)
         self.assertIs(result, first)
@@ -412,7 +413,7 @@ payload_sha256 = "{digest}"
                 with self.assertRaisesRegex(ValueError, "Betterleaks"):
                     secrets.scan_verified(
                         Path(sys.executable), self.repo, self.evidence, [], 60, (),
-                        run=mock.Mock(return_value=child),
+                        tracked=set(), open_parent=files._parent_fd, run=mock.Mock(return_value=child),
                     )
 
     def test_provenance_declarations_reject_invalid_rows(self) -> None:
@@ -420,7 +421,7 @@ payload_sha256 = "{digest}"
             "record": "report.json", "pointer": "/a~1b/~0c",
             "payload": "data.raw", "payload_sha256": "0" * 64,
         }
-        valid = secrets.provenance_spec({"sha256_provenance": [row]}, self.config_path, "secrets")
+        valid = adapters._secrets_provenance({"sha256_provenance": [row]}, self.config_path, "secrets")
         self.assertEqual(valid[0].pointer, ("a/b", "~c"))
         for invalid in (
             {}, [42], [dict(row, record="report.txt")], [dict(row, payload="report.json")],
@@ -428,7 +429,7 @@ payload_sha256 = "{digest}"
             [dict(row, pointer="/a~2b")], [row, row],
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
-                secrets.provenance_spec({"sha256_provenance": invalid}, self.config_path, "secrets")
+                adapters._secrets_provenance({"sha256_provenance": invalid}, self.config_path, "secrets")
 
     def test_unattested_match_locations_do_not_verify(self) -> None:
         digest = hashlib.sha256(b"example source").hexdigest()
