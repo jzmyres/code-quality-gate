@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
@@ -27,18 +27,24 @@ from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
+    ConfigError,
     GateError,
     UnsupportedError,
+    _STRING,
     _check_keys,
     _config_error,
     _describe,
     _number,
     _optional_string_list,
+    _read_scalar,
     _string,
     _string_list,
+    _unique,
 )
 from .runner import Diagnostics, RunResult, RunTimeout, execution_outcome, mark_step, remaining_budget, run
 from .tools import tool_binary
+
+is_files_argument = command.is_files_argument
 
 if TYPE_CHECKING:
     from .checks import CheckSelection
@@ -64,6 +70,12 @@ class AdapterContext:
     evidence_dir: Path
     base_override: DiffBaseOverride | None = None
     selection: CheckSelection | None = None
+    inventory_files: list[str] | None = None
+
+
+def _inventory_files(context: AdapterContext) -> list[str]:
+    inventory = getattr(context, "inventory_files", None)
+    return context.files if inventory is None else inventory
 
 
 @dataclass(frozen=True)
@@ -98,6 +110,7 @@ class AdapterDescriptor:
     entry_direction: Callable[[str, str], str] | None = None
     parse_candidate_inputs: bool = False
     no_tests_hint: str = ""
+    file_selection: Literal["expanded", "affected"] | None = None
     runs_suite: bool = field(kw_only=True)
 
     def allowed_keys(self) -> tuple[str, ...]:
@@ -217,7 +230,7 @@ def _graph_modules(
         key = f"checks.{context.check.id}.classes"
         known = ", ".join(sorted(context.config.classes))
         raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
-    selected = sorted(path for path in context.files if context.classes.get(path) in spec.classes)
+    selected = sorted(path for path in _inventory_files(context) if context.classes.get(path) in spec.classes)
     languages = source_languages(context.root, selected, context.config, context.classes)
     modules: dict[str, list[str]] = {"python": [], "lisp": [], "bash": []}
     for path, language in languages.items():
@@ -757,8 +770,34 @@ ADAPTERS: dict[str, AdapterDescriptor] = {}
 
 
 def register_adapter(descriptor: AdapterDescriptor) -> AdapterDescriptor:
-    ADAPTERS[descriptor.name] = descriptor
+    name = descriptor.name
+    label = f"adapter {name!r}"
+    if name in ADAPTERS:
+        raise ValueError(f"{label}: duplicate name")
+    mode = descriptor.file_selection
+    if mode is not None and (not isinstance(mode, str) or mode not in ("expanded", "affected")):
+        raise ValueError(f"{label}: file_selection must be 'expanded', 'affected', or None")
+    _validate_adapter_keys(descriptor.keys, label)
+    if not callable(descriptor.budget):
+        raise ValueError(f"{label}: budget must be callable")
+    ADAPTERS[name] = descriptor
     return descriptor
+
+
+def _validate_adapter_keys(keys: tuple[str, ...], label: str) -> None:
+    if not isinstance(keys, tuple):
+        raise ValueError(f"{label}: keys must be a tuple")
+    seen = set(COMMON_CHECK_KEYS)
+    try:
+        for index, key in enumerate(keys):
+            field = f"keys[{index}]"
+            _read_scalar(label, field, key, _STRING)
+            _unique(
+                seen, key, label, field, "a distinct adapter key", f"duplicate or reserved key {key!r}",
+                _config_error,
+            )
+    except ConfigError as error:
+        raise ValueError(str(error)) from error
 
 
 def remove_adapter(name: str) -> None:
@@ -803,6 +842,7 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     subject_noun="character",
     failure_wording="occurrences",
+    file_selection="expanded",
     runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
@@ -829,6 +869,7 @@ register_adapter(AdapterDescriptor(
     elisp_lint.run_lint,
     budget=_spec_budget,
     parse_candidate_inputs=True,
+    file_selection="affected",
     runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
@@ -838,6 +879,7 @@ register_adapter(AdapterDescriptor(
     elisp_lint.run_lint,
     budget=_spec_budget,
     parse_candidate_inputs=True,
+    file_selection="affected",
     runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(
@@ -848,6 +890,7 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="python_tests",
+    file_selection="expanded",
     runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
@@ -886,6 +929,7 @@ register_adapter(AdapterDescriptor(
     location_coverage="complete",
     display=lambda value: f"{value:.1f}",
     requires_adapter="elisp_tests",
+    file_selection="expanded",
     runs_suite=True,
 ))
 register_adapter(AdapterDescriptor(
@@ -920,6 +964,7 @@ register_adapter(AdapterDescriptor(
     (),
     _comments_spec,
     _run_comments,
+    file_selection="expanded",
     runs_suite=False,
 ))
 register_adapter(AdapterDescriptor(

@@ -6,7 +6,7 @@ import operator
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 if TYPE_CHECKING:
     from .ratchet import BaselineEntry
@@ -129,7 +129,7 @@ class Config:
     shared_base: str | None = None
 
 
-def _config_error(path: Path, key: str, expected: str, actual: str) -> ConfigError:
+def _config_error(path: Path | str, key: str, expected: str, actual: str) -> ConfigError:
     return ConfigError(f"{path}: {key}: expected {expected}, got {actual}")
 
 
@@ -139,14 +139,17 @@ def _describe(value: object) -> str:
     return type(value).__name__
 
 
+_Location = TypeVar("_Location", Path, str)
+
+
 def _unique(
     seen: set[Any],
     key: Any,
-    path: Path,
+    path: _Location,
     where: str,
     expected: str,
     actual: str,
-    error: Callable[[Path, str, str, str], Exception],
+    error: Callable[[_Location, str, str, str], Exception],
 ) -> None:
     if key in seen:
         raise error(path, where, expected, actual)
@@ -255,7 +258,7 @@ _INTEGER_LIST = _ValueRule(
 
 
 def _read_scalar(
-    path: Path,
+    path: Path | str,
     full_key: str,
     value: Any,
     rule: _ValueRule,

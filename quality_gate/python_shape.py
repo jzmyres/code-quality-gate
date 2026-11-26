@@ -489,9 +489,11 @@ def _scan_files(
     Every Python file the check selects counts, whatever its name: a helper
     called from a selected program without the .py suffix has two call sites.
     """
+    from .adapters import _inventory_files
+
     measured = set(scoped)
     indexes: dict[str, FileIndex] = {}
-    for relative in context.files:
+    for relative in _inventory_files(context):
         if relative in measured or not is_python_program(
             context.root, relative
         ):

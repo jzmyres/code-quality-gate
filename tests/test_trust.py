@@ -729,6 +729,7 @@ class StubFloorTrustTests(TrustCase):
             default_direction="min",
             entry_direction=lambda _subject, _configured: "min",
         )
+        adapters.remove_adapter(descriptor.name)
         adapters.register_adapter(descriptor)
         prepared = prepare_trust(self.repo, self.directory, [])
         self.addCleanup(prepared.close)

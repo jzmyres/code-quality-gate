@@ -16,6 +16,7 @@ from unittest import mock
 from support import GATE, FixtureCase, baseline_text, stub_check_result, with_clones
 from test_python_tests import tests_config
 
+from quality_gate.files import DiffBaseOverride
 from quality_gate.python_tests import _parse_python_tests
 
 sys.path.insert(0, str(GATE))
@@ -142,6 +143,54 @@ enforcement = "enforced"
 baseline = "verification.toml"
 """
 
+COVERAGE_CONFIG = STUB_CONFIG.replace(
+    'checks = ["stub"]', 'checks = ["python-measure", "elisp-measure"]',
+).split("[checks.stub]")[0] + r"""
+[checks.python-suite]
+adapter = "python_tests"
+tier = 1
+enforcement = "enforced"
+run = ["python3", "-m", "unittest"]
+tests_pattern = 'Ran (\d+) tests'
+
+[checks.python-measure]
+adapter = "python_crap"
+tier = 1
+enforcement = "enforced"
+requires = "python-suite"
+
+[checks.elisp-suite]
+adapter = "elisp_tests"
+tier = 1
+enforcement = "enforced"
+suite = "suite.el"
+
+[checks.elisp-measure]
+adapter = "elisp_crap"
+tier = 1
+enforcement = "enforced"
+requires = "elisp-suite"
+
+[checks.bridge]
+adapter = "coverage-bridge"
+tier = 1
+enforcement = "enforced"
+requires = "elisp-measure"
+
+[checks.verify]
+adapter = "verification"
+tier = 1
+enforcement = "enforced"
+requires = "bridge"
+"""
+
+
+def parse_coverage_bridge(
+    raw: dict[str, object], _root: Path, path: Path, full_key: str,
+) -> adapters.ParsedSpec:
+    requires = policy._string(raw, "requires", path, f"{full_key}.requires")
+    return adapters.ParsedSpec(StubSpec(1), "stub/1", ("tests",), requires=requires)
+
 
 def _package_imports(tree: ast.AST):
     for node in ast.walk(tree):
@@ -204,19 +253,69 @@ class AdapterRegistrationTests(unittest.TestCase):
                     )
 
     def test_shipped_adapters_register_unchanged(self) -> None:
-        names = (
-            "command", "clones", "source_chars", "python_tests",
-            "elisp_tests", "elisp_compile", "elisp_checkdoc",
-            "python_crap", "python_shape", "python_mutation", "variant_dispatch",
-            "elisp_crap", "verification",
+        descriptors = tuple(adapters.ADAPTERS.values())
+        modes = {
+            "source_chars": "expanded",
+            "python_crap": "expanded",
+            "elisp_crap": "expanded",
+            "comments": "expanded",
+            "elisp_compile": "affected",
+            "elisp_checkdoc": "affected",
+        }
+        self.assertEqual(
+            {item.name: item.file_selection for item in descriptors},
+            {name: modes.get(name) for name in adapters.ADAPTERS} | modes,
         )
-        descriptors = [adapters.adapter_for(name) for name in names]
         with mock.patch.dict(adapters.ADAPTERS, clear=True):
             for descriptor in descriptors:
                 with self.subTest(adapter=descriptor.name):
                     self.assertIs(adapters.register_adapter(descriptor), descriptor)
                     self.assertIs(adapters.adapter_for(descriptor.name), descriptor)
-            self.assertEqual(adapters.adapter_names(), names)
+            self.assertEqual(adapters.adapter_names(), tuple(item.name for item in descriptors))
+
+    def assert_rejected(self, descriptor: adapters.AdapterDescriptor, field: str) -> None:
+        before = tuple(adapters.ADAPTERS.items())
+        with self.assertRaises(ValueError) as caught:
+            adapters.register_adapter(descriptor)
+        self.assertIn(descriptor.name, str(caught.exception))
+        self.assertIn(field, str(caught.exception))
+        self.assertEqual(adapters.adapter_names(), tuple(name for name, _ in before))
+        for name, original in before:
+            self.assertIs(adapters.ADAPTERS[name], original, name)
+
+    def test_occupied_names_are_rejected(self) -> None:
+        for name, descriptor in tuple(adapters.ADAPTERS.items()):
+            with self.subTest(adapter=name):
+                self.assert_rejected(descriptor, "duplicate name")
+                self.assert_rejected(dataclasses.replace(STUB, name=name), "duplicate name")
+
+    def test_invalid_metadata_is_rejected(self) -> None:
+        descriptor = dataclasses.replace(STUB, name="unregistered-fixture")
+        cases = [
+            ("file_selection", "all"),
+            ("file_selection", ["expanded"]),
+            ("keys", ["count"]),
+            ("keys", ("count", 42)),
+            ("keys", ("count", "")),
+            ("keys", ("count", " \t")),
+            ("keys", ("count", "count")),
+            *(("keys", ("count", key)) for key in policy.COMMON_CHECK_KEYS),
+            ("budget", 10),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                self.assert_rejected(dataclasses.replace(descriptor, **{field: value}), field)
+
+    def test_registration_leaves_the_budget_provider_unevaluated(self) -> None:
+        def budget(spec: StubSpec) -> int:
+            return spec.count
+
+        provider = mock.Mock(wraps=budget)
+        descriptor = dataclasses.replace(STUB, name="lazy-budget-fixture", budget=provider)
+        with mock.patch.dict(adapters.ADAPTERS):
+            self.assertIs(adapters.register_adapter(descriptor), descriptor)
+            self.assertIs(adapters.adapter_for(descriptor.name), descriptor)
+            provider.assert_not_called()
 
 
 class CheckDependencyTests(unittest.TestCase):
@@ -301,6 +400,154 @@ class StubAdapterTests(unittest.TestCase):
     def config(self, text: str) -> policy.Config:
         (self.root / "quality-gate.toml").write_text(text, encoding="utf-8")
         return policy.load_config(self.root)
+
+    def test_descriptor_selection_controls_the_runner_and_report(self) -> None:
+        initializer, seed = "pkg/__init__.py", "pkg/seed.py"
+        dependent, unrelated, external = "consumer.py", "unrelated.py", "external.py"
+        classes = dict.fromkeys((initializer, seed, dependent, unrelated), "python") | {external: "other"}
+        expanded = {initializer: "changed", seed: f"package initializer {initializer} changed"}
+        affected = expanded | {dependent: f"depends on {seed}", external: f"depends on {dependent}"}
+        graph = (set(classes), expanded, affected)
+        incomplete_graph = (set(classes) - {unrelated}, expanded, affected)
+        for name, mode, reasons in (
+            ("fixture-expand", "expanded", expanded),
+            ("fixture-depend", "affected", affected),
+            ("fixture-full", None, {}),
+        ):
+            runner = mock.Mock(side_effect=self.run_selection_stub)
+            descriptor = dataclasses.replace(STUB, name=name, file_selection=mode, run=runner)
+            adapters.register_adapter(descriptor)
+            self.addCleanup(adapters.remove_adapter, name)
+            config = self.config(STUB_CONFIG.replace('adapter = "stub"', f'adapter = "{name}"') + """
+[classes.other]
+code = true
+description = "Other source"
+""")
+            check = config.checks["stub"]
+            inputs = {
+                path for path, class_name in classes.items()
+                if check.id in config.classes[class_name].checks
+            }
+            full_override = f"full run: unplaced file {unrelated}"
+            default_reason = "full run" if mode is None else None
+            for case, changed, facts, expected_reasons, full in (
+                ("changed", {initializer}, graph, reasons, default_reason),
+                ("clean", set(), graph, {}, default_reason),
+                ("full override", {initializer, unrelated}, incomplete_graph, reasons, full_override),
+            ):
+                with self.subTest(adapter=name, check=check.id, case=case):
+                    runner.reset_mock()
+                    result = self.run_selection(config, check, classes, changed, facts)
+                    selected = (
+                        dict.fromkeys(inputs, full) if full else
+                        {path: expected_reasons[path] for path in inputs & expected_reasons.keys()}
+                    )
+                    left_out = dict.fromkeys(inputs - selected.keys(), checks.OUTSIDE_SCOPE)
+                    reason = full or ("affected files" if selected else checks.OUTSIDE_SCOPE)
+                    report = result.to_json()["selection"]
+                    self.assertDictEqual(report["selected"], selected, f"{check.id} selected inputs")
+                    self.assertDictEqual(report["left_out"], left_out, f"{check.id} left-out inputs")
+                    self.assertEqual(report["reason"], reason, check.id)
+                    if selected:
+                        runner.assert_called_once()
+                        context = runner.call_args.args[0]
+                        self.assertEqual(context.files, sorted(selected), check.id)
+                        self.assertCountEqual(context.inventory_files, classes, check.id)
+                    else:
+                        runner.assert_not_called()
+                        self.assertEqual(result.execution, "not_run", check.id)
+
+    def run_selection(self, config, check, classes, changed, graph):
+        with (
+            tempfile.TemporaryDirectory(dir=self.root) as directory,
+            mock.patch.object(checks, "affected_graph", return_value=graph),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            return checks._policy_results(
+                self.root, config, sorted(classes), classes, 0, [check],
+                DiffBaseOverride(changed_paths=frozenset(changed)), Path(directory), False,
+            )[0]
+
+    @staticmethod
+    def run_selection_stub(context: adapters.AdapterContext) -> checks.CheckResult:
+        assert context.selection is not None
+        context.selection.selected.clear()
+        result = run_stub(context)
+        result.report_fields["selection"] = {"reason": "adapter report"}
+        return result
+
+    def test_parsed_command_selection_uses_only_an_exact_files_argument(self) -> None:
+        import json
+
+        for argument, suite, mode in (
+            ("{files}", False, "affected"),
+            ("prefix={files}", False, None),
+            ("{files}\n", False, None),
+            ("{files}", True, None),
+        ):
+            with self.subTest(argument=argument, suite=suite):
+                run = json.dumps([sys.executable, "-c", "print('Ran 1 test')", argument])
+                config_text = STUB_CONFIG.replace('adapter = "stub"', 'adapter = "command"')
+                config_text = config_text.replace("count = 4", f"run = {run}")
+                if suite:
+                    config_text += "\ntests_pattern = 'Ran ([0-9]+) test'\n"
+                config = self.config(config_text)
+                check = config.checks["stub"]
+                self.assertEqual(checks._file_selection_mode(check), mode, check.id)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    result = checks.run_check(
+                        self.root, config, check, ["a.py"], {"a.py": "python"},
+                        prefix="check: stub", evidence_dir=self.root,
+                    )
+                    empty = checks.run_check(
+                        self.root, config, check, [], {}, prefix="check: stub", evidence_dir=self.root,
+                    )
+                self.assertEqual(result.outcome, "pass", result.reason)
+                expected = "a.py" if argument == "{files}" else argument
+                self.assertEqual(result.diagnostics.argv[-1], expected)
+                if argument == "{files}":
+                    self.assertIn("no files selected", empty.reason)
+                else:
+                    self.assertEqual(empty.outcome, "pass", empty.reason)
+
+    def test_coverage_suites_are_scheduled_by_runtime_and_dependencies(self) -> None:
+        descriptor = dataclasses.replace(
+            STUB, name="coverage-bridge", keys=("requires",), parse=parse_coverage_bridge,
+        )
+        adapters.register_adapter(descriptor)
+        self.addCleanup(adapters.remove_adapter, descriptor.name)
+        (self.root / "suite.el").touch()
+        config = self.config(COVERAGE_CONFIG)
+        measures = [check for check in config.checks.values() if "crap" in check.evidence]
+        for case, changed, targets, should_run in (
+            ("changed", {"a.py"}, measures, True),
+            ("clean", set(), measures, False),
+            ("forced", set(), [config.checks["verify"]], True),
+        ):
+            with self.subTest(case=case):
+                scheduled = [config.checks[name] for name in checks._needed_order(config, targets)]
+                graph = ({"a.py"}, {"a.py": "changed"}, {"a.py": "changed"})
+                with (
+                    mock.patch.object(checks, "affected_graph", return_value=graph),
+                    mock.patch.object(checks, "_require_coverage", create=True,
+                                      side_effect=AssertionError("planner invoked coverage repair")),
+                ):
+                    plan = checks._affected_selection(
+                        self.root, config, ["a.py"], {"a.py": "python"}, self.root,
+                        frozenset(changed), scheduled, None,
+                    )
+                running = {name for name, selection in plan.items() if not selection.skip}
+                for measure in measures:
+                    self.assertEqual(measure.id in running, should_run, measure.id)
+                    if measure.id in running:
+                        missing = set(measure.required) - running
+                        self.assertFalse(
+                            missing, f"{measure.id} is missing required suites {sorted(missing)}",
+                        )
+                if case == "forced":
+                    for measure in measures:
+                        for suite in measure.required:
+                            self.assertEqual(plan[suite].reason, "full run: required by verify", suite)
 
     def test_stub_is_parsed_run_and_displayed_through_the_registry(self) -> None:
         config = self.config(STUB_CONFIG)
@@ -392,8 +639,9 @@ class StubAdapterTests(unittest.TestCase):
             ("", "existing", "added"),
             ("widget", "widget existing", "new widget added"),
         ):
-            descriptor = dataclasses.replace(STUB, subject_noun=noun)
+            descriptor = dataclasses.replace(STUB, name=f"subject-{noun or 'empty'}", subject_noun=noun)
             adapters.register_adapter(descriptor)
+            self.addCleanup(adapters.remove_adapter, descriptor.name)
             for adapter in (descriptor, descriptor.name):
                 with self.subTest(noun=noun, adapter=adapter):
                     errors = io.StringIO()

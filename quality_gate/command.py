@@ -87,38 +87,31 @@ def _file_argument(name: str) -> str:
     return f"./{name}" if name.startswith("-") else name
 
 
-@dataclass
-class _RunExpansion:
-    files: list[str]
+def is_files_argument(argument: str) -> bool:
+    return argument == "{files}"
 
 
-_EXPANSION = re.compile(
-    r"(?P<files>\{files\})"
-    r"|(?P<tool>\{tool:(?P<name>[^{}]+)\})"
-    r"|(?P<literal>.*)",
-    re.DOTALL,
-)
+_TOOL_ARGUMENT = re.compile(r"\{tool:(?P<name>[^{}]+)\}")
 
 
 def _expand_run(
     check: CheckDef, files: list[str]
 ) -> tuple[list[str], str | None]:
     spec = check.spec
-    state = _RunExpansion([_file_argument(name) for name in files])
+    file_arguments = [_file_argument(name) for name in files]
     expanded: list[str] = []
     for argument in spec.run:
-        match = _EXPANSION.fullmatch(argument)
-        assert match is not None
-        if match.lastgroup == "tool":
+        if is_files_argument(argument):
+            expanded.extend(file_arguments)
+            continue
+        match = _TOOL_ARGUMENT.fullmatch(argument)
+        if match is not None:
             try:
                 expanded.append(str(tool_binary(match.group("name"))))
             except UnsupportedError as error:
                 return [], str(error)
             continue
-        if match.lastgroup == "files":
-            expanded.extend(state.files)
-        else:
-            expanded.append(argument)
+        expanded.append(argument)
     return expanded, None
 
 
@@ -363,7 +356,7 @@ def _run_command(context: Any) -> Any:
 
     root, check, prefix = context.root, context.check, context.prefix
     spec, start, selected, names = _adapter_selection(context)
-    if "{files}" in spec.run and not selected:
+    if any(map(is_files_argument, spec.run)) and not selected:
         return _command_failure(
             check,
             spec,

@@ -17,15 +17,17 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from . import gate_result
 from .adapters import (
     AdapterContext,
+    AdapterDescriptor,
     GraphExtraction,
     adapter_for,
     affected_graph,
     extract_contract_graph,
+    is_files_argument,
     module_contract_findings,
     module_ownership,
 )
@@ -502,7 +504,7 @@ def _policy_order(config: Config, needed: set[str]) -> list[str]:
     return [identifier for identifier in config.checks if identifier in needed]
 
 
-def _check_descriptor(check: CheckDef) -> Any:
+def _check_descriptor(check: CheckDef) -> AdapterDescriptor:
     descriptor = adapter_for(check.adapter)
     if descriptor is None:
         raise GateError(f"unsupported adapter {check.adapter!r}")
@@ -522,8 +524,8 @@ def _adapter_runner(
     selection: CheckSelection | None = None,
 ) -> CheckResult:
     context = AdapterContext(
-        root, config, check, files, classes, prefix, prior, evidence_dir,
-        base_override, selection,
+        root, config, check, files if selection is None else selection.files,
+        classes, prefix, prior, evidence_dir, base_override, selection, inventory_files=files,
     )
     return _check_descriptor(check).run(context)
 
@@ -843,14 +845,13 @@ class CheckSelection:
     reason: str
     skip: bool = False
     full_suite: str | None = None
+    files: list[str] = field(default_factory=list)
+    adapter_report: bool = False
 
     def report(self) -> dict[str, Any]:
-        return {"selected": self.selected, "left_out": self.left_out, "reason": self.reason}
+        return {"selected": self.selected.copy(), "left_out": self.left_out.copy(), "reason": self.reason}
 
 
-DEPENDENT_FILE_ADAPTERS = frozenset({"elisp_compile", "elisp_checkdoc"})
-CRAP_ADAPTERS = frozenset({"python_crap", "elisp_crap"})
-CHANGED_FILE_ADAPTERS = CRAP_ADAPTERS | {"source_chars", "comments"}
 OUTSIDE_SCOPE = "no changed file affects this input"
 RUNTIME_SUITE_REASON = "full run: suite runtime inputs are undeclared"
 
@@ -859,10 +860,11 @@ def _command_suite(check: CheckDef) -> bool:
     return check.adapter == "command" and "tests" in check.evidence
 
 
-def _per_file(check: CheckDef) -> bool:
-    return check.adapter in DEPENDENT_FILE_ADAPTERS | CHANGED_FILE_ADAPTERS or (
-        check.adapter == "command" and "{files}" in check.spec.run and not _command_suite(check)
-    )
+def _file_selection_mode(check: CheckDef) -> Literal["expanded", "affected"] | None:
+    if check.adapter == "command" and not _command_suite(check):
+        if any(map(is_files_argument, check.spec.run)):
+            return "affected"
+    return _check_descriptor(check).file_selection
 
 
 def _global_input(config: Config, classes: dict[str, str], changed: frozenset[str]) -> str | None:
@@ -904,14 +906,17 @@ def _file_scope(
     check: CheckDef, files: list[str], expanded: dict[str, str],
     affected: dict[str, str], full: str | None,
 ) -> CheckSelection:
-    per_file = _per_file(check)
-    if not per_file:
+    mode = _file_selection_mode(check)
+    if mode is None:
         reason = full or "full run"
-        return CheckSelection(dict.fromkeys(files, reason), {}, reason)
+        return CheckSelection(
+            dict.fromkeys(files, reason), {}, reason, files=files,
+            adapter_report=check.adapter == "python_shape",
+        )
     if full is not None:
         reason = full if files else f"{full} (no files in the input class)"
-        return CheckSelection(dict.fromkeys(files, full), {}, reason, skip=not files)
-    reasons = expanded if check.adapter in CHANGED_FILE_ADAPTERS else affected
+        return CheckSelection(dict.fromkeys(files, full), {}, reason, skip=not files, files=files)
+    reasons = expanded if mode == "expanded" else affected
     return _affected_file_scope(files, reasons)
 
 
@@ -920,13 +925,13 @@ def _affected_file_scope(files: list[str], reasons: dict[str, str]) -> CheckSele
     selected = {path: reasons[path] for path in sorted(paths & reasons.keys())}
     left_out = dict.fromkeys(sorted(paths - reasons.keys()), OUTSIDE_SCOPE)
     reason = "affected files" if selected else OUTSIDE_SCOPE
-    return CheckSelection(selected, left_out, reason, skip=not selected)
+    return CheckSelection(selected, left_out, reason, skip=not selected, files=list(selected))
 
 
-def _elisp_suite_scope(path: str, reason: str | None) -> CheckSelection:
+def _elisp_suite_scope(path: str, reason: str | None, files: list[str]) -> CheckSelection:
     if reason is None:
         return CheckSelection({}, {path: OUTSIDE_SCOPE}, OUTSIDE_SCOPE, skip=True)
-    return CheckSelection({path: reason}, {}, reason)
+    return CheckSelection({path: reason}, {}, reason, files=files)
 
 
 def _check_selection(
@@ -935,24 +940,15 @@ def _check_selection(
 ) -> CheckSelection:
     suite_reason = full or runtime_reason
     if check.adapter == "elisp_tests":
-        return _elisp_suite_scope(Path(check.spec.suite).as_posix(), suite_reason)
+        return _elisp_suite_scope(Path(check.spec.suite).as_posix(), suite_reason, inputs)
     if check.adapter == "python_tests":
-        return CheckSelection({}, {}, suite_reason or "full run", full_suite=suite_reason)
+        return CheckSelection(
+            {}, {}, suite_reason or "full run", full_suite=suite_reason, files=inputs, adapter_report=True,
+        )
     if _command_suite(check):
         reason = "full run: command adapter suite is opaque"
-        return CheckSelection({}, {}, reason)
+        return CheckSelection({}, {}, reason, files=inputs)
     return _file_scope(check, inputs, expanded, affected, full)
-
-
-def _require_coverage(
-    check: CheckDef, config: Config, selections: dict[str, CheckSelection],
-) -> None:
-    if check.adapter not in CRAP_ADAPTERS or selections[check.id].skip:
-        return
-    suite = check.spec.requires
-    if selections[suite].skip:
-        reason = f"full run: coverage required by {check.id}"
-        selections[suite] = _elisp_suite_scope(Path(config.checks[suite].spec.suite).as_posix(), reason)
 
 
 def _affected_selection(
@@ -971,9 +967,16 @@ def _affected_selection(
         selections[check.id] = _check_selection(
             check, inputs, expanded, affected, full or forced.get(check.id), runtime_reason,
         )
-    for check in checks:
-        _require_coverage(check, config, selections)
     return selections
+
+
+def _record_check_selection(
+    result: CheckResult, selection: CheckSelection | None, planned_report: dict[str, Any] | None,
+) -> None:
+    if planned_report is not None:
+        result.report_fields["selection"] = planned_report
+    elif selection is not None:
+        result.report_fields.setdefault("selection", selection.report())
 
 
 def _run_selected_check(
@@ -982,6 +985,7 @@ def _run_selected_check(
     base_override: DiffBaseOverride, selection: CheckSelection | None,
 ) -> CheckResult:
     prefix = f"check: {check.id}"
+    planned_report = selection.report() if selection is not None and not selection.adapter_report else None
     if selection is not None and selection.skip:
         result = _check_result(
             check, time.monotonic(), "not_run", execution="not_run",
@@ -990,14 +994,11 @@ def _run_selected_check(
         print(f"{prefix}: not run ({selection.reason})")
     else:
         print(f"{prefix} ({check.adapter})", flush=True)
-        if selection is not None and _per_file(check):
-            files = list(selection.selected)
         result = run_check(
             root, config, check, files, classes, prefix=prefix, evidence_dir=evidence_dir,
             prior=prior, base_override=base_override, selection=selection,
         )
-    if selection is not None:
-        result.report_fields.setdefault("selection", selection.report())
+    _record_check_selection(result, selection, planned_report)
     return result
 
 
