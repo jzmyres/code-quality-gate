@@ -759,12 +759,12 @@ def _bound_test_references(relative: str, source: str) -> set[str]:
 
 def _reference_rank(
     used: set[str], modules: frozenset[str], names: set[str], name: str,
-) -> tuple[int, bool, int]:
+) -> tuple[bool, int, int]:
     members = {
         path.removeprefix(f"{module}.")
         for module in modules for path in used if path.startswith(f"{module}.")
     }
-    return len(names & members), name in members, len({member.split(".", 1)[0] for member in members})
+    return name in members, len(names & members), len({member.split(".", 1)[0] for member in members})
 
 
 def _preferred_test_cohort(
@@ -772,8 +772,8 @@ def _preferred_test_cohort(
     modules: frozenset[str], names: set[str],
 ) -> tuple[str, ...]:
     ranks = {test: _reference_rank(references[test], modules, names, function.name) for test in tests}
-    best = max(ranks.values(), default=(0, False, 0))
-    if best == (0, False, 0):
+    best = max(ranks.values(), default=(False, 0, 0))
+    if best == (False, 0, 0):
         return ()
     preferred = tuple(test for test in tests if ranks[test] == best)
     return () if preferred == tests else preferred

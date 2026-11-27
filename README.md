@@ -1159,10 +1159,10 @@ Use `test_runner = "pytest"` to run ordinary pytest test functions and fixtures.
 in the same Python environment that runs the gate. This mode considers `test_*.py` and
 `*_test.py` in the selected test inventory and passes the matching files directly to pytest.
 For each changed function, pytest can start with a smaller cohort of the selected files.
-The gate ranks files by the number of distinct changed symbols they reference through explicit
-absolute imports from the measured module. Ties favor a reference to the exact function and then the number
-of distinct module members referenced. The highest-ranked files run together when their score is
-positive and they form a strict subset. This ranking uses static import bindings and dotted names.
+Files with an explicit reference to the changed function rank first. Ties favor more distinct
+changed symbols, then more distinct module members. The ranking qualifies references through
+explicit absolute imports from the measured module. The highest-ranked files run together when
+their score is positive and they form a strict subset.
 It can prefer tests of a module's public entry points when they exercise a changed helper indirectly.
 The full selection runs when no smaller cohort qualifies and for each mutant that passes the
 preferred tests. Within one pytest mutation measurement, original and mutant runs use fresh copies
