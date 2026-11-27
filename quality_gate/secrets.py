@@ -6,7 +6,10 @@ import re
 import shutil
 import stat
 import sys
-from collections.abc import Callable, Iterable
+import zlib
+from array import array
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from itertools import batched
 from pathlib import Path
@@ -17,12 +20,21 @@ from .json_input import load_json
 _MAX_FILES_PER_INVOCATION = 24
 _FINDINGS_EXIT = 3
 _MAX_RECORD_BYTES = 16 << 20
+_MAX_COMPRESSED_BYTES = 16 << 20
 _DIGEST_WIDTH = 64
 _REDACTED_ASSIGNMENT = re.compile(r'([A-Za-z0-9_.-]+"[ \t]*:[ \t]*")REDACTED"')
 _SHA256 = re.compile(rb"[0-9a-f]{64}")
 _MARKER = "verified-provenance-position"
 _OpenParent = Callable[[Path, str], int]
 _DigestSpan = tuple[int, int, str]
+_Coordinate = tuple[str, str, int, int, int, int]
+_ReportRun = Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class GzipDigests:
+    compressed: str
+    decoded: str
 
 
 @dataclass(frozen=True)
@@ -31,6 +43,7 @@ class Provenance:
     pointer: tuple[str, ...]
     payload: str
     payload_sha256: str
+    gzip: GzipDigests | None = None
 
 
 def _copy_regular(parent: int, name: str, destination: Path, relative: str) -> None:
@@ -121,16 +134,52 @@ def _pointer_value(value: Any, pointer: tuple[str, ...]) -> Any:
 @dataclass
 class _Record:
     data: bytes
-    starts: tuple[int, ...]
+    starts: Sequence[int]
     pointers: dict[str, list[tuple[str, ...]]]
+    gzip: GzipDigests | None = None
+
+
+def _record(data: bytes, gzip: GzipDigests | None = None) -> _Record:
+    starts = array("I", (0,))
+    starts.extend(match.end() for match in re.finditer(b"\n", data))
+    return _Record(data, starts, {}, gzip)
+
+
+def _single_gzip_member(compressed: bytes) -> bytes | None:
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        data = inflater.decompress(compressed, _MAX_RECORD_BYTES + 1)
+    except zlib.error:
+        return None
+    if not inflater.eof or inflater.unused_data or len(data) > _MAX_RECORD_BYTES:
+        return None
+    return data
+
+
+def _read_gzip_record(path: Path) -> _Record | None:
+    with path.open("rb") as stream:
+        compressed = stream.read(_MAX_COMPRESSED_BYTES + 1)
+    if len(compressed) > _MAX_COMPRESSED_BYTES:
+        return None
+    data = _single_gzip_member(compressed)
+    if data is None:
+        return None
+    digests = GzipDigests(hashlib.sha256(compressed).hexdigest(), hashlib.sha256(data).hexdigest())
+    return _record(data, digests)
 
 
 def _read_record(path: Path) -> _Record | None:
+    if path.name.endswith(".json.gz"):
+        return _read_gzip_record(path)
     with path.open("rb") as stream:
         data = stream.read(_MAX_RECORD_BYTES + 1)
     if len(data) > _MAX_RECORD_BYTES:
         return None
-    return _Record(data, (0, *(match.end() for match in re.finditer(b"\n", data))), {})
+    return _record(data)
+
+
+def _tracked_record(declaration: Provenance, tracked: set[str]) -> bool:
+    return declaration.gzip is None or declaration.record in tracked
 
 
 def _selected_provenance(
@@ -140,7 +189,7 @@ def _selected_provenance(
     for declaration in declarations:
         if (
             paths.get(declaration.record) and paths.get(declaration.payload)
-            and declaration.payload in tracked
+            and declaration.payload in tracked and _tracked_record(declaration, tracked)
         ):
             yield declaration
 
@@ -155,15 +204,21 @@ def _pinned_payloads(directory: Path, selected: Iterable[Provenance]) -> Iterabl
             yield declaration
 
 
-def _verified_records(directory: Path, pinned: Iterable[Provenance]) -> dict[str, _Record]:
-    records: dict[str, _Record | None] = {}
-    for declaration in pinned:
-        if declaration.record not in records:
-            records[declaration.record] = _read_record(directory / declaration.record)
-        record = records[declaration.record]
-        if record is not None:
-            record.pointers.setdefault(declaration.payload_sha256, []).append(declaration.pointer)
-    return {path: record for path, record in records.items() if record is not None}
+def _verified_records(
+    directory: Path, paths: Iterable[str], pinned: dict[str, list[Provenance]],
+) -> dict[str, _Record]:
+    records = {}
+    for path in paths:
+        if path not in pinned:
+            continue
+        record = _read_record(directory / path)
+        if record is None:
+            continue
+        for declaration in pinned[path]:
+            if record.gzip == declaration.gzip:
+                record.pointers.setdefault(declaration.payload_sha256, []).append(declaration.pointer)
+        records[path] = record
+    return records
 
 
 def _finding_bounds(finding: dict[str, Any], record: _Record) -> tuple[int, int, int] | None:
@@ -277,6 +332,12 @@ def _candidate_span(finding: dict[str, Any], records: dict[str, _Record]) -> _Di
     return _matched_digest(finding, record)
 
 
+def _proven_record_rows(record: _Record, rows: dict[_DigestSpan, list[int]]) -> Iterable[int]:
+    for span in _proven_spans(record, rows):
+        if record.gzip is None or len(rows[span]) == 1:
+            yield from rows[span]
+
+
 def _verified_finding_rows(findings: list[dict[str, Any]], records: dict[str, _Record]) -> set[int]:
     candidates: dict[str, dict[_DigestSpan, list[int]]] = {}
     for index, finding in enumerate(findings):
@@ -284,11 +345,7 @@ def _verified_finding_rows(findings: list[dict[str, Any]], records: dict[str, _R
         path = finding["File"]
         if span is not None and span[2] in records[path].pointers:
             candidates.setdefault(path, {}).setdefault(span, []).append(index)
-    verified = set()
-    for path, rows in candidates.items():
-        for span in _proven_spans(records[path], rows):
-            verified.update(rows[span])
-    return verified
+    return {index for path, rows in candidates.items() for index in _proven_record_rows(records[path], rows)}
 
 
 def _decode_report(child: Any) -> list[Any]:
@@ -320,9 +377,55 @@ def _report(child: Any) -> list[dict[str, Any]]:
     return findings
 
 
-def _report_findings(child: Any, records: dict[str, _Record]) -> tuple[int, int]:
+def _coordinate(finding: dict[str, Any]) -> _Coordinate:
+    return (
+        finding["File"], finding["RuleID"], finding["StartLine"], finding["EndLine"],
+        finding["StartColumn"], finding["EndColumn"],
+    )
+
+
+def _by_coordinate(findings: list[dict[str, Any]]) -> dict[_Coordinate, list[dict[str, Any]]]:
+    coordinates = defaultdict(list)
+    for finding in findings:
+        coordinates[_coordinate(finding)].append(finding)
+    return coordinates
+
+
+def _direct_gzip_report(paths: list[str], run_report: _ReportRun) -> list[dict[str, Any]]:
+    """Replay the same archive paths through one decompression layer and no codecs."""
+    child = run_report(paths, "--max-archive-depth=1", "--max-decode-depth=0")
+    if child.execution != "completed":
+        return []
+    try:
+        return _report(child)
+    except ValueError:
+        return []
+
+
+def _same_unique_row(
+    row: dict[str, Any], baseline: dict[_Coordinate, list[dict[str, Any]]],
+    direct: dict[_Coordinate, list[dict[str, Any]]],
+) -> bool:
+    key = _coordinate(row)
+    return baseline[key] == direct.get(key) == [row]
+
+
+def _unique_direct_gzip_rows(
+    findings: list[dict[str, Any]], candidates: set[int], run_report: _ReportRun,
+) -> set[int]:
+    if not candidates:
+        return set()
+    baseline = _by_coordinate(findings)
+    paths = sorted({findings[index]["File"] for index in candidates})
+    direct = _by_coordinate(_direct_gzip_report(paths, run_report))
+    return {index for index in candidates if _same_unique_row(findings[index], baseline, direct)}
+
+
+def _report_findings(child: Any, records: dict[str, _Record], run_report: _ReportRun) -> tuple[int, int]:
     findings = _report(child)
-    verified = _verified_finding_rows(findings, records)
+    candidates = _verified_finding_rows(findings, records)
+    archives = {index for index in candidates if records[findings[index]["File"]].gzip is not None}
+    verified = (candidates - archives) | _unique_direct_gzip_rows(findings, archives, run_report)
     for index, finding in enumerate(findings):
         if index in verified:
             continue
@@ -348,26 +451,35 @@ def scan_verified(
 ) -> VerifiedScan:
     paths = _snapshot(root, directory, selected, open_parent)
     candidates = _selected_provenance(paths, tracked, declarations)
-    records = _verified_records(directory, _pinned_payloads(directory, candidates))
+    pinned = defaultdict(list)
+    for declaration in _pinned_payloads(directory, candidates):
+        pinned[declaration.record].append(declaration)
     argv = [
         *_scanner_argv(binary), f"--exit-code={_FINDINGS_EXIT}",
-        "--report-format=json", "--report-path=-", "--",
+        "--report-format=json", "--report-path=-",
     ]
-    return _scan_reports(argv, directory, sorted(paths) or ["."], records, budget, run)
+
+    def run_report(targets: Iterable[str], *flags: str) -> Any:
+        return run(
+            [*argv, *flags, "--", *targets], cwd=directory, env={}, budget_seconds=budget,
+            capture_limit=None,
+        )
+
+    return _scan_reports(directory, sorted(paths) or ["."], pinned, run_report)
 
 
 def _scan_reports(
-    argv: list[str], directory: Path, paths: list[str], records: dict[str, _Record], budget: float,
-    run: Callable[..., Any],
+    directory: Path, paths: list[str], pinned: dict[str, list[Provenance]], run_report: _ReportRun,
 ) -> VerifiedScan:
     unresolved = verified = 0
     with_findings = None
     for targets in batched(paths, _MAX_FILES_PER_INVOCATION):
-        child = run([*argv, *targets], cwd=directory, env={}, budget_seconds=budget, capture_limit=None)
+        child = run_report(targets)
         safe_child = replace(child, stdout=b"", stderr=b"", output_tail=b"", output_bytes=0)
         if child.execution != "completed":
             return VerifiedScan(safe_child, unresolved, verified)
-        batch_unresolved, batch_verified = _report_findings(child, records)
+        records = _verified_records(directory, targets, pinned)
+        batch_unresolved, batch_verified = _report_findings(child, records, run_report)
         unresolved += batch_unresolved
         verified += batch_verified
         if child.returncode == _FINDINGS_EXIT:

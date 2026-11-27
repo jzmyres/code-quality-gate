@@ -455,9 +455,15 @@ payload_sha256 = "edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18
 Choose the payload and independently verify its digest before adding the
 declaration to the policy used by `--policy-from`. The payload must be
 Git-tracked and both paths must be exact repository-relative paths to separate
-regular files. The record must be a UTF-8 `.json` file of up to 16 MiB. The
-JSON Pointer uses `~0` and `~1` escapes and zero-based array indices. Each
-record and pointer pair can appear once.
+regular files. A plain `.json` record can contain up to 16 MiB of UTF-8 JSON.
+The JSON Pointer uses `~0` and `~1` escapes and zero-based array indices.
+Each record and pointer pair can appear once.
+
+For a Git-tracked `.json.gz` record, add `compressed_sha256` for the exact
+captured gzip bytes and `decoded_sha256` for the exact UTF-8 JSON bytes. Both
+fields require 64 lowercase hex digits and belong only on `.json.gz` rows.
+Compressed and decoded bytes each have a 16 MiB limit. The record must have
+one complete gzip member with a valid checksum and no trailing bytes.
 
 The check hashes the payload's captured raw bytes. Use the exact bytes the
 producer hashed. For example, when a producer hashes the contents of a
@@ -470,14 +476,20 @@ mid-line. The gate requires exactly one location on the reported line at or
 after the reported start column with the same byte width and redacted match
 template. It then checks that the location identifies the declared lowercase
 digest string. A verified finding counts in
-`measurement.verified_sha256_provenance`. Other findings, including findings
-on the same line, retain their normal enforcement. Findings from decoded
-content and archives stay in scope and cannot use a declaration.
+`measurement.verified_sha256_provenance`. For each gzip proof candidate,
+the gate reruns the pinned scanner on the same captured archive with one
+archive layer and secondary decoding disabled. The original scan and this
+replay must each report exactly one identical finding at that coordinate.
+The standard scan retains its usual archive and decoding settings. Other
+findings, including adjacent credentials and findings in secondary decoded
+content, retain their normal enforcement.
 
 A check without `--policy-from` scans without applying these declarations.
 Missing payloads, changed bytes, duplicate JSON member names, and findings
-whose location cannot be verified also leave the scanner finding in place.
-The check rejects a failed scan or an incomplete or invalid scanner report.
+whose location cannot be verified leave the scanner finding in place. A
+failed, incomplete, or invalid gzip replay leaves the original finding in
+place. The check rejects a failed standard scan or an incomplete or invalid
+standard scanner report.
 
 ## Tool lock: `tools.lock.toml`
 
