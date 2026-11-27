@@ -597,7 +597,7 @@ asset with more than 256 candidate rows leaves all of them unresolved. The
 
 Use `[[checks.secrets.public_hardware_model_v1]]` in the existing trusted
 directory for `--policy-from`. Each declaration covers one finding in a
-Git-tracked regular `.json` or `.json.gz` file. Review the public model entry
+Git-tracked regular `.json`, `.json.gz` or `.py` file. Review the public model entry
 independently and pin the separate catalogue commit in the trusted policy.
 An authorized candidate policy replacement can supply these declarations
 once it is included in a trusted directory for a subsequent run.
@@ -613,19 +613,35 @@ once it is included in a trusted directory for a subsequent run.
 | `catalogue.sha256` | SHA-256 of the entire catalogue blob |
 | `catalogue.literal_start`, `catalogue.literal_end` | Zero-based, half-open byte interval inside the quotes of the complete unescaped string literal in a UTF-8 Python catalogue |
 
+Python declarations use `record`, the two match offsets and the same
+`catalogue` fields. They supply `source_sha256` (SHA-256 of the complete
+captured source bytes), `role` (`keyword` or `attribute_equality`) and
+`identifier` (the exact ASCII Python name). A keyword names one explicitly
+written call argument. An attribute equality has one `==` operator, with the
+named attribute on its left and a complete plain quoted string on its right.
+The name, operator and value must share a physical line. The match interval
+covers the whole scanner match, which may start at a suffix of the name,
+such as `key=` within `device_key=`. Both the literal bytes and the full
+redacted match must agree with the source. Escapes, composed strings and
+ambiguous match shapes remain unresolved. Python declarations have neither a
+JSON pointer nor an archive digest. The captured source and the catalogue
+must have different paths and byte digests.
+
 Only gzip records use `compressed_sha256`. A gzip record contains one
 complete member, and its compressed and decoded bytes each have a 16 MiB
-limit. Raw JSON records also have a 16 MiB limit. Each record and pointer
-pair and each record and match interval pair can occur only once. The Git
-operand follows the size, reachability and regular-file checks for a
+limit. Raw JSON and Python records also have a 16 MiB limit. Each JSON record
+and pointer pair and each record and match interval pair can occur only once.
+The Git operand follows the size, reachability and regular-file checks for a
 historical SHA-256 payload. The gate parses the catalogue without executing
-it and compares its exact string to the declared strict JSON scalar.
+it and compares its exact string to the declared strict JSON scalar or
+Python literal.
 
 The proof requires an untransformed `fs.content` `generic-api-key` finding
-with exact physical byte coordinates and one matching assignment shape
+with exact physical byte coordinates and one matching source shape
 across the entire line. The normal report and a direct replay must each
 produce one identical row at that coordinate. The replay disables secondary
-decoding and reads zero archive layers for raw JSON and one for gzip.
+decoding and reads zero archive layers for raw JSON and Python and one for
+gzip.
 `measurement.verified_public_hardware_models` counts verified findings when
 the trusted policy enables this proof. Other findings retain normal
 enforcement, including adjacent findings in the same record.

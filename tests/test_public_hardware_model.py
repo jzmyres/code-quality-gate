@@ -20,6 +20,11 @@ _OTHER_LABEL = _LABEL.replace(b"h100", b"h800")
 _ASSIGNMENT = b'key": "' + _LABEL + b'"'
 _CATALOGUE = "catalogue/models.py"
 _SOURCE = b'# Public accelerator model table\nMODELS = {"' + _LABEL + b'": 80}\n'
+_PYTHON_CATALOGUE = "catalogue/synthetic.py"
+_PYTHON_SOURCE = b'# Invented public accelerator catalogue for tests\nMODELS = {"quanta-x780-vm6-92gb": 92}\n'
+_PYTHON_LABEL = b"quanta-x780-vm6-92gb"
+_KEYWORD_MATCH = b"key='" + _PYTHON_LABEL + b"'"
+_EQUALITY_MATCH = b'key == "' + _PYTHON_LABEL + b'"'
 _RULE = """
 [[rule]]
 pattern = "*.json*"
@@ -48,16 +53,21 @@ def _row(path: str, span: tuple[int, int]) -> dict:
     }
 
 
-def _policy_row(declaration: model.Declaration) -> dict:
-    assert declaration.pointer == ("unit_key",)
+def _policy_row(declaration: model.ModelDeclaration) -> dict:
     match_start, match_end = declaration.match_span
     literal_start, literal_end = declaration.catalogue.literal_span
     row = dict(
-        record=declaration.record, pointer="/unit_key", match_start=match_start, match_end=match_end,
-        decoded_sha256=declaration.decoded_sha256,
+        record=declaration.record, match_start=match_start, match_end=match_end,
         catalogue=dict(payload=asdict(declaration.catalogue.payload), sha256=declaration.catalogue.sha256,
                        literal_start=literal_start, literal_end=literal_end),
     )
+    if isinstance(declaration, model.PythonDeclaration):
+        return dict(
+            row, role=declaration.role, identifier=declaration.identifier,
+            source_sha256=declaration.source_sha256,
+        )
+    assert declaration.pointer == ("unit_key",)
+    row.update(pointer="/unit_key", decoded_sha256=declaration.decoded_sha256)
     if declaration.compressed_sha256 is not None:
         row["compressed_sha256"] = declaration.compressed_sha256
     return row
@@ -69,7 +79,7 @@ def _toml(value) -> str:
     return json.dumps(value)
 
 
-def _policy(*declarations: model.Declaration) -> str:
+def _policy(*declarations: model.ModelDeclaration) -> str:
     tables = [
         "[[checks.secrets.public_hardware_model_v1]]\n"
         + "\n".join(f"{name} = {_toml(value)}" for name, value in _policy_row(declaration).items())
@@ -83,17 +93,22 @@ class PublicHardwareModelTests(FixtureCase):
         super().setUp()
         self.add_file(_CATALOGUE, _SOURCE)
         self.add_file("catalogue/other.py", _SOURCE.replace(_LABEL, _OTHER_LABEL))
+        self.add_file(_PYTHON_CATALOGUE, _PYTHON_SOURCE)
         self.commit_all("public catalogue")
-        commit = self.git("rev-parse", "HEAD").stdout.strip()
-        blob = self.git("rev-parse", f"HEAD:{_CATALOGUE}").stdout.strip()
-        start = _SOURCE.index(_LABEL)
-        self.catalogue = model.Catalogue(
-            secrets.GitPayload(_CATALOGUE, commit, blob, len(_SOURCE)),
-            _sha(_SOURCE), (start, start + len(_LABEL)),
-        )
+        self.catalogue = self._catalogue(_CATALOGUE, _SOURCE, _LABEL)
+        self.python_catalogue = self._catalogue(_PYTHON_CATALOGUE, _PYTHON_SOURCE, _PYTHON_LABEL)
         self.directory = self.base / "snapshot"
         self.directory.mkdir()
         self.reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+
+    def _catalogue(self, path: str, source: bytes, label: bytes) -> model.Catalogue:
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        blob = self.git("rev-parse", f"HEAD:{path}").stdout.strip()
+        start = source.index(label)
+        return model.Catalogue(
+            secrets.GitPayload(path, commit, blob, len(source)),
+            _sha(source), (start, start + len(label)),
+        )
 
     def _record(
         self, data: bytes = b'{"unit_key": "' + _LABEL + b'"}\n', *, archive: bool = False,
@@ -107,11 +122,11 @@ class PublicHardwareModelTests(FixtureCase):
             self.catalogue, _sha(content) if archive else None,
         )
 
-    def _prepare(self, *declarations: model.Declaration):
+    def _prepare(self, *declarations: model.ModelDeclaration):
         paths = {declaration.record: True for declaration in declarations}
         return model.prepare(declarations, paths, set(paths), self.reader.read)
 
-    def _verified(self, declaration: model.Declaration, row: dict | None = None) -> set[int]:
+    def _verified(self, declaration: model.ModelDeclaration, row: dict | None = None) -> set[int]:
         finding = row if row is not None else _row(declaration.record, declaration.match_span)
         return model.verified_rows(
             [finding], self.directory, mock.Mock(return_value=_child([finding])),
@@ -133,9 +148,148 @@ class PublicHardwareModelTests(FixtureCase):
         cache = self._require_scanner().parent.parent
         result = self.run_qg_process(*args, env={"QG_TOOLS_DIR": str(cache)})
         self.assertEqual(result.returncode, expected, result.stderr)
-        for value in (_LABEL.decode(), _synthetic_credential()):
+        for value in (_LABEL.decode(), _PYTHON_LABEL.decode(), _synthetic_credential()):
             self.assertNotIn(value, result.stdout + result.stderr)
         return result, self.check_by_id(self.parse_json(result), "secrets")
+
+    def _python_record(
+        self, source: bytes, match: bytes = _KEYWORD_MATCH, *,
+        role: str = "keyword", identifier: str = "device_key",
+    ) -> tuple[model.PythonDeclaration, dict]:
+        name = "measurement.py"
+        (self.directory / name).write_bytes(source)
+        start = source.index(match)
+        span = start, start + len(match)
+        declaration = model.PythonDeclaration(
+            name, role, identifier, span, _sha(source), self.python_catalogue,
+        )
+        line = source.count(b"\n", 0, start) + 1
+        column = start - (source.rfind(b"\n", 0, start) + 1)
+        row = dict(
+            _row(name, (column, column + len(match))),
+            StartLine=line, EndLine=line, Fingerprint=f"{name}:generic-api-key:{line}",
+            Match=match.replace(_PYTHON_LABEL, b"REDACTED", 1).decode("ascii"),
+        )
+        return declaration, row
+
+    def test_python_trusted_cli_keeps_the_adjacent_credential(self) -> None:
+        credential = _synthetic_credential().encode()
+        source = (
+            b"# synthetic measurement\n"
+            b"measure(device_" + _KEYWORD_MATCH + b", token='" + credential + b"')\n"
+            b"assert record." + _EQUALITY_MATCH + b"\n"
+            b"measure(other_" + _KEYWORD_MATCH + b")\n"
+        )
+        keyword, _ = self._python_record(source)
+        attribute, _ = self._python_record(
+            source, _EQUALITY_MATCH, role="attribute_equality", identifier="key",
+        )
+        self.add_file(keyword.record, source)
+        self.add_file("control.json", b"{}\n")
+        self.commit_all("tracked synthetic Python measurements")
+        self.write_config(_policy(keyword, attribute))
+        self.commit_all("trusted model declarations")
+
+        standalone, _ = self._cli(1)
+        self.assertEqual(len(re.findall(r"(?m)^RuleID:\s+generic-api-key$", standalone.stderr)), 3)
+        result, check = self._cli(1, self.trusted_directory("HEAD"))
+        self.assertEqual(check["measurement"]["verified_public_hardware_models"], 2)
+        self.assertEqual(result.stderr.count("RuleID: github-pat"), 1)
+        self.assertEqual(result.stderr.count("RuleID: generic-api-key"), 1)
+        self.assertIn("Line: 4\n", result.stderr)
+
+    def test_python_binds_the_exact_identifier_and_selected_ast_role(self) -> None:
+        keyword, row = self._python_record(b"measure(device_" + _KEYWORD_MATCH + b")\n")
+        self.assertEqual(self._verified(keyword, row), {0})
+        for wrong in ("key", "other_key"):
+            self.assertEqual(self._verified(replace(keyword, identifier=wrong), row), set())
+        self.assertEqual(self._verified(replace(keyword, role="attribute_equality"), row), set())
+        self.assertEqual(self._verified(replace(keyword, catalogue=self.catalogue), row), set())
+        self.assertEqual(self._verified(replace(keyword, source_sha256="0" * 64), row), set())
+        for other in ((keyword.match_span[0] + 1, keyword.match_span[1]),
+                      (keyword.match_span[0], keyword.match_span[1] - 1)):
+            self.assertEqual(self._verified(replace(keyword, match_span=other), row), set())
+
+        source = b"assert tools.describe(item)." + _EQUALITY_MATCH + b"\r\n"
+        attribute, finding = self._python_record(
+            source, _EQUALITY_MATCH, role="attribute_equality", identifier="key",
+        )
+        self.assertEqual(self._verified(attribute, finding), {0})
+        self.assertEqual(self._verified(replace(attribute, role="keyword"), finding), set())
+        self.assertEqual(self._verified(replace(attribute, identifier="device_key"), finding), set())
+
+    def test_python_wrong_or_ambiguous_lexical_sites_keep_findings(self) -> None:
+        literal = b"'" + _PYTHON_LABEL + b"'"
+        cases = (
+            (b"device_" + _KEYWORD_MATCH, _KEYWORD_MATCH),
+            (b"# device_" + _KEYWORD_MATCH, _KEYWORD_MATCH),
+            (b'text = "device_' + _KEYWORD_MATCH + b'"', _KEYWORD_MATCH),
+            (b"load(device_" + _KEYWORD_MATCH + b" + suffix)", _KEYWORD_MATCH),
+            (b"load(device_" + _KEYWORD_MATCH + b" 'additional')", _KEYWORD_MATCH),
+            (b"load(device_" + _KEYWORD_MATCH + b", other_" + _KEYWORD_MATCH + b")", _KEYWORD_MATCH),
+            (b"load(device_" + _KEYWORD_MATCH + b",\n     device_" + _KEYWORD_MATCH + b")", _KEYWORD_MATCH),
+            (b"load(device_key= " + b"\n " + literal + b")", b"key= "),
+            (b"load(device_key=(" + literal + b"))", b"key=(" + literal),
+            (b"load(device_key=r" + literal + b")", b"key=r" + literal),
+            (b"load(device_key=f" + literal + b")", b"key=f" + literal),
+            (b"load(device_key='''" + _PYTHON_LABEL + b"''')", b"key='''" + _PYTHON_LABEL + b"'"),
+            (b"load(device_key='" + _PYTHON_LABEL + b"\\x21')", b"key='" + _PYTHON_LABEL + b"\\x21'"),
+            ("load(device_ｋ".encode() + _KEYWORD_MATCH[1:] + b")", _KEYWORD_MATCH[1:]),
+            (b"load(**{'device_key': " + literal + b"})", b"key': " + literal),
+        )
+        for source, fragment in cases:
+            with self.subTest(source=source):
+                declaration, row = self._python_record(source + b"\n", fragment)
+                self.assertEqual(self._verified(declaration, row), set())
+        for source in (b"assert record." + _EQUALITY_MATCH + b" == fallback",
+                       b"assert record().\n" + _EQUALITY_MATCH,
+                       b"assert (" + b"\n  record\n)." + _EQUALITY_MATCH,
+                       b"assert " + _EQUALITY_MATCH,
+                       b"# record." + _EQUALITY_MATCH):
+            with self.subTest(source=source):
+                declaration, row = self._python_record(
+                    source + b"\n", _EQUALITY_MATCH, role="attribute_equality", identifier="key",
+                )
+                self.assertEqual(self._verified(declaration, row), set())
+
+    def test_python_requires_tracked_exact_bytes_and_a_unique_identical_replay(self) -> None:
+        declaration, row = self._python_record(b"measure(device_" + _KEYWORD_MATCH + b")\n")
+        name = declaration.record
+        self.assertEqual(model.prepare((declaration,), {name: True}, set(), self.reader.read), {})
+        self.assertEqual(model.prepare((declaration,), {name: False}, {name}, self.reader.read), {})
+        proofs = self._prepare(declaration)
+        replay = mock.Mock(return_value=_child([row]))
+        self.assertEqual(model.verified_rows([row], self.directory, replay, proofs=proofs), {0})
+        replay.assert_called_once_with([name], "--max-archive-depth=0", "--max-decode-depth=0")
+
+        self.assertEqual(model.verified_rows([row, row], self.directory, replay, proofs=proofs), set())
+        for changed in ([], [row, row], [dict(row, Description="different row")]):
+            replay.return_value = _child(changed)
+            self.assertEqual(model.verified_rows([row], self.directory, replay, proofs=proofs), set())
+        for changed in (dict(row, Match="key = 'REDACTED'"), dict(row, StartColumn=row["StartColumn"] - 1),
+                        dict(row, EndColumn=row["EndColumn"] + 1), dict(row, Secret="unredacted")):
+            self.assertEqual(self._verified(declaration, changed), set())
+        current = self.directory / name
+        current.write_bytes(current.read_bytes() + b"# exact source pin is stale\n")
+        self.assertEqual(self._verified(declaration, row), set())
+
+    def test_python_model_policy_rejects_unknown_roles_identifiers_and_fields(self) -> None:
+        declaration, _ = self._python_record(b"measure(device_" + _KEYWORD_MATCH + b")\n")
+        row = _policy_row(declaration)
+        key = "public_hardware_model_v1"
+        self.assertEqual(adapters._public_models({key: [row]}, self.config_path, "secrets"), (declaration,))
+        catalogue = row["catalogue"]
+        bad = (
+            dict(row, role="assignment"), dict(row, identifier="device-key"),
+            dict(row, identifier="dév"), dict(row, identifier="class"), dict(row, pointer="/device_key"),
+            dict(row, compressed_sha256="0" * 64), dict(row, decoded_sha256=row["source_sha256"]),
+            dict(row, source_sha256="x" * 64), dict(row, record="measurement.json"),
+            dict(row, match_start=True), dict(row, source_sha256=catalogue["sha256"]),
+            dict(row, catalogue=dict(catalogue, payload=dict(catalogue["payload"], path=row["record"]))),
+        )
+        for declarations in ([row, row], *([change] for change in bad)):
+            with self.subTest(declarations=declarations), self.assertRaises(ConfigError):
+                adapters._public_models({key: declarations}, self.config_path, "secrets")
 
     def test_real_default_and_direct_scans_keep_same_line_credentials_and_other_generic_match(self) -> None:
         binary = self._require_scanner()

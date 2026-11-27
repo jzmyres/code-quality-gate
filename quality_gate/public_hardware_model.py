@@ -1,9 +1,10 @@
-"""Prove one JSON scanner occurrence from a trusted public hardware catalogue."""
+"""Prove a typed scanner occurrence from a trusted public hardware catalogue."""
 from __future__ import annotations
 
 import ast
 import hashlib
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
@@ -33,8 +34,21 @@ class Declaration:
 
 
 @dataclass(frozen=True)
+class PythonDeclaration:
+    record: str
+    role: str
+    identifier: str
+    match_span: _Span
+    source_sha256: str
+    catalogue: Catalogue
+
+
+ModelDeclaration = Declaration | PythonDeclaration
+
+
+@dataclass(frozen=True)
 class _Proof:
-    declaration: Declaration
+    declaration: ModelDeclaration
     label: str
 
 
@@ -66,17 +80,19 @@ def _catalogue_label(read_blob: secrets._ReadGitBlob, catalogue: Catalogue) -> s
     return _literal_at(checked[0], catalogue.literal_span)
 
 
-def _selected(declaration: Declaration, paths: dict[str, bool], tracked: set[str]) -> bool:
+def _selected(declaration: ModelDeclaration, paths: dict[str, bool], tracked: set[str]) -> bool:
     path = declaration.record
-    return (
-        bool(paths.get(path)) and path in tracked and path.endswith((".json", ".json.gz"))
-        and path != declaration.catalogue.payload.path
-        and path.endswith(".json.gz") == (declaration.compressed_sha256 is not None)
+    if not paths.get(path) or path not in tracked or path == declaration.catalogue.payload.path:
+        return False
+    if isinstance(declaration, PythonDeclaration):
+        return path.endswith(".py")
+    return path.endswith((".json", ".json.gz")) and (
+        path.endswith(".json.gz") == (declaration.compressed_sha256 is not None)
     )
 
 
 def prepare(
-    declarations: tuple[Declaration, ...], paths: dict[str, bool], tracked: set[str],
+    declarations: tuple[ModelDeclaration, ...], paths: dict[str, bool], tracked: set[str],
     read_blob: secrets._ReadGitBlob,
 ) -> dict[str, tuple[_Proof, ...]]:
     """Read catalogue bytes only through the authenticated Git blob reader."""
@@ -95,11 +111,14 @@ def _load_record(path: Path) -> _Record | None:
     source = secrets._read_record(path)
     if source is None:
         return None
+    digest = source.gzip.decoded if source.gzip else hashlib.sha256(source.data).hexdigest()
+    if source.python:
+        tree = secrets._python_tree(source.data)
+        return _Record(source, digest, tree) if tree is not None else None
     try:
         original = load_json(source.data.decode("utf-8"))
     except (ValueError, RecursionError):
         return None
-    digest = source.gzip.decoded if source.gzip else hashlib.sha256(source.data).hexdigest()
     return _Record(source, digest, original)
 
 
@@ -147,8 +166,93 @@ def _bind_pointer(record: _Record, span: _Span, pointer: tuple[str, ...], label:
     return secrets._pointer_value(marked, pointer) == marker.decode("ascii")
 
 
+def _python_match(
+    row: dict[str, Any], source: secrets._Record, match: _Span, literal: secrets._DigestSpan,
+) -> bool:
+    """Compare the whole finding with the spelling of a bound Python literal."""
+    bounds = secrets._finding_bounds(row, source)
+    if bounds is None or row.get("Secret") != "REDACTED":
+        return False
+    start, line_end, width = bounds
+    first, end, _ = literal
+    if match != (start, start + width) or match[1] != end + 1:
+        return False
+    prefix = source.data[start:first]
+    redacted = prefix + b"REDACTED" + source.data[end:match[1]]
+    line_start = source.starts[row["StartLine"] - 1]
+    return (
+        row.get("Match") == redacted.decode("ascii")
+        and secrets._unique_value(source.data, prefix, line_start, line_end, end - first) == first
+    )
+
+
+def _unique_keyword(call: ast.Call, identifier: str) -> ast.keyword | None:
+    matches = [argument for argument in call.keywords if argument.arg == identifier]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _python_operands(
+    tree: ast.Module, declaration: PythonDeclaration,
+) -> Iterator[tuple[ast.keyword | ast.Attribute, ast.expr]]:
+    for node in ast.walk(tree):
+        match declaration.role, node:
+            case "keyword", ast.Call() as call:
+                argument = _unique_keyword(call, declaration.identifier)
+                if argument is not None:
+                    yield argument, argument.value
+            case "attribute_equality", ast.Compare(
+                left=ast.Attribute() as target, ops=[ast.Eq()], comparators=[value],
+            ):
+                yield target, value
+
+
+def _python_anchor(
+    source: secrets._Record, operand: ast.keyword | ast.Attribute, identifier: bytes,
+) -> int | None:
+    if isinstance(operand, ast.keyword):
+        return source.starts[operand.lineno - 1] + operand.col_offset
+    position = secrets._line_source(source, operand)
+    if position is None:
+        return None
+    start, raw = position
+    return start + len(raw) - len(identifier) if raw.endswith(b"." + identifier) else None
+
+
+def _python_site(
+    source: secrets._Record, operand: ast.keyword | ast.Attribute, literal: secrets._DigestSpan,
+    declaration: PythonDeclaration,
+) -> bool:
+    identifier = declaration.identifier.encode("utf-8")
+    start = _python_anchor(source, operand, identifier)
+    if start is None:
+        return False
+    after = start + len(identifier)
+    operator = b"=" if declaration.role == "keyword" else b"=="
+    return (
+        start <= declaration.match_span[0] < after
+        and source.data[start:after] == identifier
+        and source.data[after:literal[0] - 1].strip(b" \t") == operator
+    )
+
+
+def _bind_python(
+    row: dict[str, Any], record: _Record, proof: PythonDeclaration, label: str,
+) -> bool:
+    if record.decoded_sha256 != proof.source_sha256:
+        return False
+    return sum(
+        (literal := secrets._literal_string(record.source, value)) is not None
+        and literal[2] == label
+        and _python_site(record.source, operand, literal, proof)
+        and _python_match(row, record.source, proof.match_span, literal)
+        for operand, value in _python_operands(record.original, proof)
+    ) == 1
+
+
 def _proves(row: dict[str, Any], record: _Record, proof: _Proof) -> bool:
     declaration = proof.declaration
+    if isinstance(declaration, PythonDeclaration):
+        return _bind_python(row, record, declaration, proof.label)
     if not _pinned_bytes(declaration, record):
         return False
     span = _value_span(row, record.source, declaration.match_span)
@@ -197,7 +301,7 @@ def verified_rows(
 
 
 def prepare_scan(
-    declarations: tuple[Declaration, ...], paths: dict[str, bool], tracked: set[str],
+    declarations: tuple[ModelDeclaration, ...], paths: dict[str, bool], tracked: set[str],
     read_blob: secrets._ReadGitBlob,
 ) -> secrets._VerifyModels:
     return partial(verified_rows, proofs=prepare(declarations, paths, tracked, read_blob))
