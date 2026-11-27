@@ -188,8 +188,11 @@ Rules:
   `run_seconds` (default 300) are positive integers. `test_runner` is `unittest` by default.
   Set it to `pytest` to require verified collection and test execution in both copied trees.
   A strict subset ranked by explicit module and symbol use can run first. A mutant that passes
-  those tests runs against the full selection with its own verified original. `mutant_seconds`
-  bounds each child invocation, and `run_seconds` bounds both cohorts and their setup and cleanup.
+  those tests runs against the full selection with its own verified original. Within a pytest mutation
+  measurement, functions in the same module can reuse a passing original for the identical ordered
+  cohort. Pytest originals and mutants run in fresh copies from the same snapshot. Source bytes used
+  for selection must match the snapshot. `mutant_seconds`
+  bounds each child invocation, and `run_seconds` includes both cohorts, copying and cleanup.
 * `python_shape` requires `base` and `crap_check`, and has no `baseline` key. `scope`
   is `changed` or `tree`; `crap_check` names a `python_crap` check whose `threshold`
   is CPF's limit; `max_chain` is an integer of at least 1; `clone_min_tokens` is 20-49;

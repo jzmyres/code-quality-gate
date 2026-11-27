@@ -17,8 +17,8 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -552,14 +552,14 @@ def _mutations(
 
 
 def _changed_functions(
-    context: Any, spec: MutationSpec, base: DiffBase,
+    context: Any, spec: MutationSpec, base: DiffBase, *,
+    read_source: Callable[[Path, str], str] | None = None,
 ) -> list[python_shape.ShapeFunction]:
     diff = python_shape._diff_lines(context.root, base.commit)
     paths = python_shape._measured_paths(context, spec, diff)
+    read = read_source or python_shape._read_source
     indexes = {
-        relative: python_shape._file_index(
-            relative, python_shape._read_source(context.root, relative)
-        )
+        relative: python_shape._file_index(relative, read(context.root, relative))
         for relative in paths
     }
     before = python_shape._base_functions(
@@ -698,12 +698,11 @@ def _test_references(
 
 def _tests_by_function(
     root: Path, functions: list[python_shape.ShapeFunction],
-    test_files: list[str], module_names: dict[str, frozenset[str]],
+    test_files: list[str], module_names: dict[str, frozenset[str]], *,
+    read_source: Callable[[Path, str], str] = python_shape._read_source,
 ) -> dict[str, tuple[str, ...]]:
     references = {
-        relative: _test_references(
-            relative, python_shape._read_source(root, relative)
-        )
+        relative: _test_references(relative, read_source(root, relative))
         for relative in test_files
     }
     return {
@@ -745,9 +744,8 @@ def _qualify_test_paths(paths: set[str], local: str, imported: str) -> Iterable[
             yield imported + path[len(local):]
 
 
-def _bound_test_references(root: Path, relative: str) -> set[str]:
+def _bound_test_references(relative: str, source: str) -> set[str]:
     """Qualify explicit uses through a binding with one import path in this file."""
-    source = python_shape._read_source(root, relative)
     nodes = list(ast.walk(python_shape._parse_tree(relative, source)))
     paths = _test_load_paths(nodes)
     imports: dict[str, set[str]] = {}
@@ -783,10 +781,11 @@ def _preferred_test_cohort(
 
 def _preferred_pytest_tests(
     functions: list[python_shape.ShapeFunction], tests: dict[str, tuple[str, ...]],
-    root: Path, module_names: dict[str, frozenset[str]],
+    root: Path, module_names: dict[str, frozenset[str]], *,
+    read_source: Callable[[Path, str], str],
 ) -> dict[str, tuple[str, ...]]:
     references = {
-        relative: _bound_test_references(root, relative)
+        relative: _bound_test_references(relative, read_source(root, relative))
         for relative in dict.fromkeys(relative for cohort in tests.values() for relative in cohort)
     }
     names: dict[str, set[str]] = {}
@@ -979,8 +978,29 @@ def _verify_pytest_report(result: RunResult, report: Path, subject: str) -> _Pyt
         raise GateError(f"{subject} could not be verified: {error}\n{detail[-2000:]}") from error
 
 
-def _fresh_copy(source: Path, work: Path, number: int) -> Path:
-    destination = work / f"copy-{number:04d}"
+class _SelectedSources:
+    """Retain the exact bytes used to plan the measured functions and pytest cohorts."""
+
+    def __init__(self) -> None:
+        self.contents: dict[str, bytes] = {}
+
+    def read(self, root: Path, relative: str) -> str:
+        try:
+            if relative not in self.contents:
+                self.contents[relative] = (root / relative).read_bytes()
+            return self.contents[relative].decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except (OSError, UnicodeDecodeError) as error:
+            raise GateError(f"cannot read {relative}: {error}") from error
+
+
+@dataclass(frozen=True)
+class _Copies:
+    directory: Path
+    source: Path
+    originals: dict[tuple[str, tuple[str, ...]], _PytestEvidence] = field(default_factory=dict)
+
+
+def _copy_tree(source: Path, destination: Path) -> Path:
     shutil.copytree(
         source, destination,
         ignore=shutil.ignore_patterns(
@@ -988,6 +1008,23 @@ def _fresh_copy(source: Path, work: Path, number: int) -> Path:
         ),
     )
     return destination
+
+
+def _fresh_copy(source: Path, work: Path, number: int) -> Path:
+    return _copy_tree(source, work / f"copy-{number:04d}")
+
+
+def _measurement_copies(
+    root: Path, work: Path, spec: MutationSpec, start: float, tests: dict[str, tuple[str, ...]],
+    selected: dict[str, bytes],
+) -> _Copies:
+    source = root
+    if spec.test_runner == "pytest" and any(tests.values()) and _remaining(start, spec) > 0:
+        source = _copy_tree(root, work / "original-source")
+        for relative, original in selected.items():
+            if (source / relative).read_bytes() != original:
+                raise GateError(f"python-mutation: selected source differs from snapshot: {relative}")
+    return _Copies(work, source)
 
 
 def _passed(result: Any) -> bool:
@@ -1023,13 +1060,13 @@ def _baseline_passed(
 
 def _baseline(
     function: python_shape.ShapeFunction, tests: tuple[str, ...],
-    root: Path, work: Path, number: int, spec: MutationSpec, start: float,
+    root: Path, copies: _Copies, number: int, spec: MutationSpec, start: float,
     tools_dir: Path,
 ) -> bool | _PytestEvidence:
     remaining = _remaining(start, spec)
     if remaining <= 0:
         return False
-    copy_root = _fresh_copy(root, work, number)
+    copy_root = _fresh_copy(copies.source, copies.directory, number)
     remaining = _remaining(start, spec)
     if remaining <= 0:
         return False
@@ -1061,6 +1098,23 @@ def _pytest_baseline(
             + ", ".join(evidence.assertions[:3])
         )
     return evidence if _remaining(start, spec) > 0 else False
+
+
+def _original_baseline(
+    function: python_shape.ShapeFunction, tests: tuple[str, ...],
+    root: Path, copies: _Copies, numbers: list[int], spec: MutationSpec, start: float,
+    tools_dir: Path,
+) -> bool | _PytestEvidence:
+    if _remaining(start, spec) <= 0:
+        return False
+    key = (function.path, tests)
+    if key in copies.originals:
+        return copies.originals[key]
+    baseline = _baseline(function, tests, root, copies, numbers[0], spec, start, tools_dir)
+    numbers[0] += 1
+    if isinstance(baseline, _PytestEvidence):
+        copies.originals[key] = baseline
+    return baseline
 
 
 def _outcome(result: Any, function: python_shape.ShapeFunction) -> str:
@@ -1177,12 +1231,12 @@ def _not_run_records(
 def _run_mutant(
     function: python_shape.ShapeFunction, mutation: Mutation,
     tests: tuple[str, ...], spec: MutationSpec,
-    start: float, root: Path, work: Path, numbers: list[int], tools_dir: Path,
+    start: float, root: Path, copies: _Copies, numbers: list[int], tools_dir: Path,
     baseline: bool | _PytestEvidence = True,
 ) -> tuple[str, bool]:
     if _remaining(start, spec) <= 0:
         return "not run (over budget)", True
-    copy_root = _fresh_copy(root, work, numbers[0])
+    copy_root = _fresh_copy(copies.source, copies.directory, numbers[0])
     numbers[0] += 1
     (copy_root / function.path).write_text(
         mutation.mutated_source, encoding="utf-8"
@@ -1222,42 +1276,32 @@ def _pytest_outcome(
     return "killed" if evidence.assertions else "survived"
 
 
-@dataclass
-class _FallbackCohort:
-    tests: tuple[str, ...]
-    baseline: bool | _PytestEvidence | None = None
-
-
 def _run_with_fallback(
     function: python_shape.ShapeFunction, mutation: Mutation,
     tests: tuple[str, ...], spec: MutationSpec, start: float,
-    root: Path, work: Path, numbers: list[int], tools_dir: Path,
-    baseline: bool | _PytestEvidence, fallback: _FallbackCohort | None,
+    root: Path, copies: _Copies, numbers: list[int], tools_dir: Path,
+    baseline: bool | _PytestEvidence, fallback: tuple[str, ...],
 ) -> tuple[tuple[str, ...], str, bool]:
     outcome, over_budget = _run_mutant(
-        function, mutation, tests, spec, start, root, work, numbers, tools_dir, baseline,
+        function, mutation, tests, spec, start, root, copies, numbers, tools_dir, baseline,
     )
-    if over_budget or outcome != "survived" or fallback is None:
+    if over_budget or outcome != "survived" or not fallback:
         return tests, outcome, over_budget
-    if fallback.baseline is None:
-        fallback.baseline = _baseline(
-            function, fallback.tests, root, work, numbers[0], spec, start, tools_dir,
-        )
-        numbers[0] += 1
-    if not fallback.baseline:
+    original = _original_baseline(function, fallback, root, copies, numbers, spec, start, tools_dir)
+    if not original:
         return tests, outcome, True
     outcome, over_budget = _run_mutant(
-        function, mutation, fallback.tests, spec, start, root, work, numbers, tools_dir, fallback.baseline,
+        function, mutation, fallback, spec, start, root, copies, numbers, tools_dir, original,
     )
-    return fallback.tests, outcome, over_budget
+    return fallback, outcome, over_budget
 
 
 def _run_generated(
     function: python_shape.ShapeFunction, mutations: list[Mutation],
     tests: tuple[str, ...], spec: MutationSpec,
-    start: float, root: Path, work: Path, numbers: list[int],
+    start: float, root: Path, copies: _Copies, numbers: list[int],
     records: list[dict[str, Any]], tools_dir: Path,
-    baseline: bool | _PytestEvidence = True, *, fallback: _FallbackCohort | None = None,
+    baseline: bool | _PytestEvidence = True, *, fallback: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     findings: list[Finding] = []
     for position, mutation in enumerate(mutations):
@@ -1268,7 +1312,7 @@ def _run_generated(
             return records, findings, False
         tested, outcome, over_budget = _run_with_fallback(
             function, mutation, tests, spec, start,
-            root, work, numbers, tools_dir, baseline, fallback,
+            root, copies, numbers, tools_dir, baseline, fallback,
         )
         records.append(_record(function, mutation, tested, outcome))
         if over_budget:
@@ -1284,7 +1328,7 @@ def _run_generated(
 def _run_function(
     function: python_shape.ShapeFunction, tests: tuple[str, ...],
     source: str, spec: MutationSpec, start: float,
-    root: Path, work: Path, numbers: list[int], tools_dir: Path, *,
+    root: Path, copies: _Copies, numbers: list[int], tools_dir: Path, *,
     preferred: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     if _remaining(start, spec) <= 0:
@@ -1297,22 +1341,23 @@ def _run_function(
     generated = _generated_mutations(mutations)
     if _remaining(start, spec) <= 0:
         return records + _not_run_records(function, generated, initial), [], False
-    baseline = _baseline(function, initial, root, work, numbers[0], spec, start, tools_dir)
+    baseline = _original_baseline(function, initial, root, copies, numbers, spec, start, tools_dir)
     if not baseline:
         return records + _not_run_records(function, generated, initial), [], False
-    numbers[0] += 1
     return _run_generated(
-        function, generated, initial, spec, start, root, work, numbers, records,
-        tools_dir, baseline, fallback=_FallbackCohort(tests) if preferred else None,
+        function, generated, initial, spec, start, root, copies, numbers, records,
+        tools_dir, baseline, fallback=tests if preferred else (),
     )
 
 
 def _source_for(
-    root: Path, relative: str, sources: dict[str, str]
+    root: Path, relative: str, sources: dict[str, str], *, snapshot: Path,
 ) -> str:
     source = sources.get(relative)
     if source is None:
-        source = python_shape._read_source(root, relative)
+        if snapshot != root and (snapshot / relative).read_bytes() != (root / relative).read_bytes():
+            raise GateError(f"python-mutation: measured source changed while copying {relative}")
+        source = python_shape._read_source(snapshot, relative)
         sources[relative] = source
     return source
 
@@ -1335,7 +1380,7 @@ def _unfinished_after_cleanup(
 def _measure(
     context: Any, spec: MutationSpec, functions: list[python_shape.ShapeFunction],
     tests: dict[str, tuple[str, ...]], start: float, *,
-    preferred: dict[str, tuple[str, ...]],
+    preferred: dict[str, tuple[str, ...]], selected: dict[str, bytes],
 ) -> tuple[list[dict[str, Any]], list[Finding], list[python_shape.ShapeFunction]]:
     records: list[dict[str, Any]] = []
     findings: list[Finding] = []
@@ -1343,7 +1388,10 @@ def _measure(
     sources: dict[str, str] = {}
     tools_dir = _tools_dir().resolve()
     with tempfile.TemporaryDirectory(prefix="qg-mutation-") as temporary:
-        work = Path(temporary)
+        copies = _measurement_copies(
+            context.root, Path(temporary), spec, start, tests,
+            selected,
+        )
         numbers = [0]
         for index, function in enumerate(functions):
             if _remaining(start, spec) <= 0:
@@ -1353,10 +1401,10 @@ def _measure(
             if not function_tests:
                 findings.append(_no_test_finding(function))
                 continue
-            source = _source_for(context.root, function.path, sources)
+            source = _source_for(context.root, function.path, sources, snapshot=copies.source)
             related, survived, finished = _run_function(
                 function, function_tests, source, spec, start,
-                context.root, work, numbers, tools_dir,
+                context.root, copies, numbers, tools_dir,
                 preferred=preferred.get(function.identity, ()),
             )
             records.extend(related)
@@ -1412,21 +1460,25 @@ def _run_python_mutation(context: Any) -> CheckResult:
             context.root, check.spec.base, resolved=context.base_override
         )
         mark_step("python-mutation selection")
-        functions = _changed_functions(context, check.spec, base)
-        test_files = (
-            _pytest_test_file_paths(context) if check.spec.test_runner == "pytest"
-            else _test_file_paths(context)
-        )
+        is_pytest = check.spec.test_runner == "pytest"
+        selected = _SelectedSources()
+        read_source = selected.read
+        functions = _changed_functions(context, check.spec, base, read_source=read_source)
+        test_files = _pytest_test_file_paths(context) if is_pytest else _test_file_paths(context)
         imports = module_graph.PythonImports.from_repository(context.root, context.config.python_import_roots)
         module_names = imports.identities(context.inventory_files)
-        tests = _tests_by_function(context.root, functions, test_files, module_names)
+        tests = _tests_by_function(
+            context.root, functions, test_files, module_names, read_source=read_source,
+        )
         preferred = (
-            _preferred_pytest_tests(functions, tests, context.root, module_names)
-            if check.spec.test_runner == "pytest" else {}
+            _preferred_pytest_tests(functions, tests, context.root, module_names, read_source=read_source)
+            if is_pytest else {}
         )
         mark_step("python-mutation execution")
         spec = replace(check.spec, import_roots=context.config.python_import_roots)
-        records, findings, unfinished = _measure(context, spec, functions, tests, start, preferred=preferred)
+        records, findings, unfinished = _measure(
+            context, spec, functions, tests, start, preferred=preferred, selected=selected.contents,
+        )
         findings.extend(
             _over_budget_finding(function, check.spec)
             for function in unfinished

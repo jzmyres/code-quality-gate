@@ -24,13 +24,13 @@ IMPORT = "from pkg.app import flag\n"
 
 
 class PytestMutationCase(MutationCase):
-    def prepare(self, tests: str, **options: object) -> None:
+    def prepare(self, tests: str, *, app: str = APP, **options: object) -> None:
         self.write_config(mutation_config(
             test_runner="pytest", function_mutants=1, **options,
         ).replace('"unittest", "discover", "-s", "tests"', '"pytest", "tests"'))
         self.base_commit()
         self.commit({
-            "pkg/app.py": APP,
+            "pkg/app.py": app,
             "tests/app_test.py": IMPORT + tests,
         })
 
@@ -294,6 +294,65 @@ class PreferredCohortTests(PytestMutationCase):
         return [(call.kwargs["stage"], list(call.args[2])) for call in runs.call_args_list]
 
 
+class OriginalReuseTests(PytestMutationCase):
+    def commit_functions(self, changed: dict[str, str]) -> None:
+        self.write_config(mutation_config(test_runner="pytest", function_mutants=1))
+        self.base_commit()
+        self.commit(changed)
+
+    def test_shared_original_is_scoped_to_the_measured_module(self) -> None:
+        self.commit_functions({
+            "pkg/app.py": APP + "\ndef ready():\n    return True\n",
+            "pkg/extra.py": "def active():\n    return True\n",
+            "tests/test_apps.py": (
+                "from pkg.app import flag, ready\nfrom pkg.extra import active\n"
+                "def test_flags():\n    assert flag() and ready() and active()\n"
+            ),
+        })
+        attempts, killed = self.run_and_record_kills()
+        cohort = ("tests/test_apps.py",)
+        self.assertEqual(attempts, [
+            ("original tests", "pkg/app.py", cohort),
+            ("mutant run", "pkg/app.py", cohort),
+            ("mutant run", "pkg/app.py", cohort),
+            ("original tests", "pkg/extra.py", cohort),
+            ("mutant run", "pkg/extra.py", cohort),
+        ])
+        self.assertEqual(killed, ["pkg/app.py:flag", "pkg/app.py:ready", "pkg/extra.py:active"])
+
+    def test_distinct_preferred_cohorts_keep_separate_originals_and_share_fallback(self) -> None:
+        self.commit_functions({
+            "pkg/app.py": APP + "\ndef ready():\n    return True\n",
+            "tests/test_flag.py": IMPORT + "def test_flag():\n    assert isinstance(flag(), bool)\n",
+            "tests/test_ready.py": (
+                "from pkg.app import ready\ndef test_ready():\n    assert isinstance(ready(), bool)\n"
+            ),
+            "tests/test_both.py": (
+                "from pkg import app\ndef test_both():\n"
+                "    assert getattr(app, 'flag')() and getattr(app, 'ready')()\n"
+            ),
+        })
+        attempts, killed = self.run_and_record_kills()
+        flag = ("tests/test_flag.py",)
+        ready = ("tests/test_ready.py",)
+        full = ("tests/test_both.py", *flag, *ready)
+        self.assertEqual([(stage, tests) for stage, _, tests in attempts], [
+            ("original tests", flag), ("mutant run", flag), ("original tests", full),
+            ("mutant run", full), ("original tests", ready), ("mutant run", ready), ("mutant run", full),
+        ])
+        self.assertEqual(killed, ["pkg/app.py:flag", "pkg/app.py:ready"])
+
+    def run_and_record_kills(self) -> tuple[list[tuple[str, str, tuple[str, ...]]], list[str]]:
+        with mock.patch.object(python_mutation, "_run_pytest", wraps=python_mutation._run_pytest) as runs:
+            result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        copy_roots = [call.args[1] for call in runs.call_args_list]
+        self.assertEqual(len(copy_roots), len(set(copy_roots)))
+        attempts = [(call.kwargs["stage"], call.args[5], call.args[2]) for call in runs.call_args_list]
+        killed = [row["subject"] for row in self.mutants(check) if row["outcome"] == "killed"]
+        return attempts, killed
+
+
 class ReceiptTests(PytestMutationCase):
     def test_mutant_does_not_launch_after_copy_exhausts_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -307,24 +366,101 @@ class ReceiptTests(PytestMutationCase):
                 mock.patch.object(python_mutation, "_run_pytest") as run_pytest,
             ):
                 result = python_mutation._run_mutant(
-                    function, mutation, ("tests/test_app.py",), spec, 0, root, root, [0], root,
+                    function, mutation, ("tests/test_app.py",), spec, 0, root,
+                    python_mutation._Copies(root, root), [0], root,
                 )
             self.assertEqual(result, ("not run (over budget)", True))
             run_pytest.assert_not_called()
             self.assertEqual((root / "app.py").read_text(), mutation.mutated_source)
 
-    def test_verified_receipts_drive_adapter_without_pytest(self) -> None:
-        self.prepare("from pkg import app\ndef test_flag():\n    assert getattr(app, 'flag')()\n")
+    def test_original_receipt_is_reused_for_two_independently_verified_mutants(self) -> None:
+        self.prepare(
+            "from pkg import app\ndef test_flag():\n"
+            "    assert getattr(app, 'flag')() and getattr(app, 'ready')()\n",
+            app=APP + "\ndef ready():\n    return True\n",
+        )
         node = "tests/app_test.py::test_flag"
+        invocations = []
 
         def complete(argv, *, cwd, **_kwargs):
-            assertions = [node] if cwd.name == "copy-0001" else []
+            invocations.append(cwd.name)
+            assertions = [node] if cwd.name != "copy-0000" else []
             return self.write_receipt(argv, [node], assertions)
 
-        with mock.patch.object(python_mutation, "run", side_effect=complete):
-            result, _document, check = self.run_mutation()
-        self.assertEqual(result.returncode, 0, output(result))
-        self.assertIn("killed", {row["outcome"] for row in self.mutants(check)})
+        check = self.passing_receipts(complete)
+        self.assertEqual(invocations, ["copy-0000", "copy-0001", "copy-0002"])
+        kills = [row["subject"] for row in self.mutants(check) if row["outcome"] == "killed"]
+        self.assertEqual(kills, ["pkg/app.py:flag", "pkg/app.py:ready"])
+
+    def test_cache_requires_a_successful_original_for_the_exact_order(self) -> None:
+        copies = python_mutation._Copies(self.base, self.base / "snapshot")
+        spec = python_mutation.MutationSpec("changed", "HEAD", 10, 1, 10, "pytest")
+        function = SimpleNamespace(path="pkg/app.py")
+        cohort = ("tests/test_first.py", "tests/test_second.py")
+        reverse = cohort[::-1]
+        receipt = python_mutation._PytestEvidence(("one",), ("one",), ())
+        other = python_mutation._PytestEvidence(("two",), ("two",), ())
+        copies_used = [0]
+
+        def original(tests):
+            return python_mutation._original_baseline(
+                function, tests, self.base, copies, copies_used, spec, 0, self.base,
+            )
+
+        with (
+            mock.patch.object(python_mutation, "_remaining", return_value=5),
+            mock.patch.object(python_mutation, "_baseline", side_effect=[False, receipt, other]) as runs,
+        ):
+            self.assertFalse(original(cohort))
+            self.assertIs(original(cohort), receipt)
+            self.assertIs(original(cohort), receipt)
+            self.assertIs(original(reverse), other)
+        self.assertEqual([call.args[1] for call in runs.call_args_list], [cohort, cohort, reverse])
+        with mock.patch.object(python_mutation, "_remaining", return_value=0):
+            self.assertFalse(original(cohort))
+
+    def test_changed_measured_source_after_snapshot_rejects(self) -> None:
+        self.prepare("def test_flag():\n    assert flag()\n")
+        real_copy = python_mutation._copy_tree
+
+        def copy_then_change(source, destination):
+            copied = real_copy(source, destination)
+            (source / "pkg/app.py").write_bytes(APP.replace("\n", "\r\n").encode())
+            return copied
+
+        with (
+            mock.patch.object(python_mutation, "_copy_tree", side_effect=copy_then_change),
+            mock.patch.object(python_mutation, "_run_pytest") as run_pytest,
+        ):
+            check = self.assert_check_error()
+        self.assertIn("measured source changed while copying pkg/app.py", check["reason"])
+        run_pytest.assert_not_called()
+
+    def test_measured_source_changed_before_copy_refuses(self) -> None:
+        self.assert_selection_change_refused("pkg/app.py")
+
+    def test_test_source_changed_before_copy_refuses(self) -> None:
+        self.assert_selection_change_refused("tests/app_test.py")
+
+    def assert_selection_change_refused(self, relative: str) -> None:
+        self.prepare("def test_flag():\n    assert flag()\n")
+        real_copy = python_mutation._copy_tree
+
+        def change_then_copy(source, destination):
+            if destination.name == "original-source":
+                path = source / relative
+                path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+            return real_copy(source, destination)
+
+        with (
+            mock.patch.object(python_mutation, "_copy_tree", side_effect=change_then_copy),
+            mock.patch.object(
+                python_mutation, "_run_pytest", wraps=python_mutation._run_pytest,
+            ) as run_pytest,
+        ):
+            check = self.assert_check_error()
+        self.assertIn(f"selected source differs from snapshot: {relative}", check["reason"])
+        run_pytest.assert_not_called()
 
     def test_verified_receipts_drive_pytest_fallback(self) -> None:
         self.prepare("import pkg.app as app\ndef test_flag():\n    assert isinstance(app.flag(), bool)\n")
@@ -342,9 +478,7 @@ class ReceiptTests(PytestMutationCase):
             assertions = [nodes[-1]] if cwd.name == "copy-0003" else []
             return self.write_receipt(argv, nodes, assertions)
 
-        with mock.patch.object(python_mutation, "run", side_effect=complete):
-            result, _document, check = self.run_mutation()
-        self.assertEqual(result.returncode, 0, output(result))
+        check = self.passing_receipts(complete)
         self.assertEqual(invocations, [preferred, preferred, full, full])
         killed = self.mutants(check)[-1]
         self.assertEqual((killed["outcome"], killed["tests"]), ("killed", full))
@@ -361,6 +495,12 @@ class ReceiptTests(PytestMutationCase):
         self.assert_over_budget(result, check)
         self.assertEqual(invocations, [preferred, preferred])
         self.assertEqual(self.mutants(check)[-1]["tests"], preferred)
+
+    def passing_receipts(self, complete) -> dict[str, Any]:
+        with mock.patch.object(python_mutation, "run", side_effect=complete):
+            result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        return check
 
     @staticmethod
     def write_receipt(argv: list[str], nodes: list[str], assertions: list[str]) -> RunResult:

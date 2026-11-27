@@ -1139,10 +1139,10 @@ its absolute path, with an empty entry resolved as the gate's current directory;
 the source repository is replaced by the same relative path inside the copy. No other allowlisted
 value is a path the gate does not set itself, and no
 other variable is inherited, so no inherited path or relative traversal can reach the source
-tree. The unmutated baseline runs for every changed function that has tests, including functions
-without generated mutants. A baseline failure in this environment is a check error naming the
-failing test. By default, the selected test files run in that copy with the bounded
-runner as
+tree. An unmutated baseline is required for every changed function that has tests, including
+functions without generated mutants. A baseline failure in this environment is a check error naming
+the failing test. By default, the selected test files run against the original for each changed
+function and against each mutant, using separate copies and the bounded runner as
 `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
 
 Use `test_runner = "pytest"` to run ordinary pytest test functions and fixtures. Install pytest
@@ -1155,10 +1155,12 @@ of distinct module members referenced. The highest-ranked files run together whe
 positive and they form a strict subset. This ranking uses static import bindings and dotted names.
 It can prefer tests of a module's public entry points when they exercise a changed helper indirectly.
 The full selection runs when no smaller cohort qualifies and for each mutant that passes the
-preferred tests. Each cohort runs against its own unmutated copy before it runs any mutants. The
-first original is required even if no mutants are generated. Later mutants of the same function reuse
-that original evidence. Each child has the configured time limit, and the aggregate deadline covers
-both cohorts.
+preferred tests. Within one pytest mutation measurement, original and mutant runs use fresh copies
+from the same private snapshot of the repository. The measured production and candidate test files
+used for selection must match that snapshot byte for byte. Before running mutants for a module and an ordered
+cohort, pytest verifies a passing original in its own copy. Later measurements of functions in that
+module can reuse the original evidence for the identical cohort. Each child has the configured time
+limit, and the aggregate deadline covers the snapshot, both cohorts and cleanup.
 
 Pytest reads its configuration from the copy and starts Python's import path with the copied
 `python_import_roots` in policy order, followed by the copy root when it is distinct.
