@@ -497,9 +497,9 @@ record and pointer pair can appear once.
 
 A Git-tracked `.py` record can contain up to 16 MiB of UTF-8 Python source.
 Use `/ASSIGNMENT/literal-key` for a key in a single top-level assignment
-such as `DIGESTS = {"token_config.json": "…"}`. Use a separate Git-tracked
-working-tree payload path. The assignment uses one ASCII identifier and a
-dictionary of unique, unescaped string literal keys and values. The selected
+such as `DIGESTS = {"token_config.json": "…"}`. Use a separate tracked
+payload path or a bounded gzip payload table. The assignment uses one ASCII
+identifier and a dictionary of unique, unescaped string literal keys and values. The selected
 value must be one single- or double-quoted lowercase digest on the scanner's
 reported line. The gate parses the source without executing it and compares
 the literal's byte span against the scanner's match. The proof covers that

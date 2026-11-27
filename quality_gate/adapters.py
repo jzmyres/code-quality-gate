@@ -591,10 +591,10 @@ def _provenance_payload(
     value = row.get("payload")
     key = f"{where}.payload"
     if isinstance(value, dict):
-        if python:
-            raise _config_error(path, key, "a tracked payload path for a .py record", "inline table")
         if value.keys() & {"compressed_sha256", "decoded_size"}:
             return _gzip_payload(value, path, key)
+        if python:
+            raise _config_error(path, key, "a tracked raw or gzip payload for a .py record", "Git object")
         return _git_payload(value, path, key)
     name = _string(row, "payload", path, key)
     _validate_exact_path(path, key, name)

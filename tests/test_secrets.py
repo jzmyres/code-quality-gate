@@ -601,6 +601,39 @@ payload_sha256 = "{digest}"
         for value in (digest, credential, other):
             self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_python_provenance_hashes_gzip_operand_and_scans_it(self) -> None:
+        binary, _, _, original = self._python_provenance_fixture()
+        payload = f'token = "{_synthetic_credential()}"\n'.encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        archive = gzip.compress(payload, mtime=0)
+        compressed = hashlib.sha256(archive).hexdigest()
+        policy = self.config_path.read_text(encoding="utf-8")
+        row = f'payload = "pack.raw"\npayload_sha256 = "{original}"'
+        self.assertEqual(policy.count(row), 1)
+        declaration = (
+            f'payload = {{path = "pack.gz", compressed_sha256 = "{compressed}", '
+            f'decoded_size = {len(payload)}}}\n'
+            f'payload_sha256 = "{digest}"'
+        )
+        self.write_config(policy.replace(row, declaration) + '''
+[[rule]]
+pattern = "*.gz"
+class = "config"
+reason = "synthetic compressed payload"
+''')
+        self.add_file("pack.gz", archive)
+        self.add_file("checksums.py", f"DIGESTS = {{'token_config.json': '{digest}'}}\n")
+        self.commit_all()
+        trusted = self.trusted_directory("HEAD", name="trusted-python-gzip")
+        checked, _ = self._run_provenance(binary, trusted, 1, 1)
+        self.assertEqual(checked.stderr.count("RuleID: github-pat"), 1)
+        self.assertNotIn("RuleID: generic-api-key", checked.stderr)
+
+        self.add_file("pack.gz", gzip.compress(payload, mtime=1))
+        altered, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: github-pat", altered.stderr)
+        self.assertIn("RuleID: generic-api-key", altered.stderr)
+
     def test_python_proof_refuses_equal_shape_same_line_even_if_declared_site_is_last(self) -> None:
         binary, trusted, payload, digest = self._python_provenance_fixture()
         self.add_file("pack.raw", payload)
@@ -1189,13 +1222,18 @@ decoded_sha256 = "{decoded_pin or hashlib.sha256(record).hexdigest()}"
         }
         valid, = adapters._secrets_provenance({"sha256_provenance": [row]}, self.config_path, "secrets")
         self.assertEqual(valid.pointer, ("DIGESTS", "one/two~three"))
+        gzip_fields = dict(path="data.gz", compressed_sha256="0" * 64, decoded_size=1)
+        compressed, = adapters._secrets_provenance(
+            {"sha256_provenance": [dict(row, payload=gzip_fields)]}, self.config_path, "secrets",
+        )
+        self.assertEqual(compressed.payload, secrets.GzipPayload("data.gz", "0" * 64, 1))
         for invalid in (
             dict(row, pointer="/DIGESTS"), dict(row, pointer="/DIGESTS/key/extra"),
             dict(row, pointer="/1DIGESTS/key"), dict(row, pointer="/while/key"),
             dict(row, pointer="/DIGESTS/"), dict(row, payload="checksums.py"),
             dict(row, compressed_sha256="0" * 64),
             dict(row, payload={"path": "data.raw", "commit": "1" * 40, "blob": "2" * 40, "size": 1}),
-            dict(row, payload={"path": "data.gz", "compressed_sha256": "0" * 64, "decoded_size": 1}),
+            dict(row, payload=dict(gzip_fields, decoded_size=-1)),
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
                 adapters._secrets_provenance({"sha256_provenance": [invalid]}, self.config_path, "secrets")
