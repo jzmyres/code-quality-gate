@@ -453,11 +453,30 @@ payload_sha256 = "edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18
 ```
 
 Choose the payload and independently verify its digest before adding the
-declaration to the policy used by `--policy-from`. The payload must be
-Git-tracked and both paths must be exact repository-relative paths to separate
-regular files. A plain `.json` record can contain up to 16 MiB of UTF-8 JSON.
-The JSON Pointer uses `~0` and `~1` escapes and zero-based array indices.
-Each record and pointer pair can appear once.
+declaration to the policy used by `--policy-from`. Use exact repository-relative
+paths to separate regular files. With a string `payload`, the gate hashes the
+captured working-tree bytes of a Git-tracked file.
+
+A historical payload uses an inline table for the same `payload` field:
+
+```toml
+payload = { path = "evidence/pack.raw", commit = "1111111111111111111111111111111111111111", blob = "2222222222222222222222222222222222222222", size = 4 }
+```
+
+Replace the sample IDs with full lowercase hexadecimal commit and blob IDs in
+the repository's object format. The commit must be an ancestor of the
+candidate HEAD captured by the check, or equal to it. Git lookups ignore
+replacement references and grafts and do not fetch. Repositories configured
+for promisor lookups leave historical proofs unresolved. The literal path
+must identify exactly one regular blob at that commit, no larger than 16 MiB.
+The gate verifies its object ID, byte length and `payload_sha256` within the
+check's budget. This lookup does not add its historical contents to the
+working-tree scan. The rest of the declaration uses the same record and
+pointer fields.
+
+A plain `.json` record can contain up to 16 MiB of UTF-8 JSON. The JSON
+Pointer uses `~0` and `~1` escapes and zero-based array indices. Each
+record and pointer pair can appear once.
 
 For a Git-tracked `.json.gz` record, add `compressed_sha256` for the exact
 captured gzip bytes and `decoded_sha256` for the exact UTF-8 JSON bytes. Both

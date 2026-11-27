@@ -15,6 +15,9 @@ import string
 import struct
 import subprocess
 import sys
+import time
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from unittest import mock
 
@@ -341,16 +344,195 @@ payload_sha256 = "{digest}"
             {"Ω": "π", "pack": [{"tokens_sha256": digest}], **extra}, ensure_ascii=False,
         )
 
-    def _run_provenance(self, binary: Path, trusted: Path | None, status: int, verified: int | None):
+    def _run_provenance(
+        self, binary: Path, trusted: Path | None, status: int, verified: int | None,
+        *, repo: Path | None = None,
+    ):
         trust_args = ["--only", "secrets"] if trusted is None else ["--policy-from", str(trusted)]
         result = self.run_qg_process(
-            "check", "--json", *trust_args,
+            "check", "--json", *trust_args, repo=repo,
             env={"QG_TOOLS_DIR": str(binary.parent.parent)},
         )
         self.assertEqual(result.returncode, status, result.stderr)
         check = self.check_by_id(self.parse_json(result), "secrets")
         self.assertEqual((check.get("measurement") or {}).get("verified_sha256_provenance"), verified)
         return result, check
+
+    def _git_fixture(self, filename: str = "proofs/old.raw") -> tuple[secrets.GitPayload, str]:
+        source = b"synthetic historical provenance bytes\x00"
+        self.add_file(filename, source)
+        self.add_file("proofs/other.raw", b"an independent synthetic negative control")
+        (self.repo / "proofs/linked.raw").symlink_to("old.raw")
+        self.commit_all()
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        blob = self.git("rev-parse", f"{commit}:{filename}").stdout.strip()
+        return secrets.GitPayload(filename, commit, blob, len(source)), hashlib.sha256(source).hexdigest()
+
+    def _declare_git_proof(
+        self, operand: secrets.GitPayload, digest: str, data: str, *, archive: bool = False,
+    ) -> Path:
+        name = "report.json.gz" if archive else "report.json"
+        original = data.encode()
+        content = gzip.compress(original, mtime=0) if archive else original
+        self.add_file(name, content)
+        base = BASE_CONFIG + DECLARATION + """
+[[rule]]
+pattern = "*.json*"
+class = "config"
+reason = "synthetic report fixtures"
+
+[[rule]]
+pattern = "*.raw"
+class = "config"
+reason = "synthetic historical operands"
+"""
+        operand_fields = (
+            f'path = "{operand.path}", commit = "{operand.commit}", '
+            f'blob = "{operand.blob}", size = {operand.size}'
+        )
+        declaration = f"""
+[[checks.secrets.sha256_provenance]]
+record = "{name}"
+pointer = "/pack/0/tokens_sha256"
+payload = {{ {operand_fields} }}
+payload_sha256 = "{digest}"
+"""
+        if archive:
+            declaration += f'compressed_sha256 = "{hashlib.sha256(content).hexdigest()}"\n'
+            declaration += f'decoded_sha256 = "{hashlib.sha256(original).hexdigest()}"\n'
+        self.write_config(base + declaration)
+        self.commit_all()
+        revision = self.git("rev-parse", "HEAD").stdout.strip()
+        return self.trusted_directory(revision, name=f"trusted-{revision}")
+
+    def test_git_proof_uses_old_bytes_in_no_local_clone_and_keeps_other_findings(self) -> None:
+        binary = self._require_scanner()
+        operand, digest = self._git_fixture(":(top)old operand.raw")
+        trusted = self._declare_git_proof(operand, digest, self._digest_record(digest))
+        self.add_file(operand.path, b"new tracked bytes")
+        self.commit_all()
+        clone = self.base / "fresh"
+        self.git("clone", "--no-local", "--single-branch", "--no-tags", str(self.repo), str(clone))
+        self.assertFalse((clone / ".git/objects/info/alternates").exists())
+        self.assertEqual((clone / operand.path).read_bytes(), b"new tracked bytes")
+        result, _ = self._run_provenance(binary, trusted, 0, 1, repo=clone)
+        self.assertNotIn(digest, result.stdout + result.stderr)
+
+        (clone / operand.path).unlink()
+        adjacent, undeclared = _synthetic_credential(), _synthetic_credential(43)
+        (clone / "report.json").write_text(self._digest_record(digest, adjacent=adjacent))
+        (clone / "undeclared.json").write_text(self._digest_record(undeclared))
+        result, check = self._run_provenance(binary, trusted, 1, 1, repo=clone)
+        self.assertEqual(check["reason"], "Betterleaks reported 2 unresolved finding(s)")
+        self.assertEqual(result.stderr.count("RuleID: github-pat"), 2)
+        for value in (digest, adjacent, undeclared):
+            self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_git_payload_requires_exact_regular_blob_and_size(self) -> None:
+        operand, digest = self._git_fixture()
+        linked_blob = self.git("rev-parse", "HEAD:proofs/linked.raw").stdout.strip()
+        linked_size = len(os.readlink(self.repo / "proofs/linked.raw").encode())
+        other = self.git("rev-parse", "HEAD:proofs/other.raw").stdout.strip()
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{operand.commit},gitlink")
+        self.git("commit", "-m", "synthetic gitlink")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+        self.assertEqual(reader.digest(operand), digest)
+        for invalid in (
+            replace(operand, commit="0" * 40), replace(operand, commit=operand.blob),
+            replace(operand, path="proofs/missing.raw"), replace(operand, path="proofs"),
+            replace(operand, path="proofs/linked.raw", blob=linked_blob, size=linked_size),
+            replace(operand, commit=head, path="gitlink", blob=operand.commit),
+            replace(operand, blob=other), replace(operand, size=operand.size + 1),
+            replace(operand, size=secrets.MAX_GIT_PAYLOAD_BYTES + 1),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(reader.digest(invalid))
+
+    def test_git_payload_uses_the_repository_object_format(self) -> None:
+        repo = self.base / "sha256"
+        self.git("init", "--object-format=sha256", str(repo))
+        self.repo = repo
+        self.add_file("empty.raw", b"")
+        self.commit_all()
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        blob = self.git("rev-parse", "HEAD:empty.raw").stdout.strip()
+        self.assertEqual((len(commit), len(blob)), (64, 64))
+        reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, repo, 60))
+        payload = secrets.GitPayload("empty.raw", commit, blob, 0)
+        self.assertEqual(reader.digest(payload), hashlib.sha256(b"").hexdigest())
+        self.assertIsNone(reader.digest(replace(payload, commit="0" * 40, blob="1" * 40)))
+
+    def test_git_payload_ignores_local_only_commits_grafts_and_replacements(self) -> None:
+        operand, digest = self._git_fixture()
+        self.add_file("proofs/new.raw", b"head is a separate descendant")
+        self.commit_all()
+        local = self.git("commit-tree", f"{operand.commit}^{{tree}}", "-m", "local only").stdout.strip()
+        changed = replace(operand, commit=local)
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("branch", "local-only", local)
+        reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+        self.assertTrue(reader._reachable_commit(operand.commit))
+        self.assertFalse(reader._reachable_commit(local))
+        self.assertIsNone(reader.digest(changed))
+        self.git("replace", "--graft", head, local)
+        self._verify_ignored_ancestry_override(head, changed, operand, digest)
+
+        self.git("replace", "-d", head)
+        self.add_file(".git/info/grafts", f"{head} {local}\n")
+        self._verify_ignored_ancestry_override(head, changed, operand, digest)
+
+    def _verify_ignored_ancestry_override(
+        self, head: str, changed: secrets.GitPayload, operand: secrets.GitPayload, digest: str,
+    ) -> None:
+        self.git("merge-base", "--is-ancestor", changed.commit, head)
+        reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+        self.assertIsNone(reader.digest(changed))
+        self.assertEqual(reader.digest(operand), digest)
+
+    def test_git_payload_respects_deadline_and_refuses_promisor_lookup(self) -> None:
+        operand, _ = self._git_fixture()
+        with mock.patch.object(adapters, "run", wraps=runner.run) as launch:
+            reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+            with runner.check_deadline("secrets", time.monotonic() - 2, 1):
+                self.assertIsNone(reader.digest(operand))
+            launch.assert_not_called()
+            self.git("config", "remote.promised.promisor", "true")
+            reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+            self.assertIsNone(reader.digest(operand))
+            launch.assert_called_once()
+        self.assertIn("config", launch.call_args.args[0])
+        self.assertEqual(launch.call_args.kwargs["env"]["GIT_ALLOW_PROTOCOL"], "")
+        self.assertEqual(launch.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+
+    def test_git_payload_checks_its_sha_and_is_read_once_per_run(self) -> None:
+        operand, digest = self._git_fixture()
+        declarations = [
+            secrets.Provenance("report.json", ("slot", index), operand, pin)
+            for pin, index in ((digest, "0"), ("0" * 64, "1"), (digest, "2"))
+        ]
+        reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+        with mock.patch.object(reader, "digest", wraps=reader.digest) as read:
+            pinned = list(secrets._pinned_payloads(self.evidence, declarations, reader))
+        self.assertEqual(pinned, [declarations[0], declarations[2]])
+        read.assert_called_once_with(operand)
+
+    def test_git_payload_keeps_gzip_and_json_coordinate_checks(self) -> None:
+        binary = self._require_scanner()
+        operand, digest = self._git_fixture()
+        record = self._digest_record(digest)
+        trusted = self._declare_git_proof(operand, digest, record, archive=True)
+        self._run_provenance(binary, trusted, 0, 1)
+        self.add_file("report.json.gz", gzip.compress(record.encode(), mtime=1))
+        self._run_provenance(binary, trusted, 1, 0)
+
+        for invalid in (
+            json.dumps({"pack": [{"tokens_sha256": digest}] * 2}),
+            record.replace('"tokens_sha256"', '"tokens_sha256": "placeholder", "tokens_sha256"'),
+        ):
+            trusted = self._declare_git_proof(operand, digest, invalid, archive=True)
+            result, _ = self._run_provenance(binary, trusted, 1, 0)
+            self.assertIn("RuleID: generic-api-key", result.stderr)
 
     def test_trusted_payload_verifies_exact_json_scalar(self) -> None:
         binary, trusted, digest = self._provenance_fixture()
@@ -676,6 +858,30 @@ decoded_sha256 = "{decoded_pin or hashlib.sha256(record).hexdigest()}"
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
                 adapters._secrets_provenance({"sha256_provenance": [invalid]}, self.config_path, "secrets")
+
+    def test_git_payload_declarations_reject_invalid_origin_and_duplicate_pointer(self) -> None:
+        operand = dict(path="proofs/file.raw", commit="0" * 40, blob="1" * 40, size=10)
+        row = dict(record="report.json", pointer="/tokens_sha256", payload=operand, payload_sha256="2" * 64)
+        parsed, = adapters._secrets_provenance({"sha256_provenance": [row]}, self.config_path, "secrets")
+        self.assertEqual(parsed.payload, secrets.GitPayload(**operand))
+        for invalid in (
+            dict(operand, path="../data.raw"), dict(operand, path="report.json"),
+            dict(operand, path="proofs/*.raw"), dict(operand, commit="HEAD"),
+            dict(operand, commit="a" * 39), dict(operand, blob="a" * 64),
+            dict(operand, size=-1), dict(operand, size=True),
+            dict(operand, size=secrets.MAX_GIT_PAYLOAD_BYTES + 1),
+            dict(operand, alternate_path="extra.raw"),
+            {key: value for key, value in operand.items() if key != "size"},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                adapters._secrets_provenance(
+                    {"sha256_provenance": [dict(row, payload=invalid)]}, self.config_path, "secrets",
+                )
+        with self.assertRaises(ConfigError):
+            adapters._secrets_provenance(
+                {"sha256_provenance": [row, dict(row, payload="proofs/local.raw")]},
+                self.config_path, "secrets",
+            )
 
     def test_unattested_match_locations_do_not_verify(self) -> None:
         digest = hashlib.sha256(b"example source").hexdigest()
