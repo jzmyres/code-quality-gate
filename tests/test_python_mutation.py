@@ -1576,7 +1576,79 @@ class GeneratorTests(unittest.TestCase):
             int(record.replacement) - 1
             for record in generated if record.operator == "n+1"
         ]
-        self.assertEqual(constants, list(range(1, 20)), constants)
+        self.assertEqual(constants, list(range(1, 21)), constants)
+        removed = next(record for record in records if record.operator == "delete")
+        self.assertEqual(removed.rule, "deletion removes a retained local binding")
+
+    def test_deleting_the_only_referenced_import_does_not_fill_the_sample(self) -> None:
+        source = "def select():\n    from os import fspath\n    return fspath('a')\n"
+        _function, records = self.generated(source, 1)
+        removed, *_ = records
+        self.assertEqual(removed.mutated_line, "deleted: from os import fspath")
+        self.assertEqual(removed.rule, "deletion removes a retained local binding")
+        generated = [record for record in records if record.rule is None]
+        self.assertEqual(len(generated), 1, records)
+        self.assertIn("return fspath", generated[0].mutated_line)
+
+    def test_keep_deleting_assignments_with_available_fallback_bindings(self) -> None:
+        cases = {
+            "module": ("label", "label = 'fallback'"),
+            "import": ("label", "from names import label"),
+            "builtin": ("len", ""),
+            "star": ("label", "from names import *"),
+            "dynamic": ("label", "globals().update(label='fallback')"),
+            "module attribute": ("label", "import sys\nsys.modules[__name__].label = 'fallback'"),
+            "module alias": ("label", "import this_module as current\ncurrent.label = 'fallback'"),
+            "package metadata": ("__path__", ""),
+        }
+        for key, (name, suffix) in cases.items():
+            with self.subTest(key=key):
+                source = f"def select():\n    {name} = 'blue'\n    return {name}\n{suffix}\n"
+                _function, records = self.generated(source)
+                removed = next(record for record in records if record.operator == "delete")
+                self.assertEqual(removed.mutated_line, f"deleted: {name} = 'blue'")
+                self.assertIsNone(removed.rule)
+
+    def test_keep_deleting_mutations_that_preserve_local_lookup(self) -> None:
+        source = ("def select(active):\n    label = 'old'\n    if active:\n"
+                  "        label = 'new'\n    return label\n")
+        _function, records = self.generated(source)
+        rewrites = [record for record in records if record.mutated_line.startswith("deleted: label")]
+        self.assertEqual([record.line for record in rewrites], [2, 4])
+        self.assertTrue(all(record.rule is None for record in rewrites))
+
+    def test_method_lookups_use_the_compilers_mangled_name(self) -> None:
+        body = "class C:\n    def select(self):\n        __label = 'blue'\n        return __label\n"
+        for suffix, expected in (("", "deletion removes a retained local binding"),
+                                 ("_C__label = 'fallback'\n", None)):
+            with self.subTest(suffix=suffix):
+                source = body + suffix
+                method = ast.parse(source).body[0].body[0]
+                removed, *_ = python_mutation._mutations(method, source, 1)
+                self.assertEqual(removed.mutated_line, "deleted: __label = 'blue'")
+                self.assertEqual(removed.rule, expected)
+
+    def test_keep_deletions_when_the_only_read_is_a_postponed_annotation(self) -> None:
+        source = ("from __future__ import annotations\ndef select():\n    label = 'blue'\n"
+                  "    def inner() -> label:\n        pass\n    return inner\n")
+        function = ast.parse(source).body[1]
+        removed, *_ = python_mutation._mutations(function, source, 1)
+        self.assertEqual(removed.mutated_line, "deleted: label = 'blue'")
+        self.assertIsNone(removed.rule)
+
+    def test_keep_deleting_a_binding_when_the_enclosing_scope_can_supply_it(self) -> None:
+        source = ("def enclosing():\n    label = 'fallback'\n    def select():\n"
+                  "        label = 'blue'\n        return label\n    return select\n")
+        function = ast.parse(source).body[0].body[1]
+        removed, *_ = python_mutation._mutations(function, source, 1)
+        self.assertEqual(removed.mutated_line, "deleted: label = 'blue'")
+        self.assertIsNone(removed.rule)
+
+    def test_keep_deletions_inside_a_type_parameter_scope(self) -> None:
+        source = "def select[T]():\n    label = 'blue'\n    return label\n"
+        _function, records = self.generated(source, 1)
+        self.assertEqual(records[0].mutated_line, "deleted: label = 'blue'")
+        self.assertIsNone(records[0].rule)
 
     def test_deleting_a_decorated_definition_removes_its_decorators(self) -> None:
         _function, records = self.generated(DECORATED_NESTED)

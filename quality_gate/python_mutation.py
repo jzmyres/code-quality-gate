@@ -10,10 +10,12 @@ Comparison mutants use the operator's complement and its source spelling.
 from __future__ import annotations
 
 import ast
+import builtins
 import copy
 import json
 import os
 import shutil
+import symtable
 import sys
 import tempfile
 import time
@@ -494,6 +496,106 @@ def _generated_rule(
     return None
 
 
+_NAMESPACE_ATTRIBUTES = {
+    "__builtins__", "__dict__", "__globals__", "__setattr__",
+    "f_builtins", "f_globals", "f_locals", "modules",
+}
+_DYNAMIC_NAMESPACE_NAMES = _NAMESPACE_ATTRIBUTES | {
+    "*", "__import__", "builtins", "eval", "exec", "globals", "locals", "setattr", "vars",
+}
+
+
+def _binding_scope_path(
+    module: ast.Module, function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[int, ...]:
+    """Locate a direct module function or method by statement position."""
+    if function in module.body:
+        return (module.body.index(function),)
+    for index, statement in enumerate(module.body):
+        if isinstance(statement, ast.ClassDef) and function in statement.body:
+            return index, statement.body.index(function)
+    return ()
+
+
+def _binding_scope(
+    table: symtable.SymbolTable, module: ast.Module, address: tuple[int, ...],
+) -> symtable.SymbolTable | None:
+    """Match the definition's compiler scope in this version of the source."""
+    owner = module
+    for position in address:
+        owner = owner.body[position]
+        definitions = {(child.get_name(), child.get_lineno()): child for child in table.get_children()
+                       if child.get_type() in {"class", "function"}}
+        table = definitions.get((owner.name, owner.lineno))
+        if table is None:
+            return None
+    return table
+
+
+def _read_names(table: symtable.SymbolTable, scope: Callable[[symtable.Symbol], bool]) -> set[str]:
+    return {symbol.get_name() for symbol in table.get_symbols() if symbol.is_referenced() and scope(symbol)}
+
+
+def _retained_reads(
+    original: symtable.SymbolTable | None, mutated: symtable.SymbolTable | None,
+) -> set[str]:
+    """Names still read in this scope that now use global lookup."""
+    if original is None or mutated is None:
+        return set()
+    return _read_names(original, symtable.Symbol.is_local) & _read_names(mutated, symtable.Symbol.is_global)
+
+
+def _mentions_dynamic_namespace(node: ast.AST) -> bool:
+    """Recognize namespace names, including literal attributes used by reflection."""
+    fields = vars(node)
+    names = (fields.get("id"), fields.get("attr"), fields.get("name"))
+    return bool(_DYNAMIC_NAMESPACE_NAMES.intersection(names)) or (
+        isinstance(node, ast.Constant) and node.value in _NAMESPACE_ATTRIBUTES
+    )
+
+
+def _dynamic_namespace(module: ast.Module, unresolved: set[str]) -> bool:
+    """Whether source uses namespace access or may write a missing module attribute."""
+    for node in ast.walk(module):
+        if _mentions_dynamic_namespace(node):
+            return True
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store) and node.attr in unresolved:
+            return True
+    return False
+
+
+def _declared_globals(table: symtable.SymbolTable) -> set[str]:
+    return {symbol.get_name() for symbol in table.get_symbols()
+            if symbol.is_assigned() or symbol.is_imported() or symbol.is_declared_global()}
+
+
+def _without_fallback(table: symtable.SymbolTable, reads: set[str]) -> set[str]:
+    return {name for name in reads - _declared_globals(table) - vars(builtins).keys()
+            if not (name.startswith("__") and name.endswith("__"))}
+
+
+def _local_binding_rule(
+    module: ast.Module, function: ast.FunctionDef | ast.AsyncFunctionDef,
+    source: str, mutated_source: str, path: str,
+) -> str | None:
+    address = _binding_scope_path(module, function)
+    if not address:
+        return None
+    try:
+        original = symtable.symtable(source, path, "exec")
+    except SyntaxError:
+        return None
+    mutated = symtable.symtable(mutated_source, path, "exec")
+    reads = _retained_reads(
+        _binding_scope(original, module, address),
+        _binding_scope(mutated, ast.parse(mutated_source), address),
+    )
+    unresolved = _without_fallback(mutated, reads)
+    if unresolved and not _dynamic_namespace(module, unresolved):
+        return "deletion removes a retained local binding"
+    return None
+
+
 def _mutation(
     function: ast.FunctionDef | ast.AsyncFunctionDef, change: _Change,
     parents: dict[int, tuple[ast.AST, str]], module: ast.Module,
@@ -543,6 +645,9 @@ def _mutations(
             module_function, change, parents, module, function_index,
             path, original, source,
         )
+        if mutation.rule is None and mutation.delete:
+            rule = _local_binding_rule(module, module_function, source, mutation.mutated_source, path)
+            mutation = replace(mutation, rule=rule)
         found.append(mutation)
         if mutation.rule is None:
             generated += 1

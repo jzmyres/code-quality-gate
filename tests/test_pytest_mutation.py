@@ -60,6 +60,43 @@ class PytestMutationTests(PytestMutationCase):
         })
         self.assertEqual(self.git("status", "--porcelain").stdout, "")
 
+    def test_only_local_binding_does_not_displace_a_killable_deletion(self) -> None:
+        self.prepare(
+            "def test_flag():\n    assert flag(True) == 'blue'\n    assert flag(False) == 'disabled'\n",
+            app=("def flag(enabled):\n    label = str\n    if enabled:\n"
+                 "        return label('blue')\n    return 'disabled'\n"),
+        )
+        result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        records = self.mutants(check)
+        self.assertEqual([row["outcome"] for row in records], ["not generated", "killed"])
+        self.assertEqual(records[0]["rule"], "deletion removes a retained local binding")
+        self.assertEqual(records[1]["operator"], "delete")
+        self.assertEqual(records[1]["mutated"], "deleted: if enabled:")
+
+    def assert_global_fallback_deletion(self, app: str) -> None:
+        self.prepare(
+            "def test_flag():\n    assert flag() == 'blue'\n",
+            app=app,
+        )
+        result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual([(row["mutated"], row["outcome"]) for row in self.mutants(check)], [
+            ("deleted: label = 'blue'", "killed"),
+        ])
+
+    def test_reflective_global_fallback_keeps_a_killable_deletion(self) -> None:
+        self.assert_global_fallback_deletion(
+            "def flag():\n    label = 'blue'\n    return label\n"
+            "getattr(flag, '__globals__')['label'] = 'fallback'\n",
+        )
+
+    def test_module_dictionary_global_fallback_keeps_a_killable_deletion(self) -> None:
+        self.assert_global_fallback_deletion(
+            "import sys\n\ndef flag():\n    label = 'blue'\n    return label\n"
+            "vars(sys.modules[__name__])['label'] = 'fallback'\n",
+        )
+
     def test_passing_pytest_function_reports_survivor(self) -> None:
         self.prepare("def test_flag():\n    assert isinstance(flag(), bool)\n")
         result, _document, check = self.run_mutation()
