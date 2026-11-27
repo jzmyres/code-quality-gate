@@ -286,6 +286,12 @@ Its optional `allow` array defaults to empty. Each entry specifies exactly one
 nonempty `name` or `prefix` and a nonempty `owner`. Names and prefixes match
 case-sensitively. This policy allows `HOME` and names beginning with `XDG_`.
 
+A Python function's single-use local subprocess environment can report named overrides at their
+source lines. The assignment must immediately precede a recognized subprocess call that passes
+the local as `env=`. Supported assignments inherit `os.environ` in a dictionary literal, copy it,
+or pass it to the builtin `dict` with explicit keywords. Computed keys, competing bindings,
+and references that may escape this assignment and call retain their existing inventory behavior.
+
 ```toml
 [checks.env_surface]
 adapter = "env_surface"
