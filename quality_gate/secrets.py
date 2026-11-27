@@ -17,7 +17,9 @@ from .json_input import load_json
 _MAX_FILES_PER_INVOCATION = 24
 _FINDINGS_EXIT = 3
 _MAX_RECORD_BYTES = 16 << 20
-_ASSIGNMENT = re.compile(rb'[A-Za-z0-9_.-]+"[ \t]*:[ \t]*"([0-9a-f]{64})"')
+_DIGEST_WIDTH = 64
+_REDACTED_ASSIGNMENT = re.compile(r'([A-Za-z0-9_.-]+"[ \t]*:[ \t]*")REDACTED"')
+_SHA256 = re.compile(rb"[0-9a-f]{64}")
 _MARKER = "verified-provenance-position"
 _OpenParent = Callable[[Path, str], int]
 
@@ -163,7 +165,8 @@ def _verified_records(directory: Path, pinned: Iterable[Provenance]) -> dict[str
     return {path: record for path, record in records.items() if record is not None}
 
 
-def _matched_span(finding: dict[str, Any], record: _Record) -> tuple[int, int] | None:
+def _finding_bounds(finding: dict[str, Any], record: _Record) -> tuple[int, int, int] | None:
+    """Betterleaks v1.10.1 can start mid-line, making its start column a lower bound."""
     line = finding["StartLine"]
     start, end = finding["StartColumn"] - 1, finding["EndColumn"]
     if not (line == finding["EndLine"] and 1 <= line <= len(record.starts) and 0 <= start < end):
@@ -172,25 +175,49 @@ def _matched_span(finding: dict[str, Any], record: _Record) -> tuple[int, int] |
     line_end = record.starts[line] - 1 if line < len(record.starts) else len(record.data)
     if line_start + end > line_end:
         return None
-    return line_start + start, line_start + end
+    return line_start + start, line_end, end - start
 
 
-def _matched_digest(
-    finding: dict[str, Any], data: bytes, span: tuple[int, int] | None,
-) -> tuple[int, int, str] | None:
-    """Extract the digest from the full match, which includes the key suffix."""
-    if span is None:
+def _match_prefix(finding: dict[str, Any]) -> bytes | None:
+    template = finding.get("Match")
+    if finding.get("Secret") != "REDACTED" or not isinstance(template, str):
         return None
-    start, end = span
-    raw = data[start:end]
-    assignment = _ASSIGNMENT.fullmatch(raw)
-    if assignment is None:
+    if template.count("REDACTED") != 1:
         return None
-    first, last = assignment.span(1)
-    expected = (raw[:first] + b"REDACTED" + raw[last:]).decode("ascii")
-    if finding.get("Secret") != "REDACTED" or finding.get("Match") != expected:
+    match = _REDACTED_ASSIGNMENT.fullmatch(template)
+    return match[1].encode("ascii") if match is not None else None
+
+
+def _unique_value(data: bytes, prefix: bytes, start: int, line_end: int) -> int | None:
+    """Locate the sole fixed-width raw value, including overlapping candidates."""
+    prefix_end = line_end - _DIGEST_WIDTH - 1
+    first = None
+    while (position := data.find(prefix, start, prefix_end)) != -1:
+        value_start = position + len(prefix)
+        if data[value_start + _DIGEST_WIDTH] == ord('"'):
+            if first is not None:
+                return None
+            first = value_start
+        start = position + 1
+    return first
+
+
+def _matched_digest(finding: dict[str, Any], record: _Record) -> tuple[int, int, str] | None:
+    bounds = _finding_bounds(finding, record)
+    prefix = _match_prefix(finding)
+    if bounds is None or prefix is None:
         return None
-    return start + first, start + last, assignment[1].decode("ascii")
+    start, line_end, width = bounds
+    if width != len(prefix) + _DIGEST_WIDTH + 1:
+        return None
+    first = _unique_value(record.data, prefix, start, line_end)
+    if first is None:
+        return None
+    last = first + _DIGEST_WIDTH
+    digest = record.data[first:last]
+    if not _SHA256.fullmatch(digest):
+        return None
+    return first, last, digest.decode("ascii")
 
 
 def _proves_pointer(record: _Record, start: int, end: int, digest: str) -> bool:
@@ -229,7 +256,7 @@ def _eligible_finding(finding: dict[str, Any], records: dict[str, _Record]) -> b
     record = records.get(path)
     if record is None:
         return False
-    digest = _matched_digest(finding, record.data, _matched_span(finding, record))
+    digest = _matched_digest(finding, record)
     return digest is not None and _proves_pointer(record, *digest)
 
 

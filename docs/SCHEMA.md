@@ -461,10 +461,12 @@ producer hashed. For example, when a producer hashes the contents of a
 tensor, a serialized tensor container with a header is a different payload.
 Both the policy pin and the selected scalar must equal the recomputed digest.
 
-The pinned scanner scans every selected input under its standard rules. The
-gate uses the report's match and byte coordinates to confirm that the one
-`generic-api-key` finding identifies the declared lowercase digest string in
-the JSON record. A verified finding counts in
+The pinned scanner scans every selected input under its standard rules.
+Betterleaks v1.10.1 can report columns relative to a fragment that starts
+mid-line. The gate requires exactly one location on the reported line at or
+after the reported start column with the same byte width and redacted match
+template. It then checks that the location identifies the declared lowercase
+digest string. A verified finding counts in
 `measurement.verified_sha256_provenance`. Other findings, including findings
 on the same line, retain their normal enforcement. Findings from decoded
 content and archives stay in scope and cannot use a declaration.
