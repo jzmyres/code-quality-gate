@@ -63,6 +63,12 @@ def _synthetic_credential() -> str:
     return "ghp_" + "".join(rng.choices(string.ascii_letters + string.digits, k=36))
 
 
+def _fragmented_record(fields: bytes) -> bytes:
+    head, tail = b'{"padding":"', b'",\n'
+    padding = b"a" * (124_800 - len(head + tail))
+    return head + padding + tail + b" " * 300 + fields + b"\n}\n"
+
+
 class SecretsTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
@@ -291,9 +297,9 @@ class SecretsTests(FixtureCase):
 
     def _provenance_fixture(
         self, *, declare_in_trusted: bool = True, tracked_payload: bool = True,
+        pointer: str = "/pack/0/tokens_sha256", payload: bytes = struct.pack("<4q", 7, 31, 151, 4),
     ) -> tuple[Path, Path, str]:
         binary = self._require_scanner()
-        payload = struct.pack("<4q", 7, 31, 151, 4)
         digest = hashlib.sha256(payload).hexdigest()
         base = BASE_CONFIG + """
 [[rule]]
@@ -309,7 +315,7 @@ reason = "payload fixtures"
         declaration = f"""
 [[checks.secrets.sha256_provenance]]
 record = "report.json"
-pointer = "/pack/0/tokens_sha256"
+pointer = "{pointer}"
 payload = "pack.raw"
 payload_sha256 = "{digest}"
 """
@@ -358,6 +364,61 @@ payload_sha256 = "{digest}"
         self.assertNotIn("RuleID: generic-api-key", result.stderr)
         self.assertNotIn(credential, result.stdout + result.stderr)
 
+    def test_fragment_local_columns_verify_exact_json_scalar(self) -> None:
+        binary, trusted, digest = self._provenance_fixture(
+            pointer="/toy.token_reader", payload=b"quality-gate synthetic provenance\n",
+        )
+        fields = f'"toy.token_reader": "{digest}"'.encode()
+        record = _fragmented_record(fields)
+        self.add_file("report.json", record)
+        scanner = runner.run(
+            [*secrets._scanner_argv(binary), "--exit-code=3", "--report-format=json",
+             "--report-path=-", "--", "report.json"],
+            cwd=self.repo, env={}, budget_seconds=60, capture_limit=None,
+        )
+        self.assertEqual(scanner.returncode, 3, scanner.stderr_text)
+        finding, = json.loads(scanner.stdout)
+        self.assertEqual((finding["StartLine"], finding["StartColumn"]), (2, 106))
+        self.assertEqual(record.splitlines()[1].index(b"token_reader") + 1, 306)
+
+        result, _ = self._run_provenance(binary, trusted, 0, 1)
+        self.assertNotIn(digest, result.stdout + result.stderr)
+
+        credential = _synthetic_credential()
+        self.add_file("report.json", _fragmented_record(fields + f', "credential": "{credential}"'.encode()))
+        result, _ = self._run_provenance(binary, trusted, 1, 1)
+        self.assertIn("RuleID: github-pat", result.stderr)
+        self.assertNotIn(credential, result.stdout + result.stderr)
+
+        self.add_file("pack.raw", b"different payload")
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_fragment_local_column_can_coincide_with_another_match(self) -> None:
+        binary, trusted, digest = self._provenance_fixture(pointer="/toy.token_reader")
+        rng = random.Random(43)
+        credential = "".join(rng.choices(string.ascii_letters + string.digits, k=64))
+        first = f'"toy.token_reader": "{digest}",'.encode()
+        second = f'"other.token_reader": "{credential}"'.encode()
+        self.add_file("report.json", _fragmented_record(first.ljust(198) + second))
+
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("Column: 106\nRuleID: generic-api-key", result.stderr)
+        self.assertIn("Column: 306\nRuleID: generic-api-key", result.stderr)
+        self.assertNotIn(credential, result.stdout + result.stderr)
+
+        self.add_file("report.json", _fragmented_record(second))
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_overlapping_match_spans_are_ambiguous(self) -> None:
+        prefix = b'tokens_sha256": "'
+        span = prefix + b"x" * 64 + b'"'
+        offset = len(span) - 1 - prefix.index(b'"')
+        data = span[:offset] + span
+        self.assertIsNone(secrets._unique_value(data, prefix, 0, len(data)))
+        self.assertEqual(secrets._unique_value(data, prefix, 1, len(data)), offset + len(prefix))
+
     def test_nonmatching_payload_and_wrong_pointer_leave_findings(self) -> None:
         binary, trusted, digest = self._provenance_fixture()
         self.add_file("report.json", self._digest_record(digest).replace('"pack"', '"other"'))
@@ -373,6 +434,12 @@ payload_sha256 = "{digest}"
         binary, trusted, digest = self._provenance_fixture()
         self.add_file("report.json", json.dumps({
             "pack": [{"tokens_sha256": digest}, {"tokens_sha256": digest}],
+        }))
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertIn("RuleID: generic-api-key", result.stderr)
+
+        self.add_file("report.json", json.dumps({
+            "other": {"tokens_sha256": digest}, "pack": [{"tokens_sha256": digest}],
         }))
         result, _ = self._run_provenance(binary, trusted, 1, 1)
         self.assertIn("RuleID: generic-api-key", result.stderr)
@@ -445,7 +512,10 @@ payload_sha256 = "{digest}"
         self.assertTrue(secrets._eligible_finding(finding, records))
         for changed in (
             {"EndLine": 2}, {"EndColumn": len(data) + 1}, {"StartColumn": 1},
-            {"Match": "unrelated"}, {"Tags": ["decoded:base64"]},
+            {"StartColumn": 4, "EndColumn": len(data)},
+            {"Match": "unrelated"}, {"Match": 123},
+            {"Match": 'REDACTEDtokens_sha256": "REDACTED"'},
+            {"Secret": "incorrect redaction"}, {"Tags": ["decoded:base64"]},
             {"Attributes": {"path": "report.json", "resource": "fs.archive"}},
         ):
             with self.subTest(changed=changed):
