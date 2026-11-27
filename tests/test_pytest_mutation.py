@@ -338,6 +338,131 @@ class PreferredCohortTests(PytestMutationCase):
         return [(call.kwargs["stage"], list(call.args[2])) for call in runs.call_args_list]
 
 
+class ExactFunctionCohortTests(PytestMutationCase):
+    test_path = "tests/app_test.py"
+
+    def run_and_observe(self):
+        real = python_mutation._run_pytest
+        attempts = []
+
+        def observe(*args, **kwargs):
+            evidence = real(*args, **kwargs)
+            attempts.append((kwargs["stage"], args[2], evidence))
+            return evidence
+
+        with mock.patch.object(python_mutation, "_run_pytest", side_effect=observe):
+            result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        return self.mutants(check)[-1], attempts
+
+    def test_parametrized_function_keeps_exact_ids_and_excludes_its_sibling(self) -> None:
+        self.prepare(
+            "import pytest\n"
+            "@pytest.mark.parametrize('mode', [0, 1], ids=['a::case', 'b[case]'])\n"
+            "def test_direct(mode):\n"
+            "    from pkg.app import flag as witness\n"
+            "    assert witness(mode) is True\n"
+            "def test_unrelated():\n"
+            "    raise RuntimeError('outside the witness')\n",
+            app="def flag(mode):\n    return True\n",
+        )
+        record, attempts = self.run_and_observe()
+        exact = f"{self.test_path}::test_direct"
+        self.assertEqual((record["outcome"], record["tests"]), ("killed", [exact]))
+        self.assertEqual([(stage, selected) for stage, selected, _ in attempts], [
+            ("original tests", (exact,)), ("mutant run", (exact,)),
+        ])
+        ids = (f"{exact}[a::case]", f"{exact}[b[case]]")
+        for _, _, evidence in attempts:
+            self.assertEqual(evidence.collected, ids)
+            self.assertEqual(evidence.executed, ids)
+        self.assertEqual(attempts[-1][-1].assertions, ids)
+
+    def test_tied_indirect_file_still_runs_after_an_exact_survivor(self) -> None:
+        self.prepare("def test_direct():\n    assert isinstance(flag(), bool)\n")
+        fallback = "tests/test_helper.py"
+        self.add_file(
+            fallback, IMPORT + "def helper():\n    return flag()\n"
+            "def test_indirect():\n    assert helper()\n",
+        )
+        record, attempts = self.run_and_observe()
+        exact = (f"{self.test_path}::test_direct",)
+        files = (self.test_path, fallback)
+        self.assertEqual([(stage, selected) for stage, selected, _ in attempts], [
+            ("original tests", exact), ("mutant run", exact),
+            ("original tests", files), ("mutant run", files),
+        ])
+        self.assertEqual(attempts[1][-1].assertions, ())
+        self.assertEqual((record["outcome"], record["tests"]), ("killed", list(files)))
+
+    def test_exact_function_rejects_a_mutant_that_drops_a_parameter(self) -> None:
+        self.prepare(
+            "import pytest\n"
+            "@pytest.mark.parametrize('mode', ['ordinary', 'extra'] if flag() else ['ordinary'])\n"
+            "def test_direct(mode):\n    assert flag()\n"
+            "def test_other():\n    pass\n",
+        )
+        self.assert_pytest_error("mutant run", "collected or executed different tests from the original")
+
+    def test_exact_function_rejects_non_assertion_errors(self) -> None:
+        self.prepare(
+            "def test_direct():\n    if not flag():\n        raise RuntimeError('mutant call')\n"
+            "def test_other():\n    pass\n",
+        )
+        with mock.patch.object(python_mutation, "_run_pytest", wraps=python_mutation._run_pytest) as runs:
+            self.assert_pytest_error("mutant run", f"call error in {self.test_path}::test_direct")
+        exact = (f"{self.test_path}::test_direct",)
+        self.assertEqual([call.args[2] for call in runs.call_args_list], [exact, exact])
+
+    def test_exact_function_timeout_cannot_kill(self) -> None:
+        self.prepare("def test_direct():\n    assert flag()\ndef test_other():\n    pass\n", mutant_seconds=3)
+        real_run = python_mutation.run
+
+        def run_or_timeout(argv, *, cwd, **kwargs):
+            if cwd.name == "copy-0001":
+                self.assertEqual(argv[-1], f"{self.test_path}::test_direct")
+                return RunResult(tuple(argv), "budget", None, timed_out=True)
+            return real_run(argv, cwd=cwd, **kwargs)
+
+        with mock.patch.object(python_mutation, "run", side_effect=run_or_timeout):
+            self.assert_pytest_error("mutant run", "timed out after 3 s")
+
+
+class ExactFunctionBindingTests(unittest.TestCase):
+    test_path = "tests/test_binding.py"
+
+    def test_path_with_a_selector_separator_cannot_prove_a_function_family(self) -> None:
+        source = IMPORT + "def test_direct():\n    assert flag()\n"
+        relative = "tests/test_report::diagnostic.py"
+        self.assertEqual(python_mutation._exact_test_functions(relative, source), {})
+        self.assertEqual(python_mutation._exact_test_functions(self.test_path, source),
+                         {"test_direct": {"pkg.app.flag"}})
+
+    def test_unproved_bindings_keep_the_whole_file(self) -> None:
+        before = IMPORT + "from pkg import app\n"
+        after = "\ndef test_indirect():\n    assert getattr(app, 'flag')()\n"
+        fixtures = (
+            "def test_direct(flag=lambda: True):\n    assert flag()\n",
+            "def test_direct():\n    flag = lambda: True\n    assert flag()\n",
+            "def test_direct():\n    def helper():\n        return flag()\n    assert helper()\n",
+            "def test_direct():\n    assert flag is not None\n",
+            "def test_direct():\n    assert flag()\ntest_direct = lambda: True\n",
+            "def test_direct():\n    assert flag()\ndef test_direct():\n    assert True\n",
+            "@custom_decorator\ndef test_direct():\n    assert flag()\n",
+            "def test_direct():\n    assert flag()\nfrom other import *\n",
+            "def test_direct():\n    assert flag()\ngetattr(test_direct, '__globals__')\n",
+            "def test_direct():\n    global flag\n    assert flag()\n",
+            "def test_direct():\n    assert flag()\napp.flag = lambda: True\n",
+        )
+        for candidate in fixtures:
+            with self.subTest(candidate=candidate):
+                functions = python_mutation._exact_test_functions(self.test_path, before + candidate + after)
+                selected = python_mutation._exact_test_cohort(
+                    (self.test_path,), {self.test_path: functions}, {"pkg.app.flag"},
+                )
+                self.assertEqual(selected, ())
+
+
 class OriginalReuseTests(PytestMutationCase):
     def commit_functions(self, changed: dict[str, str]) -> None:
         self.write_config(mutation_config(test_runner="pytest", function_mutants=1))
@@ -604,6 +729,62 @@ class ReceiptTests(PytestMutationCase):
 
 
 class HookEvidenceTests(unittest.TestCase):
+    def test_function_selectors_require_canonical_copied_paths_and_a_function_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            copy = root / "copy"
+            copy.mkdir()
+            (copy / "linked.py").symlink_to(root / "outside.py")
+            select = pytest_mutation_run._selected_tests
+            path = "tests/test_unique.py"
+            chosen = [f"{path}::test_named", f"{path}::test_other"]
+            self.assertEqual(select(copy, chosen), ({copy / path}, dict.fromkeys(chosen, copy / path)))
+            for invalid in (
+                [f"{path}::"], [f"{path}::Class::test_named"], [f"{path}::test_named[x]"],
+                [f"./{path}::test_named"], ["README.md::test_named"], ["linked.py::test_named"],
+                ["../outside.py::test_named"], ["::test_named"], [f"{copy / path}::test_named"],
+                [path, chosen[0]], [chosen[0], chosen[0]],
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    select(copy, invalid)
+
+    def test_collected_function_family_uses_copied_path_and_top_level_metadata(self) -> None:
+        path = Path("/copied/tests/test_unique.py")
+        first, second = "tests/test_unique.py::test_a", "tests/test_unique.py::test_b"
+        module = SimpleNamespace(obj=SimpleNamespace(__file__=str(path)))
+        evidence = pytest_mutation_run.Evidence(
+            {path}, object, AssertionError, expected_functions={first: path, second: path},
+            test_function=SimpleNamespace,
+        )
+
+        def item(family, label, nodeid, **updates):
+            metadata = {"path": path, "parent": module, "name": label, "nodeid": nodeid,
+                        "originalname": family, "getparent": lambda _: module}
+            return SimpleNamespace(**(metadata | updates))
+
+        a = item("test_a", "test_a[a::id]", f"{first}[a::id]")
+        b = item("test_b", "test_b[b[id]]", f"{second}[b[id]]")
+        evidence.pytest_collection_finish(SimpleNamespace(items=[a, b]))
+        self.assertEqual(evidence.errors, set())
+        self.assertEqual(evidence.collected, [a.nodeid, b.nodeid])
+        evidence.pytest_deselected([b])
+        self.assertEqual(
+            evidence.errors.pop(), "pytest deselected an instance of a selected copied function family",
+        )
+        errors = "pytest did not collect exactly the selected copied function families"
+        for items in (
+            [a],
+            [a, item("test_b", "test_b", second, parent=object())],
+            [a, item("test_b", "test_b", second, parent=None, getparent=lambda _: None)],
+            [a, item("test_b", "test_b", "tests/other.py::test_b")],
+            [a, item("test_b", "test_b", second, path=Path("/outside/test_unique.py"))],
+            [a, item("test_b", "test_b_suffix", second + "_suffix")],
+        ):
+            with self.subTest(items=items):
+                evidence.pytest_collection_finish(SimpleNamespace(items=items))
+                self.assertIn(errors, evidence.errors)
+                evidence.errors.clear()
+
     def report(self, evidence, item, when, exception, *, failed=False, skipped=False):
         hook = evidence.pytest_runtest_makereport(
             item, SimpleNamespace(excinfo=SimpleNamespace(value=exception)),
@@ -736,5 +917,6 @@ def load_tests(loader, standard_tests, _pattern):
     if importlib.util.find_spec("pytest") is not None:
         return standard_tests
     return unittest.TestSuite(
-        loader.loadTestsFromTestCase(case) for case in (ReceiptTests, HookEvidenceTests)
+        loader.loadTestsFromTestCase(case)
+        for case in (ExactFunctionBindingTests, ReceiptTests, HookEvidenceTests)
     )

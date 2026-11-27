@@ -188,8 +188,11 @@ Rules:
   `run_seconds` (default 300) are positive integers. `test_runner` is `unittest` by default.
   Set it to `pytest` to require verified collection and test execution in both copied trees.
   A strict subset ranked by explicit module and symbol use can run first. References to the exact
-  changed function rank ahead of references to other symbols. A mutant that passes the preferred
-  tests runs against the full selection with its own verified original. Within a pytest mutation
+  changed function rank ahead of references to other symbols. When a smaller cohort is supported
+  by directly bound calls inside unique top-level `test_` functions, the preferred run can use
+  `file.py::test_name` selectors. It verifies the copied files and function families and retains
+  all their parameter IDs. A mutant that passes the preferred tests runs against the full file
+  selection with its own verified original. Within a pytest mutation
   measurement, functions in the same module can reuse a passing original for the identical ordered
   cohort. Pytest originals and mutants run in fresh copies from the same snapshot. Source bytes used
   for selection must match the snapshot. `mutant_seconds`
