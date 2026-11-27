@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
@@ -757,6 +758,121 @@ def _bound_test_references(relative: str, source: str) -> set[str]:
     }
 
 
+_TEST_BINDING_FIELDS = {
+    ast.Name: "id", ast.arg: "arg", ast.FunctionDef: "name", ast.AsyncFunctionDef: "name",
+    ast.ClassDef: "name",
+    ast.ExceptHandler: "name", ast.MatchAs: "name", ast.MatchStar: "name", ast.MatchMapping: "rest",
+    ast.TypeVar: "name", ast.TypeVarTuple: "name", ast.ParamSpec: "name",
+}
+_TEST_NAMESPACE_FIELDS = {"__dict__", "__globals__", "__builtins__", "f_globals", "f_locals", "modules"}
+_UNSTABLE_TEST_NAMES = _TEST_NAMESPACE_FIELDS | {
+    "*", "eval", "exec", "globals", "locals", "vars", "setattr", "delattr", "patch", "__test__",
+}
+
+
+def _test_binding(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        return None
+    if isinstance(node, ast.alias):
+        return node.asname or node.name.split(".", 1)[0]
+    field = _TEST_BINDING_FIELDS.get(type(node))
+    return getattr(node, field) if field else None
+
+
+def _unstable_test_namespace(node: ast.AST) -> bool:
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return True
+    if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return True
+    return _reflective_test_name(node)
+
+
+def _reflective_test_name(node: ast.AST) -> bool:
+    fields = vars(node)
+    names = (fields.get("id"), fields.get("attr"), fields.get("name"))
+    return bool(_UNSTABLE_TEST_NAMES.intersection(names)) or (
+        isinstance(node, ast.Constant) and node.value in _TEST_NAMESPACE_FIELDS
+    )
+
+
+def _stable_test_imports(nodes: list[ast.AST], bindings: Counter[str]) -> dict[str, str]:
+    return {local: target for local, target in _test_import_bindings(nodes)
+            if bindings[local.split(".", 1)[0]] == 1}
+
+
+def _test_callee(node: ast.expr, imports: dict[str, str]) -> str:
+    name = ".".join(module_graph._callee_parts(node))
+    for local, target in imports.items():
+        if name == local or name.startswith(f"{local}."):
+            return target + name[len(local):]
+    return ""
+
+
+def _ordinary_test_definition(node: ast.stmt, bindings: Counter[str], imports: dict[str, str]) -> bool:
+    return (
+        isinstance(node, ast.FunctionDef) and node.name.startswith("test_") and bindings[node.name] == 1
+        and all(_parametrize_mark(mark, imports) for mark in node.decorator_list)
+    )
+
+
+def _parametrize_mark(mark: ast.expr, imports: dict[str, str]) -> bool:
+    return isinstance(mark, ast.Call) and _test_callee(mark.func, imports) == "pytest.mark.parametrize"
+
+
+def _test_function_calls(
+    function: ast.FunctionDef, imports: dict[str, str], bindings: Counter[str],
+) -> set[str]:
+    local_imports = set(function.body)
+    imports = imports.copy()
+    calls = set()
+    for node in _walk(function):
+        if node in local_imports:
+            imports.update(_stable_test_imports([node], bindings))
+        if isinstance(node, ast.Call):
+            calls.add(_test_callee(node.func, imports))
+    return calls
+
+
+def _exact_test_functions(relative: str, source: str) -> dict[str, set[str]]:
+    tree = python_shape._parse_tree(relative, source)
+    nodes = list(ast.walk(tree))
+    if "::" in relative or any(_unstable_test_namespace(node) for node in nodes):
+        return {}
+    bindings = _test_binding_counts(nodes)
+    imports: dict[str, str] = {}
+    functions = {}
+    for statement in tree.body:
+        if _ordinary_test_definition(statement, bindings, imports):
+            functions[statement.name] = _test_function_calls(statement, imports, bindings)
+        imports.update(_stable_test_imports([statement], bindings))
+    return functions
+
+
+def _test_binding_counts(nodes: list[ast.AST]) -> Counter[str]:
+    return Counter(name for node in nodes if (name := _test_binding(node)) is not None)
+
+
+def _test_function_matches(
+    functions: dict[str, set[str]], wanted: set[str],
+) -> tuple[str, ...]:
+    return tuple(name for name, calls in functions.items() if calls & wanted)
+
+
+def _exact_test_cohort(
+    files: tuple[str, ...], functions: dict[str, dict[str, set[str]]], wanted: set[str],
+) -> tuple[str, ...]:
+    matches = {file: _test_function_matches(functions[file], wanted) for file in files}
+    if not _has_function_reduction(matches, functions):
+        return ()
+    return tuple(f"{file}::{name}" for file, names in matches.items() for name in names)
+
+
+def _has_function_reduction(
+    matches: dict[str, tuple[str, ...]], functions: dict[str, dict[str, set[str]]],
+) -> bool:
+    return any(not names or len(names) < len(functions[file]) for file, names in matches.items())
+
+
 def _reference_rank(
     used: set[str], modules: frozenset[str], names: set[str], name: str,
 ) -> tuple[bool, int, int]:
@@ -779,24 +895,35 @@ def _preferred_test_cohort(
     return () if preferred == tests else preferred
 
 
+def _pytest_reference_indexes(
+    root: Path, tests: dict[str, tuple[str, ...]], read_source: Callable[[Path, str], str],
+) -> tuple[dict[str, set[str]], dict[str, dict[str, set[str]]]]:
+    sources = {
+        relative: read_source(root, relative)
+        for relative in dict.fromkeys(relative for cohort in tests.values() for relative in cohort)
+    }
+    references = {relative: _bound_test_references(relative, source) for relative, source in sources.items()}
+    exact = {relative: _exact_test_functions(relative, source) for relative, source in sources.items()}
+    return references, exact
+
+
 def _preferred_pytest_tests(
     functions: list[python_shape.ShapeFunction], tests: dict[str, tuple[str, ...]],
     root: Path, module_names: dict[str, frozenset[str]], *,
     read_source: Callable[[Path, str], str],
 ) -> dict[str, tuple[str, ...]]:
-    references = {
-        relative: _bound_test_references(relative, read_source(root, relative))
-        for relative in dict.fromkeys(relative for cohort in tests.values() for relative in cohort)
-    }
+    references, exact = _pytest_reference_indexes(root, tests, read_source)
     names: dict[str, set[str]] = {}
     for function in functions:
         names.setdefault(function.path, set()).add(function.name)
-    return {
-        function.identity: _preferred_test_cohort(
-            function, tests[function.identity], references, module_names[function.path], names[function.path],
-        )
-        for function in functions
-    }
+    preferred = {}
+    for function in functions:
+        files = tests[function.identity]
+        modules = module_names[function.path]
+        selected = _preferred_test_cohort(function, files, references, modules, names[function.path])
+        wanted = {f"{module}.{function.name}" for module in modules}
+        preferred[function.identity] = _exact_test_cohort(selected or files, exact, wanted) or selected
+    return preferred
 
 
 def _copy_directory(copy_root: Path, name: str) -> Path:
