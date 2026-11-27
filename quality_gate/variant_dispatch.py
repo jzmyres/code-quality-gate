@@ -308,15 +308,30 @@ _FUNCTION_SET_HANDLERS = {
 }
 
 
-def _scope_walk(nodes: list[ast.AST]):
-    """Every node of one scope, without descending into nested functions."""
+def _scope_walk(nodes: list[ast.AST], in_exception_context: bool = False):
+    """Walk one function scope and mark nodes inside try or with blocks."""
     for node in nodes:
         if isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
         ):
             continue
-        yield node
-        yield from _scope_walk(list(ast.iter_child_nodes(node)))
+        yield node, in_exception_context
+        child_context = in_exception_context or isinstance(
+            node, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)
+        )
+        yield from _scope_walk(list(ast.iter_child_nodes(node)), child_context)
+
+
+def _assertion_observations(scope: list[tuple[ast.AST, bool]]) -> set[ast.Compare]:
+    """Find the assertion predicates eligible to be omitted as result observations."""
+    observations: set[ast.Compare] = set()
+    for node, in_exception_context in scope:
+        match node:
+            case ast.Assert() if in_exception_context:
+                return set()
+            case ast.Assert(test=ast.Compare(ops=[ast.Eq() | ast.NotEq()]) as test):
+                observations.add(test)
+    return observations
 
 
 def _vocabulary_literals(
@@ -334,7 +349,11 @@ def _function_literals(
 ) -> frozenset[str]:
     subjects: dict[str, set[str]] = {}
     displays: list[frozenset[str]] = []
-    for child in _scope_walk(node.body):
+    scope = list(_scope_walk(node.body))
+    observations = _assertion_observations(scope)
+    for child, _ in scope:
+        if child in observations:
+            continue
         handler = _FUNCTION_SET_HANDLERS.get(type(child))
         if handler is not None:
             handler(child, subjects, displays)

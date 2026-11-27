@@ -1012,6 +1012,14 @@ union of its literal sets, and a literal set is the string literals of one of th
   elements, with at least two literals; its set is its keys or elements, and a nested tuple, list or
   set element contributes its string literals.
 
+A single `==` or `!=` used as the entire predicate of a Python `assert` is treated as a result
+check. Its operands and assertion message are still scanned for dispatch expressions, such as a
+dict selecting a callable by name. If an assertion is nested in `try` or `with`, the adapter keeps
+direct assertion comparisons throughout that function. These constructs can consume an
+`AssertionError` and affect which operation runs later. The rule covers `except*`, `finally` and
+`async with`. It uses lexical function bodies and cannot resolve catches in callers or the runtime
+behavior of handlers and context managers.
+
 A literal counts only if it contains a letter, so numbers, exit codes and the empty string never form
 a vocabulary. A literal set with fewer than two literals is not a vocabulary and contributes
 nothing. Two owners are linked when their sets share at least two literals. Each connected group
