@@ -194,6 +194,11 @@ Rules:
   cohort. Pytest originals and mutants run in fresh copies from the same snapshot. Source bytes used
   for selection must match the snapshot. `mutant_seconds`
   bounds each child invocation, and `run_seconds` includes both cohorts, copying and cleanup.
+  A deletion that changes a retained local read to a global lookup with no apparent module or
+  builtin binding is reported as `not generated` and leaves a slot in the function's sample.
+  The rule applies when the compiler scope of a module-level function or method of a module-level
+  class can be matched and the source gives no indication of dynamic namespace access. Deleting one
+  of several local bindings or revealing a declared global fallback can still yield a measured mutant.
 * `python_shape` requires `base` and `crap_check`, and has no `baseline` key. `scope`
   is `changed` or `tree`; `crap_check` names a `python_crap` check whose `threshold`
   is CPF's limit; `max_chain` is an integer of at least 1; `clone_min_tokens` is 20-49;
