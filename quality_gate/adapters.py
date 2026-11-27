@@ -513,6 +513,7 @@ def _run_comments(context: AdapterContext) -> Any:
 
 
 _PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
+_GZIP_DIGEST_FIELDS = ("compressed_sha256", "decoded_sha256")
 
 
 def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
@@ -521,20 +522,39 @@ def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
     return tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:])
 
 
+def _provenance_digest(row: dict[str, Any], field: str, path: Path, where: str) -> str:
+    key = f"{where}.{field}"
+    digest = _string(row, field, path, key)
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise _config_error(path, key, "64 lowercase hex digits", "invalid value")
+    return digest
+
+
+def _gzip_digests(row: dict[str, Any], record: str, path: Path, where: str) -> secrets.GzipDigests | None:
+    if record.endswith(".json.gz"):
+        compressed, decoded = (_provenance_digest(row, field, path, where) for field in _GZIP_DIGEST_FIELDS)
+        return secrets.GzipDigests(compressed, decoded)
+    if any(field in row for field in _GZIP_DIGEST_FIELDS):
+        raise _config_error(path, where, "gzip digest pins only for a .json.gz record", "unexpected pins")
+    return None
+
+
 def _parse_provenance(row: Any, path: Path, where: str) -> secrets.Provenance:
     if not isinstance(row, dict):
         raise _config_error(path, where, "a table", type(row).__name__)
-    _check_keys(row, _PROVENANCE_FIELDS, path, where)
-    record, pointer, payload, digest = (
-        _string(row, field, path, f"{where}.{field}") for field in _PROVENANCE_FIELDS
+    _check_keys(row, (*_PROVENANCE_FIELDS, *_GZIP_DIGEST_FIELDS), path, where)
+    record, pointer, payload = (
+        _string(row, field, path, f"{where}.{field}") for field in ("record", "pointer", "payload")
     )
     _validate_exact_path(path, f"{where}.record", record)
     _validate_exact_path(path, f"{where}.payload", payload)
-    if not record.endswith(".json") or record == payload:
-        raise _config_error(path, where, "a .json record and a separate payload", "invalid paths")
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise _config_error(path, f"{where}.payload_sha256", "64 lowercase hex digits", "invalid value")
-    return secrets.Provenance(record, _read_pointer(pointer, path, f"{where}.pointer"), payload, digest)
+    if not record.endswith((".json", ".json.gz")) or record == payload:
+        raise _config_error(path, where, "a .json or .json.gz record and a separate payload", "invalid paths")
+    digest = _provenance_digest(row, "payload_sha256", path, where)
+    return secrets.Provenance(
+        record, _read_pointer(pointer, path, f"{where}.pointer"), payload, digest,
+        _gzip_digests(row, record, path, where),
+    )
 
 
 def _secrets_provenance(raw: dict[str, Any], path: Path, key: str) -> tuple[secrets.Provenance, ...]:
