@@ -427,6 +427,10 @@ class ExactFunctionCohortTests(PytestMutationCase):
         with mock.patch.object(python_mutation, "run", side_effect=run_or_timeout):
             self.assert_pytest_error("mutant run", "timed out after 3 s")
 
+
+class ExactFunctionBindingTests(unittest.TestCase):
+    test_path = "tests/test_binding.py"
+
     def test_path_with_a_selector_separator_cannot_prove_a_function_family(self) -> None:
         source = IMPORT + "def test_direct():\n    assert flag()\n"
         relative = "tests/test_report::diagnostic.py"
@@ -913,5 +917,6 @@ def load_tests(loader, standard_tests, _pattern):
     if importlib.util.find_spec("pytest") is not None:
         return standard_tests
     return unittest.TestSuite(
-        loader.loadTestsFromTestCase(case) for case in (ReceiptTests, HookEvidenceTests)
+        loader.loadTestsFromTestCase(case)
+        for case in (ExactFunctionBindingTests, ReceiptTests, HookEvidenceTests)
     )
