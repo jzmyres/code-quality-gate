@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import unittest
+from textwrap import indent
 from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase, output
@@ -158,6 +159,100 @@ class Example:
         self.assertEqual([(row.name, row.access) for row in reader.findings], [
             ("CHILD", "write"), (None, "computed"), ("PAIR", "write"), (None, "computed"),
         ])
+
+    def test_env_surface_allowlists_adjacent_local_child_environment_overrides(self):
+        names = ("EARLY", "LATE", "VALUE", "FIRST", "SECOND", "METHOD")
+        self.configure("[" + ", ".join(f'{{name = "{name}", owner = "fixture"}}' for name in names) + "]")
+        self.add_file("a.py", '''\
+import os as system
+import subprocess as process
+from subprocess import check_output as output
+def inline(argv):
+    return process.run(argv, env={"EARLY": "before", **system.environ, "LATE": system.getenv("VALUE")})
+def local(argv):
+    child = {"EARLY": "before", **system.environ, "LATE": system.getenv("VALUE")}
+    return process.run(argv, env=child)
+def copied(argv):
+    child = system.environ.copy()
+    output(argv, env=child)
+async def constructed(argv):
+    from os import environ as inherited
+    import subprocess as local_process
+    child = dict(inherited, FIRST="initial",
+                 SECOND="next")
+    result = local_process.Popen(argv, env=child)
+    return result
+class Worker:
+    def launch(self, argv):
+        child = {**system.environ, "METHOD": "enabled"}
+        return process.run(argv, env=child)
+''')
+        report = self.inventory(0)
+        expected = [(5, "EARLY", "write"), (5, "LATE", "write"), (5, "VALUE", "read"),
+                    (7, "EARLY", "write"), (7, "LATE", "write"), (7, "VALUE", "read"),
+                    (15, "FIRST", "write"), (16, "SECOND", "write"), (21, "METHOD", "write")]
+        self.assertEqual(report["measurement"]["findings"], [
+            {"name": name, "path": "a.py", "line": line, "access": access} for line, name, access in expected
+        ])
+
+    def assert_computed_child_environment(self, body, lines, *, module="", parameters="argv"):
+        header = f"import os\nimport subprocess\n{module}def launch({parameters}):\n"
+        source = header + indent(body + "\n", "    ")
+        self.assert_rows("a.py", source, [(line + header.count("\n"), None, "computed") for line in lines])
+
+    def test_env_surface_keeps_nonlocal_or_escaping_child_mappings_computed(self):
+        assignment = 'child = {**os.environ, "MODE": "demo"}'
+        invocation = 'subprocess.run(argv, env=child)'
+        cases = (
+            (f'{assignment}\n{invocation}\n{invocation}', (1, 2, 3)),
+            (f'{assignment}\ninspect_mapping(child)\n{invocation}', (1, 3)),
+            (f'{assignment}\n{invocation}\nreturn child', (1, 2)),
+            (f'child = {{}}\n{assignment}\n{invocation}', (2, 3)),
+            (f'global child\n{assignment}\n{invocation}', (2, 3)),
+            (f'{assignment}\nsubprocess.run(child, env=child)', (1, 2)),
+            (f'import another_module as child\n{assignment}\n{invocation}', (2, 3)),
+            (f'match argv:\n    case child:\n        pass\n{assignment}\n{invocation}', (4, 5)),
+            (f'try:\n    pass\nexcept Exception as child:\n    pass\n{assignment}\n{invocation}', (5, 6)),
+            (f'def nested(child): pass\n{assignment}\n{invocation}', (2, 3)),
+        )
+        for body, lines in cases:
+            with self.subTest(body=body):
+                self.assert_computed_child_environment(body, lines)
+        self.assert_rows("a.py", '''\
+import os, subprocess
+def outer():
+    child = None
+    def launch(argv):
+        nonlocal child
+        child = {**os.environ, "MODE": "demo"}
+        return subprocess.run(argv, env=child)
+''', [(6, None, "computed"), (7, None, "computed")])
+
+    def test_env_surface_keeps_unresolved_child_mappings_computed(self):
+        assignment = 'child = {**os.environ, "MODE": "demo"}'
+        invocation = 'subprocess.run(argv, env=child)'
+        cases = (
+            (f'{assignment}\nother.run(argv, env=child)', (1,), {}),
+            (f'{assignment}\nsubprocess.unknown(argv, env=child)', (1, 2), {}),
+            (f'{assignment}\nsubprocess.run(argv, env=child, **opts)', (1, 2), {}),
+            (f'child = {{**os.environ, key: "demo"}}\n{invocation}', (1, 2), {}),
+            (f'child = {{**os.environ, **extra}}\n{invocation}', (1, 2), {}),
+            (f'child = dict(os.environ, **extra)\n{invocation}', (1, 2), {}),
+            (f'child = os.environ.copy(extra)\n{invocation}', (1, 2), {}),
+            (f'child = other\n{invocation}', (2,), {}),
+            (f'{assignment}\n{invocation}', (1,), {"parameters": "argv, subprocess"}),
+            (f'{assignment}\n{invocation}', (2,), {"parameters": "argv, os"}),
+            (f'child = dict(os.environ, MODE="demo")\n{invocation}', (1, 2), {"module": "dict = other\n"}),
+            (f'{assignment}\n{invocation}', (1, 2), {"module": "subprocess = other\n"}),
+            (f'{assignment}\n{invocation}', (1, 2), {"module": "subprocess.run = other\n"}),
+            (f'{assignment}\n{invocation}', (1, 2), {"module": "from extra import *\n"}),
+            (f'vars()\n{assignment}\n{invocation}', (2, 3), {}),
+            (f'getattr(subprocess, "__dict__")\n{assignment}\n{invocation}', (2, 3), {}),
+            (f'{assignment}\n{invocation}', (1, 2), {"module": "from builtins import setattr as reflect\n"}),
+        )
+        for body, lines, options in cases:
+            with self.subTest(body=body, options=options):
+                self.assert_computed_child_environment(body, lines, **options)
 
     def test_env_surface_elisp_constructs(self):
         self.assert_rows("example.el", fixture_source("elisp"), [
