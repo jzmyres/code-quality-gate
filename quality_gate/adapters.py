@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, public_vocab, python_crap, python_mutation, secrets, shell_syntax,
+    module_graph, public_hardware_model, public_vocab, python_crap, python_mutation, secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import (
@@ -35,6 +35,7 @@ from .policy import (
     GateError,
     UnsupportedError,
     _STRING,
+    _TABLE,
     _check_keys,
     _config_error,
     _describe,
@@ -42,6 +43,7 @@ from .policy import (
     _number,
     _optional_string_list,
     _read_scalar,
+    _read_value,
     _string,
     _string_list,
     _unique,
@@ -516,7 +518,8 @@ def _run_comments(context: AdapterContext) -> Any:
     )
 
 
-_PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
+_PROVENANCE_RECORD_FIELDS = ("record", "pointer")
+_PROVENANCE_FIELDS = (*_PROVENANCE_RECORD_FIELDS, "payload", "payload_sha256")
 _GZIP_DIGEST_FIELDS = ("compressed_sha256", "decoded_sha256")
 _GIT_PAYLOAD_FIELDS = ("path", "commit", "blob", "size")
 _GZIP_PAYLOAD_FIELDS = ("path", "compressed_sha256", "decoded_size")
@@ -524,6 +527,9 @@ _PUBLIC_VOCABULARY_FIELDS = (
     "path", "published_url", "published_revision", "published_sha256", "published_size", "pointers",
 )
 _PUBLIC_ARCHIVE_FIELDS = ("compressed_sha256", "compressed_size")
+_PUBLIC_MODEL_KEY = "public_hardware_model_v1"
+_PUBLIC_MODEL_FIELDS = (*_PROVENANCE_RECORD_FIELDS, "match_start", "match_end", "decoded_sha256", "catalogue")
+_MODEL_CATALOGUE_FIELDS = ("payload", "sha256", "literal_start", "literal_end")
 
 
 def _valid_python_pointer(parts: tuple[str, ...]) -> bool:
@@ -720,10 +726,82 @@ def _public_vocabulary(
     return tuple(declarations)
 
 
+def _byte_span(
+    row: dict[str, Any], prefix: str, path: Path, where: str, limit: int,
+) -> tuple[int, int]:
+    start_key, end_key = f"{prefix}_start", f"{prefix}_end"
+    start = _integer(row, start_key, path, f"{where}.{start_key}", minimum=0, maximum=limit)
+    end = _integer(row, end_key, path, f"{where}.{end_key}", minimum=1, maximum=limit)
+    if end <= start:
+        raise _config_error(path, where, "an increasing half-open byte interval", "invalid span")
+    return start, end
+
+
+def _model_catalogue(row: dict[str, Any], path: Path, where: str) -> public_hardware_model.Catalogue:
+    name = f"{where}.catalogue"
+    catalogue = _read_value(row, "catalogue", path, name, _TABLE)
+    _check_keys(catalogue, _MODEL_CATALOGUE_FIELDS, path, name)
+    payload = _read_value(catalogue, "payload", path, f"{name}.payload", _TABLE)
+    source = _git_payload(payload, path, f"{name}.payload")
+    digest = _provenance_digest(catalogue, "sha256", path, name)
+    literal_span = _byte_span(catalogue, "literal", path, name, source.size)
+    return public_hardware_model.Catalogue(source, digest, literal_span)
+
+
+def _public_model_spec(row: Any, path: Path, where: str) -> public_hardware_model.Declaration:
+    _read_scalar(path, where, row, _TABLE)
+    record = _string(row, "record", path, f"{where}.record")
+    _validate_exact_path(path, f"{where}.record", record)
+    if not record.endswith((".json", ".json.gz")):
+        raise _config_error(path, where, "a .json or .json.gz record path", "invalid suffix")
+    archive = record.endswith(".json.gz")
+    allowed = (*_PUBLIC_MODEL_FIELDS, "compressed_sha256") if archive else _PUBLIC_MODEL_FIELDS
+    _check_keys(row, allowed, path, where)
+    pointer_text = _string(row, "pointer", path, f"{where}.pointer")
+    pointer = _read_pointer(pointer_text, path, f"{where}.pointer", python=False)
+    span = _byte_span(row, "match", path, where, secrets._MAX_RECORD_BYTES)
+    catalogue = _model_catalogue(row, path, where)
+    if record == catalogue.payload.path:
+        raise _config_error(path, where, "a separate catalogue operand", "identical paths")
+    decoded = _provenance_digest(row, "decoded_sha256", path, where)
+    compressed = _provenance_digest(row, "compressed_sha256", path, where) if archive else None
+    return public_hardware_model.Declaration(record, pointer, span, decoded, catalogue, compressed)
+
+
+def _public_models(
+    raw: dict[str, Any], path: Path, key: str,
+) -> tuple[public_hardware_model.Declaration, ...]:
+    name = f"{key}.{_PUBLIC_MODEL_KEY}"
+    rows = raw.get(_PUBLIC_MODEL_KEY, [])
+    if not isinstance(rows, list):
+        raise _config_error(path, name, "an array of tables", "invalid value")
+    declarations = []
+    pointers: set[tuple[str, tuple[str, ...]]] = set()
+    matches: set[tuple[str, tuple[int, int]]] = set()
+    for index, row in enumerate(rows):
+        where = f"{name}[{index}]"
+        declaration = _public_model_spec(row, path, where)
+        _unique(pointers, (declaration.record, declaration.pointer), path, where,
+                "a unique record and pointer", "duplicate", _config_error)
+        _unique(matches, (declaration.record, declaration.match_span), path, where,
+                "a unique record and match interval", "duplicate", _config_error)
+        declarations.append(declaration)
+    return tuple(declarations)
+
+
 @dataclass(frozen=True)
 class _SecretsSpec:
     digests: tuple[secrets.Provenance, ...]
     vocabulary: tuple[public_vocab.PublishedVocabulary, ...]
+    models: tuple[public_hardware_model.Declaration, ...]
+
+
+def _secrets_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -> ParsedSpec:
+    return ParsedSpec(
+        _SecretsSpec(_secrets_provenance(raw, path, key), _public_vocabulary(raw, path, key),
+                     _public_models(raw, path, key)),
+        "secrets/1", ("static",),
+    )
 
 
 def _secrets_result(context: AdapterContext, start: float, child: RunResult, budget: int) -> Any:
@@ -737,19 +815,21 @@ def _secrets_result(context: AdapterContext, start: float, child: RunResult, bud
     )
 
 
-def _scanner_measurement(scan: secrets.VerifiedScan, *, vocabulary: bool) -> dict[str, Any]:
+def _scanner_measurement(scan: secrets.VerifiedScan, spec: _SecretsSpec) -> dict[str, Any]:
     measurement: dict[str, Any] = {"verified_sha256_provenance": scan.verified}
-    if vocabulary:
+    if spec.vocabulary:
         fields = ("path", "rule", "start_line", "end_line", "start_column", "end_column")
         measurement["verified_public_vocabulary"] = len(scan.vocabulary)
         measurement["public_vocabulary_locations"] = [
             [dict(zip(fields, coordinate, strict=True)) for coordinate in row] for row in scan.vocabulary
         ]
+    if spec.models:
+        measurement["verified_public_hardware_models"] = scan.public_models
     return measurement
 
 
 def _verified_secrets_result(
-    context: AdapterContext, start: float, scan: secrets.VerifiedScan, budget: int, *, vocabulary: bool,
+    context: AdapterContext, start: float, scan: secrets.VerifiedScan, budget: int, spec: _SecretsSpec,
 ) -> Any:
     from .checks import _check_result
 
@@ -761,7 +841,7 @@ def _verified_secrets_result(
         context.check, start,
         "pass" if child.execution == "completed" and scan.unresolved == 0 else "fail",
         execution=child.execution, reason=reason, diagnostics=child.diagnostics(),
-        budget_seconds=budget, measurement=_scanner_measurement(scan, vocabulary=vocabulary),
+        budget_seconds=budget, measurement=_scanner_measurement(scan, spec),
     )
 
 
@@ -784,18 +864,26 @@ def _secrets_git_command(
     )
 
 
+def _trusted_proof_spec(context: AdapterContext) -> _SecretsSpec:
+    spec = context.check.spec
+    if context.config.policy_from_trusted_directory:
+        return spec
+    return _SecretsSpec(spec.digests, (), ())
+
+
 def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start: float, budget: int) -> Any:
     root = context.root.resolve()
     selected, tracked = _secrets_paths(root)
-    spec = context.check.spec
-    vocabulary = spec.vocabulary if context.config.policy_from_trusted_directory else ()
-    if context.config.trusted_policy and (spec.digests or vocabulary):
+    spec = _trusted_proof_spec(context)
+    if context.config.trusted_policy and (spec.digests or spec.vocabulary or spec.models):
+        prepare = partial(public_hardware_model.prepare_scan, spec.models) if spec.models else None
         verified = secrets.scan_verified(
             binary, root, directory, selected, budget, spec.digests,
             tracked=tracked, open_parent=_parent_fd, run=run,
-            git_run=partial(_secrets_git_command, root, budget), public_vocabulary=vocabulary,
+            git_run=partial(_secrets_git_command, root, budget), public_vocabulary=spec.vocabulary,
+            prepare_models=prepare,
         )
-        return _verified_secrets_result(context, start, verified, budget, vocabulary=bool(vocabulary))
+        return _verified_secrets_result(context, start, verified, budget, spec)
     child = secrets.scan(binary, root, directory, selected, budget, open_parent=_parent_fd, run=run)
     return _secrets_result(context, start, child, budget)
 
@@ -1249,11 +1337,8 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "secrets",
-    ("sha256_provenance", "public_vocabulary"),
-    lambda raw, _root, path, key: ParsedSpec(
-        _SecretsSpec(_secrets_provenance(raw, path, key), _public_vocabulary(raw, path, key)),
-        "secrets/1", ("static",),
-    ),
+    ("sha256_provenance", "public_vocabulary", _PUBLIC_MODEL_KEY),
+    _secrets_spec,
     _run_secrets,
     runs_suite=False,
 ))
