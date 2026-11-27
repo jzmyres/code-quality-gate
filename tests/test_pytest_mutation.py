@@ -427,6 +427,13 @@ class ExactFunctionCohortTests(PytestMutationCase):
         with mock.patch.object(python_mutation, "run", side_effect=run_or_timeout):
             self.assert_pytest_error("mutant run", "timed out after 3 s")
 
+    def test_path_with_a_selector_separator_cannot_prove_a_function_family(self) -> None:
+        source = IMPORT + "def test_direct():\n    assert flag()\n"
+        relative = "tests/test_report::diagnostic.py"
+        self.assertEqual(python_mutation._exact_test_functions(relative, source), {})
+        self.assertEqual(python_mutation._exact_test_functions(self.test_path, source),
+                         {"test_direct": {"pkg.app.flag"}})
+
     def test_unproved_bindings_keep_the_whole_file(self) -> None:
         before = IMPORT + "from pkg import app\n"
         after = "\ndef test_indirect():\n    assert getattr(app, 'flag')()\n"
