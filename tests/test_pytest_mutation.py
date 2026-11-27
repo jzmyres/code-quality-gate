@@ -211,6 +211,50 @@ class PreferredCohortTests(PytestMutationCase):
                 )
                 self.assertEqual(self.evaluated(check), [("killed", [self.preferred_file])])
 
+    def stage_competing_references(self, direct: str, *, other_tests: str = "") -> None:
+        app = APP + "\ndef visible():\n    return True\n\ndef writable():\n    return True\n"
+        self.stage(
+            "from pkg import app\ndef test_visible_and_writable():\n"
+            "    assert app.visible() and app.writable()\n" + other_tests,
+            "from pkg.app import flag as target\n" + direct,
+            app=app, original=app.replace("True", "False"), function_mutants=1,
+        )
+
+    def test_exact_aliases_tie_ahead_of_more_changed_siblings(self) -> None:
+        qualified = "tests/test_qualified.py"
+        self.add_file(qualified, "import pkg.app as target\ndef test_flag():\n    assert target.flag()\n")
+        self.stage_competing_references("def test_flag():\n    assert target()\n")
+        check, attempts = self.record_passing_attempts()
+        precise = [self.fallback_file, qualified]
+        self.assertEqual(attempts[:2], [("original tests", precise), ("mutant run", precise)])
+        self.assertEqual(self.evaluated(check), [
+            ("killed", precise), ("killed", [self.preferred_file]), ("killed", [self.preferred_file]),
+        ])
+
+    def test_surviving_exact_witness_runs_the_full_cohort(self) -> None:
+        self.stage_competing_references(
+            "def test_flag():\n    assert isinstance(target(), bool)\n",
+            other_tests="def test_indirect_flag():\n    assert getattr(app, 'flag')()\n",
+        )
+        check, attempts = self.record_passing_attempts()
+        precise = [self.fallback_file]
+        full = [self.preferred_file, self.fallback_file]
+        self.assertEqual(attempts[:4], [
+            ("original tests", precise), ("mutant run", precise),
+            ("original tests", full), ("mutant run", full),
+        ])
+        self.assertEqual(self.evaluated(check)[0], ("killed", full))
+
+    def test_invalid_exact_witness_refuses_before_the_full_cohort(self) -> None:
+        self.stage_competing_references(
+            "def test_flag():\n    if not target():\n        raise RuntimeError()\n",
+            other_tests="def test_indirect_flag():\n    assert getattr(app, 'flag')()\n",
+        )
+        with mock.patch.object(python_mutation, "_run_pytest", wraps=python_mutation._run_pytest) as runs:
+            self.assert_pytest_error("mutant run", f"call error in {self.fallback_file}::test_flag")
+        precise = [self.fallback_file]
+        self.assertEqual(self.attempts(runs), [("original tests", precise), ("mutant run", precise)])
+
     def test_module_entry_point_can_witness_a_changed_helper(self) -> None:
         entry = "\ndef entry():\n    return flag()\n"
         self.stage(
