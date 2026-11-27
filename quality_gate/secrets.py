@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import ast
 import hashlib
+import io
 import os
 import re
 import shutil
 import stat
 import sys
+import tokenize
+import warnings
 import zlib
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
-from itertools import batched
+from itertools import batched, chain
 from pathlib import Path
 from typing import Any
 
@@ -28,8 +32,14 @@ FULL_GIT_OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _PROMISOR_CONFIG = r"^(extensions\.partialclone|remote\..+\.promisor)$"
 _DIGEST_WIDTH = 64
 _REDACTED_ASSIGNMENT = re.compile(r'([A-Za-z0-9_.-]+"[ \t]*:[ \t]*")REDACTED"')
+_PYTHON_REDACTED_ASSIGNMENT = re.compile(r"""([A-Za-z0-9_.-]+["'][ \t]*:[ \t]*(["']))REDACTED\2""")
 _SHA256 = re.compile(rb"[0-9a-f]{64}")
 _MARKER = "verified-provenance-position"
+_GIT_FINDING_FIELDS = ("Commit", "Author", "Email", "Date", "Message")
+_RAW_PYTHON_FINDING_FIELDS = {
+    "RuleID", "File", "StartLine", "EndLine", "StartColumn", "EndColumn", "Match", "Secret",
+    "Attributes", "Tags", "Fingerprint", "SymlinkFile", "Description", "Entropy", *_GIT_FINDING_FIELDS,
+}
 _OpenParent = Callable[[Path, str], int]
 _DigestSpan = tuple[int, int, str]
 _Coordinate = tuple[str, str, int, int, int, int]
@@ -160,12 +170,13 @@ class _Record:
     starts: Sequence[int]
     pointers: dict[str, list[tuple[str, ...]]]
     gzip: GzipDigests | None = None
+    python: bool = False
 
 
-def _record(data: bytes, gzip: GzipDigests | None = None) -> _Record:
+def _record(data: bytes, gzip: GzipDigests | None = None, *, python: bool = False) -> _Record:
     starts = array("I", (0,))
     starts.extend(match.end() for match in re.finditer(b"\n", data))
-    return _Record(data, starts, {}, gzip)
+    return _Record(data, starts, {}, gzip, python)
 
 
 def _single_gzip_member(compressed: bytes, limit: int) -> bytes | None:
@@ -203,11 +214,12 @@ def _read_record(path: Path) -> _Record | None:
         data = stream.read(_MAX_RECORD_BYTES + 1)
     if len(data) > _MAX_RECORD_BYTES:
         return None
-    return _record(data)
+    return _record(data, python=path.name.endswith(".py"))
 
 
 def _tracked_record(declaration: Provenance, tracked: set[str]) -> bool:
-    return declaration.gzip is None or declaration.record in tracked
+    must_be_tracked = declaration.gzip is not None or declaration.record.endswith(".py")
+    return not must_be_tracked or declaration.record in tracked
 
 
 def _has_payload(payload: Payload, paths: dict[str, bool], tracked: set[str]) -> bool:
@@ -363,13 +375,14 @@ def _finding_bounds(finding: dict[str, Any], record: _Record) -> tuple[int, int,
     return line_start + start, line_end, end - start
 
 
-def _match_prefix(finding: dict[str, Any]) -> bytes | None:
+def _match_prefix(finding: dict[str, Any], *, python: bool) -> bytes | None:
     template = finding.get("Match")
     if finding.get("Secret") != "REDACTED" or not isinstance(template, str):
         return None
     if template.count("REDACTED") != 1:
         return None
-    match = _REDACTED_ASSIGNMENT.fullmatch(template)
+    pattern = _PYTHON_REDACTED_ASSIGNMENT if python else _REDACTED_ASSIGNMENT
+    match = pattern.fullmatch(template)
     return match[1].encode("ascii") if match is not None else None
 
 
@@ -379,7 +392,7 @@ def _unique_value(data: bytes, prefix: bytes, start: int, line_end: int) -> int 
     first = None
     while (position := data.find(prefix, start, prefix_end)) != -1:
         value_start = position + len(prefix)
-        if data[value_start + _DIGEST_WIDTH] == ord('"'):
+        if data[value_start + _DIGEST_WIDTH] == prefix[-1]:
             if first is not None:
                 return None
             first = value_start
@@ -387,15 +400,22 @@ def _unique_value(data: bytes, prefix: bytes, start: int, line_end: int) -> int 
     return first
 
 
-def _matched_digest(finding: dict[str, Any], record: _Record) -> tuple[int, int, str] | None:
-    bounds = _finding_bounds(finding, record)
-    prefix = _match_prefix(finding)
-    if bounds is None or prefix is None:
-        return None
+def _digest_start(record: _Record, line: int, bounds: tuple[int, int, int], prefix: bytes) -> int | None:
+    """Require a unique Python match shape across the physical line."""
     start, line_end, width = bounds
     if width != len(prefix) + _DIGEST_WIDTH + 1:
         return None
-    first = _unique_value(record.data, prefix, start, line_end)
+    search_start = record.starts[line - 1] if record.python else start
+    first = _unique_value(record.data, prefix, search_start, line_end)
+    return first if first is not None and first - len(prefix) >= start else None
+
+
+def _matched_digest(finding: dict[str, Any], record: _Record) -> _DigestSpan | None:
+    bounds = _finding_bounds(finding, record)
+    prefix = _match_prefix(finding, python=record.python)
+    if bounds is None or prefix is None:
+        return None
+    first = _digest_start(record, finding["StartLine"], bounds, prefix)
     if first is None:
         return None
     last = first + _DIGEST_WIDTH
@@ -440,6 +460,119 @@ def _proven_spans(record: _Record, spans: Iterable[_DigestSpan]) -> Iterable[_Di
             yield span
 
 
+def _python_tree(data: bytes) -> ast.Module | None:
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+        if encoding != "utf-8" or re.search(rb"\r(?!\n)", data):
+            return None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SyntaxWarning)
+            return ast.parse(data.decode("utf-8"))
+    except (SyntaxError, SyntaxWarning, ValueError, RecursionError):
+        return None
+
+
+def _line_source(record: _Record, node: ast.expr) -> tuple[int, bytes] | None:
+    if node.lineno != node.end_lineno or node.end_col_offset is None:
+        return None
+    line = record.starts[node.lineno - 1]
+    start = line + node.col_offset
+    return start, record.data[start:line + node.end_col_offset]
+
+
+def _plain_quoted_text(raw: bytes, value: str) -> bool:
+    quote = raw[:1]
+    return (
+        quote in (b"'", b'"') and raw[-1:] == quote and b"\\" not in raw
+        and raw[1:-1].decode("utf-8") == value
+    )
+
+
+def _literal_string(record: _Record, node: ast.expr | None) -> _DigestSpan | None:
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        return None
+    source = _line_source(record, node)
+    if source is None:
+        return None
+    start, raw = source
+    if not _plain_quoted_text(raw, node.value):
+        return None
+    return start + 1, start + len(raw) - 1, node.value
+
+
+def _literal_dictionary(record: _Record, dictionary: ast.Dict) -> dict[str, _DigestSpan]:
+    values = {}
+    for key, value in zip(dictionary.keys, dictionary.values, strict=True):
+        literal_key = _literal_string(record, key)
+        literal_value = _literal_string(record, value)
+        if literal_key is None or literal_value is None or literal_key[2] in values:
+            return {}
+        values[literal_key[2]] = literal_value
+    return values
+
+
+def _written_name(node: ast.AST) -> str | None:
+    match node:
+        case ast.Name(id=name, ctx=ast.Store() | ast.Del()):
+            return name
+        case ast.alias(name=name, asname=alias):
+            return alias or name.partition(".")[0]
+        case (
+            ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name)
+            | ast.ExceptHandler(name=name) | ast.MatchAs(name=name) | ast.MatchStar(name=name)
+            | ast.MatchMapping(rest=name)
+        ):
+            return name
+    return None
+
+
+def _exact_identifier(
+    record: _Record, target: ast.Name, names: set[str], writes: Counter[str | None],
+) -> bool:
+    source = _line_source(record, target)
+    return (
+        target.id in names and writes[target.id] == 1
+        and source is not None and source[1] == target.id.encode("ascii")
+    )
+
+
+def _dictionary_assignment(statement: ast.stmt) -> tuple[ast.Name, ast.Dict] | None:
+    match statement:
+        case ast.Assign(targets=[ast.Name() as target], value=ast.Dict() as dictionary):
+            return target, dictionary
+    return None
+
+
+def _named_dictionaries(
+    record: _Record, tree: ast.Module, names: set[str],
+) -> dict[str, dict[str, _DigestSpan]]:
+    writes = Counter(_written_name(node) for node in ast.walk(tree))
+    dictionaries = {}
+    if "*" in writes:
+        return dictionaries
+    for statement in tree.body:
+        assignment = _dictionary_assignment(statement)
+        if assignment is None:
+            continue
+        target, dictionary = assignment
+        if _exact_identifier(record, target, names, writes):
+            dictionaries[target.id] = _literal_dictionary(record, dictionary)
+    return dictionaries
+
+
+def _proven_python_spans(record: _Record, spans: Iterable[_DigestSpan]) -> Iterable[_DigestSpan]:
+    tree = _python_tree(record.data)
+    if tree is None:
+        return
+    names = {pointer[0] for pointer in chain.from_iterable(record.pointers.values())}
+    dictionaries = _named_dictionaries(record, tree, names)
+    for span in spans:
+        if any(
+            dictionaries.get(name, {}).get(key) == span for name, key in record.pointers[span[2]]
+        ):
+            yield span
+
+
 def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
     attributes = finding.get("Attributes")
     return (
@@ -451,19 +584,35 @@ def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
     )
 
 
+def _direct_python_match(finding: dict[str, Any], path: str) -> bool:
+    return (
+        finding.keys() == _RAW_PYTHON_FINDING_FIELDS
+        and finding["Tags"] == []
+        and finding["SymlinkFile"] == ""
+        and all(finding[field] == "" for field in _GIT_FINDING_FIELDS)
+        and finding["Fingerprint"] == f"{path}:generic-api-key:{finding['StartLine']}"
+    )
+
+
+def _raw_provenance_match(finding: dict[str, Any], path: str, *, python: bool) -> bool:
+    return (
+        finding["RuleID"] == "generic-api-key" and "\ufffd" not in path and _raw_file_match(finding, path)
+        and (not python or _direct_python_match(finding, path))
+    )
+
+
 def _candidate_span(finding: dict[str, Any], records: dict[str, _Record]) -> _DigestSpan | None:
     path = finding["File"]
-    if finding["RuleID"] != "generic-api-key" or "\ufffd" in path or not _raw_file_match(finding, path):
-        return None
     record = records.get(path)
-    if record is None:
+    if record is None or not _raw_provenance_match(finding, path, python=record.python):
         return None
     return _matched_digest(finding, record)
 
 
 def _proven_record_rows(record: _Record, rows: dict[_DigestSpan, list[int]]) -> Iterable[int]:
-    for span in _proven_spans(record, rows):
-        if record.gzip is None or len(rows[span]) == 1:
+    proven = _proven_python_spans(record, rows) if record.python else _proven_spans(record, rows)
+    for span in proven:
+        if (not record.python and record.gzip is None) or len(rows[span]) == 1:
             yield from rows[span]
 
 
@@ -520,9 +669,9 @@ def _by_coordinate(findings: list[dict[str, Any]]) -> dict[_Coordinate, list[dic
     return coordinates
 
 
-def _direct_gzip_report(paths: list[str], run_report: _ReportRun) -> list[dict[str, Any]]:
-    """Replay the same archive paths through one decompression layer and no codecs."""
-    child = run_report(paths, "--max-archive-depth=1", "--max-decode-depth=0")
+def _direct_report(paths: list[str], run_report: _ReportRun, archive_depth: int) -> list[dict[str, Any]]:
+    """Replay the same captured paths without secondary decoding."""
+    child = run_report(paths, f"--max-archive-depth={archive_depth}", "--max-decode-depth=0")
     if child.execution != "completed":
         return []
     try:
@@ -539,22 +688,33 @@ def _same_unique_row(
     return baseline[key] == direct.get(key) == [row]
 
 
-def _unique_direct_gzip_rows(
-    findings: list[dict[str, Any]], candidates: set[int], run_report: _ReportRun,
+def _unique_direct_rows(
+    findings: list[dict[str, Any]], candidates: set[int], run_report: _ReportRun, *, archive_depth: int,
 ) -> set[int]:
     if not candidates:
         return set()
     baseline = _by_coordinate(findings)
     paths = sorted({findings[index]["File"] for index in candidates})
-    direct = _by_coordinate(_direct_gzip_report(paths, run_report))
+    direct = _by_coordinate(_direct_report(paths, run_report, archive_depth))
     return {index for index in candidates if _same_unique_row(findings[index], baseline, direct)}
+
+
+def _replayed_candidates(
+    findings: list[dict[str, Any]], records: dict[str, _Record], candidates: set[int], run_report: _ReportRun,
+) -> set[int]:
+    archives = {index for index in candidates if records[findings[index]["File"]].gzip is not None}
+    python = {index for index in candidates if records[findings[index]["File"]].python}
+    return (
+        (candidates - archives - python)
+        | _unique_direct_rows(findings, archives, run_report, archive_depth=1)
+        | _unique_direct_rows(findings, python, run_report, archive_depth=0)
+    )
 
 
 def _report_findings(child: Any, records: dict[str, _Record], run_report: _ReportRun) -> tuple[int, int]:
     findings = _report(child)
     candidates = _verified_finding_rows(findings, records)
-    archives = {index for index in candidates if records[findings[index]["File"]].gzip is not None}
-    verified = (candidates - archives) | _unique_direct_gzip_rows(findings, archives, run_report)
+    verified = _replayed_candidates(findings, records, candidates, run_report)
     for index, finding in enumerate(findings):
         if index in verified:
             continue

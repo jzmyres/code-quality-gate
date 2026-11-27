@@ -8,6 +8,7 @@ extras it trusts, its baseline and budget handling, and its per-process setup.
 from __future__ import annotations
 
 import json
+import keyword
 import re
 import sys
 import time
@@ -521,10 +522,23 @@ _GIT_PAYLOAD_FIELDS = ("path", "commit", "blob", "size")
 _GZIP_PAYLOAD_FIELDS = ("path", "compressed_sha256", "decoded_size")
 
 
-def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
+def _valid_python_pointer(parts: tuple[str, ...]) -> bool:
+    return (
+        len(parts) == 2
+        and parts[0].isascii()
+        and parts[0].isidentifier()
+        and not keyword.iskeyword(parts[0])
+        and bool(parts[1])
+    )
+
+
+def _read_pointer(pointer: str, path: Path, where: str, *, python: bool) -> tuple[str, ...]:
     if not pointer.startswith("/") or re.search(r"~(?:[^01]|$)", pointer):
         raise _config_error(path, where, "a non-root JSON Pointer", "invalid syntax")
-    return tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:])
+    parts = tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:])
+    if python and not _valid_python_pointer(parts):
+        raise _config_error(path, where, "/ASSIGNMENT/literal-key", "invalid Python pointer")
+    return parts
 
 
 def _provenance_digest(row: dict[str, Any], field: str, path: Path, where: str) -> str:
@@ -571,10 +585,14 @@ def _gzip_payload(raw: dict[str, Any], path: Path, where: str) -> secrets.GzipPa
     return secrets.GzipPayload(name, compressed, size)
 
 
-def _provenance_payload(row: dict[str, Any], path: Path, where: str) -> secrets.Payload:
+def _provenance_payload(
+    row: dict[str, Any], path: Path, where: str, *, python: bool,
+) -> secrets.Payload:
     value = row.get("payload")
     key = f"{where}.payload"
     if isinstance(value, dict):
+        if python:
+            raise _config_error(path, key, "a tracked payload path for a .py record", "inline table")
         if value.keys() & {"compressed_sha256", "decoded_size"}:
             return _gzip_payload(value, path, key)
         return _git_payload(value, path, key)
@@ -587,19 +605,20 @@ def _parse_provenance(row: Any, path: Path, where: str) -> secrets.Provenance:
     if not isinstance(row, dict):
         raise _config_error(path, where, "a table", type(row).__name__)
     _check_keys(row, (*_PROVENANCE_FIELDS, *_GZIP_DIGEST_FIELDS), path, where)
-    record, pointer = (
+    record, pointer_text = (
         _string(row, field, path, f"{where}.{field}") for field in ("record", "pointer")
     )
     _validate_exact_path(path, f"{where}.record", record)
-    payload = _provenance_payload(row, path, where)
+    python = record.endswith(".py")
+    payload = _provenance_payload(row, path, where, python=python)
     payload_path = payload if isinstance(payload, str) else payload.path
-    if not record.endswith((".json", ".json.gz")) or record == payload_path:
-        raise _config_error(path, where, "a .json or .json.gz record and a separate payload", "invalid paths")
+    if not record.endswith((".json", ".json.gz", ".py")) or record == payload_path:
+        raise _config_error(
+            path, where, "a .json, .json.gz or .py record and a separate payload", "invalid paths",
+        )
     digest = _provenance_digest(row, "payload_sha256", path, where)
-    return secrets.Provenance(
-        record, _read_pointer(pointer, path, f"{where}.pointer"), payload, digest,
-        _gzip_digests(row, record, path, where),
-    )
+    pointer = _read_pointer(pointer_text, path, f"{where}.pointer", python=python)
+    return secrets.Provenance(record, pointer, payload, digest, _gzip_digests(row, record, path, where))
 
 
 def _secrets_provenance(raw: dict[str, Any], path: Path, key: str) -> tuple[secrets.Provenance, ...]:

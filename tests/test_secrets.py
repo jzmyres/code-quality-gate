@@ -544,6 +544,168 @@ payload_sha256 = "{digest}"
             result, _ = self._run_provenance(binary, trusted, 1, 0)
             self.assertIn("RuleID: generic-api-key", result.stderr)
 
+    def _python_provenance_fixture(self) -> tuple[Path, Path, bytes, str]:
+        binary = self._require_scanner()
+        payload = b"quality gate synthetic Python payload\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        self.write_config(BASE_CONFIG + DECLARATION + f"""
+[[rule]]
+pattern = "*.raw"
+class = "config"
+reason = "synthetic payload fixture"
+
+[[checks.secrets.sha256_provenance]]
+record = "checksums.py"
+pointer = "/DIGESTS/token_config.json"
+payload = "pack.raw"
+payload_sha256 = "{digest}"
+""")
+        self.add_file("unused.raw", b"synthetic file for the inventory rule")
+        self.commit_all()
+        trusted = self.trusted_directory("HEAD")
+        return binary, trusted, payload, digest
+
+    def test_python_provenance_requires_two_tracked_files_and_trusted_policy(self) -> None:
+        binary, trusted, payload, digest = self._python_provenance_fixture()
+        self.add_file("checksums.py", f"DIGESTS = {{'token_config.json': '{digest}'}}\n")
+        self.git("add", "checksums.py")
+        self._run_provenance(binary, trusted, 1, 0)
+        self.add_file("pack.raw", payload)
+        self._run_provenance(binary, trusted, 1, 0)
+        self.git("add", "pack.raw")
+        result, check = self._run_provenance(binary, trusted, 0, 1)
+        self.assertEqual(check["diagnostics"]["exit_code"], 3)
+        self.assertNotIn(digest, result.stdout + result.stderr)
+        self._run_provenance(binary, None, 1, None)
+
+        self.add_file("pack.raw", b"other synthetic payload bytes")
+        self._run_provenance(binary, trusted, 1, 0)
+
+    def test_python_proof_keeps_other_digest_values_and_adjacent_credentials(self) -> None:
+        binary, trusted, payload, digest = self._python_provenance_fixture()
+        credential = _synthetic_credential()
+        other = hashlib.sha256(b"a distinct synthetic 64-hex scanner fixture").hexdigest()
+        self.add_file("pack.raw", payload)
+        self.add_file("checksums.py", (
+            f'language = "Ω"; DIGESTS = {{"token_config.json": "{digest}"}}; token = "{credential}"\n'
+            f'OTHER = {{"token_config.json": "{digest}"}}\n'
+            f'DIGESTS.update({{"token_config.json": "{other}"}})\n'
+        ))
+        self.git("add", "pack.raw")
+        self._run_provenance(binary, trusted, 1, 0)
+        self.git("add", "checksums.py")
+        result, check = self._run_provenance(binary, trusted, 1, 1)
+        self.assertEqual(check["reason"], "Betterleaks reported 3 unresolved finding(s)")
+        self.assertEqual(result.stderr.count("RuleID: github-pat"), 1)
+        self.assertEqual(result.stderr.count("RuleID: generic-api-key"), 2)
+        for value in (digest, credential, other):
+            self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_python_proof_refuses_equal_shape_same_line_even_if_declared_site_is_last(self) -> None:
+        binary, trusted, payload, digest = self._python_provenance_fixture()
+        self.add_file("pack.raw", payload)
+        self.add_file("checksums.py", (
+            f"OTHER = {{'token_config.json': '{digest}'}}; "
+            f"DIGESTS = {{'token_config.json': '{digest}'}}\n"
+        ))
+        self.git("add", "pack.raw", "checksums.py")
+        result, _ = self._run_provenance(binary, trusted, 1, 0)
+        self.assertEqual(result.stderr.count("RuleID: generic-api-key"), 2)
+
+    def test_python_proof_requires_literal_top_level_assignment_and_its_exact_span(self) -> None:
+        digest = hashlib.sha256(b"synthetic Python coordinate control").hexdigest()
+        field = f"'asset_config.json': '{digest}'"
+        assignment = f"DIGESTS = {{{field}}}"
+
+        def accepted(data: bytes, pointer=("DIGESTS", "asset_config.json")) -> set[int]:
+            record = secrets._record(data, python=True)
+            record.pointers[digest] = [pointer]
+            start = data.index(b"asset_config")
+            line = data.count(b"\n", 0, start) + 1
+            column = start - record.starts[line - 1]
+            row = {
+                "RuleID": "generic-api-key", "File": "checksums.py",
+                "StartLine": line, "EndLine": line,
+                "StartColumn": column + 1, "EndColumn": column + len(field) - 1,
+                "Match": "asset_config.json': 'REDACTED'", "Secret": "REDACTED",
+                "Attributes": {"path": "checksums.py", "resource": "fs.content", "confidence": "low"},
+                "Fingerprint": f"checksums.py:generic-api-key:{line}",
+                "Tags": [], "SymlinkFile": "", "Description": "synthetic report", "Entropy": 3.8,
+                "Commit": "", "Author": "", "Email": "", "Date": "", "Message": "",
+            }
+            return secrets._verified_finding_rows([row], {"checksums.py": record})
+
+        control = f'comment = "Ω"; {assignment}\r\n'.encode()
+        self.assertEqual(accepted(control), {0})
+        self.assertEqual(accepted(control, ("OTHER", "asset_config.json")), set())
+        self.assertEqual(accepted(control, ("DIGESTS", "other")), set())
+        for source in (
+            f"# {assignment}", f'wrapper = """{assignment}"""',
+            f"if True:\n    {assignment}", f"def inner():\n    {assignment}",
+            f"DIGESTS: dict = {{{field}}}", f"DIGESTS = OTHER = {{{field}}}",
+            f"{assignment}\nDIGESTS = dict()", f"{assignment}\nDIGESTS: dict",
+            f"{assignment}\nDIGESTS |= {{}}", f"{assignment}\nOTHER = DIGESTS = {{}}",
+            f"{assignment}\nfrom example import other as DIGESTS",
+            f"{assignment}\nfrom example import *",
+            f"DIGESTS = {{{field}, 'asset_config.json': 'different'}}",
+            f"DIGESTS = {{{field}, **extra}}", f"DIGESTS = {{{field}, other: 'value'}}",
+            f"DIGESTS = {{{field}, 'other': expression}}",
+            f"DIGESTS = {{{field} ''}}", f"DIGESTS = {{{field} + ''}}",
+            f"# coding: latin-1\n{assignment}", f"{assignment}\nsyntax error",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(accepted(source.encode()), set())
+        self.assertEqual(accepted(control + b"# \xff\n"), set())
+        escaped_key = f"DIGESTS = {{'escaped\\x20{field[1:]}}}".encode()
+        self.assertEqual(accepted(escaped_key, ("DIGESTS", "escaped asset_config.json")), set())
+
+    def test_python_proof_requires_one_raw_row_in_each_report(self) -> None:
+        binary = self._require_scanner()
+        digest = hashlib.sha256(b"synthetic raw report witness").hexdigest()
+        source = f"DIGESTS = {{'token_config.json': '{digest}'}}\n".encode()
+        self.add_file("checksums.py", source)
+        child = runner.run(
+            [*secrets._scanner_argv(binary), "--exit-code=3", "--report-format=json",
+             "--report-path=-", "--", "checksums.py"],
+            cwd=self.repo, env={}, budget_seconds=60, capture_limit=None,
+        )
+        self.assertEqual(child.returncode, 3, child.stderr_text)
+        row, = json.loads(child.stdout)
+        record = secrets._record(source, python=True)
+        record.pointers[digest] = [("DIGESTS", "token_config.json")]
+        records = {"checksums.py": record}
+        replay = mock.Mock(return_value=child)
+
+        def report(*rows):
+            return replace(child, stdout=json.dumps(rows).encode())
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(secrets._report_findings(child, records, replay), (0, 1))
+            replay.assert_called_once_with(
+                ["checksums.py"], "--max-archive-depth=0", "--max-decode-depth=0",
+            )
+            self.assertEqual(secrets._report_findings(report(row, row), records, replay), (2, 0))
+            for update in (
+                {"Match": row["Match"].replace("'", '"')}, {"EndColumn": row["EndColumn"] + 1},
+                {"StartLine": 2}, {"Secret": "partial redaction"}, {"Fingerprint": "wrong"},
+                {"Tags": ["decoded:base64"]}, {"SymlinkFile": "other.py"}, {"Commit": "synthetic"},
+                {"ComponentSets": []}, {"ArchivePath": "archive.tar"},
+                {"Attributes": dict(row["Attributes"], archive="archive.tar")},
+                {"Attributes": dict(row["Attributes"], path="other.py")},
+            ):
+                with self.subTest(update=update):
+                    invalid = report(dict(row, **update))
+                    replay.return_value = invalid
+                    self.assertEqual(secrets._report_findings(invalid, records, replay), (1, 0))
+            for invalid_replay in (
+                report(row, row), report(dict(row, Entropy=0)),
+                replace(child, returncode=0, stdout=b"[]"),
+                replace(child, execution="budget"), replace(child, output_truncated=True),
+            ):
+                with self.subTest(replay=invalid_replay):
+                    replay.return_value = invalid_replay
+                    self.assertEqual(secrets._report_findings(child, records, replay), (1, 0))
+
     def test_trusted_payload_verifies_exact_json_scalar(self) -> None:
         binary, trusted, digest = self._provenance_fixture()
         result, check = self._run_provenance(binary, trusted, 0, 1)
@@ -920,9 +1082,11 @@ decoded_sha256 = "{decoded_pin or hashlib.sha256(record).hexdigest()}"
             return runner.RunResult((), "completed", 3 if rows else 0, stdout=json.dumps(rows).encode())
 
         replay = mock.Mock(return_value=child([finding]))
-        self.assertEqual(secrets._unique_direct_gzip_rows([finding], {0}, replay), {0})
+        self.assertEqual(secrets._unique_direct_rows([finding], {0}, replay, archive_depth=1), {0})
         replay.assert_called_once_with(["report.json.gz"], "--max-archive-depth=1", "--max-decode-depth=0")
-        self.assertEqual(secrets._unique_direct_gzip_rows([finding, finding], {0, 1}, replay), set())
+        self.assertEqual(
+            secrets._unique_direct_rows([finding, finding], {0, 1}, replay, archive_depth=1), set(),
+        )
 
         for invalid in (
             child([]), child([finding, finding]), child([dict(finding, Tags=["decoded:base64"])]),
@@ -932,7 +1096,7 @@ decoded_sha256 = "{decoded_pin or hashlib.sha256(record).hexdigest()}"
         ):
             with self.subTest(invalid=invalid):
                 replay.return_value = invalid
-                self.assertEqual(secrets._unique_direct_gzip_rows([finding], {0}, replay), set())
+                self.assertEqual(secrets._unique_direct_rows([finding], {0}, replay, archive_depth=1), set())
 
     def test_structured_report_must_be_complete_and_consistent(self) -> None:
         for code, report in ((0, b"bad"), (3, b"[]"), (0, b"[{}]"), (3, b"[{}]"), (1, b"[]")):
@@ -1017,6 +1181,24 @@ decoded_sha256 = "{decoded_pin or hashlib.sha256(record).hexdigest()}"
                 adapters._secrets_provenance(
                     {"sha256_provenance": [dict(row, payload=invalid)]}, self.config_path, "secrets",
                 )
+
+    def test_python_provenance_declaration_requires_assignment_and_key(self) -> None:
+        row = {
+            "record": "checksums.py", "pointer": "/DIGESTS/one~1two~0three",
+            "payload": "data.raw", "payload_sha256": "0" * 64,
+        }
+        valid, = adapters._secrets_provenance({"sha256_provenance": [row]}, self.config_path, "secrets")
+        self.assertEqual(valid.pointer, ("DIGESTS", "one/two~three"))
+        for invalid in (
+            dict(row, pointer="/DIGESTS"), dict(row, pointer="/DIGESTS/key/extra"),
+            dict(row, pointer="/1DIGESTS/key"), dict(row, pointer="/while/key"),
+            dict(row, pointer="/DIGESTS/"), dict(row, payload="checksums.py"),
+            dict(row, compressed_sha256="0" * 64),
+            dict(row, payload={"path": "data.raw", "commit": "1" * 40, "blob": "2" * 40, "size": 1}),
+            dict(row, payload={"path": "data.gz", "compressed_sha256": "0" * 64, "decoded_size": 1}),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                adapters._secrets_provenance({"sha256_provenance": [invalid]}, self.config_path, "secrets")
 
     def test_unattested_match_locations_do_not_verify(self) -> None:
         digest = hashlib.sha256(b"example source").hexdigest()

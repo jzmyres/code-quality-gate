@@ -495,6 +495,17 @@ A plain `.json` record can contain up to 16 MiB of UTF-8 JSON. The JSON
 Pointer uses `~0` and `~1` escapes and zero-based array indices. Each
 record and pointer pair can appear once.
 
+A Git-tracked `.py` record can contain up to 16 MiB of UTF-8 Python source.
+Use `/ASSIGNMENT/literal-key` for a key in a single top-level assignment
+such as `DIGESTS = {"token_config.json": "…"}`. Use a separate Git-tracked
+working-tree payload path. The assignment uses one ASCII identifier and a
+dictionary of unique, unescaped string literal keys and values. The selected
+value must be one single- or double-quoted lowercase digest on the scanner's
+reported line. The gate parses the source without executing it and compares
+the literal's byte span against the scanner's match. The proof covers that
+literal occurrence. Findings on later dictionary mutations follow standard
+enforcement.
+
 For a Git-tracked `.json.gz` record, add `compressed_sha256` for the exact
 captured gzip bytes and `decoded_sha256` for the exact UTF-8 JSON bytes. Both
 fields require 64 lowercase hex digits and belong only on `.json.gz` rows.
@@ -512,10 +523,12 @@ mid-line. The gate requires exactly one location on the reported line at or
 after the reported start column with the same byte width and redacted match
 template. It then checks that the location identifies the declared lowercase
 digest string. A verified finding counts in
-`measurement.verified_sha256_provenance`. For each gzip proof candidate,
-the gate reruns the pinned scanner on the same captured archive with one
-archive layer and secondary decoding disabled. The original scan and this
-replay must each report exactly one identical finding at that coordinate.
+`measurement.verified_sha256_provenance`. For gzip and Python proof
+candidates, the gate reruns the pinned scanner on the same captured file
+with secondary decoding disabled. The replay reads one archive layer for
+gzip and zero for Python. The original scan and this replay must each
+report exactly one identical finding at that coordinate. Python requires a
+unique matching shape across the entire physical line.
 The standard scan retains its usual archive and decoding settings. Other
 findings, including adjacent credentials and findings in secondary decoded
 content, retain their normal enforcement.
@@ -523,7 +536,7 @@ content, retain their normal enforcement.
 A check without `--policy-from` scans without applying these declarations.
 Missing payloads, changed bytes, duplicate JSON member names, and findings
 whose location cannot be verified leave the scanner finding in place. A
-failed, incomplete, or invalid gzip replay leaves the original finding in
+failed, incomplete, or invalid replay leaves the original finding in
 place. The check rejects a failed standard scan or an incomplete or invalid
 standard scanner report.
 
