@@ -445,6 +445,32 @@ payload_sha256 = "{digest}"
         self.assertIn("RuleID: generic-api-key", result.stderr)
         self.assertNotIn(digest, result.stdout + result.stderr)
 
+    def test_repeated_digest_verifies_only_declared_spans_with_two_record_parses(self) -> None:
+        binary = self._require_scanner()
+        payload = b"synthetic bytes shared by three recorded digests\x00"
+        digest = hashlib.sha256(payload).hexdigest()
+        self.add_file("pack.raw", payload)
+        self.add_file("report.json", json.dumps(
+            {"pack": [{"tokens_sha256": digest}] * 3}, indent=2,
+        ))
+        declarations = tuple(
+            secrets.Provenance("report.json", ("pack", str(index), "tokens_sha256"), "pack.raw", digest)
+            for index in (0, 2)
+        )
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            mock.patch.object(secrets, "load_json", wraps=secrets.load_json) as parse,
+        ):
+            result = secrets.scan_verified(
+                binary, self.repo, self.evidence, ("pack.raw", "report.json"), 60, declarations,
+                tracked={"pack.raw"}, open_parent=files._parent_fd, run=runner.run,
+            )
+        self.assertEqual(result.child.execution, "completed")
+        self.assertEqual((result.verified, result.unresolved), (2, 1))
+        self.assertIn("Line: 7\n", stderr.getvalue())
+        self.assertEqual(parse.call_count, 3)
+
     def test_duplicate_json_member_cannot_claim_provenance(self) -> None:
         binary, trusted, digest = self._provenance_fixture()
         self.add_file("report.json", self._digest_record(digest).replace(
@@ -509,7 +535,9 @@ payload_sha256 = "{digest}"
             "Attributes": {"path": "report.json", "resource": "fs.content"},
         }
         records = {"report.json": record}
-        self.assertTrue(secrets._eligible_finding(finding, records))
+        self.assertEqual(secrets._verified_finding_rows([finding], records), {0})
+        observations = [finding, dict(finding, Secret="incorrect redaction"), finding]
+        self.assertEqual(secrets._verified_finding_rows(observations, records), {0, 2})
         for changed in (
             {"EndLine": 2}, {"EndColumn": len(data) + 1}, {"StartColumn": 1},
             {"StartColumn": 4, "EndColumn": len(data)},
@@ -519,7 +547,7 @@ payload_sha256 = "{digest}"
             {"Attributes": {"path": "report.json", "resource": "fs.archive"}},
         ):
             with self.subTest(changed=changed):
-                self.assertFalse(secrets._eligible_finding(dict(finding, **changed), records))
+                self.assertEqual(secrets._verified_finding_rows([dict(finding, **changed)], records), set())
 
     def test_oversized_record_gets_no_verification(self) -> None:
         declaration = secrets.Provenance("report.json", ("tokens_sha256",), "pack.raw", "0" * 64)

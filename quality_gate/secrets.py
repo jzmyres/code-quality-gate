@@ -22,6 +22,7 @@ _REDACTED_ASSIGNMENT = re.compile(r'([A-Za-z0-9_.-]+"[ \t]*:[ \t]*")REDACTED"')
 _SHA256 = re.compile(rb"[0-9a-f]{64}")
 _MARKER = "verified-provenance-position"
 _OpenParent = Callable[[Path, str], int]
+_DigestSpan = tuple[int, int, str]
 
 
 @dataclass(frozen=True)
@@ -220,22 +221,39 @@ def _matched_digest(finding: dict[str, Any], record: _Record) -> tuple[int, int,
     return first, last, digest.decode("ascii")
 
 
-def _proves_pointer(record: _Record, start: int, end: int, digest: str) -> bool:
-    """Bind the matched bytes to the pointer by substituting a marker in memory."""
-    pointers = record.pointers.get(digest)
-    if not pointers:
-        return False
+def _marked_record(
+    data: bytes, spans: Iterable[_DigestSpan],
+) -> tuple[bytearray, dict[_DigestSpan, str]]:
+    """Give each candidate span its own fixed-width marker.
+
+    A matched digest sits between unescaped quotes, so distinct spans cannot
+    overlap in a valid document. The markers keep all other offsets intact.
+    """
+    marked_bytes = bytearray(data)
+    markers = {}
+    for span in spans:
+        start, end, _ = span
+        marker = f"{_MARKER}-{start}".ljust(_DIGEST_WIDTH, "-")
+        marked_bytes[start:end] = marker.encode("ascii")
+        markers[span] = marker
+    return marked_bytes, markers
+
+
+def _proven_spans(record: _Record, spans: Iterable[_DigestSpan]) -> Iterable[_DigestSpan]:
+    """Bind each candidate span to the declared scalar in both record parses."""
+    marked_bytes, markers = _marked_record(record.data, spans)
     try:
         original = load_json(record.data.decode("utf-8"))
-        marked_bytes = record.data[:start] + _MARKER.encode("ascii") + record.data[end:]
         marked = load_json(marked_bytes.decode("utf-8"))
     except (ValueError, RecursionError):
-        return False
-    return any(
-        _pointer_value(original, pointer) == digest
-        and _pointer_value(marked, pointer) == _MARKER
-        for pointer in pointers
-    )
+        return
+    for span, marker in markers.items():
+        digest = span[2]
+        if any(
+            _pointer_value(original, pointer) == digest and _pointer_value(marked, pointer) == marker
+            for pointer in record.pointers[digest]
+        ):
+            yield span
 
 
 def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
@@ -249,15 +267,28 @@ def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
     )
 
 
-def _eligible_finding(finding: dict[str, Any], records: dict[str, _Record]) -> bool:
+def _candidate_span(finding: dict[str, Any], records: dict[str, _Record]) -> _DigestSpan | None:
     path = finding["File"]
     if finding["RuleID"] != "generic-api-key" or "\ufffd" in path or not _raw_file_match(finding, path):
-        return False
+        return None
     record = records.get(path)
     if record is None:
-        return False
-    digest = _matched_digest(finding, record)
-    return digest is not None and _proves_pointer(record, *digest)
+        return None
+    return _matched_digest(finding, record)
+
+
+def _verified_finding_rows(findings: list[dict[str, Any]], records: dict[str, _Record]) -> set[int]:
+    candidates: dict[str, dict[_DigestSpan, list[int]]] = {}
+    for index, finding in enumerate(findings):
+        span = _candidate_span(finding, records)
+        path = finding["File"]
+        if span is not None and span[2] in records[path].pointers:
+            candidates.setdefault(path, {}).setdefault(span, []).append(index)
+    verified = set()
+    for path, rows in candidates.items():
+        for span in _proven_spans(records[path], rows):
+            verified.update(rows[span])
+    return verified
 
 
 def _decode_report(child: Any) -> list[Any]:
@@ -291,17 +322,16 @@ def _report(child: Any) -> list[dict[str, Any]]:
 
 def _report_findings(child: Any, records: dict[str, _Record]) -> tuple[int, int]:
     findings = _report(child)
-    verified = 0
-    for finding in findings:
-        if _eligible_finding(finding, records):
-            verified += 1
+    verified = _verified_finding_rows(findings, records)
+    for index, finding in enumerate(findings):
+        if index in verified:
             continue
         print(
             f"path: {finding['File']!r}\nLine: {finding['StartLine']}"
             f"\nColumn: {finding['StartColumn']}\nRuleID: {finding['RuleID']}",
             file=sys.stderr,
         )
-    return len(findings) - verified, verified
+    return len(findings) - len(verified), len(verified)
 
 
 @dataclass(frozen=True)
