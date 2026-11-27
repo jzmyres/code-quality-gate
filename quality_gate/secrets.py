@@ -65,6 +65,11 @@ class GitPayload:
     size: int
 
 
+_ReadGitBlob = Callable[[GitPayload], tuple[bytes, str] | None]
+_VerifyModels = Callable[[list[dict[str, Any]], Path, _ReportRun], set[int]]
+_PrepareModels = Callable[[dict[str, bool], set[str], _ReadGitBlob], _VerifyModels]
+
+
 @dataclass(frozen=True)
 class GzipPayload:
     path: str
@@ -255,14 +260,16 @@ def _exact_tree_entry(entry: bytes, payload: GitPayload) -> bool:
     )
 
 
-def _blob_digest(data: bytes, payload: GitPayload) -> str | None:
-    if len(data) != payload.size:
+def _checked_blob(data: bytes | None, payload: GitPayload) -> tuple[bytes, str] | None:
+    if data is None or len(data) != payload.size:
         return None
     algorithm = "sha1" if len(payload.blob) == 40 else "sha256"
     object_hash = hashlib.new(algorithm, usedforsecurity=False)
     object_hash.update(f"blob {payload.size}\0".encode("ascii"))
     object_hash.update(data)
-    return hashlib.sha256(data).hexdigest() if object_hash.hexdigest() == payload.blob else None
+    if object_hash.hexdigest() != payload.blob:
+        return None
+    return data, hashlib.sha256(data).hexdigest()
 
 
 class _GitPayloadReader:
@@ -304,7 +311,7 @@ class _GitPayloadReader:
             and self._read("merge-base", "--is-ancestor", commit, head) == b""
         )
 
-    def digest(self, payload: GitPayload) -> str | None:
+    def read(self, payload: GitPayload) -> tuple[bytes, str] | None:
         if not 0 <= payload.size <= MAX_GIT_PAYLOAD_BYTES or not self._reachable_commit(payload.commit):
             return None
         entry = self._read(
@@ -314,7 +321,11 @@ class _GitPayloadReader:
         if entry is None or not _exact_tree_entry(entry, payload):
             return None
         data = self._read("cat-file", "blob", payload.blob, limit=payload.size)
-        return None if data is None else _blob_digest(data, payload)
+        return _checked_blob(data, payload)
+
+    def digest(self, payload: GitPayload) -> str | None:
+        checked = self.read(payload)
+        return checked[1] if checked is not None else None
 
 
 def _gzip_payload_digest(path: Path, payload: GzipPayload) -> str | None:
@@ -391,13 +402,15 @@ def _match_prefix(finding: dict[str, Any], *, python: bool) -> bytes | None:
     return match[1].encode("ascii") if match is not None else None
 
 
-def _unique_value(data: bytes, prefix: bytes, start: int, line_end: int) -> int | None:
+def _unique_value(
+    data: bytes, prefix: bytes, start: int, line_end: int, width: int = _DIGEST_WIDTH,
+) -> int | None:
     """Locate the sole fixed-width raw value, including overlapping candidates."""
-    prefix_end = line_end - _DIGEST_WIDTH - 1
+    prefix_end = line_end - width - 1
     first = None
     while (position := data.find(prefix, start, prefix_end)) != -1:
         value_start = position + len(prefix)
-        if data[value_start + _DIGEST_WIDTH] == prefix[-1]:
+        if data[value_start + width] == prefix[-1]:
             if first is not None:
                 return None
             first = value_start
@@ -594,7 +607,7 @@ def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
     )
 
 
-def _direct_python_match(finding: dict[str, Any], path: str) -> bool:
+def _direct_generic_match(finding: dict[str, Any], path: str) -> bool:
     return (
         finding.keys() == _RAW_FINDING_FIELDS
         and finding["Tags"] == []
@@ -607,7 +620,7 @@ def _direct_python_match(finding: dict[str, Any], path: str) -> bool:
 def _raw_provenance_match(finding: dict[str, Any], path: str, *, python: bool) -> bool:
     return (
         finding["RuleID"] == "generic-api-key" and "\ufffd" not in path and _raw_file_match(finding, path)
-        and (not python or _direct_python_match(finding, path))
+        and (not python or _direct_generic_match(finding, path))
     )
 
 
@@ -939,6 +952,7 @@ class VerifiedScan:
     unresolved: int
     verified: int
     vocabulary: tuple[tuple[_Coordinate, ...], ...] = ()
+    public_models: int = 0
 
 
 def _selected_vocabulary(
@@ -947,12 +961,26 @@ def _selected_vocabulary(
     return {proof.path: proof for proof in proofs if paths.get(proof.path) and proof.path in tracked}
 
 
+def _prepare_model_scan(
+    prepare: _PrepareModels | None, paths: dict[str, bool], tracked: set[str], git: _GitPayloadReader | None,
+) -> _VerifyModels | None:
+    return prepare(paths, tracked, git.read) if prepare is not None and git is not None else None
+
+
+def _verified_model_rows(
+    findings: list[dict[str, Any]], directory: Path, run_report: _ReportRun,
+    verify: _VerifyModels | None,
+) -> set[int]:
+    return verify(findings, directory, run_report) if verify is not None else set()
+
+
 def scan_verified(
     binary: Path, root: Path, directory: Path, selected: Iterable[str], budget: float,
     declarations: tuple[Provenance, ...], *,
     tracked: set[str], open_parent: _OpenParent, run: Callable[..., Any],
     git_run: _ReportRun | None = None,
     public_vocabulary: tuple[public_vocab.PublishedVocabulary, ...] = (),
+    prepare_models: _PrepareModels | None = None,
 ) -> VerifiedScan:
     paths = _snapshot(root, directory, selected, open_parent)
     candidates = _selected_provenance(paths, tracked, declarations)
@@ -972,30 +1000,34 @@ def scan_verified(
         )
 
     vocabulary = _selected_vocabulary(public_vocabulary, paths, tracked)
-    return _scan_reports(directory, sorted(paths) or ["."], pinned, vocabulary, run_report)
+    verify_models = _prepare_model_scan(prepare_models, paths, tracked, git)
+    return _scan_reports(directory, sorted(paths) or ["."], pinned, vocabulary, run_report, verify_models)
 
 
 def _scan_reports(
     directory: Path, paths: list[str], pinned: dict[str, list[Provenance]],
     public_vocabulary: dict[str, public_vocab.PublishedVocabulary], run_report: _ReportRun,
+    verify_models: _VerifyModels | None = None,
 ) -> VerifiedScan:
-    unresolved = verified = 0
+    unresolved = verified = models = 0
     with_findings = None
     vocabulary = []
     for targets in batched(paths, _MAX_FILES_PER_INVOCATION):
         child = run_report(targets)
         safe_child = replace(child, stdout=b"", stderr=b"", output_tail=b"", output_bytes=0)
         if child.execution != "completed":
-            return VerifiedScan(safe_child, unresolved, verified, tuple(sorted(vocabulary)))
+            return VerifiedScan(safe_child, unresolved, verified, tuple(sorted(vocabulary)), models)
         findings = _report(child)
         records = _verified_records(directory, targets, pinned)
         public_rows = _verified_vocabulary_rows(directory, findings, public_vocabulary, run_report)
+        model_rows = _verified_model_rows(findings, directory, run_report, verify_models)
         batch_unresolved, batch_verified = _report_findings(
-            child, records, run_report, findings=findings, public_verified=public_rows,
+            child, records, run_report, findings=findings, public_verified=public_rows.keys() | model_rows,
         )
         unresolved += batch_unresolved
         verified += batch_verified
+        models += len(model_rows)
         vocabulary.extend(_vocabulary_location(public_rows[index]) for index in sorted(public_rows))
         if child.returncode == _FINDINGS_EXIT:
             with_findings = safe_child
-    return VerifiedScan(with_findings or safe_child, unresolved, verified, tuple(sorted(vocabulary)))
+    return VerifiedScan(with_findings or safe_child, unresolved, verified, tuple(sorted(vocabulary)), models)

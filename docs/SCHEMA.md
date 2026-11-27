@@ -593,6 +593,43 @@ component proof, or ambiguous or failed replay remain unresolved. A tokenizer
 asset with more than 256 candidate rows leaves all of them unresolved. The
 16 MiB JSON record bound for SHA-256 assignment proof still applies.
 
+### Public hardware model labels
+
+Use `[[checks.secrets.public_hardware_model_v1]]` in the existing trusted
+directory for `--policy-from`. Each declaration covers one finding in a
+Git-tracked regular `.json` or `.json.gz` file. Review the public model entry
+independently and pin the separate catalogue commit in the trusted policy.
+An authorized candidate policy replacement can supply these declarations
+once it is included in a trusted directory for a subsequent run.
+
+| Field | Meaning |
+| --- | --- |
+| `record` | Exact repository-relative path to the record |
+| `pointer` | Non-root JSON Pointer for the one model string |
+| `match_start`, `match_end` | Zero-based, half-open byte interval of the whole scanner match in the decoded record, including the matched assignment prefix and closing quote |
+| `decoded_sha256` | SHA-256 of the complete decoded JSON bytes, including for uncompressed records |
+| `compressed_sha256` | SHA-256 of the complete captured archive for `.json.gz` records |
+| `catalogue.payload` | Separate historical Git payload table with literal path, full commit and blob IDs, and exact byte size |
+| `catalogue.sha256` | SHA-256 of the entire catalogue blob |
+| `catalogue.literal_start`, `catalogue.literal_end` | Zero-based, half-open byte interval inside the quotes of the complete unescaped string literal in a UTF-8 Python catalogue |
+
+Only gzip records use `compressed_sha256`. A gzip record contains one
+complete member, and its compressed and decoded bytes each have a 16 MiB
+limit. Raw JSON records also have a 16 MiB limit. Each record and pointer
+pair and each record and match interval pair can occur only once. The Git
+operand follows the size, reachability and regular-file checks for a
+historical SHA-256 payload. The gate parses the catalogue without executing
+it and compares its exact string to the declared strict JSON scalar.
+
+The proof requires an untransformed `fs.content` `generic-api-key` finding
+with exact physical byte coordinates and one matching assignment shape
+across the entire line. The normal report and a direct replay must each
+produce one identical row at that coordinate. The replay disables secondary
+decoding and reads zero archive layers for raw JSON and one for gzip.
+`measurement.verified_public_hardware_models` counts verified findings when
+the trusted policy enables this proof. Other findings retain normal
+enforcement, including adjacent findings in the same record.
+
 ## Tool lock: `tools.lock.toml`
 
 Each top-level table names a pinned tool:
