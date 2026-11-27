@@ -15,11 +15,13 @@ from array import array
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
-from functools import cached_property
+from functools import cached_property, partial
 from itertools import batched, chain
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
+from . import public_vocab
 from .json_input import load_json
 
 _MAX_FILES_PER_INVOCATION = 24
@@ -28,6 +30,7 @@ _MAX_RECORD_BYTES = 16 << 20
 _MAX_COMPRESSED_BYTES = 16 << 20
 MAX_GIT_PAYLOAD_BYTES = 16 << 20
 MAX_GZIP_PAYLOAD_BYTES = 32 << 20
+MAX_PUBLIC_VOCABULARY_GZIP_BYTES = 16 << 20
 FULL_GIT_OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _PROMISOR_CONFIG = r"^(extensions\.partialclone|remote\..+\.promisor)$"
 _DIGEST_WIDTH = 64
@@ -36,8 +39,10 @@ _PYTHON_REDACTED_ASSIGNMENT = re.compile(r"""([A-Za-z0-9_.-]+["'][ \t]*:[ \t]*([
 _SHA256 = re.compile(rb"[0-9a-f]{64}")
 _MARKER = "verified-provenance-position"
 _GIT_FINDING_FIELDS = ("Commit", "Author", "Email", "Date", "Message")
-_RAW_PYTHON_FINDING_FIELDS = {
-    "RuleID", "File", "StartLine", "EndLine", "StartColumn", "EndColumn", "Match", "Secret",
+_POSITION_FIELDS = ("StartLine", "EndLine", "StartColumn", "EndColumn")
+_MATCH_FIELDS = {"RuleID", "Match", "Secret", *_POSITION_FIELDS}
+_RAW_FINDING_FIELDS = {
+    *_MATCH_FIELDS, "File",
     "Attributes", "Tags", "Fingerprint", "SymlinkFile", "Description", "Entropy", *_GIT_FINDING_FIELDS,
 }
 _OpenParent = Callable[[Path, str], int]
@@ -573,20 +578,25 @@ def _proven_python_spans(record: _Record, spans: Iterable[_DigestSpan]) -> Itera
             yield span
 
 
-def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
+def _raw_attachment_matches(finding: dict[str, Any], path: str) -> bool:
     attributes = finding.get("Attributes")
     return (
         isinstance(attributes, dict)
         and attributes.get("path") == path
         and attributes.get("resource") == "fs.content"
         and set(attributes) <= {"path", "resource", "confidence"}
-        and not any(finding.get(field) for field in ("Tags", "ComponentSets", "SymlinkFile"))
+    )
+
+
+def _raw_file_match(finding: dict[str, Any], path: str) -> bool:
+    return _raw_attachment_matches(finding, path) and not any(
+        finding.get(field) for field in ("Tags", "ComponentSets", "SymlinkFile")
     )
 
 
 def _direct_python_match(finding: dict[str, Any], path: str) -> bool:
     return (
-        finding.keys() == _RAW_PYTHON_FINDING_FIELDS
+        finding.keys() == _RAW_FINDING_FIELDS
         and finding["Tags"] == []
         and finding["SymlinkFile"] == ""
         and all(finding[field] == "" for field in _GIT_FINDING_FIELDS)
@@ -638,12 +648,14 @@ def _decode_report(child: Any) -> list[Any]:
     return findings
 
 
+def _has_integer_coordinates(finding: dict[str, Any]) -> bool:
+    return all(type(finding.get(field)) is int for field in _POSITION_FIELDS)
+
+
 def _finding_metadata(finding: Any) -> bool:
     return isinstance(finding, dict) and all(
         isinstance(finding.get(field), str) and finding[field] for field in ("RuleID", "File")
-    ) and all(
-        type(finding.get(field)) is int for field in ("StartLine", "EndLine", "StartColumn", "EndColumn")
-    )
+    ) and _has_integer_coordinates(finding)
 
 
 def _report(child: Any) -> list[dict[str, Any]]:
@@ -711,10 +723,7 @@ def _replayed_candidates(
     )
 
 
-def _report_findings(child: Any, records: dict[str, _Record], run_report: _ReportRun) -> tuple[int, int]:
-    findings = _report(child)
-    candidates = _verified_finding_rows(findings, records)
-    verified = _replayed_candidates(findings, records, candidates, run_report)
+def _print_unresolved(findings: list[dict[str, Any]], verified: set[int]) -> int:
     for index, finding in enumerate(findings):
         if index in verified:
             continue
@@ -723,7 +732,205 @@ def _report_findings(child: Any, records: dict[str, _Record], run_report: _Repor
             f"\nColumn: {finding['StartColumn']}\nRuleID: {finding['RuleID']}",
             file=sys.stderr,
         )
-    return len(findings) - len(verified), len(verified)
+    return len(findings) - len(verified)
+
+
+def _report_findings(
+    child: Any, records: dict[str, _Record], run_report: _ReportRun, *,
+    findings: list[dict[str, Any]] | None = None, public_verified: Iterable[int] = (),
+) -> tuple[int, int]:
+    if findings is None:
+        findings = _report(child)
+    candidates = _verified_finding_rows(findings, records)
+    verified = _replayed_candidates(findings, records, candidates, run_report)
+    return _print_unresolved(findings, verified.union(public_verified)), len(verified)
+
+
+_VOCAB_COMPONENT_FIELDS = _MATCH_FIELDS | {"Optional"}
+
+
+def _exact_publication(data: bytes | None, size: int, digest: str) -> bytes | None:
+    if data is None or len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        return None
+    return data
+
+
+def _read_exact(path: Path, size: int, digest: str) -> bytes | None:
+    with path.open("rb") as stream:
+        return _exact_publication(stream.read(size + 1), size, digest)
+
+
+def _published_bytes(directory: Path, proof: public_vocab.PublishedVocabulary) -> bytes | None:
+    path = directory / proof.path
+    if proof.compressed_size is None or proof.compressed_sha256 is None:
+        return _read_exact(path, proof.published_size, proof.published_sha256)
+    archive = _read_exact(path, proof.compressed_size, proof.compressed_sha256)
+    if archive is None:
+        return None
+    raw = _single_gzip_member(archive, proof.published_size)
+    return _exact_publication(raw, proof.published_size, proof.published_sha256)
+
+
+def _vocabulary_report_metadata(row: dict[str, Any]) -> bool:
+    return (
+        row.keys() - {"ComponentSets"} == _RAW_FINDING_FIELDS
+        and row["Tags"] == [] and row["SymlinkFile"] == ""
+        and all(row[field] == "" for field in _GIT_FINDING_FIELDS)
+    )
+
+
+def _public_row(row: dict[str, Any], path: str) -> bool:
+    return (
+        (row["File"], row["RuleID"]) == (path, "generic-password") and "\ufffd" not in path
+        and _vocabulary_report_metadata(row)
+        and _raw_attachment_matches(row, path)
+        and row["Fingerprint"] == f"{path}:generic-password:{row['StartLine']}"
+    )
+
+
+def _only_report_object(items: Any, fields: set[str]) -> dict[str, Any] | None:
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    item, = items
+    if not isinstance(item, dict) or item.keys() != fields:
+        return None
+    return item
+
+
+def _vocabulary_components(row: dict[str, Any]) -> tuple[dict[str, Any], ...] | None:
+    if "ComponentSets" not in row:
+        return ()
+    group = _only_report_object(row["ComponentSets"], {"components"})
+    if group is None:
+        return None
+    component = _only_report_object(group["components"], _VOCAB_COMPONENT_FIELDS)
+    if component is None:
+        return None
+    if component["RuleID"] != "generic-username" or component["Optional"] is not True:
+        return None
+    return (component,)
+
+
+def _vocabulary_spans(
+    record: _Record, rows: tuple[dict[str, Any], ...], keys: frozenset[str],
+) -> set[public_vocab.MemberSpan]:
+    spans = set()
+    for row in rows:
+        span = public_vocab.member_span(record.data, record.starts, row, keys)
+        if span is None or span in spans:
+            return set()
+        spans.add(span)
+    return spans
+
+
+def _raw_comparable(row: dict[str, Any]) -> dict[str, Any]:
+    attributes = {key: value for key, value in row["Attributes"].items() if key != "path"}
+    return dict(row, File=None, Fingerprint=None, Attributes=attributes)
+
+
+def _inflated_rows(
+    directory: Path, path: str, data: bytes, run_report: _ReportRun,
+) -> dict[_Coordinate, list[dict[str, Any]]]:
+    """Replay verified bytes under the same relative name without the gzip suffix."""
+    relative = path.removesuffix(".gz")
+    with TemporaryDirectory(prefix="qg-public-vocabulary-", dir=directory) as work:
+        destination = Path(work) / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        findings = _direct_report([relative], partial(run_report, cwd=Path(work)), archive_depth=0)
+    return _by_coordinate(findings)
+
+
+def _same_inflated_row(
+    row: dict[str, Any], inflated: dict[_Coordinate, list[dict[str, Any]]],
+) -> bool:
+    relative = row["File"].removesuffix(".gz")
+    replay = inflated.get((relative, *_coordinate(row)[1:]), [])
+    return (
+        len(replay) == 1 and _public_row(replay[0], relative)
+        and _raw_comparable(row) == _raw_comparable(replay[0])
+    )
+
+
+_VocabularyRows = dict[int, tuple[dict[str, Any], ...]]
+
+
+def _typed_vocabulary_rows(
+    data: bytes, candidates: _VocabularyRows, keys: frozenset[str],
+) -> _VocabularyRows:
+    record = _record(data)
+    spans = {index: _vocabulary_spans(record, rows, keys) for index, rows in candidates.items()}
+    proven = public_vocab.proven_spans(data, set().union(*spans.values()))
+    return {index: rows for index, rows in candidates.items() if spans[index] and spans[index] <= proven}
+
+
+def _direct_vocabulary_rows(
+    path: str, typed: _VocabularyRows, gzip: bool,
+    baseline: dict[_Coordinate, list[dict[str, Any]]], run_report: _ReportRun,
+) -> _VocabularyRows:
+    direct = _by_coordinate(_direct_report([path], run_report, archive_depth=int(gzip)))
+    return {index: rows for index, rows in typed.items() if _same_unique_row(rows[0], baseline, direct)}
+
+
+def _verify_vocabulary_replay(
+    directory: Path, proof: public_vocab.PublishedVocabulary, data: bytes, typed: _VocabularyRows,
+    baseline: dict[_Coordinate, list[dict[str, Any]]], run_report: _ReportRun,
+) -> _VocabularyRows:
+    gzip = proof.compressed_size is not None
+    identical = _direct_vocabulary_rows(proof.path, typed, gzip, baseline, run_report)
+    if not gzip or not identical:
+        return identical
+    inflated = _inflated_rows(directory, proof.path, data, run_report)
+    return {index: rows for index, rows in identical.items() if _same_inflated_row(rows[0], inflated)}
+
+
+def _asset_rows(
+    directory: Path, proof: public_vocab.PublishedVocabulary, candidates: _VocabularyRows,
+    baseline: dict[_Coordinate, list[dict[str, Any]]], run_report: _ReportRun,
+) -> _VocabularyRows:
+    if len(candidates) > public_vocab.MAX_POINTERS:
+        return {}
+    data = _published_bytes(directory, proof)
+    if data is None:
+        return {}
+    typed = _typed_vocabulary_rows(data, candidates, proof.keys)
+    if not typed:
+        return {}
+    return _verify_vocabulary_replay(directory, proof, data, typed, baseline, run_report)
+
+
+def _group_vocabulary_findings(
+    findings: list[dict[str, Any]], public_paths: dict[str, public_vocab.PublishedVocabulary],
+) -> dict[str, _VocabularyRows]:
+    grouped: dict[str, _VocabularyRows] = defaultdict(dict)
+    for index, row in enumerate(findings):
+        path = row["File"]
+        if path in public_paths and _public_row(row, path):
+            components = _vocabulary_components(row)
+            if components is not None:
+                grouped[path][index] = (row, *components)
+    return grouped
+
+
+def _verified_vocabulary_rows(
+    directory: Path, findings: list[dict[str, Any]],
+    public_vocabulary: dict[str, public_vocab.PublishedVocabulary], run_report: _ReportRun,
+) -> _VocabularyRows:
+    if not public_vocabulary:
+        return {}
+    verified = {}
+    baseline = _by_coordinate(findings)
+    for path, candidates in _group_vocabulary_findings(findings, public_vocabulary).items():
+        verified.update(_asset_rows(directory, public_vocabulary[path], candidates, baseline, run_report))
+    return verified
+
+
+def _vocabulary_location(rows: tuple[dict[str, Any], ...]) -> tuple[_Coordinate, ...]:
+    path = rows[0]["File"]
+    return tuple(
+        (path, row["RuleID"], row["StartLine"], row["EndLine"], row["StartColumn"], row["EndColumn"])
+        for row in rows
+    )
 
 
 @dataclass(frozen=True)
@@ -731,6 +938,13 @@ class VerifiedScan:
     child: Any
     unresolved: int
     verified: int
+    vocabulary: tuple[tuple[_Coordinate, ...], ...] = ()
+
+
+def _selected_vocabulary(
+    proofs: tuple[public_vocab.PublishedVocabulary, ...], paths: dict[str, bool], tracked: set[str],
+) -> dict[str, public_vocab.PublishedVocabulary]:
+    return {proof.path: proof for proof in proofs if paths.get(proof.path) and proof.path in tracked}
 
 
 def scan_verified(
@@ -738,6 +952,7 @@ def scan_verified(
     declarations: tuple[Provenance, ...], *,
     tracked: set[str], open_parent: _OpenParent, run: Callable[..., Any],
     git_run: _ReportRun | None = None,
+    public_vocabulary: tuple[public_vocab.PublishedVocabulary, ...] = (),
 ) -> VerifiedScan:
     paths = _snapshot(root, directory, selected, open_parent)
     candidates = _selected_provenance(paths, tracked, declarations)
@@ -750,29 +965,37 @@ def scan_verified(
         "--report-format=json", "--report-path=-",
     ]
 
-    def run_report(targets: Iterable[str], *flags: str) -> Any:
+    def run_report(targets: Iterable[str], *flags: str, cwd: Path = directory) -> Any:
         return run(
-            [*argv, *flags, "--", *targets], cwd=directory, env={}, budget_seconds=budget,
+            [*argv, *flags, "--", *targets], cwd=cwd, env={}, budget_seconds=budget,
             capture_limit=None,
         )
 
-    return _scan_reports(directory, sorted(paths) or ["."], pinned, run_report)
+    vocabulary = _selected_vocabulary(public_vocabulary, paths, tracked)
+    return _scan_reports(directory, sorted(paths) or ["."], pinned, vocabulary, run_report)
 
 
 def _scan_reports(
-    directory: Path, paths: list[str], pinned: dict[str, list[Provenance]], run_report: _ReportRun,
+    directory: Path, paths: list[str], pinned: dict[str, list[Provenance]],
+    public_vocabulary: dict[str, public_vocab.PublishedVocabulary], run_report: _ReportRun,
 ) -> VerifiedScan:
     unresolved = verified = 0
     with_findings = None
+    vocabulary = []
     for targets in batched(paths, _MAX_FILES_PER_INVOCATION):
         child = run_report(targets)
         safe_child = replace(child, stdout=b"", stderr=b"", output_tail=b"", output_bytes=0)
         if child.execution != "completed":
-            return VerifiedScan(safe_child, unresolved, verified)
+            return VerifiedScan(safe_child, unresolved, verified, tuple(sorted(vocabulary)))
+        findings = _report(child)
         records = _verified_records(directory, targets, pinned)
-        batch_unresolved, batch_verified = _report_findings(child, records, run_report)
+        public_rows = _verified_vocabulary_rows(directory, findings, public_vocabulary, run_report)
+        batch_unresolved, batch_verified = _report_findings(
+            child, records, run_report, findings=findings, public_verified=public_rows,
+        )
         unresolved += batch_unresolved
         verified += batch_verified
+        vocabulary.extend(_vocabulary_location(public_rows[index]) for index in sorted(public_rows))
         if child.returncode == _FINDINGS_EXIT:
             with_findings = safe_child
-    return VerifiedScan(with_findings or safe_child, unresolved, verified)
+    return VerifiedScan(with_findings or safe_child, unresolved, verified, tuple(sorted(vocabulary)))

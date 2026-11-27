@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, python_crap, python_mutation, secrets, shell_syntax,
+    module_graph, public_vocab, python_crap, python_mutation, secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import (
@@ -520,6 +520,10 @@ _PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
 _GZIP_DIGEST_FIELDS = ("compressed_sha256", "decoded_sha256")
 _GIT_PAYLOAD_FIELDS = ("path", "commit", "blob", "size")
 _GZIP_PAYLOAD_FIELDS = ("path", "compressed_sha256", "decoded_size")
+_PUBLIC_VOCABULARY_FIELDS = (
+    "path", "published_url", "published_revision", "published_sha256", "published_size", "pointers",
+)
+_PUBLIC_ARCHIVE_FIELDS = ("compressed_sha256", "compressed_size")
 
 
 def _valid_python_pointer(parts: tuple[str, ...]) -> bool:
@@ -639,6 +643,89 @@ def _secrets_provenance(raw: dict[str, Any], path: Path, key: str) -> tuple[secr
     return tuple(declarations)
 
 
+def _published_release(row: dict[str, Any], path: Path, where: str) -> tuple[str, str]:
+    url = _string(row, "published_url", path, f"{where}.published_url")
+    revision = _string(row, "published_revision", path, f"{where}.published_revision")
+    if not secrets.FULL_GIT_OBJECT.fullmatch(revision):
+        raise _config_error(path, f"{where}.published_revision", "a full lowercase revision ID", "invalid ID")
+    parts = url.removeprefix("https://").split("/")[1:]
+    if not (
+        re.fullmatch(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9._@+-]+)+", url)
+        and revision in parts[:-1]
+        and parts[-1] == "tokenizer.json"
+        and not {".", ".."}.intersection(parts)
+    ):
+        raise _config_error(
+            path, where, "an HTTPS tokenizer.json URL containing the full revision", "invalid URL",
+        )
+    return url, revision
+
+
+def _published_keys(row: dict[str, Any], path: Path, where: str) -> frozenset[str]:
+    key = f"{where}.pointers"
+    pointers = _string_list(row, "pointers", path, key)
+    if not 1 <= len(pointers) <= public_vocab.MAX_POINTERS:
+        raise _config_error(path, key, f"1 to {public_vocab.MAX_POINTERS} pointers", "invalid count")
+    keys: set[str] = set()
+    for pointer in pointers:
+        parts = _read_pointer(pointer, path, key, python=False)
+        if len(parts) != 3 or parts[:2] != ("model", "vocab"):
+            raise _config_error(path, key, "a /model/vocab/<key> pointer", "invalid value")
+        _unique(keys, parts[2], path, key, "distinct vocabulary keys", "duplicate", _config_error)
+    return frozenset(keys)
+
+
+def _public_vocab_spec(row: Any, path: Path, where: str) -> public_vocab.PublishedVocabulary:
+    if not isinstance(row, dict):
+        raise _config_error(path, where, "a table", type(row).__name__)
+    name = _string(row, "path", path, f"{where}.path")
+    _validate_exact_path(path, f"{where}.path", name)
+    if not name.endswith((".json", ".json.gz")):
+        raise _config_error(path, where, "a .json or .json.gz path", "invalid suffix")
+    archive = name.endswith(".json.gz")
+    _check_keys(row, (*_PUBLIC_VOCABULARY_FIELDS, *(_PUBLIC_ARCHIVE_FIELDS if archive else ())), path, where)
+    url, revision = _published_release(row, path, where)
+    size = _integer(
+        row, "published_size", path, f"{where}.published_size", minimum=1,
+        maximum=public_vocab.MAX_PUBLISHED_BYTES,
+    )
+    sha256 = _provenance_digest(row, "published_sha256", path, where)
+    keys = _published_keys(row, path, where)
+    if not archive:
+        return public_vocab.PublishedVocabulary(name, url, revision, sha256, size, keys)
+    compressed = _provenance_digest(row, "compressed_sha256", path, where)
+    compressed_size = _integer(
+        row, "compressed_size", path, f"{where}.compressed_size", minimum=1,
+        maximum=secrets.MAX_PUBLIC_VOCABULARY_GZIP_BYTES,
+    )
+    return public_vocab.PublishedVocabulary(
+        name, url, revision, sha256, size, keys, compressed, compressed_size,
+    )
+
+
+def _public_vocabulary(
+    raw: dict[str, Any], path: Path, key: str,
+) -> tuple[public_vocab.PublishedVocabulary, ...]:
+    name = f"{key}.public_vocabulary"
+    rows = raw.get("public_vocabulary", [])
+    if not isinstance(rows, list) or len(rows) > public_vocab.MAX_ASSETS:
+        raise _config_error(path, name, f"up to {public_vocab.MAX_ASSETS} tables", "invalid value")
+    declarations = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        where = f"{name}[{index}]"
+        declaration = _public_vocab_spec(row, path, where)
+        _unique(seen, declaration.path, path, where, "a unique asset path", "duplicate", _config_error)
+        declarations.append(declaration)
+    return tuple(declarations)
+
+
+@dataclass(frozen=True)
+class _SecretsSpec:
+    digests: tuple[secrets.Provenance, ...]
+    vocabulary: tuple[public_vocab.PublishedVocabulary, ...]
+
+
 def _secrets_result(context: AdapterContext, start: float, child: RunResult, budget: int) -> Any:
     from .checks import _check_result
 
@@ -650,8 +737,19 @@ def _secrets_result(context: AdapterContext, start: float, child: RunResult, bud
     )
 
 
+def _scanner_measurement(scan: secrets.VerifiedScan, *, vocabulary: bool) -> dict[str, Any]:
+    measurement: dict[str, Any] = {"verified_sha256_provenance": scan.verified}
+    if vocabulary:
+        fields = ("path", "rule", "start_line", "end_line", "start_column", "end_column")
+        measurement["verified_public_vocabulary"] = len(scan.vocabulary)
+        measurement["public_vocabulary_locations"] = [
+            [dict(zip(fields, coordinate, strict=True)) for coordinate in row] for row in scan.vocabulary
+        ]
+    return measurement
+
+
 def _verified_secrets_result(
-    context: AdapterContext, start: float, scan: secrets.VerifiedScan, budget: int,
+    context: AdapterContext, start: float, scan: secrets.VerifiedScan, budget: int, *, vocabulary: bool,
 ) -> Any:
     from .checks import _check_result
 
@@ -663,7 +761,7 @@ def _verified_secrets_result(
         context.check, start,
         "pass" if child.execution == "completed" and scan.unresolved == 0 else "fail",
         execution=child.execution, reason=reason, diagnostics=child.diagnostics(),
-        budget_seconds=budget, measurement={"verified_sha256_provenance": scan.verified},
+        budget_seconds=budget, measurement=_scanner_measurement(scan, vocabulary=vocabulary),
     )
 
 
@@ -689,13 +787,15 @@ def _secrets_git_command(
 def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start: float, budget: int) -> Any:
     root = context.root.resolve()
     selected, tracked = _secrets_paths(root)
-    if context.check.spec and context.config.trusted_policy:
+    spec = context.check.spec
+    vocabulary = spec.vocabulary if context.config.policy_from_trusted_directory else ()
+    if context.config.trusted_policy and (spec.digests or vocabulary):
         verified = secrets.scan_verified(
-            binary, root, directory, selected, budget, context.check.spec,
+            binary, root, directory, selected, budget, spec.digests,
             tracked=tracked, open_parent=_parent_fd, run=run,
-            git_run=partial(_secrets_git_command, root, budget),
+            git_run=partial(_secrets_git_command, root, budget), public_vocabulary=vocabulary,
         )
-        return _verified_secrets_result(context, start, verified, budget)
+        return _verified_secrets_result(context, start, verified, budget, vocabulary=bool(vocabulary))
     child = secrets.scan(binary, root, directory, selected, budget, open_parent=_parent_fd, run=run)
     return _secrets_result(context, start, child, budget)
 
@@ -1149,9 +1249,10 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "secrets",
-    ("sha256_provenance",),
+    ("sha256_provenance", "public_vocabulary"),
     lambda raw, _root, path, key: ParsedSpec(
-        _secrets_provenance(raw, path, key), "secrets/1", ("static",),
+        _SecretsSpec(_secrets_provenance(raw, path, key), _public_vocabulary(raw, path, key)),
+        "secrets/1", ("static",),
     ),
     _run_secrets,
     runs_suite=False,

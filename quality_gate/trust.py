@@ -992,7 +992,7 @@ def _prepare_source(
     trust = Trust(
         root=root,
         revision=source.location,
-        config=replace(config, trusted_policy=True),
+        config=replace(config, trusted_policy=True, policy_from_trusted_directory=not authorized),
         rev_config=rev_config,
         protected=protected,
         lock_path=lock_path,
