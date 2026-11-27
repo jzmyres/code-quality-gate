@@ -1688,7 +1688,7 @@ enforcement = "enforced"
             suite_edges,
         )
         self.assertIn(
-            module_graph.Edge("tests/test_pytest_mutation.py", "tests/test_python_mutation.py", 14),
+            module_graph.Edge("tests/test_pytest_mutation.py", "tests/test_python_mutation.py", 15),
             suite_edges,
         )
         self.assertEqual(measurement["modules"], sorted(modules))

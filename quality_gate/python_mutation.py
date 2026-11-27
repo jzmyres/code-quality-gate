@@ -716,6 +716,90 @@ def _tests_by_function(
     }
 
 
+def _test_aliases(aliases: list[ast.alias], prefix: str) -> Iterable[tuple[str, str]]:
+    return (
+        (alias.asname or alias.name, f"{prefix}{alias.name}")
+        for alias in aliases if alias.name != "*"
+    )
+
+
+def _test_import_bindings(nodes: list[ast.AST]) -> Iterable[tuple[str, str]]:
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            yield from _test_aliases(node.names, "")
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            yield from _test_aliases(node.names, f"{node.module}.")
+
+
+def _test_load_paths(nodes: list[ast.AST]) -> set[str]:
+    return {
+        ".".join(module_graph._callee_parts(node))
+        for node in nodes
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load)
+    }
+
+
+def _qualify_test_paths(paths: set[str], local: str, imported: str) -> Iterable[str]:
+    for path in paths:
+        if path == local or path.startswith(f"{local}."):
+            yield imported + path[len(local):]
+
+
+def _bound_test_references(root: Path, relative: str) -> set[str]:
+    """Qualify explicit uses through a binding with one import path in this file."""
+    source = python_shape._read_source(root, relative)
+    nodes = list(ast.walk(python_shape._parse_tree(relative, source)))
+    paths = _test_load_paths(nodes)
+    imports: dict[str, set[str]] = {}
+    for local, imported in _test_import_bindings(nodes):
+        imports.setdefault(local, set()).add(imported)
+    return {
+        qualified for local, targets in imports.items() if len(targets) == 1
+        for qualified in _qualify_test_paths(paths, local, next(iter(targets)))
+    }
+
+
+def _reference_rank(
+    used: set[str], modules: frozenset[str], names: set[str], name: str,
+) -> tuple[int, bool, int]:
+    members = {
+        path.removeprefix(f"{module}.")
+        for module in modules for path in used if path.startswith(f"{module}.")
+    }
+    return len(names & members), name in members, len({member.split(".", 1)[0] for member in members})
+
+
+def _preferred_test_cohort(
+    function: python_shape.ShapeFunction, tests: tuple[str, ...], references: dict[str, set[str]],
+    modules: frozenset[str], names: set[str],
+) -> tuple[str, ...]:
+    ranks = {test: _reference_rank(references[test], modules, names, function.name) for test in tests}
+    best = max(ranks.values(), default=(0, False, 0))
+    if best == (0, False, 0):
+        return ()
+    preferred = tuple(test for test in tests if ranks[test] == best)
+    return () if preferred == tests else preferred
+
+
+def _preferred_pytest_tests(
+    functions: list[python_shape.ShapeFunction], tests: dict[str, tuple[str, ...]],
+    root: Path, module_names: dict[str, frozenset[str]],
+) -> dict[str, tuple[str, ...]]:
+    references = {
+        relative: _bound_test_references(root, relative)
+        for relative in dict.fromkeys(relative for cohort in tests.values() for relative in cohort)
+    }
+    names: dict[str, set[str]] = {}
+    for function in functions:
+        names.setdefault(function.path, set()).add(function.name)
+    return {
+        function.identity: _preferred_test_cohort(
+            function, tests[function.identity], references, module_names[function.path], names[function.path],
+        )
+        for function in functions
+    }
+
+
 def _copy_directory(copy_root: Path, name: str) -> Path:
     path = copy_root / name
     path.mkdir(parents=True, exist_ok=True)
@@ -1138,12 +1222,42 @@ def _pytest_outcome(
     return "killed" if evidence.assertions else "survived"
 
 
+@dataclass
+class _FallbackCohort:
+    tests: tuple[str, ...]
+    baseline: bool | _PytestEvidence | None = None
+
+
+def _run_with_fallback(
+    function: python_shape.ShapeFunction, mutation: Mutation,
+    tests: tuple[str, ...], spec: MutationSpec, start: float,
+    root: Path, work: Path, numbers: list[int], tools_dir: Path,
+    baseline: bool | _PytestEvidence, fallback: _FallbackCohort | None,
+) -> tuple[tuple[str, ...], str, bool]:
+    outcome, over_budget = _run_mutant(
+        function, mutation, tests, spec, start, root, work, numbers, tools_dir, baseline,
+    )
+    if over_budget or outcome != "survived" or fallback is None:
+        return tests, outcome, over_budget
+    if fallback.baseline is None:
+        fallback.baseline = _baseline(
+            function, fallback.tests, root, work, numbers[0], spec, start, tools_dir,
+        )
+        numbers[0] += 1
+    if not fallback.baseline:
+        return tests, outcome, True
+    outcome, over_budget = _run_mutant(
+        function, mutation, fallback.tests, spec, start, root, work, numbers, tools_dir, fallback.baseline,
+    )
+    return fallback.tests, outcome, over_budget
+
+
 def _run_generated(
     function: python_shape.ShapeFunction, mutations: list[Mutation],
     tests: tuple[str, ...], spec: MutationSpec,
     start: float, root: Path, work: Path, numbers: list[int],
     records: list[dict[str, Any]], tools_dir: Path,
-    baseline: bool | _PytestEvidence = True,
+    baseline: bool | _PytestEvidence = True, *, fallback: _FallbackCohort | None = None,
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     findings: list[Finding] = []
     for position, mutation in enumerate(mutations):
@@ -1152,44 +1266,44 @@ def _run_generated(
                 _not_run_records(function, mutations[position:], tests)
             )
             return records, findings, False
-        outcome, over_budget = _run_mutant(
+        tested, outcome, over_budget = _run_with_fallback(
             function, mutation, tests, spec, start,
-            root, work, numbers, tools_dir, baseline,
+            root, work, numbers, tools_dir, baseline, fallback,
         )
-        records.append(_record(function, mutation, tests, outcome))
+        records.append(_record(function, mutation, tested, outcome))
         if over_budget:
             records.extend(
                 _not_run_records(function, mutations[position + 1:], tests)
             )
             return records, findings, False
         if outcome == "survived":
-            findings.append(_survived_finding(function, mutation, tests))
+            findings.append(_survived_finding(function, mutation, tested))
     return records, findings, True
 
 
 def _run_function(
     function: python_shape.ShapeFunction, tests: tuple[str, ...],
     source: str, spec: MutationSpec, start: float,
-    root: Path, work: Path, numbers: list[int], tools_dir: Path,
+    root: Path, work: Path, numbers: list[int], tools_dir: Path, *,
+    preferred: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, Any]], list[Finding], bool]:
     if _remaining(start, spec) <= 0:
         return [], [], False
     mutations = _mutations(
         function.node, source, spec.function_mutants, function.path
     )
-    records = _suppressed_records(function, mutations, tests)
+    initial = preferred or tests
+    records = _suppressed_records(function, mutations, initial)
     generated = _generated_mutations(mutations)
     if _remaining(start, spec) <= 0:
-        return records + _not_run_records(function, generated, tests), [], False
-    baseline = _baseline(function, tests, root, work, numbers[0], spec, start, tools_dir)
+        return records + _not_run_records(function, generated, initial), [], False
+    baseline = _baseline(function, initial, root, work, numbers[0], spec, start, tools_dir)
     if not baseline:
-        return records + _not_run_records(function, generated, tests), [], False
+        return records + _not_run_records(function, generated, initial), [], False
     numbers[0] += 1
-    if not generated:
-        return records, [], True
     return _run_generated(
-        function, generated, tests, spec, start,
-        root, work, numbers, records, tools_dir, baseline,
+        function, generated, initial, spec, start, root, work, numbers, records,
+        tools_dir, baseline, fallback=_FallbackCohort(tests) if preferred else None,
     )
 
 
@@ -1220,7 +1334,8 @@ def _unfinished_after_cleanup(
 
 def _measure(
     context: Any, spec: MutationSpec, functions: list[python_shape.ShapeFunction],
-    tests: dict[str, tuple[str, ...]], start: float,
+    tests: dict[str, tuple[str, ...]], start: float, *,
+    preferred: dict[str, tuple[str, ...]],
 ) -> tuple[list[dict[str, Any]], list[Finding], list[python_shape.ShapeFunction]]:
     records: list[dict[str, Any]] = []
     findings: list[Finding] = []
@@ -1242,6 +1357,7 @@ def _measure(
             related, survived, finished = _run_function(
                 function, function_tests, source, spec, start,
                 context.root, work, numbers, tools_dir,
+                preferred=preferred.get(function.identity, ()),
             )
             records.extend(related)
             findings.extend(survived)
@@ -1302,12 +1418,15 @@ def _run_python_mutation(context: Any) -> CheckResult:
             else _test_file_paths(context)
         )
         imports = module_graph.PythonImports.from_repository(context.root, context.config.python_import_roots)
-        tests = _tests_by_function(
-            context.root, functions, test_files, imports.identities(context.inventory_files),
+        module_names = imports.identities(context.inventory_files)
+        tests = _tests_by_function(context.root, functions, test_files, module_names)
+        preferred = (
+            _preferred_pytest_tests(functions, tests, context.root, module_names)
+            if check.spec.test_runner == "pytest" else {}
         )
         mark_step("python-mutation execution")
         spec = replace(check.spec, import_roots=context.config.python_import_roots)
-        records, findings, unfinished = _measure(context, spec, functions, tests, start)
+        records, findings, unfinished = _measure(context, spec, functions, tests, start, preferred=preferred)
         findings.extend(
             _over_budget_finding(function, check.spec)
             for function in unfinished

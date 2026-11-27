@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from unittest import mock
 
 from support import output
@@ -178,6 +179,121 @@ class PytestMutationTests(PytestMutationCase):
             self.assert_pytest_error("mutant run", "timed out after 2 s")
 
 
+class PreferredCohortTests(PytestMutationCase):
+    preferred_file = "tests/app_test.py"
+    fallback_file = "tests/test_other.py"
+
+    def stage(
+        self, preferred: str, fallback: str, *, app: str = APP,
+        original: str = "def flag():\n    return False\n", **options: object,
+    ) -> None:
+        self.write_config(mutation_config(test_runner="pytest", **options))
+        self.base_commit({"pkg/app.py": original, "pkg/other.py": APP})
+        self.commit({"pkg/app.py": app, self.preferred_file: preferred, self.fallback_file: fallback})
+
+    def test_direct_bindings_prefer_the_measured_module_over_a_same_name_import(self) -> None:
+        forms = (
+            ("from pkg.app import flag as target", "target"),
+            ("from pkg import app", "app.flag"),
+            ("import pkg.app as target", "target.flag"),
+            ("import pkg.app", "pkg.app.flag"),
+        )
+        self.stage("", IMPORT.replace("pkg.app", "pkg.other") + "def test_other():\n    assert flag()\n")
+        for declaration, reference in forms:
+            with self.subTest(declaration=declaration):
+                self.add_file(
+                    self.preferred_file, f"{declaration}\ndef test_measured():\n    assert {reference}()\n",
+                )
+                result, _document, check = self.run_mutation()
+                self.assertEqual(result.returncode, 0, output(result))
+                self.assertEqual(
+                    check["measurement"]["test_files"], [self.preferred_file, self.fallback_file],
+                )
+                self.assertEqual(self.evaluated(check), [("killed", [self.preferred_file])])
+
+    def test_module_entry_point_can_witness_a_changed_helper(self) -> None:
+        entry = "\ndef entry():\n    return flag()\n"
+        self.stage(
+            "from pkg import app\ndef test_entry():\n    assert app.entry()\n",
+            "from pkg.other import flag\ndef test_other():\n    assert flag()\n",
+            app=APP + entry, original=APP.replace("True", "False") + entry,
+        )
+        result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(self.evaluated(check), [("killed", [self.preferred_file])])
+
+    def test_only_suppressed_mutations_still_require_a_preferred_original(self) -> None:
+        self.stage(
+            IMPORT + "def test_preferred():\n    assert flag() is None\n",
+            "from pkg.other import flag\ndef test_other():\n    assert flag()\n",
+            app="def flag():\n    return None\n",
+        )
+        check, attempts = self.record_passing_attempts()
+        preferred = [self.preferred_file]
+        self.assertEqual(attempts, [("original tests", preferred)])
+        self.assertTrue(self.mutants(check))
+        self.assertEqual(
+            [(row["outcome"], row["tests"]) for row in self.mutants(check)],
+            [("not generated", preferred)] * len(self.mutants(check)),
+        )
+
+    def test_only_preferred_survivors_run_with_the_full_cohort(self) -> None:
+        self.stage(
+            IMPORT + "def test_result_type():\n    assert isinstance(flag(), int)\n",
+            "from pkg import app\ndef test_result():\n    assert getattr(app, 'flag')() == 5\n",
+            app="def flag():\n    return 4 + 1\n", function_mutants=3,
+        )
+        check, attempts = self.record_passing_attempts()
+        preferred = [self.preferred_file]
+        full = [self.preferred_file, self.fallback_file]
+        self.assertEqual(self.evaluated(check), [("killed", preferred), ("killed", full), ("killed", full)])
+        self.assertEqual(attempts, [
+            ("original tests", preferred), ("mutant run", preferred), ("mutant run", preferred),
+            ("original tests", full), ("mutant run", full), ("mutant run", preferred), ("mutant run", full),
+        ])
+
+    def test_survival_in_the_full_cohort_rejects(self) -> None:
+        self.stage(
+            IMPORT + "def test_preferred():\n    assert isinstance(flag(), bool)\n",
+            "from pkg import app\ndef test_other():\n    assert isinstance(getattr(app, 'flag')(), bool)\n",
+        )
+        result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(self.evaluated(check), [("survived", [self.preferred_file, self.fallback_file])])
+
+    def test_unusable_mutant_evidence_in_the_full_cohort_rejects(self) -> None:
+        self.stage(
+            IMPORT + "def test_preferred():\n    assert isinstance(flag(), bool)\n",
+            "from pkg import app\ndef test_bad():\n"
+            "    if not getattr(app, 'flag')():\n        raise RuntimeError()\n",
+        )
+        self.assert_pytest_error("mutant run", f"call error in {self.fallback_file}::test_bad")
+
+    def test_invalid_preferred_evidence_does_not_run_the_full_cohort(self) -> None:
+        self.stage(
+            IMPORT + "def test_preferred():\n    if not flag():\n        raise RuntimeError()\n",
+            "from pkg import app\ndef test_other():\n    assert getattr(app, 'flag')()\n",
+        )
+        with mock.patch.object(python_mutation, "_run_pytest", wraps=python_mutation._run_pytest) as runs:
+            self.assert_pytest_error("mutant run", f"call error in {self.preferred_file}::test_preferred")
+        preferred = [self.preferred_file]
+        self.assertEqual(self.attempts(runs), [("original tests", preferred), ("mutant run", preferred)])
+
+    def record_passing_attempts(self) -> tuple[dict[str, Any], list[tuple[str, list[str]]]]:
+        with mock.patch.object(python_mutation, "_run_pytest", wraps=python_mutation._run_pytest) as runs:
+            result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        return check, self.attempts(runs)
+
+    def evaluated(self, check: dict[str, Any]) -> list[tuple[str, list[str]]]:
+        return [
+            (row["outcome"], row["tests"]) for row in self.mutants(check) if row["outcome"] != "not generated"
+        ]
+
+    def attempts(self, runs: mock.Mock) -> list[tuple[str, list[str]]]:
+        return [(call.kwargs["stage"], list(call.args[2])) for call in runs.call_args_list]
+
+
 class ReceiptTests(PytestMutationCase):
     def test_mutant_does_not_launch_after_copy_exhausts_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -198,20 +314,60 @@ class ReceiptTests(PytestMutationCase):
             self.assertEqual((root / "app.py").read_text(), mutation.mutated_source)
 
     def test_verified_receipts_drive_adapter_without_pytest(self) -> None:
-        self.prepare("def test_flag():\n    assert flag()\n")
+        self.prepare("from pkg import app\ndef test_flag():\n    assert getattr(app, 'flag')()\n")
         node = "tests/app_test.py::test_flag"
 
         def complete(argv, *, cwd, **_kwargs):
             assertions = [node] if cwd.name == "copy-0001" else []
-            Path(argv[5]).write_text(json.dumps({
-                "collected": [node], "executed": [node], "assertions": assertions, "errors": [],
-            }), encoding="utf-8")
-            return RunResult(tuple(argv), "completed", int(bool(assertions)))
+            return self.write_receipt(argv, [node], assertions)
 
         with mock.patch.object(python_mutation, "run", side_effect=complete):
             result, _document, check = self.run_mutation()
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("killed", {row["outcome"] for row in self.mutants(check)})
+
+    def test_verified_receipts_drive_pytest_fallback(self) -> None:
+        self.prepare("import pkg.app as app\ndef test_flag():\n    assert isinstance(app.flag(), bool)\n")
+        full_only = "tests/test_fallback.py"
+        self.add_file(full_only, "from pkg import app\ndef test_flag():\n    assert getattr(app, 'flag')()\n")
+        preferred = ["tests/app_test.py"]
+        full = [*preferred, full_only]
+        invocations = []
+        real_baseline = python_mutation._baseline
+
+        def complete(argv, *, cwd, **_kwargs):
+            files = argv[8:]
+            invocations.append(files)
+            nodes = [f"{file}::test_flag" for file in files]
+            assertions = [nodes[-1]] if cwd.name == "copy-0003" else []
+            return self.write_receipt(argv, nodes, assertions)
+
+        with mock.patch.object(python_mutation, "run", side_effect=complete):
+            result, _document, check = self.run_mutation()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(invocations, [preferred, preferred, full, full])
+        killed = self.mutants(check)[-1]
+        self.assertEqual((killed["outcome"], killed["tests"]), ("killed", full))
+
+        def cutoff(function, tests, *args):
+            return real_baseline(function, tests, *args) if list(tests) == preferred else False
+
+        invocations.clear()
+        with (
+            mock.patch.object(python_mutation, "run", side_effect=complete),
+            mock.patch.object(python_mutation, "_baseline", side_effect=cutoff),
+        ):
+            result, _document, check = self.run_mutation()
+        self.assert_over_budget(result, check)
+        self.assertEqual(invocations, [preferred, preferred])
+        self.assertEqual(self.mutants(check)[-1]["tests"], preferred)
+
+    @staticmethod
+    def write_receipt(argv: list[str], nodes: list[str], assertions: list[str]) -> RunResult:
+        Path(argv[5]).write_text(json.dumps({
+            "collected": nodes, "executed": nodes, "assertions": assertions, "errors": [],
+        }), encoding="utf-8")
+        return RunResult(tuple(argv), "completed", int(bool(assertions)))
 
     def test_receipt_validation_rejects_unsound_results(self) -> None:
         report = self.base / "report.json"
