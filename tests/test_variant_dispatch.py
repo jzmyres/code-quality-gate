@@ -82,6 +82,84 @@ def second(kind):
     return 0
 """
 
+PY_LABEL_RESULT = """\
+def label_result(kind):
+    if kind == "alpha":
+        return {"kind": "alpha", "value": 1}
+    if kind == "beta":
+        return {"kind": "beta", "value": 2}
+    raise ValueError(kind)
+"""
+
+PY_ASSERT_RESULTS = """\
+from app import label_result
+
+
+def verify_labels():
+    observed = label_result("alpha")
+    assert observed["value"] == 1
+    assert observed["kind"] == "alpha"
+    assert "beta" != observed["kind"]
+    observed = label_result("beta")
+    assert observed["value"] == 2
+    assert "beta" == observed["kind"]
+    assert observed["kind"] != "alpha"
+"""
+
+PY_ASSERT_DISPATCH = """\
+
+
+def choose_label(kind, make_first, make_second):
+    assert {"alpha": make_first, "beta": make_second}[kind]() == "ready"
+"""
+
+PY_ASSERT_BRANCH = """\
+
+
+def choose_label(kind, make_first, make_second, make_default):
+    assert (
+        make_first if kind == "alpha" else
+        make_second if kind == "beta" else make_default
+    )() == "ready"
+"""
+
+PY_ASSERT_HANDLER = """\
+
+
+def choose_label(kind, make_first, make_second):
+    try:
+        assert kind == "alpha"
+    except AssertionError:
+        assert kind == "beta"
+        return make_second()
+    return make_first()
+"""
+
+PY_ASSERT_AFTER_CATCH = """\
+
+
+def choose_label(kind, make_first, make_second):
+    try:
+        assert kind == "alpha"
+    except AssertionError:
+        pass
+    else:
+        return make_first()
+    assert kind == "beta"
+    return make_second()
+"""
+
+PY_ASSERT_CONTEXT = """\
+
+
+def choose_label(kind, manager, make_first, make_second):
+    with manager:
+        assert kind == "alpha"
+        return make_first()
+    assert kind == "beta"
+    return make_second()
+"""
+
 PY_IN = """\
 def first(kind):
     if kind in ("alpha", "beta"):
@@ -448,6 +526,37 @@ class ComparisonTests(VariantCase):
     def test_exactly_one_shared_literal_is_not_a_finding(self):
         self.add_file("pkg/app.py", PY_COMPARE_ONE_LITERAL)
         self.accepted()
+
+
+class AssertionTests(VariantCase):
+    def test_expected_results_do_not_own_dispatch_literals(self):
+        self.add_file("app.py", PY_LABEL_RESULT)
+        self.add_file("test_app.py", PY_ASSERT_RESULTS)
+        self.add_file("observer.py", PY_ASSERT_RESULTS.replace(
+            '    observed = label_result("alpha")',
+            '    try:\n'
+            '        observed = label_result("alpha")\n'
+            '    except ValueError:\n'
+            '        raise',
+        ))
+        self.accepted()
+
+    def test_nested_and_exception_driven_dispatch_keep_their_literals(self):
+        self.add_file("app.py", PY_LABEL_RESULT)
+        for dispatch in (
+            PY_ASSERT_DISPATCH, PY_ASSERT_BRANCH, PY_ASSERT_HANDLER,
+            PY_ASSERT_AFTER_CATCH, PY_ASSERT_CONTEXT,
+        ):
+            with self.subTest(dispatch=dispatch):
+                self.add_file("test_app.py", PY_ASSERT_RESULTS + dispatch)
+                findings = self.rejected()
+                self.assertEqual(len(findings), 1)
+                measurement = findings[0]["measurement"]
+                self.assertEqual(measurement["literals"], ["alpha", "beta"])
+                self.assertEqual(
+                    [owner["name"] for owner in measurement["owners"]],
+                    ["label_result", "choose_label"],
+                )
 
 
 class InDisplayTests(VariantCase):
