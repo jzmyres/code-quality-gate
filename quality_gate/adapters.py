@@ -23,7 +23,9 @@ from . import (
     module_graph, python_crap, python_mutation, secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
-from .files import DiffBaseOverride, InventoryClasses, _parent_fd, enumerate_entries, source_languages
+from .files import (
+    DiffBaseOverride, InventoryClasses, _parent_fd, enumerate_entries, git_argv, source_languages,
+)
 from .json_input import load_json
 from .policy import (
     COMMON_CHECK_KEYS,
@@ -35,6 +37,7 @@ from .policy import (
     _check_keys,
     _config_error,
     _describe,
+    _integer,
     _number,
     _optional_string_list,
     _read_scalar,
@@ -514,6 +517,7 @@ def _run_comments(context: AdapterContext) -> Any:
 
 _PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
 _GZIP_DIGEST_FIELDS = ("compressed_sha256", "decoded_sha256")
+_GIT_PAYLOAD_FIELDS = ("path", "commit", "blob", "size")
 
 
 def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
@@ -539,16 +543,42 @@ def _gzip_digests(row: dict[str, Any], record: str, path: Path, where: str) -> s
     return None
 
 
+def _git_payload(raw: dict[str, Any], path: Path, where: str) -> secrets.GitPayload:
+    _check_keys(raw, _GIT_PAYLOAD_FIELDS, path, where)
+    name, commit, blob = (
+        _string(raw, field, path, f"{where}.{field}") for field in _GIT_PAYLOAD_FIELDS[:3]
+    )
+    _validate_exact_path(path, f"{where}.path", name)
+    valid_ids = all(secrets.FULL_GIT_OBJECT.fullmatch(value) for value in (commit, blob))
+    if not valid_ids or len(commit) != len(blob):
+        raise _config_error(
+            path, where, "full lowercase commit and blob IDs in the same Git object format", "invalid IDs",
+        )
+    size = _integer(raw, "size", path, f"{where}.size", minimum=0, maximum=secrets.MAX_GIT_PAYLOAD_BYTES)
+    return secrets.GitPayload(name, commit, blob, size)
+
+
+def _provenance_payload(row: dict[str, Any], path: Path, where: str) -> str | secrets.GitPayload:
+    value = row.get("payload")
+    key = f"{where}.payload"
+    if isinstance(value, dict):
+        return _git_payload(value, path, key)
+    name = _string(row, "payload", path, key)
+    _validate_exact_path(path, key, name)
+    return name
+
+
 def _parse_provenance(row: Any, path: Path, where: str) -> secrets.Provenance:
     if not isinstance(row, dict):
         raise _config_error(path, where, "a table", type(row).__name__)
     _check_keys(row, (*_PROVENANCE_FIELDS, *_GZIP_DIGEST_FIELDS), path, where)
-    record, pointer, payload = (
-        _string(row, field, path, f"{where}.{field}") for field in ("record", "pointer", "payload")
+    record, pointer = (
+        _string(row, field, path, f"{where}.{field}") for field in ("record", "pointer")
     )
     _validate_exact_path(path, f"{where}.record", record)
-    _validate_exact_path(path, f"{where}.payload", payload)
-    if not record.endswith((".json", ".json.gz")) or record == payload:
+    payload = _provenance_payload(row, path, where)
+    payload_path = payload.path if isinstance(payload, secrets.GitPayload) else payload
+    if not record.endswith((".json", ".json.gz")) or record == payload_path:
         raise _config_error(path, where, "a .json or .json.gz record and a separate payload", "invalid paths")
     digest = _provenance_digest(row, "payload_sha256", path, where)
     return secrets.Provenance(
@@ -610,6 +640,18 @@ def _secrets_paths(root: Path) -> tuple[list[str], set[str]]:
     return selected, tracked
 
 
+def _secrets_git_command(
+    root: Path, budget: float, *args: str, env: dict[str, str], capture_limit: int,
+) -> RunResult | None:
+    remaining = remaining_budget(budget)
+    if remaining <= 0:
+        return None
+    return run(
+        git_argv(root, "-c", "advice.graftFileDeprecated=false", *args),
+        env=env, budget_seconds=remaining, capture_limit=capture_limit,
+    )
+
+
 def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start: float, budget: int) -> Any:
     root = context.root.resolve()
     selected, tracked = _secrets_paths(root)
@@ -617,6 +659,7 @@ def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start:
         verified = secrets.scan_verified(
             binary, root, directory, selected, budget, context.check.spec,
             tracked=tracked, open_parent=_parent_fd, run=run,
+            git_run=partial(_secrets_git_command, root, budget),
         )
         return _verified_secrets_result(context, start, verified, budget)
     child = secrets.scan(binary, root, directory, selected, budget, open_parent=_parent_fd, run=run)

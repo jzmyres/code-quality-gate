@@ -11,6 +11,7 @@ from array import array
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+from functools import cached_property
 from itertools import batched
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ _MAX_FILES_PER_INVOCATION = 24
 _FINDINGS_EXIT = 3
 _MAX_RECORD_BYTES = 16 << 20
 _MAX_COMPRESSED_BYTES = 16 << 20
+MAX_GIT_PAYLOAD_BYTES = 16 << 20
+FULL_GIT_OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_PROMISOR_CONFIG = r"^(extensions\.partialclone|remote\..+\.promisor)$"
 _DIGEST_WIDTH = 64
 _REDACTED_ASSIGNMENT = re.compile(r'([A-Za-z0-9_.-]+"[ \t]*:[ \t]*")REDACTED"')
 _SHA256 = re.compile(rb"[0-9a-f]{64}")
@@ -38,10 +42,18 @@ class GzipDigests:
 
 
 @dataclass(frozen=True)
+class GitPayload:
+    path: str
+    commit: str
+    blob: str
+    size: int
+
+
+@dataclass(frozen=True)
 class Provenance:
     record: str
     pointer: tuple[str, ...]
-    payload: str
+    payload: str | GitPayload
     payload_sha256: str
     gzip: GzipDigests | None = None
 
@@ -182,25 +194,109 @@ def _tracked_record(declaration: Provenance, tracked: set[str]) -> bool:
     return declaration.gzip is None or declaration.record in tracked
 
 
+def _has_payload(payload: str | GitPayload, paths: dict[str, bool], tracked: set[str]) -> bool:
+    return isinstance(payload, GitPayload) or (paths.get(payload, False) and payload in tracked)
+
+
 def _selected_provenance(
     paths: dict[str, bool], tracked: set[str],
     declarations: tuple[Provenance, ...],
 ) -> Iterable[Provenance]:
     for declaration in declarations:
-        if (
-            paths.get(declaration.record) and paths.get(declaration.payload)
-            and declaration.payload in tracked and _tracked_record(declaration, tracked)
-        ):
+        if not paths.get(declaration.record) or not _tracked_record(declaration, tracked):
+            continue
+        if _has_payload(declaration.payload, paths, tracked):
             yield declaration
 
 
-def _pinned_payloads(directory: Path, selected: Iterable[Provenance]) -> Iterable[Provenance]:
-    digests: dict[str, str] = {}
+def _exact_tree_entry(entry: bytes, payload: GitPayload) -> bool:
+    header, _, name = entry.partition(b"\t")
+    mode, _, identity = header.partition(b" ")
+    return (
+        name == os.fsencode(payload.path) + b"\0"
+        and mode in (b"100644", b"100755")
+        and identity.split() == [b"blob", payload.blob.encode("ascii"), str(payload.size).encode("ascii")]
+    )
+
+
+def _blob_digest(data: bytes, payload: GitPayload) -> str | None:
+    if len(data) != payload.size:
+        return None
+    algorithm = "sha1" if len(payload.blob) == 40 else "sha256"
+    object_hash = hashlib.new(algorithm, usedforsecurity=False)
+    object_hash.update(f"blob {payload.size}\0".encode("ascii"))
+    object_hash.update(data)
+    return hashlib.sha256(data).hexdigest() if object_hash.hexdigest() == payload.blob else None
+
+
+class _GitPayloadReader:
+    def __init__(self, command: _ReportRun) -> None:
+        self.command = command
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(
+            GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_GRAFT_FILE=os.devnull, GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="",
+        )
+
+    def _read(self, *args: str, limit: int = 8192, status: int = 0) -> bytes | None:
+        child = self.command(*args, env=self.env, capture_limit=limit)
+        if (child is None or child.execution != "completed" or child.returncode != status
+                or child.output_truncated or child.stderr):
+            return None
+        return child.stdout
+
+    @cached_property
+    def head(self) -> str | None:
+        """Resolve HEAD without allowing older Git to attempt a promisor lookup."""
+        if self._read("config", "--get-regexp", _PROMISOR_CONFIG, status=1) != b"":
+            return None
+        return self._commit("HEAD")
+
+    def _commit(self, revision: str) -> str | None:
+        data = self._read("rev-parse", "--verify", "--quiet", "--end-of-options", f"{revision}^{{commit}}")
+        if data is None:
+            return None
+        value = data.decode("ascii", "replace").removesuffix("\n")
+        return value if FULL_GIT_OBJECT.fullmatch(value) else None
+
+    def _reachable_commit(self, commit: str) -> bool:
+        head = self.head
+        return (
+            head is not None
+            and len(head) == len(commit)
+            and self._commit(commit) == commit
+            and self._read("merge-base", "--is-ancestor", commit, head) == b""
+        )
+
+    def digest(self, payload: GitPayload) -> str | None:
+        if not 0 <= payload.size <= MAX_GIT_PAYLOAD_BYTES or not self._reachable_commit(payload.commit):
+            return None
+        entry = self._read(
+            "--literal-pathspecs", "ls-tree", "-z", "-l", "--full-tree",
+            payload.commit, "--", payload.path,
+        )
+        if entry is None or not _exact_tree_entry(entry, payload):
+            return None
+        data = self._read("cat-file", "blob", payload.blob, limit=payload.size)
+        return None if data is None else _blob_digest(data, payload)
+
+
+def _payload_digest(directory: Path, payload: str | GitPayload, git: _GitPayloadReader | None) -> str | None:
+    if isinstance(payload, GitPayload):
+        return git.digest(payload) if git is not None else None
+    with (directory / payload).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _pinned_payloads(
+    directory: Path, selected: Iterable[Provenance], git: _GitPayloadReader | None,
+) -> Iterable[Provenance]:
+    digests: dict[str | GitPayload, str | None] = {}
     for declaration in selected:
-        if declaration.payload not in digests:
-            with (directory / declaration.payload).open("rb") as stream:
-                digests[declaration.payload] = hashlib.file_digest(stream, "sha256").hexdigest()
-        if digests[declaration.payload] == declaration.payload_sha256:
+        payload = declaration.payload
+        if payload not in digests:
+            digests[payload] = _payload_digest(directory, payload, git)
+        if digests[payload] == declaration.payload_sha256:
             yield declaration
 
 
@@ -448,11 +544,13 @@ def scan_verified(
     binary: Path, root: Path, directory: Path, selected: Iterable[str], budget: float,
     declarations: tuple[Provenance, ...], *,
     tracked: set[str], open_parent: _OpenParent, run: Callable[..., Any],
+    git_run: _ReportRun | None = None,
 ) -> VerifiedScan:
     paths = _snapshot(root, directory, selected, open_parent)
     candidates = _selected_provenance(paths, tracked, declarations)
     pinned = defaultdict(list)
-    for declaration in _pinned_payloads(directory, candidates):
+    git = _GitPayloadReader(git_run) if git_run is not None else None
+    for declaration in _pinned_payloads(directory, candidates, git):
         pinned[declaration.record].append(declaration)
     argv = [
         *_scanner_argv(binary), f"--exit-code={_FINDINGS_EXIT}",
