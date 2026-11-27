@@ -2118,6 +2118,7 @@ class ContractTests(unittest.TestCase):
         function = self.function(source)
         spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
         root, work = self.source_tree(source)
+        copies = python_mutation._Copies(work, root)
         with mock.patch.object(
             python_mutation, "_run_unittest",
             return_value=RunResult(
@@ -2125,12 +2126,12 @@ class ContractTests(unittest.TestCase):
             ),
         ):
             self.assertTrue(python_mutation._baseline(
-                function, ("tests/test_app.py",), root, work,
+                function, ("tests/test_app.py",), root, copies,
                 0, spec, time.monotonic(), Path("/tools"),
             ))
         self.assertTrue((work / "copy-0000/pkg/app.py").exists())
         self.assertFalse(python_mutation._baseline(
-            function, ("tests/test_app.py",), root, work,
+            function, ("tests/test_app.py",), root, copies,
             1, spec, time.monotonic() - 11, Path("/tools"),
         ))
         self.assertFalse((work / "copy-0001").exists())
@@ -2140,6 +2141,7 @@ class ContractTests(unittest.TestCase):
         function = self.function(source)
         spec = python_mutation.MutationSpec("changed", "HEAD", 5, 20, 1)
         root, work = self.source_tree(source)
+        copies = python_mutation._Copies(work, root)
         real_copy = python_mutation._fresh_copy
 
         def slow_copy(source_root: Path, destination: Path, number: int) -> Path:
@@ -2156,7 +2158,7 @@ class ContractTests(unittest.TestCase):
             ),
         ) as run_tests:
             self.assertFalse(python_mutation._baseline(
-                function, ("tests/test_app.py",), root, work,
+                function, ("tests/test_app.py",), root, copies,
                 0, spec, time.monotonic(), Path("/tools"),
             ))
         run_tests.assert_not_called()
@@ -2268,7 +2270,7 @@ class ContractTests(unittest.TestCase):
         ):
             outcome, over_budget = python_mutation._run_mutant(
                 function, mutation, ("tests/test_app.py",),
-                spec, time.monotonic(), root, work, numbers, Path("/tools"),
+                spec, time.monotonic(), root, python_mutation._Copies(work, root), numbers, Path("/tools"),
             )
         self.assertEqual((outcome, over_budget), ("killed", False))
         self.assertEqual(numbers, [1])
@@ -2279,7 +2281,7 @@ class ContractTests(unittest.TestCase):
         root, work = self.source_tree(source)
         result = python_mutation._run_mutant(
             function, mutation, ("tests/test_app.py",),
-            spec, time.monotonic() - 11, root, work, [0], Path("/tools"),
+            spec, time.monotonic() - 11, root, python_mutation._Copies(work, root), [0], Path("/tools"),
         )
         self.assertEqual(result, ("not run (over budget)", True))
         self.assertFalse((work / "copy-0000").exists())
@@ -2288,13 +2290,14 @@ class ContractTests(unittest.TestCase):
         source, function, mutation = self.work_mutation()
         spec = python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10)
         records: list[Any] = []
+        copies = python_mutation._Copies(Path("."), Path("."))
         with mock.patch.object(
             python_mutation, "_run_mutant",
             return_value=("survived", False),
         ):
             records, findings, finished = python_mutation._run_generated(
                 function, [mutation], ("tests/test_app.py",), spec,
-                time.monotonic(), Path("."), Path("."), [0], records, Path("/tools"),
+                time.monotonic(), Path("."), copies, [0], records, Path("/tools"),
             )
         self.assertTrue(finished)
         self.assertEqual(records[0]["outcome"], "survived")
@@ -2303,7 +2306,7 @@ class ContractTests(unittest.TestCase):
         with mock.patch.object(python_mutation, "_run_mutant") as run_mutant:
             records, findings, finished = python_mutation._run_generated(
                 function, [mutation], ("tests/test_app.py",), cut,
-                time.monotonic() - 2, Path("."), Path("."), [0], [], Path("/tools"),
+                time.monotonic() - 2, Path("."), copies, [0], [], Path("/tools"),
             )
         run_mutant.assert_not_called()
         self.assertFalse(finished)
@@ -2316,7 +2319,8 @@ class ContractTests(unittest.TestCase):
         with mock.patch.object(python_mutation, "_mutations") as generate:
             result = python_mutation._run_function(
                 function, ("tests/test_app.py",), source, spec,
-                time.monotonic() - 11, Path("."), Path("."), [0], Path("/tools"),
+                time.monotonic() - 11, Path("."), python_mutation._Copies(Path("."), Path(".")),
+                [0], Path("/tools"),
             )
         generate.assert_not_called()
         self.assertEqual(result, ([], [], False))
@@ -2332,7 +2336,8 @@ class ContractTests(unittest.TestCase):
             records, findings, finished = python_mutation._run_function(
                 function, ("tests/test_app.py",), source,
                 python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10),
-                time.monotonic(), Path("."), Path("."), [0], Path("/tools"),
+                time.monotonic(), Path("."), python_mutation._Copies(Path("."), Path(".")),
+                [0], Path("/tools"),
             )
         baseline.assert_called_once()
         self.assertTrue(finished)
@@ -2347,12 +2352,12 @@ class ContractTests(unittest.TestCase):
             path.write_text("first", encoding="utf-8")
             sources: dict[str, str] = {}
             self.assertEqual(
-                python_mutation._source_for(root, "pkg/app.py", sources),
+                python_mutation._source_for(root, "pkg/app.py", sources, snapshot=root),
                 "first",
             )
             path.write_text("second", encoding="utf-8")
             self.assertEqual(
-                python_mutation._source_for(root, "pkg/app.py", sources),
+                python_mutation._source_for(root, "pkg/app.py", sources, snapshot=root),
                 "first",
             )
 
@@ -2378,26 +2383,22 @@ class ContractTests(unittest.TestCase):
             [function], [], time.monotonic(), over
         ), [function])
 
-    def test_measure_runs_each_function_and_reports_none_unfinished(self) -> None:
+    def test_unittest_measure_runs_an_original_for_each_function(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             context = SimpleNamespace(root=Path(directory))
-            function = self.function("def empty():\n    0\n")
-            with mock.patch.object(
-                python_mutation, "_source_for", return_value=(
-                    "def empty():\n    0\n"
-                ),
-            ), mock.patch.object(
-                python_mutation, "_baseline", return_value=True
+            source = "def empty():\n    0\n\ndef other():\n    0\n"
+            functions = list(python_mutation.python_shape._file_index("pkg/app.py", source).functions)
+            tests = {function.identity: ("tests/test_app.py",) for function in functions}
+            with (
+                mock.patch.object(python_mutation, "_source_for", return_value=source),
+                mock.patch.object(python_mutation, "_baseline", return_value=True) as baseline,
             ):
                 records, findings, unfinished = python_mutation._measure(
                     context,
-                    python_mutation.MutationSpec(
-                        "changed", "HEAD", 10, 20, 10
-                    ),
-                    [function],
-                    {function.identity: ("tests/test_app.py",)},
-                    time.monotonic(), preferred={},
+                    python_mutation.MutationSpec("changed", "HEAD", 10, 20, 10),
+                    functions, tests, time.monotonic(), preferred={}, selected={},
                 )
+        self.assertEqual(baseline.call_count, 2)
         self.assertTrue(records)
         self.assertEqual(findings, [])
         self.assertEqual(unfinished, [])
