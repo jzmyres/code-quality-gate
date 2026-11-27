@@ -528,7 +528,9 @@ _PUBLIC_VOCABULARY_FIELDS = (
 )
 _PUBLIC_ARCHIVE_FIELDS = ("compressed_sha256", "compressed_size")
 _PUBLIC_MODEL_KEY = "public_hardware_model_v1"
-_PUBLIC_MODEL_FIELDS = (*_PROVENANCE_RECORD_FIELDS, "match_start", "match_end", "decoded_sha256", "catalogue")
+_MODEL_BINDING_FIELDS = ("match_start", "match_end", "catalogue")
+_PUBLIC_MODEL_FIELDS = (*_PROVENANCE_RECORD_FIELDS, *_MODEL_BINDING_FIELDS, "decoded_sha256")
+_PYTHON_MODEL_FIELDS = ("record", *_MODEL_BINDING_FIELDS, "role", "identifier", "source_sha256")
 _MODEL_CATALOGUE_FIELDS = ("payload", "sha256", "literal_start", "literal_end")
 
 
@@ -737,7 +739,9 @@ def _byte_span(
     return start, end
 
 
-def _model_catalogue(row: dict[str, Any], path: Path, where: str) -> public_hardware_model.Catalogue:
+def _model_catalogue(
+    row: dict[str, Any], path: Path, where: str, record: str,
+) -> public_hardware_model.Catalogue:
     name = f"{where}.catalogue"
     catalogue = _read_value(row, "catalogue", path, name, _TABLE)
     _check_keys(catalogue, _MODEL_CATALOGUE_FIELDS, path, name)
@@ -745,24 +749,44 @@ def _model_catalogue(row: dict[str, Any], path: Path, where: str) -> public_hard
     source = _git_payload(payload, path, f"{name}.payload")
     digest = _provenance_digest(catalogue, "sha256", path, name)
     literal_span = _byte_span(catalogue, "literal", path, name, source.size)
+    if record == source.path:
+        raise _config_error(path, where, "a separate catalogue operand", "identical paths")
     return public_hardware_model.Catalogue(source, digest, literal_span)
 
 
-def _public_model_spec(row: Any, path: Path, where: str) -> public_hardware_model.Declaration:
+def _python_model_spec(
+    row: dict[str, Any], path: Path, where: str, record: str,
+) -> public_hardware_model.PythonDeclaration:
+    _check_keys(row, _PYTHON_MODEL_FIELDS, path, where)
+    role = _string(row, "role", path, f"{where}.role")
+    if role not in ("keyword", "attribute_equality"):
+        raise _config_error(path, f"{where}.role", "keyword or attribute_equality", "invalid role")
+    identifier = _string(row, "identifier", path, f"{where}.identifier")
+    if not identifier.isascii() or not identifier.isidentifier() or keyword.iskeyword(identifier):
+        raise _config_error(path, f"{where}.identifier", "an ASCII Python identifier", "invalid identifier")
+    span = _byte_span(row, "match", path, where, secrets._MAX_RECORD_BYTES)
+    digest = _provenance_digest(row, "source_sha256", path, where)
+    catalogue = _model_catalogue(row, path, where, record)
+    if digest == catalogue.sha256:
+        raise _config_error(path, where, "distinct source and catalogue bytes", "identical digests")
+    return public_hardware_model.PythonDeclaration(record, role, identifier, span, digest, catalogue)
+
+
+def _public_model_spec(row: Any, path: Path, where: str) -> public_hardware_model.ModelDeclaration:
     _read_scalar(path, where, row, _TABLE)
     record = _string(row, "record", path, f"{where}.record")
     _validate_exact_path(path, f"{where}.record", record)
+    if record.endswith(".py"):
+        return _python_model_spec(row, path, where, record)
     if not record.endswith((".json", ".json.gz")):
-        raise _config_error(path, where, "a .json or .json.gz record path", "invalid suffix")
+        raise _config_error(path, where, "a .json, .json.gz or .py record path", "invalid suffix")
     archive = record.endswith(".json.gz")
     allowed = (*_PUBLIC_MODEL_FIELDS, "compressed_sha256") if archive else _PUBLIC_MODEL_FIELDS
     _check_keys(row, allowed, path, where)
     pointer_text = _string(row, "pointer", path, f"{where}.pointer")
     pointer = _read_pointer(pointer_text, path, f"{where}.pointer", python=False)
     span = _byte_span(row, "match", path, where, secrets._MAX_RECORD_BYTES)
-    catalogue = _model_catalogue(row, path, where)
-    if record == catalogue.payload.path:
-        raise _config_error(path, where, "a separate catalogue operand", "identical paths")
+    catalogue = _model_catalogue(row, path, where, record)
     decoded = _provenance_digest(row, "decoded_sha256", path, where)
     compressed = _provenance_digest(row, "compressed_sha256", path, where) if archive else None
     return public_hardware_model.Declaration(record, pointer, span, decoded, catalogue, compressed)
@@ -770,7 +794,7 @@ def _public_model_spec(row: Any, path: Path, where: str) -> public_hardware_mode
 
 def _public_models(
     raw: dict[str, Any], path: Path, key: str,
-) -> tuple[public_hardware_model.Declaration, ...]:
+) -> tuple[public_hardware_model.ModelDeclaration, ...]:
     name = f"{key}.{_PUBLIC_MODEL_KEY}"
     rows = raw.get(_PUBLIC_MODEL_KEY, [])
     if not isinstance(rows, list):
@@ -781,8 +805,9 @@ def _public_models(
     for index, row in enumerate(rows):
         where = f"{name}[{index}]"
         declaration = _public_model_spec(row, path, where)
-        _unique(pointers, (declaration.record, declaration.pointer), path, where,
-                "a unique record and pointer", "duplicate", _config_error)
+        if isinstance(declaration, public_hardware_model.Declaration):
+            _unique(pointers, (declaration.record, declaration.pointer), path, where,
+                    "a unique record and pointer", "duplicate", _config_error)
         _unique(matches, (declaration.record, declaration.match_span), path, where,
                 "a unique record and match interval", "duplicate", _config_error)
         declarations.append(declaration)
@@ -793,7 +818,7 @@ def _public_models(
 class _SecretsSpec:
     digests: tuple[secrets.Provenance, ...]
     vocabulary: tuple[public_vocab.PublishedVocabulary, ...]
-    models: tuple[public_hardware_model.Declaration, ...]
+    models: tuple[public_hardware_model.ModelDeclaration, ...]
 
 
 def _secrets_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -> ParsedSpec:
