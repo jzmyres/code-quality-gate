@@ -518,6 +518,7 @@ def _run_comments(context: AdapterContext) -> Any:
 _PROVENANCE_FIELDS = ("record", "pointer", "payload", "payload_sha256")
 _GZIP_DIGEST_FIELDS = ("compressed_sha256", "decoded_sha256")
 _GIT_PAYLOAD_FIELDS = ("path", "commit", "blob", "size")
+_GZIP_PAYLOAD_FIELDS = ("path", "compressed_sha256", "decoded_size")
 
 
 def _read_pointer(pointer: str, path: Path, where: str) -> tuple[str, ...]:
@@ -558,10 +559,24 @@ def _git_payload(raw: dict[str, Any], path: Path, where: str) -> secrets.GitPayl
     return secrets.GitPayload(name, commit, blob, size)
 
 
-def _provenance_payload(row: dict[str, Any], path: Path, where: str) -> str | secrets.GitPayload:
+def _gzip_payload(raw: dict[str, Any], path: Path, where: str) -> secrets.GzipPayload:
+    _check_keys(raw, _GZIP_PAYLOAD_FIELDS, path, where)
+    name = _string(raw, "path", path, f"{where}.path")
+    _validate_exact_path(path, f"{where}.path", name)
+    compressed = _provenance_digest(raw, "compressed_sha256", path, where)
+    size = _integer(
+        raw, "decoded_size", path, f"{where}.decoded_size", minimum=0,
+        maximum=secrets.MAX_GZIP_PAYLOAD_BYTES,
+    )
+    return secrets.GzipPayload(name, compressed, size)
+
+
+def _provenance_payload(row: dict[str, Any], path: Path, where: str) -> secrets.Payload:
     value = row.get("payload")
     key = f"{where}.payload"
     if isinstance(value, dict):
+        if value.keys() & {"compressed_sha256", "decoded_size"}:
+            return _gzip_payload(value, path, key)
         return _git_payload(value, path, key)
     name = _string(row, "payload", path, key)
     _validate_exact_path(path, key, name)
@@ -577,7 +592,7 @@ def _parse_provenance(row: Any, path: Path, where: str) -> secrets.Provenance:
     )
     _validate_exact_path(path, f"{where}.record", record)
     payload = _provenance_payload(row, path, where)
-    payload_path = payload.path if isinstance(payload, secrets.GitPayload) else payload
+    payload_path = payload if isinstance(payload, str) else payload.path
     if not record.endswith((".json", ".json.gz")) or record == payload_path:
         raise _config_error(path, where, "a .json or .json.gz record and a separate payload", "invalid paths")
     digest = _provenance_digest(row, "payload_sha256", path, where)

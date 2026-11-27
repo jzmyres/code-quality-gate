@@ -23,6 +23,7 @@ _FINDINGS_EXIT = 3
 _MAX_RECORD_BYTES = 16 << 20
 _MAX_COMPRESSED_BYTES = 16 << 20
 MAX_GIT_PAYLOAD_BYTES = 16 << 20
+MAX_GZIP_PAYLOAD_BYTES = 32 << 20
 FULL_GIT_OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _PROMISOR_CONFIG = r"^(extensions\.partialclone|remote\..+\.promisor)$"
 _DIGEST_WIDTH = 64
@@ -50,10 +51,20 @@ class GitPayload:
 
 
 @dataclass(frozen=True)
+class GzipPayload:
+    path: str
+    compressed_sha256: str
+    decoded_size: int
+
+
+Payload = str | GitPayload | GzipPayload
+
+
+@dataclass(frozen=True)
 class Provenance:
     record: str
     pointer: tuple[str, ...]
-    payload: str | GitPayload
+    payload: Payload
     payload_sha256: str
     gzip: GzipDigests | None = None
 
@@ -157,23 +168,28 @@ def _record(data: bytes, gzip: GzipDigests | None = None) -> _Record:
     return _Record(data, starts, {}, gzip)
 
 
-def _single_gzip_member(compressed: bytes) -> bytes | None:
+def _single_gzip_member(compressed: bytes, limit: int) -> bytes | None:
     inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
     try:
-        data = inflater.decompress(compressed, _MAX_RECORD_BYTES + 1)
+        data = inflater.decompress(compressed, limit + 1)
     except zlib.error:
         return None
-    if not inflater.eof or inflater.unused_data or len(data) > _MAX_RECORD_BYTES:
+    if not inflater.eof or inflater.unused_data or len(data) > limit:
         return None
     return data
 
 
-def _read_gzip_record(path: Path) -> _Record | None:
+def _read_gzip_bytes(path: Path) -> bytes | None:
     with path.open("rb") as stream:
         compressed = stream.read(_MAX_COMPRESSED_BYTES + 1)
-    if len(compressed) > _MAX_COMPRESSED_BYTES:
+    return compressed if len(compressed) <= _MAX_COMPRESSED_BYTES else None
+
+
+def _read_gzip_record(path: Path) -> _Record | None:
+    compressed = _read_gzip_bytes(path)
+    if compressed is None:
         return None
-    data = _single_gzip_member(compressed)
+    data = _single_gzip_member(compressed, _MAX_RECORD_BYTES)
     if data is None:
         return None
     digests = GzipDigests(hashlib.sha256(compressed).hexdigest(), hashlib.sha256(data).hexdigest())
@@ -194,8 +210,11 @@ def _tracked_record(declaration: Provenance, tracked: set[str]) -> bool:
     return declaration.gzip is None or declaration.record in tracked
 
 
-def _has_payload(payload: str | GitPayload, paths: dict[str, bool], tracked: set[str]) -> bool:
-    return isinstance(payload, GitPayload) or (paths.get(payload, False) and payload in tracked)
+def _has_payload(payload: Payload, paths: dict[str, bool], tracked: set[str]) -> bool:
+    if isinstance(payload, GitPayload):
+        return True
+    path = payload.path if isinstance(payload, GzipPayload) else payload
+    return paths.get(path, False) and path in tracked
 
 
 def _selected_provenance(
@@ -281,9 +300,23 @@ class _GitPayloadReader:
         return None if data is None else _blob_digest(data, payload)
 
 
-def _payload_digest(directory: Path, payload: str | GitPayload, git: _GitPayloadReader | None) -> str | None:
+def _gzip_payload_digest(path: Path, payload: GzipPayload) -> str | None:
+    if not 0 <= payload.decoded_size <= MAX_GZIP_PAYLOAD_BYTES:
+        return None
+    compressed = _read_gzip_bytes(path)
+    if compressed is None or hashlib.sha256(compressed).hexdigest() != payload.compressed_sha256:
+        return None
+    data = _single_gzip_member(compressed, payload.decoded_size)
+    if data is None or len(data) != payload.decoded_size:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _payload_digest(directory: Path, payload: Payload, git: _GitPayloadReader | None) -> str | None:
     if isinstance(payload, GitPayload):
         return git.digest(payload) if git is not None else None
+    if isinstance(payload, GzipPayload):
+        return _gzip_payload_digest(directory / payload.path, payload)
     with (directory / payload).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
@@ -291,7 +324,7 @@ def _payload_digest(directory: Path, payload: str | GitPayload, git: _GitPayload
 def _pinned_payloads(
     directory: Path, selected: Iterable[Provenance], git: _GitPayloadReader | None,
 ) -> Iterable[Provenance]:
-    digests: dict[str | GitPayload, str | None] = {}
+    digests: dict[Payload, str | None] = {}
     for declaration in selected:
         payload = declaration.payload
         if payload not in digests:

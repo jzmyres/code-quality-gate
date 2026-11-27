@@ -74,6 +74,10 @@ def _fragmented_record(fields: bytes) -> bytes:
     return head + padding + tail + b" " * 300 + fields + b"\n}\n"
 
 
+def _gzip_operand(archive: bytes, size: int) -> secrets.GzipPayload:
+    return secrets.GzipPayload("pack.gz", hashlib.sha256(archive).hexdigest(), size)
+
+
 class SecretsTests(FixtureCase):
     def setUp(self) -> None:
         super().setUp()
@@ -355,7 +359,8 @@ payload_sha256 = "{digest}"
         )
         self.assertEqual(result.returncode, status, result.stderr)
         check = self.check_by_id(self.parse_json(result), "secrets")
-        self.assertEqual((check.get("measurement") or {}).get("verified_sha256_provenance"), verified)
+        actual = (check.get("measurement") or {}).get("verified_sha256_provenance")
+        self.assertEqual(actual, verified, result.stderr)
         return result, check
 
     def _git_fixture(self, filename: str = "proofs/old.raw") -> tuple[secrets.GitPayload, str]:
@@ -368,33 +373,38 @@ payload_sha256 = "{digest}"
         blob = self.git("rev-parse", f"{commit}:{filename}").stdout.strip()
         return secrets.GitPayload(filename, commit, blob, len(source)), hashlib.sha256(source).hexdigest()
 
-    def _declare_git_proof(
-        self, operand: secrets.GitPayload, digest: str, data: str, *, archive: bool = False,
+    def _declare_typed_proof(
+        self, operand: secrets.GitPayload | secrets.GzipPayload, digest: str, data: str,
+        *, archive: bool = False,
     ) -> Path:
         name = "report.json.gz" if archive else "report.json"
         original = data.encode()
         content = gzip.compress(original, mtime=0) if archive else original
         self.add_file(name, content)
-        base = BASE_CONFIG + DECLARATION + """
+        if isinstance(operand, secrets.GitPayload):
+            operand_pattern = "*.raw"
+            operand_fields = f'commit = "{operand.commit}", blob = "{operand.blob}", size = {operand.size}'
+        else:
+            operand_pattern = operand.path
+            operand_fields = (
+                f'compressed_sha256 = "{operand.compressed_sha256}", decoded_size = {operand.decoded_size}'
+            )
+        base = BASE_CONFIG + DECLARATION + f"""
 [[rule]]
 pattern = "*.json*"
 class = "config"
 reason = "synthetic report fixtures"
 
 [[rule]]
-pattern = "*.raw"
+pattern = "{operand_pattern}"
 class = "config"
-reason = "synthetic historical operands"
+reason = "synthetic payload fixtures"
 """
-        operand_fields = (
-            f'path = "{operand.path}", commit = "{operand.commit}", '
-            f'blob = "{operand.blob}", size = {operand.size}'
-        )
         declaration = f"""
 [[checks.secrets.sha256_provenance]]
 record = "{name}"
 pointer = "/pack/0/tokens_sha256"
-payload = {{ {operand_fields} }}
+payload = {{ path = "{operand.path}", {operand_fields} }}
 payload_sha256 = "{digest}"
 """
         if archive:
@@ -408,7 +418,7 @@ payload_sha256 = "{digest}"
     def test_git_proof_uses_old_bytes_in_no_local_clone_and_keeps_other_findings(self) -> None:
         binary = self._require_scanner()
         operand, digest = self._git_fixture(":(top)old operand.raw")
-        trusted = self._declare_git_proof(operand, digest, self._digest_record(digest))
+        trusted = self._declare_typed_proof(operand, digest, self._digest_record(digest))
         self.add_file(operand.path, b"new tracked bytes")
         self.commit_all()
         clone = self.base / "fresh"
@@ -521,7 +531,7 @@ payload_sha256 = "{digest}"
         binary = self._require_scanner()
         operand, digest = self._git_fixture()
         record = self._digest_record(digest)
-        trusted = self._declare_git_proof(operand, digest, record, archive=True)
+        trusted = self._declare_typed_proof(operand, digest, record, archive=True)
         self._run_provenance(binary, trusted, 0, 1)
         self.add_file("report.json.gz", gzip.compress(record.encode(), mtime=1))
         self._run_provenance(binary, trusted, 1, 0)
@@ -530,7 +540,7 @@ payload_sha256 = "{digest}"
             json.dumps({"pack": [{"tokens_sha256": digest}] * 2}),
             record.replace('"tokens_sha256"', '"tokens_sha256": "placeholder", "tokens_sha256"'),
         ):
-            trusted = self._declare_git_proof(operand, digest, invalid, archive=True)
+            trusted = self._declare_typed_proof(operand, digest, invalid, archive=True)
             result, _ = self._run_provenance(binary, trusted, 1, 0)
             self.assertIn("RuleID: generic-api-key", result.stderr)
 
@@ -682,6 +692,112 @@ payload_sha256 = "{digest}"
             with self.subTest(policy_source=policy_source):
                 result, _ = self._run_provenance(binary, policy_source, 1, None)
                 self.assertRegex(result.stderr, r"(?m)^RuleID:\s+generic-api-key$")
+
+    def test_gzip_payload_hashes_decoded_bytes_from_tracked_regular_input(self) -> None:
+        binary = self._require_scanner()
+        payload = b"decoded synthetic provenance bytes\x00"
+        digest = hashlib.sha256(payload).hexdigest()
+        archive = gzip.compress(payload, mtime=0)
+        operand = _gzip_operand(archive, len(payload))
+        trusted = self._declare_typed_proof(operand, digest, self._digest_record(digest))
+        path = self.add_file(operand.path, archive)
+        self._run_provenance(binary, trusted, 1, 0)
+
+        self.git("add", "--", operand.path)
+        self._run_provenance(binary, trusted, 0, 1)
+        self._run_provenance(binary, None, 1, None)
+
+        path.write_bytes(gzip.compress(payload, mtime=1))
+        self._run_provenance(binary, trusted, 1, 0)
+        original = self.base / "original.gz"
+        original.write_bytes(archive)
+        path.unlink()
+        path.symlink_to(original)
+        self._run_provenance(binary, trusted, 1, 0)
+
+    def test_gzip_payload_requires_matching_decoded_digest_and_size(self) -> None:
+        binary = self._require_scanner()
+        payload = b"decoded synthetic provenance bytes\x00"
+        archive = gzip.compress(payload, mtime=0)
+        operand = _gzip_operand(archive, len(payload))
+        self.add_file(operand.path, archive)
+        correct_digest = hashlib.sha256(payload).hexdigest()
+        for declaration, digest in (
+            (operand, operand.compressed_sha256),
+            (replace(operand, decoded_size=len(payload) - 1), correct_digest),
+            (replace(operand, decoded_size=len(payload) + 1), correct_digest),
+        ):
+            with self.subTest(declaration=declaration, digest=digest):
+                trusted = self._declare_typed_proof(declaration, digest, self._digest_record(digest))
+                result, _ = self._run_provenance(binary, trusted, 1, 0)
+                self.assertIn("RuleID: generic-api-key", result.stderr)
+
+    def test_gzip_payload_keeps_record_proof_and_scans_both_archives(self) -> None:
+        binary = self._require_scanner()
+        neighbor, embedded = _synthetic_credential(), _synthetic_credential(44)
+        payload = f'token = "{embedded}"\n'.encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        archive = gzip.compress(payload, mtime=0)
+        operand = _gzip_operand(archive, len(payload))
+        self.add_file(operand.path, archive)
+        record = self._digest_record(digest, credential=neighbor)
+        trusted = self._declare_typed_proof(operand, digest, record, archive=True)
+        result, check = self._run_provenance(binary, trusted, 1, 1)
+        self.assertEqual(check["reason"], "Betterleaks reported 2 unresolved finding(s)")
+        self.assertEqual(result.stderr.count("RuleID: github-pat"), 2)
+        for path in (operand.path, "report.json.gz"):
+            self.assertIn(f"path: {path!r}", result.stderr)
+        for value in (digest, neighbor, embedded):
+            self.assertNotIn(value, result.stdout + result.stderr)
+
+        self.add_file("report.json.gz", gzip.compress(record.encode(), mtime=1))
+        self._run_provenance(binary, trusted, 1, 0)
+
+    def test_gzip_payload_reader_rejects_bad_members_and_compressed_overruns(self) -> None:
+        payload = b"synthetic payload\x00"
+        archive = gzip.compress(payload, mtime=0)
+        path = self.evidence / "pack.gz"
+        for invalid in (b"plain text", archive[:-1], archive + archive, archive + b"\x00",
+                        archive[:-8] + b"\x00" * 4 + archive[-4:]):
+            with self.subTest(invalid=invalid):
+                path.write_bytes(invalid)
+                self.assertIsNone(secrets._gzip_payload_digest(path, _gzip_operand(invalid, len(payload))))
+
+        path.write_bytes(archive)
+        operand = _gzip_operand(archive, len(payload))
+        with mock.patch.object(secrets, "_MAX_COMPRESSED_BYTES", len(archive) - 1):
+            self.assertIsNone(secrets._gzip_payload_digest(path, operand))
+        with mock.patch.object(secrets, "_MAX_COMPRESSED_BYTES", len(archive)):
+            self.assertEqual(secrets._gzip_payload_digest(path, operand), hashlib.sha256(payload).hexdigest())
+
+    def test_gzip_payload_reader_enforces_decoded_cap(self) -> None:
+        limit = secrets.MAX_GZIP_PAYLOAD_BYTES
+        payload = b"x" * limit
+        path = self.evidence / "pack.gz"
+        archive = gzip.compress(payload, compresslevel=1, mtime=0)
+        path.write_bytes(archive)
+        self.assertEqual(
+            secrets._gzip_payload_digest(path, _gzip_operand(archive, limit)),
+            hashlib.sha256(payload).hexdigest(),
+        )
+        archive = gzip.compress(payload + b"x", compresslevel=1, mtime=0)
+        path.write_bytes(archive)
+        for size in (limit, limit + 1):
+            with self.subTest(size=size):
+                self.assertIsNone(secrets._gzip_payload_digest(path, _gzip_operand(archive, size)))
+
+    def test_gzip_payload_reuses_digest_for_same_operand(self) -> None:
+        payload = b"synthetic payload\x00"
+        archive = gzip.compress(payload, mtime=0)
+        operand = _gzip_operand(archive, len(payload))
+        path = self.evidence / operand.path
+        path.write_bytes(archive)
+        digest = hashlib.sha256(payload).hexdigest()
+        correct = secrets.Provenance("report.json", ("first",), operand, digest)
+        wrong = replace(correct, pointer=("second",), payload_sha256="0" * 64)
+        with mock.patch.object(secrets, "_gzip_payload_digest", wraps=secrets._gzip_payload_digest) as read:
+            self.assertEqual(list(secrets._pinned_payloads(self.evidence, [correct, wrong], None)), [correct])
+        read.assert_called_once_with(path, operand)
 
     def _gzip_fixture(
         self, record: bytes, payload: bytes, *, decoded_pin: str | None = None, tracked: bool = True,
@@ -882,6 +998,25 @@ decoded_sha256 = "{decoded_pin or hashlib.sha256(record).hexdigest()}"
                 {"sha256_provenance": [row, dict(row, payload="proofs/local.raw")]},
                 self.config_path, "secrets",
             )
+
+    def test_gzip_payload_declarations_require_exact_keys_and_values(self) -> None:
+        operand = dict(path="proofs/file.gz", compressed_sha256="1" * 64, decoded_size=10)
+        row = dict(record="report.json", pointer="/tokens_sha256", payload=operand, payload_sha256="2" * 64)
+        parsed, = adapters._secrets_provenance({"sha256_provenance": [row]}, self.config_path, "secrets")
+        self.assertEqual(parsed.payload, secrets.GzipPayload(**operand))
+        for invalid in (
+            dict(operand, path="/absolute.gz"), dict(operand, path="../file.gz"),
+            dict(operand, path="proofs/*.gz"), dict(operand, path="report.json"),
+            dict(operand, compressed_sha256="A" * 64), dict(operand, compressed_sha256="1" * 63),
+            dict(operand, decoded_size=-1), dict(operand, decoded_size=True),
+            dict(operand, decoded_size=secrets.MAX_GZIP_PAYLOAD_BYTES + 1),
+            dict(operand, commit="0" * 40, blob="1" * 40, size=10),
+            {key: value for key, value in operand.items() if key != "decoded_size"},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                adapters._secrets_provenance(
+                    {"sha256_provenance": [dict(row, payload=invalid)]}, self.config_path, "secrets",
+                )
 
     def test_unattested_match_locations_do_not_verify(self) -> None:
         digest = hashlib.sha256(b"example source").hexdigest()

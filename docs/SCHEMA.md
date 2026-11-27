@@ -460,6 +460,20 @@ declaration to the policy used by `--policy-from`. Use exact repository-relative
 paths to separate regular files. With a string `payload`, the gate hashes the
 captured working-tree bytes of a Git-tracked file.
 
+A compressed payload uses an inline table for the same `payload` field.
+
+```toml
+payload = { path = "evidence/pack.gz", compressed_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", decoded_size = 4 }
+```
+
+Replace the sample `compressed_sha256` with the 64 lowercase hex digits of
+the captured Git-tracked archive's SHA-256. The archive can be up to 16 MiB
+and must contain one complete gzip member with a valid checksum and no
+trailing bytes. `decoded_size` is the exact decoded byte count, from zero
+through 32 MiB. `payload_sha256` is the SHA-256 of the decoded bytes. The
+archive remains a regular input to the standard scanner. These fields belong
+inside the `payload` table and are independent of the pins on a gzip record.
+
 A historical payload uses an inline table for the same `payload` field:
 
 ```toml
@@ -487,10 +501,10 @@ fields require 64 lowercase hex digits and belong only on `.json.gz` rows.
 Compressed and decoded bytes each have a 16 MiB limit. The record must have
 one complete gzip member with a valid checksum and no trailing bytes.
 
-The check hashes the payload's captured raw bytes. Use the exact bytes the
-producer hashed. For example, when a producer hashes the contents of a
-tensor, a serialized tensor container with a header is a different payload.
-Both the policy pin and the selected scalar must equal the recomputed digest.
+Use the exact bytes the producer hashed. For example, when a producer hashes
+the contents of a tensor, a serialized tensor container with a header is a
+different payload. Both the policy pin and the selected scalar must equal the
+recomputed digest.
 
 The pinned scanner scans every selected input under its standard rules.
 Betterleaks v1.10.1 can report columns relative to a fragment that starts
