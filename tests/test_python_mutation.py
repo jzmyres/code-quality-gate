@@ -2396,7 +2396,7 @@ class ContractTests(unittest.TestCase):
                     ),
                     [function],
                     {function.identity: ("tests/test_app.py",)},
-                    time.monotonic(),
+                    time.monotonic(), preferred={},
                 )
         self.assertTrue(records)
         self.assertEqual(findings, [])

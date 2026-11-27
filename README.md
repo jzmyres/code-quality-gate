@@ -1138,22 +1138,35 @@ its absolute path, with an empty entry resolved as the gate's current directory;
 the source repository is replaced by the same relative path inside the copy. No other allowlisted
 value is a path the gate does not set itself, and no
 other variable is inherited, so no inherited path or relative traversal can reach the source
-tree. The baseline runs once for every changed function that has tests, whether or not any
-mutant is generated. A baseline that fails in this environment is a check error naming the
-failing test, never a pass. By default, the selected test files run in that copy with the bounded
+tree. The unmutated baseline runs for every changed function that has tests, including functions
+without generated mutants. A baseline failure in this environment is a check error naming the
+failing test. By default, the selected test files run in that copy with the bounded
 runner as
 `python3 -I -B -m unittest discover -s DIR -p FILE`, one file at a time.
 
 Use `test_runner = "pytest"` to run ordinary pytest test functions and fixtures. Install pytest
 in the same Python environment that runs the gate. This mode considers `test_*.py` and
 `*_test.py` in the selected test inventory and passes the matching files directly to pytest.
+For each changed function, pytest can start with a smaller cohort of the selected files.
+The gate ranks files by the number of distinct changed symbols they reference through explicit
+absolute imports from the measured module. Ties favor a reference to the exact function and then the number
+of distinct module members referenced. The highest-ranked files run together when their score is
+positive and they form a strict subset. This ranking uses static import bindings and dotted names.
+It can prefer tests of a module's public entry points when they exercise a changed helper indirectly.
+The full selection runs when no smaller cohort qualifies and for each mutant that passes the
+preferred tests. Each cohort runs against its own unmutated copy before it runs any mutants. The
+first original is required even if no mutants are generated. Later mutants of the same function reuse
+that original evidence. Each child has the configured time limit, and the aggregate deadline covers
+both cohorts.
+
 Pytest reads its configuration from the copy and starts Python's import path with the copied
 `python_import_roots` in policy order, followed by the copy root when it is distinct.
 Both runs must collect tests from the selected copied files, execute at least one
 test, and import the measured module from the copy. The mutant must collect and execute the same
 test IDs as the original. A failed assertion or explicit pytest failure in the test body kills a
 mutant. A verified passing mutant survives. Empty collection, zero execution, collection or import
-errors, fixture errors and per-mutant timeouts invalidate the check.
+errors, fixture errors and per-mutant timeouts invalidate the check. Each mutant result reports
+its decisive test cohort in `tests`. A suppressed mutant lists the selected original cohort.
 
 Each run makes the check process a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)` on Linux). After
 the mutant's process group is stopped, every remaining descendant the check adopted is stopped and
