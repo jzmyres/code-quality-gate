@@ -472,6 +472,8 @@ payload_sha256 = "{digest}"
         head = self.git("rev-parse", "HEAD").stdout.strip()
         self.git("branch", "local-only", local)
         reader = secrets._GitPayloadReader(partial(adapters._secrets_git_command, self.repo, 60))
+        self.assertTrue(reader._reachable_commit(operand.commit))
+        self.assertFalse(reader._reachable_commit(local))
         self.assertIsNone(reader.digest(changed))
         self.git("replace", "--graft", head, local)
         self._verify_ignored_ancestry_override(head, changed, operand, digest)
