@@ -540,6 +540,58 @@ failed, incomplete, or invalid replay leaves the original finding in
 place. The check rejects a failed standard scan or an incomplete or invalid
 standard scanner report.
 
+### Published tokenizer vocabulary integers
+
+A trusted policy can opt in to exact integer proof for a published tokenizer
+asset. This example uses a synthetic release address and illustrative pins.
+
+```toml
+[[checks.secrets.public_vocabulary]]
+path = "assets/tokenizer.json.gz"
+published_url = "https://example.invalid/releases/1111111111111111111111111111111111111111/tokenizer.json"
+published_revision = "1111111111111111111111111111111111111111"
+published_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+published_size = 4000
+compressed_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+compressed_size = 1200
+pointers = ["/model/vocab/example-password-label", "/model/vocab/example-username-label"]
+```
+
+Independently retrieve the exact revision and verify the published bytes
+before adding the declaration to the directory used by `--policy-from`. The
+gate uses the pinned size and SHA-256 offline. It accepts vocabulary
+declarations from that trusted directory. If a run authorizes a candidate
+policy replacement, the replacement's vocabulary declarations take effect
+after they are included in a trusted directory for a subsequent run.
+
+Declare up to 16 exact Git-tracked regular file paths, with up to 256 distinct
+`/model/vocab/<key>` JSON Pointers per path. Use the JSON Pointer escapes
+`~0` and `~1` for literal tilde and slash. For an uncompressed `.json` file,
+omit both compressed fields. The published JSON size is capped at 32 MiB.
+A `.json.gz` file is capped at 16 MiB and must contain one complete gzip
+member without extra bytes. The published pins apply to its exact inflated
+bytes. The captured input is scanned with the standard flags.
+
+The gate parses the complete UTF-8 document with unique object names and
+requires a BPE, WordLevel, or WordPiece model with nonnegative integer
+vocabulary IDs. Each proof requires a single physical member line with a
+trailing comma and a unique redacted match at the exact reported byte
+coordinates. The redacted span must cover the complete canonical decimal
+integer at the declared pointer. The supported finding is
+`generic-password` with zero or one optional `generic-username` component.
+An attached component needs its own declared pointer and exact integer
+proof. The standard scan and the decoding-disabled replay must each produce
+the same unique row. For gzip, a second decoding-disabled replay reads the
+already verified inflated bytes directly.
+
+The measurement `verified_public_vocabulary` counts verified findings.
+`public_vocabulary_locations` reports each verified row's redacted
+coordinates, with the primary location first and any attached location
+second. Findings with inconsistent bytes, unknown shape, incomplete
+component proof, or ambiguous or failed replay remain unresolved. A tokenizer
+asset with more than 256 candidate rows leaves all of them unresolved. The
+16 MiB JSON record bound for SHA-256 assignment proof still applies.
+
 ## Tool lock: `tools.lock.toml`
 
 Each top-level table names a pinned tool:
