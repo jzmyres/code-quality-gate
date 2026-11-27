@@ -356,11 +356,12 @@ the check unsupported.
 
 Betterleaks prints redacted findings to stderr with the repository-relative
 path, line, and rule. Gate checks print paths, so a credential in a filename
-is visible. A trusted policy may declare a digest field in JSON or a tracked
-single-member gzip JSON record. The gate hashes a captured tracked file, the
-decoded bytes of a pinned tracked gzip payload, or a pinned reachable Git blob.
-It verifies that the finding identifies the exact field. A gzip record also
-requires pins for the compressed and decoded bytes. See the
+is visible. A trusted policy may declare a digest field in JSON, a tracked
+single-member gzip JSON record, or a tracked Python dictionary literal.
+The gate hashes a captured tracked file. For JSON records it also supports
+the decoded bytes of a pinned tracked gzip payload and pinned reachable Git
+blobs. The gate verifies that the finding identifies the exact value. A gzip
+record requires pins for the compressed and decoded bytes. See the
 [SHA-256 provenance policy](docs/SCHEMA.md#sha-256-provenance-policy).
 
 ### Source comments
