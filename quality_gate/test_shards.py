@@ -20,7 +20,9 @@ from pathlib import Path
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 CGROUP_MEMBERSHIP = Path("/proc/self/cgroup")
-FAILED_OUTCOMES = ("failure", "error", "unexpected success")
+FAILED_OUTCOMES = ("unexpected success", "failure", "error")
+EVENT_OUTCOMES = ("passed", "skipped", "expected failure", *FAILED_OUTCOMES)
+FIXTURE_OUTCOMES = {"fixture skipped": "skipped", "blocked": "error"}
 RUNTIME_SUITE_REASON = "full run: suite runtime inputs are undeclared"
 
 
@@ -30,6 +32,15 @@ class ShardError(Exception):
 
 def _journal_event(journal, event, value):
     print(json.dumps([event, value]), file=journal, flush=True)
+
+
+def _decode_journal_frame(line, decode):
+    if not line.endswith("\n"):
+        raise ValueError("incomplete journal frame")
+    frame = decode(line)
+    if not isinstance(frame, list) or len(frame) != 2 or not isinstance(frame[0], str):
+        raise ValueError(f"invalid journal frame: {frame!r}")
+    return frame
 
 
 class ShardResult(unittest.TextTestResult):
@@ -46,6 +57,7 @@ class ShardResult(unittest.TextTestResult):
         self.ids = ids
         self.observe = observe
         self.records = []
+        self.started = []
         self.fixtures = []
         self.fixture_outcomes = {}
         self.offsets = dict.fromkeys((field for _, field in self.event_fields), 0)
@@ -58,13 +70,20 @@ class ShardResult(unittest.TextTestResult):
         if self.active_test is not None:
             raise ShardError(f"unittest occurrence {self.ids[self.position]!r} started again before stopping")
         self.active_test = test
-        self.passed_subtest = False
+        self.passed_tests = []
+        self.started.append(self.position)
         self.emit("started", self.position)
         super().startTest(test)
+        self.started_at = time.monotonic()
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self.passed_tests.append(test)
 
     def addSubTest(self, test, subtest, err):
-        self.passed_subtest |= err is None
         super().addSubTest(test, subtest, err)
+        if err is None:
+            self.passed_tests.append(subtest)
 
     def addSkip(self, test, reason):
         super().addSkip(test, reason)
@@ -83,23 +102,21 @@ class ShardResult(unittest.TextTestResult):
             self.emit("fixture", event)
 
     def stopTest(self, test):
+        stopped_at = time.monotonic()
         if test is not self.active_test:
             raise ShardError(f"unittest occurrence {_test_ids([test])[0]!r} stopped without starting")
         self.active_test = None
         if sys.exception() is None:
             events = list(self.events(test))
-            outcome = self.case_outcome(events)
-            self.record(outcome, events)
+            outcome = _case_outcome(events)
+            if outcome is None:
+                name = self.ids[self.position]
+                raise ShardError(f"unittest occurrence {name!r} stopped without an outcome")
+            self.record(outcome, events, stopped_at - self.started_at)
         super().stopTest(test)
 
-    def case_outcome(self, events):
-        outcomes = [outcome for _, outcome, _ in events]
-        if outcomes and (outcomes[-1] != "skipped" or not self.passed_subtest):
-            return outcomes[-1]
-        return "passed"
-
-    def record(self, outcome, events):
-        record = [self.position, self.ids[self.position], outcome, events]
+    def record(self, outcome, events, duration, fixture=None):
+        record = [self.position, self.ids[self.position], outcome, events, duration, fixture]
         self.records.append(record)
         self.emit("terminal", record)
 
@@ -108,14 +125,28 @@ class ShardResult(unittest.TextTestResult):
             self.observe(event, value)
 
     def events(self, current):
+        for test in self.passed_tests:
+            yield self.event_id(test, current), "passed", ""
+        yield from self.result_events(current)
+
+    def result_events(self, current):
         for outcome, field in self.event_fields:
             entries = getattr(self, field)
             for entry in entries[self.offsets[field]:]:
                 test, detail = entry if isinstance(entry, tuple) else (entry, "")
                 if not isinstance(test, unittest.suite._ErrorHolder):
-                    name = self.ids[self.position] if test is current else _test_ids([test])[0]
-                    yield name, outcome, detail
+                    yield self.event_id(test, current), outcome, detail
             self.offsets[field] = len(entries)
+
+    def event_id(self, test, current):
+        return self.ids[self.position] if test is current else _test_ids([test])[0]
+
+
+def _case_outcome(events):
+    outcomes = {outcome for _, outcome, _ in events}
+    if "passed" in outcomes:
+        outcomes.discard("skipped")
+    return max(outcomes, key=EVENT_OUTCOMES.index, default=None)
 
 
 class ShardSuite(unittest.TestSuite):
@@ -133,7 +164,7 @@ class ShardSuite(unittest.TestSuite):
             return
         outcome = result.fixture_outcomes.get(fixture)
         if outcome is not None:
-            result.record("fixture skipped" if outcome == "skipped" else "blocked", [])
+            result.record("fixture skipped" if outcome == "skipped" else "blocked", [], None, fixture)
 
 
 def _blocking_fixture(test, result):
@@ -209,18 +240,16 @@ def _affected_discovery(path, journal):
 
 def _affected_schedule(tests, ids, loader, full, journal):
     cases = set()
-    reported_ids = []
     failed = []
-    for position, (test, name) in enumerate(zip(tests, ids, strict=True)):
+    for position, test in enumerate(tests):
         if isinstance(test, unittest.loader._FailedTest):
-            reported_ids.append(None)
             failed.append(position)
         else:
-            reported_ids.append(name)
             cases.add(id(test))
     full = _suite_reason(full, loader, cases)
     header = {
-        "ids": reported_ids,
+        "ids": ids,
+        "discovery_failed": failed,
         "full": full,
         "discovery_errors": loader.errors,
     }
@@ -243,9 +272,9 @@ def _affected_event(journal, event, value):
 
 def _affected_execution(tests, ids, positions, journal):
     report = _execute(tests, ids, positions, functools.partial(_affected_event, journal))
-    _validate_records(ids, positions, report["records"])
+    _validate_records(ids, positions, report["records"], report["fixtures"], started=report["started"])
     _journal_event(journal, "finished", None)
-    return int(any(outcome in FAILED_OUTCOMES for _, outcome, _ in _events(report["records"], [report])))
+    return int(bool(failed_subjects(report["records"], report["fixtures"])))
 
 
 def _run_affected(path):
@@ -259,7 +288,8 @@ def _run_affected(path):
 
 def _affected_error(journal, error):
     if journal.tell() == 0:
-        print(json.dumps({"ids": [], "full": None, "discovery_errors": []}), file=journal, flush=True)
+        header = {"ids": [], "discovery_failed": [], "full": None, "discovery_errors": []}
+        print(json.dumps(header), file=journal, flush=True)
     _journal_event(journal, "error", str(error))
     print(f"unittest shards: {error}", file=sys.stderr)
     return 1
@@ -314,7 +344,7 @@ def _execute(tests, ids, positions=None, observe=None):
         result = unittest.TextTestRunner(
             stream=stream, resultclass=result_class, warnings=None if sys.warnoptions else "default",
         ).run(suite)
-    return {"ids": ids, "records": result.records, "fixtures": result.fixtures}
+    return {"ids": ids, "records": result.records, "fixtures": result.fixtures, "started": result.started}
 
 
 def _discovery_difference(expected, actual, worker):
@@ -344,15 +374,131 @@ def _position_labels(ids, positions):
     return ", ".join(_position_label(ids, position) for position in positions)
 
 
-def _validate_records(ids, expected, records):
-    problems = _record_problems(expected, records)
-    details = "; ".join(
-        f"{name} {_position_labels(ids, positions)}" for name, positions in problems.items() if positions
+def _valid_ids(ids):
+    return isinstance(ids, list) and all(isinstance(name, str) for name in ids)
+
+
+def _valid_event(event, outcomes):
+    return (
+        isinstance(event, (list, tuple)) and len(event) == 3
+        and all(isinstance(item, str) for item in event) and event[1] in outcomes
     )
+
+
+def _duration(value):
+    return type(value) in (int, float) and 0 <= value <= sys.float_info.max
+
+
+def _valid_events(events, outcomes):
+    return isinstance(events, list) and all(map(functools.partial(_valid_event, outcomes=outcomes), events))
+
+
+def _validate_fixture_record(label, record, fixture_events):
+    _, _, outcome, events, duration, fixture = record
+    if duration is not None or events != []:
+        raise ShardError(f"{label}: invalid timing or case events for {outcome!r}")
+    if (fixture, FIXTURE_OUTCOMES[outcome]) not in fixture_events:
+        raise ShardError(f"{label}: missing setup fixture evidence for {outcome!r}: {fixture!r}")
+
+
+def _validate_case_record(label, record):
+    _, _, outcome, events, duration, fixture = record
+    if not _valid_events(events, EVENT_OUTCOMES):
+        raise ShardError(f"{label}: invalid unittest outcome events")
+    if outcome != _case_outcome(events) or fixture is not None or not _duration(duration):
+        raise ShardError(f"{label}: invalid outcome or duration: {outcome!r}, {duration!r}")
+
+
+def _validate_terminal(ids, record, fixture_events):
+    position, name, outcome, _, _, fixture = record
+    label = _position_label(ids, position)
+    if name != ids[position]:
+        raise ShardError(f"{label}: expected the discovery ID, got {name!r}")
+    if not isinstance(outcome, str):
+        raise ShardError(f"{label}: invalid outcome {outcome!r}")
+    if outcome in FIXTURE_OUTCOMES:
+        if not isinstance(fixture, str):
+            raise ShardError(f"{label}: expected a setup fixture ID, got {fixture!r}")
+        _validate_fixture_record(label, record, fixture_events)
+    else:
+        _validate_case_record(label, record)
+
+
+def _valid_position(position):
+    return type(position) is int
+
+
+def _validate_starts(ids, expected, records, started):
+    measured = [record[0] for record in records if record[4] is not None]
+    if started[:len(measured)] != measured:
+        detail = _position_labels(ids, sorted(set(started) | set(measured)))
+        raise ShardError(f"started occurrences disagree with measured records: {detail}")
+    outstanding = started[len(measured):]
+    allowed = expected[len(records):len(records) + 1]
+    if outstanding not in ([], allowed):
+        raise ShardError(f"unexpected outstanding starts: {_position_labels(ids, outstanding)}")
+
+
+def _record_position(record):
+    if not isinstance(record, list) or not record or not _valid_position(record[0]):
+        raise ShardError(f"invalid terminal record: {record!r}")
+    return record[0]
+
+
+def _record_problem_detail(ids, expected, records):
+    return "; ".join(
+        f"{name} {_position_labels(ids, positions)}"
+        for name, positions in _record_problems(expected, records).items() if positions
+    )
+
+
+def _validate_schedule(ids, expected, records):
+    details = _record_problem_detail(ids, expected, records)
     if details:
         raise ShardError(
             f"shard record validation failed: expected one record per discovery position, got {details}"
         )
+    positions = list(map(_record_position, records))
+    if positions != expected:
+        raise ShardError(f"out-of-order terminal records: {_position_labels(ids, positions)}")
+
+
+def _validate_record_shapes(ids, records):
+    if not isinstance(records, list):
+        raise ShardError("expected a list of terminal records")
+    for record in records:
+        position = _record_position(record)
+        if len(record) != 6:
+            raise ShardError(f"{_position_label(ids, position)}: invalid terminal record shape")
+
+
+def _setup_fixtures(fixtures):
+    if not _valid_events(fixtures, ("error", "skipped")):
+        raise ShardError("invalid unittest fixture events")
+    return {
+        (name, outcome) for name, outcome, _ in fixtures
+        if name.startswith(("setUpClass (", "setUpModule ("))
+    }
+
+
+def _validate_started(ids, expected, records, started):
+    if started is None:
+        return
+    if not isinstance(started, list) or not all(map(_valid_position, started)):
+        raise ShardError(f"invalid started occurrences: {started!r}")
+    _validate_starts(ids, expected, records, started)
+
+
+def _validate_records(ids, expected, records, fixtures, *, complete=True, started=None):
+    if not _valid_ids(ids):
+        raise ShardError("expected a discovery ID list of strings")
+    _validate_record_shapes(ids, records)
+    expected = list(expected)
+    _validate_schedule(ids, expected if complete else expected[:len(records)], records)
+    fixture_events = _setup_fixtures(fixtures)
+    for record in records:
+        _validate_terminal(ids, record, fixture_events)
+    _validate_started(ids, expected, records, started)
 
 
 def validate_reports(ids, reports):
@@ -360,7 +506,15 @@ def validate_reports(ids, reports):
         difference = _discovery_difference(ids, report["ids"], worker)
         if difference:
             raise ShardError(difference)
-    _validate_records(ids, range(len(ids)), _records(reports))
+    records = sorted(_records(reports), key=_record_position)
+    fixtures = [event for report in reports for event in report.get("fixtures", [])]
+    _validate_records(ids, range(len(ids)), records, fixtures, started=_report_starts(reports))
+
+
+def _report_starts(reports):
+    if any("started" not in report for report in reports):
+        return None
+    return sorted(position for report in reports for position in report["started"])
 
 
 def _records(reports):
@@ -393,17 +547,34 @@ def _worker(options):
     ids = _test_ids(tests)
     selected = plan["shares"][int(index)] if ids == plan["ids"] else []
     with path.with_suffix(".jsonl").open("w", encoding="utf-8") as journal:
-        report = _execute(tests, ids, selected, functools.partial(_journal_event, journal))
-    path.write_text(json.dumps({"ids": ids, "fixtures": report["fixtures"]}), encoding="utf-8")
+        _execute(tests, ids, selected, functools.partial(_journal_event, journal))
+    path.write_text(json.dumps(ids), encoding="utf-8")
 
 
-def _completed_records(path):
+def _worker_journal(path, interrupted):
+    events = {name: [] for name in ("started", "terminal", "fixture")}
     try:
-        contents = path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8") as journal:
+            _read_worker_frames(journal, events, interrupted)
     except FileNotFoundError:
-        return []
-    events = (json.loads(line) for line in contents.split("\n")[:-1])
-    return [record for event, record in events if event == "terminal"]
+        pass
+    return events
+
+
+def _read_worker_frames(journal, events, interrupted):
+    for line in journal:
+        if interrupted and not line.endswith("\n"):
+            break
+        event, value = _decode_journal_frame(line, json.loads)
+        _append_worker_frame(events, event, value)
+
+
+def _append_worker_frame(events, event, value):
+    if event not in events:
+        raise ValueError(f"unexpected worker journal event {event!r}")
+    if event == "terminal":
+        _record_position(value)
+    events[event].append(value)
 
 
 def _worker_failure(path, ids, positions, records, reason):
@@ -416,21 +587,35 @@ def _worker_failure(path, ids, positions, records, reason):
 
 def _load_worker_report(path):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        ids = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as error:
         raise ShardError(f"expected a readable JSON report at {path}, got {error}") from error
+    if not _valid_ids(ids):
+        raise ShardError(f"{path}: expected a discovery ID list of strings")
+    return ids
+
+
+def _worker_records(path, ids, positions, status):
+    try:
+        return _worker_journal(path.with_suffix(".jsonl"), interrupted=bool(status))
+    except (OSError, ShardError, ValueError, RecursionError) as error:
+        reason = f"invalid worker journal: {error}"
+        if status:
+            reason = f"expected exit status 0, got {status}; {reason}"
+        raise _worker_failure(path, ids, positions, [], reason) from error
 
 
 def _read_worker(process, path, ids, positions):
     status = process.wait()
-    records = _completed_records(path.with_suffix(".jsonl"))
+    events = _worker_records(path, ids, positions, status)
+    records, fixtures, started = events["terminal"], events["fixture"], events["started"]
     try:
         if status:
             raise ShardError(f"expected exit status 0, got {status}")
-        report = _load_worker_report(path)
-        if ids == report["ids"]:
-            _validate_records(ids, positions, records)
-        return {**report, "records": records}
+        discovered = _load_worker_report(path)
+        if ids == discovered:
+            _validate_records(ids, positions, records, fixtures, started=started)
+        return {"ids": discovered, "records": records, "fixtures": fixtures, "started": started}
     except ShardError as error:
         raise _worker_failure(path, ids, positions, records, str(error)) from error
 
@@ -513,19 +698,29 @@ def _summary(reports, elapsed):
     return int(failed)
 
 
-def _failed_ids(reports):
-    tests = {name for _, name, outcome, _ in _records(reports) if outcome in FAILED_OUTCOMES}
-    fixtures = {name for name, outcome, _ in _events((), reports) if outcome in FAILED_OUTCOMES}
+def failed_subjects(records, fixtures, labels=None):
+    labels = {} if labels is None else labels
+    tests = {labels.get(position, name) for position, name in _failed_occurrences(records)}
+    fixtures = {name for name, outcome, _ in fixtures if outcome in FAILED_OUTCOMES}
     return sorted(tests | fixtures)
 
 
-def _write_failed_report(path, reports, status):
+def _failed_occurrences(records):
+    return [(record[0], record[1]) for record in records if record[2] in FAILED_OUTCOMES]
+
+
+def _write_result_report(path, ids, reports, status):
     if path is None:
         return status
+    document = {
+        "ids": ids,
+        "records": sorted(_records(reports), key=_record_position),
+        "fixtures": [event for report in reports for event in report["fixtures"]],
+    }
     try:
-        path.write_text(json.dumps({"failed": _failed_ids(reports)}), encoding="utf-8")
+        path.write_text(json.dumps(document, allow_nan=False), encoding="utf-8")
     except OSError as error:
-        print(f"unittest shards: cannot write failed test report {path}: {error}", file=sys.stderr)
+        print(f"unittest shards: cannot write test result report {path}: {error}", file=sys.stderr)
         return 1
     return status
 
@@ -585,7 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--start-directory", dest="start", required=True)
     parser.add_argument("-p", "--pattern", default="test*.py")
     parser.add_argument("-j", "--workers", type=int)
-    parser.add_argument("--failed-report", type=Path, metavar="PATH")
+    parser.add_argument("--result-report", type=Path, metavar="PATH")
     parser.add_argument("--worker", nargs=2, help=argparse.SUPPRESS)
     return parser
 
@@ -636,12 +831,12 @@ def main(argv=None):
         validate_reports(ids, reports)
     except (ShardError, ImportError, OSError) as error:
         print(f"unittest shards: {error}", file=sys.stderr)
-        if options is not None and options.failed_report is not None:
-            print(f"unittest shards: no failed test report written to {options.failed_report}",
+        if options is not None and options.result_report is not None:
+            print(f"unittest shards: no test result report written to {options.result_report}",
                   file=sys.stderr)
         return 1
     status = _summary(reports, time.monotonic() - start)
-    return _write_failed_report(options.failed_report, reports, status)
+    return _write_result_report(options.result_report, ids, reports, status)
 
 
 def _entry(argv):

@@ -306,6 +306,32 @@ requires = "legacy-tests"
             "expired": False, "location": "tests/suite.el", "locations": None,
         } for symbol in ("failing", "surprising")])
 
+    def test_ert_quit_is_reported_even_when_native_counts_exclude_it(self) -> None:
+        for spec, expected, reason in (
+            ("", False, "(quit)"),
+            (":expected-result '(satisfies ert-test-quit-p) ", True, "did not complete all selected tests"),
+        ):
+            with self.subTest(expected=expected):
+                self.add_file("tests/suite.el", "(require 'ert)\n"
+                              f"(ert-deftest quitting () {spec}(signal 'quit nil))\n"
+                              "(ert-run-tests-batch-and-exit t)\n")
+                _result, check = self.assert_outcome("fail", reason)
+                subjects = [finding["subject"] for finding in check["findings"]]
+                self.assertEqual(subjects, [] if expected else ["quitting"])
+                row, = check["test_results"]
+                self.assertEqual(row["outcome"], "ert-test-quit")
+                self.assertEqual(row["expected"], expected)
+                self.assertGreaterEqual(row["duration_seconds"], 0)
+
+    def test_emacs_signal_preserves_execution_diagnostics(self) -> None:
+        self.add_file("tests/suite.el", "(require 'ert)\n"
+                      "(ert-deftest interrupted () (signal-process (emacs-pid) 'SIGKILL))\n"
+                      "(ert-run-tests-batch-and-exit t)\n")
+        _result, check = self.assert_outcome("unsupported", "Emacs terminated by signal 9")
+        self.assertEqual(check["execution"], "signal")
+        self.assertEqual(check["diagnostics"]["signal"], 9)
+        self.assertNotIn("test_results", check)
+
     def test_no_tests_and_all_skipped_fail(self) -> None:
         suites = [
             ("(ert-run-tests-batch-and-exit \"no-such-test\")", "0 selected, 0 skipped"),
@@ -490,7 +516,9 @@ baseline = "crap.toml"
         wrapper.chmod(0o755)
         self.write_config(config(f'emacs = {json.dumps(str(wrapper))}'))
         document = {"emacs_version": version, "selected": 1, "passed": 1, "failed": 0,
-                    "skipped": 0, "failures": [], "definitions": []}
+                    "skipped": 0, "selected_ids": ["passing"],
+                    "test_results": [{"position": 0, "id": "passing", "outcome": "ert-test-passed",
+                                      "duration_seconds": 0.125, "expected": True}], "definitions": []}
         encoded = json.dumps(json.dumps(document))
         self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {encoded})\n")
 
@@ -519,7 +547,9 @@ baseline = "crap.toml"
 
     def test_invalid_json_measurements_are_unsupported(self) -> None:
         valid = {"emacs_version": "30.1", "selected": 1, "passed": 1, "failed": 0,
-                 "skipped": 0, "failures": [], "definitions": []}
+                 "skipped": 0, "selected_ids": ["passing"],
+                    "test_results": [{"position": 0, "id": "passing", "outcome": "ert-test-passed",
+                                      "duration_seconds": 0.125, "expected": True}], "definitions": []}
         documents = [
             [],
             {"missing": "keys"},
@@ -528,8 +558,13 @@ baseline = "crap.toml"
             {**valid, "emacs_version": ""},
             {**valid, "selected": True},
             {**valid, "passed": 0},
-            {**valid, "failures": [{"name": "extra", "condition": "failure"}]},
-            {**valid, "failures": "bad"},
+            {**valid, "selected_ids": ["different"]},
+            {**valid, "test_results": []},
+            {**valid, "test_results": "bad"},
+            {**valid, "test_results": [{**valid["test_results"][0], "duration_seconds": -1}]},
+            {**valid, "test_results": valid["test_results"] * 2},
+            {**valid, "selected": 2, "passed": 2, "selected_ids": ["passing", "passing"],
+             "test_results": [valid["test_results"][0], {**valid["test_results"][0], "position": 1}]},
             {**valid, "definitions": ["bad"]},
             {**valid, "definitions": [{"symbol": None, "file": "src/core.el", "position": 1,
                                         "stop_points": 1, "reached": 0}]},
@@ -546,11 +581,13 @@ baseline = "crap.toml"
             with self.subTest(document=document):
                 encoded = json.dumps(json.dumps(document))
                 self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {encoded})\n")
-                self.assert_outcome("unsupported", "expected", "got")
+                _result, check = self.assert_outcome("unsupported", "result.json", "expected", "got")
+                self.assertNotIn("test_results", check)
+                self.assertEqual(check["diagnostics"]["exit_code"], 0)
 
     def test_duplicate_test_count_is_unsupported(self) -> None:
         report = ('{"emacs_version":"30.1","selected":1,"passed":1,"failed":1,"failed":0,'
-                  '"skipped":0,"failures":[],"definitions":[]}')
+                  '"skipped":0,"selected_ids":[],"test_results":[],"definitions":[]}')
         self.report_version("30.1")
         self.add_file("tests/suite.el", SUITE + f"(defun json-encode (_object) {json.dumps(report)})\n")
         _result, check = self.assert_outcome("unsupported", "JSON result document", "duplicate name 'failed'")

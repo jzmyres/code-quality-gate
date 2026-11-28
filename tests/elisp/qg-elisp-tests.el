@@ -238,8 +238,8 @@ gate's instrumentation."
                                     (error-message-string failure)))))
       (qg-elisp-tests--delete directory))))
 
-(ert-deftest qg-elisp-tests-child-failures ()
-  "Describe unexpected ERT results with their names and conditions."
+(ert-deftest qg-elisp-tests-child-results ()
+  "Describe both unexpected ERT outcomes with their native types and conditions."
   (let ((directory (qg-elisp-tests--temporary-directory)))
     (unwind-protect
         (progn
@@ -253,19 +253,18 @@ gate's instrumentation."
                    "(ert-run-tests-batch-and-exit"
                    " \"qg-elisp-tests-nested-failing\")\n"))
           (let* ((stats (qg-elisp-child--run-tests directory "failing.el"))
-                 (failures (qg-elisp-child--failures stats)))
-            (should (= (length failures) 2))
-            (let ((broken (cl-find "qg-elisp-tests-nested-failing-broken"
-                                   (append failures nil)
-                                   :key (lambda (item) (alist-get 'name item))
-                                   :test #'equal)))
-              (should broken)
-              (should (string-match-p "ert-test-failed"
-                                      (alist-get 'condition broken))))
-            (should (cl-find "qg-elisp-tests-nested-failing-surprising"
-                             (append failures nil)
-                             :key (lambda (item) (alist-get 'name item))
-                             :test #'equal))))
+                 (report (qg-elisp-child--test-results stats))
+                 (rows (alist-get 'test_results report))
+                 (broken (aref rows 0))
+                 (surprising (aref rows 1)))
+            (should (equal (alist-get 'selected_ids report)
+                           ["qg-elisp-tests-nested-failing-broken"
+                            "qg-elisp-tests-nested-failing-surprising"]))
+            (should (equal (alist-get 'outcome broken) "ert-test-failed"))
+            (should (equal (alist-get 'outcome surprising) "ert-test-passed"))
+            (dolist (row (append rows nil))
+              (should (eq (alist-get 'expected row) :json-false))
+              (should (stringp (alist-get 'condition row))))))
       (qg-elisp-tests--delete directory))))
 
 (ert-deftest qg-elisp-tests-child-result-document ()
@@ -298,7 +297,9 @@ gate's instrumentation."
             (should (= (alist-get 'selected report) 1))
             (should (= (alist-get 'passed report) 1))
             (should (= (alist-get 'failed report) 0))
-            (should (equal (alist-get 'failures report) []))
+            (should (equal (alist-get 'selected_ids report) ["qg-elisp-tests-nested-result"]))
+            (should (equal (alist-get 'outcome (aref (alist-get 'test_results report) 0))
+                           "ert-test-passed"))
             (should (equal (alist-get 'file entry) "module.el"))
             (should (> (alist-get 'stop_points entry) 0))))
       (qg-elisp-tests--delete directory))))

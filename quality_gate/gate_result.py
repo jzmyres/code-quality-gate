@@ -527,7 +527,7 @@ def _check_base(result: CheckResult) -> str | None:
 
 def _ledger_check(result: CheckResult) -> dict[str, Any]:
     selection = result.report_fields.get("selection")
-    return {
+    row = {
         "id": result.id,
         "adapter": result.adapter,
         "metric_version": result.metric_version,
@@ -545,6 +545,10 @@ def _ledger_check(result: CheckResult) -> dict[str, Any]:
         },
         "findings": [_ledger_finding(item) for item in _reported_findings(result)],
     }
+
+    if "test_results" in result.report_fields:
+        row["test_results"] = result.report_fields["test_results"]
+    return row
 
 
 def _ledger_scope(

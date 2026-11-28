@@ -29,6 +29,13 @@ if TYPE_CHECKING:
 
 ELISP_MINIMUM_VERSION = "30.1"
 _VERSION_TEXT_LIMIT = 128
+ERT_OUTCOMES = {
+    "ert-test-passed": "completed",
+    "ert-test-failed": "completed",
+    "ert-test-skipped": "skipped",
+    "ert-test-quit": None,
+    "ert-test-aborted-with-non-local-exit": None,
+}
 
 
 @dataclass(frozen=True)
@@ -207,15 +214,13 @@ def _definition(item: Any, selected: list[str]) -> bool:
             and _definition_file(item, selected) and _definition_counts(item))
 
 
-def _failure(item: Any) -> bool:
-    return (isinstance(item, dict) and set(item) == {"name", "condition"}
-            and all(isinstance(item[key], str) and item[key] for key in ("name", "condition")))
-
-
 def _validate_shape(document: Any) -> None:
     if not isinstance(document, dict):
         raise ValueError("a JSON object")
-    keys = {"emacs_version", "selected", "passed", "failed", "skipped", "failures", "definitions"}
+    keys = {
+        "emacs_version", "selected", "passed", "failed", "skipped", "selected_ids",
+        "test_results", "definitions",
+    }
     if set(document) != keys:
         raise ValueError(f"keys {sorted(keys)}, got {sorted(document)}")
 
@@ -223,16 +228,85 @@ def _validate_shape(document: Any) -> None:
 def _validate_counts(document: dict[str, Any]) -> None:
     if not all(_count(document[key]) for key in ("selected", "passed", "failed", "skipped")):
         raise ValueError("non-negative integer test counts")
-    if document["selected"] != document["passed"] + document["failed"] + document["skipped"]:
-        raise ValueError("selected equal to passed + failed + skipped")
 
 
-def _validate_failures(document: dict[str, Any]) -> None:
-    failures = document["failures"]
-    if not isinstance(failures, list) or not all(_failure(item) for item in failures):
-        raise ValueError("a list of named failure conditions")
-    if len(failures) != document["failed"]:
-        raise ValueError("one condition per unexpected result")
+def _result_keys(row: Any, label: str) -> None:
+    keys = {"position", "id", "outcome", "expected", "duration_seconds"}
+    if not isinstance(row, dict) or type(row.get("expected")) is not bool:
+        raise ValueError(f"{label}: expected a result row with boolean expectedness")
+    if not row["expected"]:
+        keys.add("condition")
+    if set(row) != keys:
+        raise ValueError(f"{label}: expected result keys {sorted(keys)}, got {sorted(row)}")
+
+
+def _result_duration(duration: Any) -> bool:
+    return type(duration) in (int, float) and 0 <= duration <= sys.float_info.max
+
+
+def _validate_unexpected_result(row: dict, label: str) -> None:
+    condition = row["condition"]
+    if row["outcome"] == "ert-test-skipped" or not isinstance(condition, str) or not condition:
+        raise ValueError(f"{label}: invalid unexpected result condition")
+
+
+def _validate_result(row: Any, position: int, name: str) -> None:
+    label = f"ERT selection position {position} ({name!r})"
+    _result_keys(row, label)
+    if type(row["position"]) is not int or (row["position"], row["id"]) != (position, name):
+        raise ValueError(f"{label}: got position {row['position']!r} and ID {row['id']!r}")
+    _validate_result_outcome(row, label)
+
+
+def _validate_result_outcome(row: dict, label: str) -> None:
+    outcome = row["outcome"]
+    if not isinstance(outcome, str) or outcome not in ERT_OUTCOMES:
+        raise ValueError(f"{label}: invalid native outcome {outcome!r}")
+    if not _result_duration(row["duration_seconds"]):
+        raise ValueError(f"{label}: invalid duration {row['duration_seconds']!r}")
+    if not row["expected"]:
+        _validate_unexpected_result(row, label)
+
+
+def _result_class(row: dict) -> str | None:
+    category = ERT_OUTCOMES[row["outcome"]]
+    if category == "completed":
+        return "passed" if row["expected"] else "failed"
+    return category
+
+
+def _validate_selected_ids(ids: list) -> None:
+    seen = set()
+    for position, name in enumerate(ids):
+        if not isinstance(name, str) or not name or name in seen:
+            raise ValueError(f"ERT selection position {position}: invalid or duplicate selected ID {name!r}")
+        seen.add(name)
+
+
+def _result_counts(ids: list, rows: list) -> dict:
+    counts = dict.fromkeys(("passed", "failed", "skipped"), 0)
+    for position, name in enumerate(ids):
+        if position >= len(rows):
+            raise ValueError(f"ERT selection position {position} ({name!r}): missing result")
+        row = rows[position]
+        _validate_result(row, position, name)
+        category = _result_class(row)
+        if category is not None:
+            counts[category] += 1
+    if len(rows) > len(ids):
+        raise ValueError(f"unexpected ERT result at position {len(ids)}: {rows[len(ids)]!r}")
+    return counts
+
+
+def _validate_results(document: dict[str, Any]) -> None:
+    ids, rows = document["selected_ids"], document["test_results"]
+    if not isinstance(ids, list) or not isinstance(rows, list):
+        raise ValueError("expected selected_ids and test_results arrays")
+    _validate_selected_ids(ids)
+    counts = _result_counts(ids, rows)
+    native_counts = {key: document[key] for key in counts}
+    if (len(ids), counts) != (document["selected"], native_counts):
+        raise ValueError(f"ERT result counts disagree with native totals: selected={len(ids)}, {counts}")
 
 
 def _validate_definitions(document: dict[str, Any], selected: list[str]) -> None:
@@ -245,7 +319,7 @@ def validate_document(document: Any, selected: list[str]) -> dict[str, Any]:
     """Validate a child measurement, raising ValueError on malformed evidence."""
     _validate_shape(document)
     _validate_counts(document)
-    _validate_failures(document)
+    _validate_results(document)
     _validate_definitions(document, selected)
     return document
 
@@ -260,7 +334,7 @@ def _error_document(document: Any) -> bool:
 def _read_document(path: Path, selected: list[str], version: str) -> dict[str, Any]:
     try:
         document = load_json(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as error:
+    except (OSError, ValueError, RecursionError) as error:
         raise ValueError(f"a JSON result document, got {error}") from error
     _validate_report_version(document, version)
     if _error_document(document):
@@ -272,7 +346,7 @@ def _read_document(path: Path, selected: list[str], version: str) -> dict[str, A
         ).encode("utf-8"))
         return validated
     except (OSError, ValueError) as error:
-        raise ValueError(f"a valid result ({error}), got {document!r}") from error
+        raise ValueError(f"a valid result, got {error}") from error
 
 
 def apply_document(result: Any, document: dict[str, Any]) -> None:
@@ -282,16 +356,22 @@ def apply_document(result: Any, document: dict[str, Any]) -> None:
     result.measurement = {"tests": document["selected"] - document["skipped"]}
     result.tool = {"name": "Emacs", "version": document["emacs_version"]}
     result.adapter_data = document["definitions"]
-    result.report_fields = {"definitions": document["definitions"]}
+    result.report_fields = {"definitions": document["definitions"], "test_results": document["test_results"]}
+
+
+def _unexpected_results(document: dict[str, Any]) -> list[dict]:
+    return [row for row in document["test_results"] if not row["expected"]]
 
 
 def _verdict(document: dict[str, Any]) -> str | None:
+    unexpected = _unexpected_results(document)
+    if unexpected:
+        conditions = "; ".join(f"{row['id']}: {row['condition']}" for row in unexpected)
+        return f"unexpected test results: {conditions}"
     if document["selected"] == document["skipped"]:
         return f"no test executed: {document['selected']} selected, {document['skipped']} skipped"
-    if document["failed"]:
-        return "unexpected test results: " + "; ".join(
-            f"{item['name']}: {item['condition']}" for item in document["failures"]
-        )
+    if document["selected"] != document["passed"] + document["failed"] + document["skipped"]:
+        return "ERT did not complete all selected tests"
     return None
 
 
@@ -300,7 +380,7 @@ def _temporary() -> tempfile.TemporaryDirectory[str]:
 
 
 def _failure_findings(document: dict[str, Any], suite: str) -> list[FindingResult]:
-    names = sorted({item["name"] for item in document["failures"]})
+    names = sorted(row["id"] for row in _unexpected_results(document))
     return [
         FindingResult(
             subject=name, value=1, bound=None, threshold=0, baseline_reason=None,
@@ -312,21 +392,23 @@ def _failure_findings(document: dict[str, Any], suite: str) -> list[FindingResul
 
 def _finish(context: Any, start: float, run_result: Any, document: dict[str, Any],
             evidence: Path) -> Any:
-    from .checks import _check_result, _tests_result
+    from .checks import _check_result, _combined_reason, _tests_result
 
     check, spec = context.check, context.check.spec
     diagnostics = run_result.diagnostics()
     if "error" in document:
         return _tests_result(
-            check, spec, start, context.prefix, document["error"],
+            check, spec, start, context.prefix, f"child exit {run_result.returncode}: {document['error']}",
             diagnostics=diagnostics, report=False,
         )
-    if run_result.returncode != 0:
-        reason = f"expected child exit 0 with a result, got exit {run_result.returncode}"
-        return _tests_result(check, spec, start, context.prefix, reason, outcome="unsupported",
-                             diagnostics=diagnostics, report=False)
     reason = _verdict(document)
-    result = _check_result(check, start, "fail" if reason else "pass", budget_seconds=spec.budget_seconds,
+    outcome = "fail" if reason else "pass"
+    if run_result.returncode != 0:
+        reason = _combined_reason(
+            f"expected child exit 0 with a result, got exit {run_result.returncode}", reason,
+        )
+        outcome = "unsupported"
+    result = _check_result(check, start, outcome, budget_seconds=spec.budget_seconds,
                            diagnostics=diagnostics, reason=reason, evidence_path=evidence)
     result.findings = _failure_findings(document, spec.suite)
     apply_document(result, document)
@@ -342,6 +424,11 @@ def _execution_failure(context: Any, start: float, run_result: Any) -> Any:
         return _tests_result(
             check, spec, start, prefix, "Emacs exceeded its budget",
             execution=outcome.name, diagnostics=run_result.diagnostics(), report=False,
+        )
+    if outcome.signal:
+        return _tests_result(
+            check, spec, start, prefix, f"Emacs terminated by signal {-run_result.returncode}",
+            outcome="unsupported", execution=outcome.name, diagnostics=run_result.diagnostics(), report=False,
         )
     if outcome.error:
         reason = f"expected Emacs command {spec.emacs!r}, got {run_result.error}"
@@ -427,7 +514,9 @@ def run_tests(context: Any) -> Any:
         mark_step("Emacs result validation")
         document = _read_document(evidence, selected, version)
     except ValueError as error:
-        reason = f"expected {error}; child exit {child.returncode}, execution {child.execution}"
+        reason = (
+            f"{evidence.name}: expected {error}; child exit {child.returncode}, execution {child.execution}"
+        )
         result = _tests_result(context.check, spec, start, context.prefix, reason, outcome="unsupported",
                                execution=child.execution, diagnostics=child.diagnostics(), report=False)
         return _finish_test_result(result, temporary_reason, context.prefix)

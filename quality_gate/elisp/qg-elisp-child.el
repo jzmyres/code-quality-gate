@@ -85,14 +85,40 @@
         (string-trim-right (buffer-string)))
     (ert-string-for-test-result result nil)))
 
-(defun qg-elisp-child--failures (stats)
-  "Return STATS' unexpected test results as a JSON array."
-  (vconcat
-   (cl-loop for test across (ert--stats-tests stats)
-            for result across (ert--stats-test-results stats)
-            unless (ert-test-result-expected-p test result)
-            collect `((name . ,(format "%s" (ert-test-name test)))
-                      (condition . ,(qg-elisp-child--condition result))))))
+(defun qg-elisp-child--test-results (stats)
+  "Return the selected IDs and terminal result rows from STATS."
+  (let ((tests (ert--stats-tests stats))
+        (results (ert--stats-test-results stats)))
+    (unless (and (vectorp tests) (vectorp results)
+                 (= (length tests) (length results) (ert-stats-total stats)))
+      (error "ERT selected-test and result vectors disagree with the selection total"))
+    `((selected_ids . ,(vconcat (mapcar #'qg-elisp-child--test-id tests)))
+      (test_results . ,(vconcat
+                        (cl-loop for test across tests
+                                 for result across results
+                                 for position from 0
+                                 collect (qg-elisp-child--test-result test result position)))))))
+
+(defun qg-elisp-child--test-id (test)
+  "Return the selected TEST's symbol name."
+  (let ((name (and (ert-test-p test) (ert-test-name test))))
+    (unless (and name (symbolp name))
+      (error "Invalid selected ERT test: %S" test))
+    (symbol-name name)))
+
+(defun qg-elisp-child--test-result (test result position)
+  "Return TEST's native RESULT at selection POSITION as a JSON object."
+  (let ((id (qg-elisp-child--test-id test)))
+    (unless (ert-test-result-p result)
+      (error "Missing native ERT result for %s at position %d" id position))
+    (let ((expected (ert-test-result-expected-p test result)))
+      `((position . ,position)
+        (id . ,id)
+        (outcome . ,(symbol-name (type-of result)))
+        (expected . ,(if expected t :json-false))
+        (duration_seconds . ,(ert-test-result-duration result))
+        ,@(unless expected
+            `((condition . ,(qg-elisp-child--condition result))))))))
 
 (defun qg-elisp-child--definition (root definition)
   "Return DEFINITION's stop-point counts as a JSON object relative to ROOT."
@@ -126,7 +152,7 @@ Edebug stop-point counts."
              (passed . ,(ert-stats-completed-expected stats))
              (failed . ,(ert-stats-completed-unexpected stats))
              (skipped . ,(ert-stats-skipped stats))
-             (failures . ,(qg-elisp-child--failures stats))
+             ,@(qg-elisp-child--test-results stats)
              (definitions . ,(vconcat (mapcar (lambda (name)
                                                (qg-elisp-child--definition root name))
                                              names))))))

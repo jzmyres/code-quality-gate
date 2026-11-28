@@ -215,8 +215,20 @@ class ShardsTests(unittest.TestCase):
         environment.pop("QG_PYTHON", None)
         start = self.root / "tests"
         suite = unittest.TestLoader().discover(str(start))
-        with open(os.devnull, "w", encoding="utf-8") as output, shards._quiet(output):
+        ids = []
+        start_test = unittest.TextTestResult.startTest
+
+        def record_start(result, test):
+            ids.append(test.id())
+            start_test(result, test)
+
+        with (
+            open(os.devnull, "w", encoding="utf-8") as output,
+            shards._quiet(output),
+            mock.patch.object(unittest.TextTestResult, "startTest", record_start),
+        ):
             serial = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+        self.assertCountEqual(ids, list(EXPECTED))
         self.assertEqual(serial.testsRun, len(EXPECTED))
         self.assertEqual({test.id() for test, _ in serial.failures},
                          {key for key, value in EXPECTED.items() if value == "failure"})
@@ -231,13 +243,11 @@ class ShardsTests(unittest.TestCase):
             ):
                 self.assertEqual(shards.main(["-s", str(start), "-j", str(workers)]), 1)
                 reports, _ = summary.call_args.args
-                ids = reports[0]["ids"]
-                self.assertEqual(set(ids), set(EXPECTED))
-                records = {
-                    test_id: outcome
-                    for report in reports for _, test_id, outcome, _ in report["records"]
-                }
-                self.assertEqual(records, EXPECTED)
+                self.assertEqual(reports[0]["ids"], ids)
+                records = [row[:3] for report in reports for row in report["records"]]
+                self.assertEqual(sorted(records), [
+                    [position, name, EXPECTED[name]] for position, name in enumerate(ids)
+                ])
 
     def test_shards_discovery_difference_names_position_and_ids(self):
         with self.assertRaisesRegex(shards.ShardError, r"worker 2.*position 2.*'case.b'.*'case.c'"):
@@ -265,10 +275,37 @@ class ShardsTests(unittest.TestCase):
 
     def test_shards_missing_duplicate_and_unexpected_records_name_ids(self):
         ids = ["case.a", "case.b"]
-        records = [[position, "case.a", "passed", []] for position in (0, 0, 2)]
+        records = [[position, "case.a", "passed", [], 0.0, None] for position in (0, 0, 2)]
         diagnostic = r"missing position 2.*case.b.*unexpected position 3.*duplicated position 1.*case.a"
         with self.assertRaisesRegex(shards.ShardError, diagnostic):
             shards.validate_reports(ids, [{"ids": ids, "records": records}])
+
+    def test_shards_reject_starts_inconsistent_with_terminal_records(self):
+        case = unittest.FunctionTestCase(lambda: None)
+        ids = [case.id()]
+        report = shards._execute([case], ids)
+        for starts, defect in (([], "disagree with measured"), ([0, 0], "unexpected outstanding")):
+            with self.subTest(starts=starts):
+                with self.assertRaisesRegex(shards.ShardError, f"{defect}.*{re.escape(ids[0])}"):
+                    shards._validate_records(ids, range(1), report["records"], [], started=starts)
+
+    def test_affected_runner_records_discovery_failure_with_real_id(self):
+        loader = shards.AffectedLoader()
+        failed = unittest.loader._FailedTest("missing", ImportError("missing fixture"))
+        regular = unittest.FunctionTestCase(lambda: None)
+        loader.sourced_cases.add(id(regular))
+        ids = [regular.id(), failed.id()]
+        journal = io.StringIO()
+        loader.errors.append("missing fixture")
+        with contextlib.redirect_stdout(io.StringIO()):
+            tests, recorded_ids, positions = shards._affected_schedule(
+                [regular, failed], ids, loader, None, journal,
+            )
+            self.assertEqual(shards._affected_execution(tests, recorded_ids, positions, journal), 1)
+        header, *events = [json.loads(line) for line in journal.getvalue().splitlines()]
+        self.assertEqual(header["ids"], ids)
+        self.assertEqual(header["discovery_failed"], [1])
+        self.assertEqual(events[1][1][:3], [1, ids[1], "error"])
 
     def test_shards_assign_shares_keeps_modules_and_classes_together(self):
         self.enterContext(mock.patch.dict(sys.modules))
@@ -310,7 +347,38 @@ class ShardsTests(unittest.TestCase):
         self.assertIn("Ran 1 test in 0.000s", output.getvalue())
         self.assertIn("FAILED (failures=2, skipped=1)", output.getvalue())
 
-    def test_failed_report_is_sorted_and_unique(self):
+    def test_shards_store_null_fixture_durations_and_invoked_subtest_evidence(self):
+        class Fixture(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                raise unittest.SkipTest("fixture prevents invocation")
+
+            def runTest(self):
+                self.fail("unreachable")
+
+        class Mixed(unittest.TestCase):
+            def runTest(self):
+                with self.subTest(number=1):
+                    pass
+                with self.subTest(number=2):
+                    self.skipTest("only this subtest")
+
+        cases = [Fixture(), Mixed()]
+        ids = [test.id() for test in cases]
+        clock = mock.Mock(side_effect=(8.0, 8.375))
+        with mock.patch.object(shards.time, "monotonic", clock):
+            report = shards._execute(cases, ids)
+        shards.validate_reports(ids, [report])
+        self.assertEqual(clock.call_count, 2)
+        fixture, invoked = report["records"]
+        self.assertEqual(fixture[:5], [0, ids[0], "fixture skipped", [], None])
+        self.assertEqual(invoked[:3], [1, ids[1], "passed"])
+        self.assertEqual(invoked[4], 0.375)
+        self.assertEqual([(name.removeprefix(ids[1]), outcome) for name, outcome, _ in invoked[3]], [
+            (" (number=1)", "passed"), (" (number=2)", "skipped"),
+        ])
+
+    def test_result_report_includes_failures_and_fixture_events(self):
         (self.root / "tests" / "test_report.py").write_text(
             "import unittest\n"
             "class Blocked(unittest.TestCase):\n"
@@ -333,13 +401,15 @@ class ShardsTests(unittest.TestCase):
         path = self.temporary / "suite report.json"
         for workers in (1, 2):
             with self.subTest(workers=workers):
-                result = self._run_fixture("test*.py", workers, "--failed-report", str(path))
+                result = self._run_fixture("test*.py", workers, "--result-report", str(path))
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"failed": [
+                report = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(shards.failed_subjects(report["records"], report["fixtures"]), [
                     "setUpClass (test_report.Blocked)", "test_output.OutputCase.test_failure",
                     "test_report.Cases.test_subtests", "test_report.Cases.test_unexpected_success",
                     "unittest.loader._FailedTest.test_broken",
-                ]})
+                ])
+                self.assertEqual([row[1] for row in report["records"]], report["ids"])
                 self.assertIn("failures=3, errors=2, skipped=2, unexpected successes=1", result.stdout)
                 path.unlink()
 
@@ -352,17 +422,19 @@ class ShardsTests(unittest.TestCase):
         ):
             status = shards.main([
                 "-s", str(self.root / "tests"), "-p", "test_skips.py", "-j", "1",
-                "--failed-report", str(path),
+                "--result-report", str(path),
             ])
         return status, stdout.getvalue(), stderr.getvalue()
 
-    def test_failed_report_is_empty_on_pass(self):
+    def test_result_report_includes_invoked_skips_on_pass(self):
         path = self.temporary / "passed.json"
         status, _, error = self._run_local_report_fixture(path)
         self.assertEqual(status, 0, error)
-        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"failed": []})
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual([row[2] for row in report["records"]], ["skipped", "skipped"])
+        self.assertTrue(all(row[4] >= 0 for row in report["records"]))
 
-    def test_failed_report_write_error_names_path(self):
+    def test_result_report_write_error_names_path(self):
         path = self.temporary / "missing" / "failed.json"
         status, output, error = self._run_local_report_fixture(path)
         self.assertEqual(status, 1)
@@ -370,22 +442,22 @@ class ShardsTests(unittest.TestCase):
         self.assertIn("cannot write", error)
         self.assertIn("OK (skipped=2)", output)
 
-    def test_failed_report_discovery_error_names_path(self):
+    def test_result_report_discovery_error_names_path(self):
         path = self.temporary / "failed.json"
         missing = self.root / "missing"
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            self.assertEqual(shards.main(["-s", str(missing), "-j", "1", "--failed-report", str(path)]), 1)
+            self.assertEqual(shards.main(["-s", str(missing), "-j", "1", "--result-report", str(path)]), 1)
         self.assertIn(
             f"discovery start {str(missing)!r}: expected an importable test directory", stderr.getvalue(),
         )
         self.assertIn(str(path), stderr.getvalue())
         self.assertFalse(path.exists())
 
-    def test_no_failed_report_option_leaves_output_and_status_unchanged(self):
+    def test_no_result_report_option_leaves_output_and_status_unchanged(self):
         path = self.temporary / "failed.json"
         plain = self._run_fixture("test_output.py", 1)
         self.assertEqual(list(self.temporary.rglob("*.json")), [])
-        reported = self._run_fixture("test_output.py", 1, "--failed-report", str(path))
+        reported = self._run_fixture("test_output.py", 1, "--result-report", str(path))
         self.assertEqual(reported.returncode, plain.returncode)
         self.assertEqual(reported.stderr, plain.stderr)
         self.assertEqual(
@@ -433,6 +505,28 @@ class ShardsTests(unittest.TestCase):
         process.poll.return_value = None
         shards._stop_worker(process)
         process.kill.assert_called_once()
+
+    def test_corrupt_worker_journal_preserves_exit_and_names_report(self):
+        log = self.temporary / "worker.log"
+        path = self.temporary / "worker.json"
+        log.write_text("worker diagnostic", encoding="utf-8")
+        journal = path.with_suffix(".jsonl")
+        process = mock.Mock()
+        for status, frame in (
+            (-15, '["terminal", []]\n'),
+            (0, '[]\n'),
+            (0, '["started", 0]'),
+            (0, '["extra", 0]\n'),
+        ):
+            with self.subTest(status=status, frame=frame):
+                process.wait.return_value = status
+                journal.write_text(frame, encoding="utf-8")
+                with self.assertRaises(shards.ShardError) as caught:
+                    shards._read_worker(process, path, ["case.a"], [0])
+                self.assertIn("worker.json", str(caught.exception))
+                self.assertIn("invalid worker journal", str(caught.exception))
+                if status:
+                    self.assertIn(f"got {status}", str(caught.exception))
 
     def _run_fixture(self, pattern, workers=None, *report_args):
         argv = [sys.executable, "-I", "-B", "-X", "faulthandler"]

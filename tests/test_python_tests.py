@@ -454,7 +454,7 @@ class PythonTestsTests(FixtureCase):
         self.use_shard_runner("missing")
         self.add_test("test_unused", "    def test_passes(self):\n        pass\n")
         _result, check = self.failed_tests("command exited 1", "expected an importable test directory")
-        self.assertIn("failed-tests.json: failed test report is missing", check["reason"])
+        self.assertIn("test-results.json: test result report is missing", check["reason"])
         self.assertEqual(check["findings"], [])
 
     def test_failed_command_without_summary_has_no_measurement(self) -> None:
@@ -1134,55 +1134,75 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
             time.monotonic() + 60,
         )
 
-    def failed_report_path(self) -> Path:
+    def result_report_path(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())) / "failed.json"
 
     def assert_report_refused(self, path: Path, defect: str) -> None:
         with self.assertRaises(ValueError) as raised:
-            python_tests._read_failed_report(path)
+            python_tests._read_result_report(path)
         self.assertIn(str(path), str(raised.exception))
         self.assertIn(defect, str(raised.exception))
 
-    def test_failed_report_reads_test_ids(self) -> None:
-        path = self.failed_report_path()
-        path.write_text('{"failed": ["test_example.Case.test_failure"]}', encoding="utf-8")
-        self.assertEqual(python_tests._read_failed_report(path), ["test_example.Case.test_failure"])
+    def test_result_report_reads_test_ids(self) -> None:
+        path = self.result_report_path()
+        document = {
+            "ids": ["case.test"],
+            "records": [[0, "case.test", "passed", [["case.test", "passed", ""]], 0.25, None]],
+            "fixtures": [],
+        }
+        path.write_text(json.dumps(document), encoding="utf-8")
+        self.assertEqual(python_tests._read_result_report(path), document)
 
-    def test_failed_report_refuses_missing_file(self) -> None:
-        self.assert_report_refused(self.failed_report_path(), "missing")
+    def test_result_report_refuses_missing_file(self) -> None:
+        self.assert_report_refused(self.result_report_path(), "missing")
 
-    def test_failed_report_refuses_unreadable_file(self) -> None:
-        path = self.failed_report_path()
+    def test_result_report_refuses_unreadable_file(self) -> None:
+        path = self.result_report_path()
         path.mkdir()
-        self.assert_report_refused(path, "cannot read")
+        self.assert_report_refused(path, "invalid test result report")
 
-    def test_failed_report_refuses_invalid_json(self) -> None:
-        path = self.failed_report_path()
+    def test_result_report_refuses_invalid_json(self) -> None:
+        path = self.result_report_path()
         for document in ('{"failed":', '{"failed": [], "failed": []}'):
             with self.subTest(document=document):
                 path.write_text(document, encoding="utf-8")
-                self.assert_report_refused(path, "invalid JSON")
+                self.assert_report_refused(path, "invalid test result report")
 
-    def test_failed_report_refuses_extra_key(self) -> None:
-        path = self.failed_report_path()
-        path.write_text('{"failed": [], "extra": []}', encoding="utf-8")
-        self.assert_report_refused(path, "only the 'failed' key")
+    def test_result_report_refuses_extra_key(self) -> None:
+        path = self.result_report_path()
+        path.write_text('{"ids": [], "records": [], "fixtures": [], "extra": []}', encoding="utf-8")
+        self.assert_report_refused(path, "only the ids, records and fixtures keys")
 
-    def test_failed_report_refuses_invalid_failed_value(self) -> None:
-        path = self.failed_report_path()
+    def test_result_report_refuses_invalid_ids(self) -> None:
+        path = self.result_report_path()
         for value in (42, ["valid.id", 42]):
             with self.subTest(value=value):
-                path.write_text(json.dumps({"failed": value}), encoding="utf-8")
-                self.assert_report_refused(path, "a list of strings")
+                path.write_text(json.dumps({"ids": value, "records": [], "fixtures": []}), encoding="utf-8")
+                self.assert_report_refused(path, "discovery ID list of strings")
+
+    def test_journal_rejects_malformed_discovery_positions_and_finish_markers(self) -> None:
+        path = self.result_report_path()
+        header = {"ids": ["first", "second"], "discovery_failed": [], "full": None, "discovery_errors": []}
+        for update, frame, diagnosis in (
+            ({"discovery_failed": [True]}, ["finished", None], "invalid discovery failure positions"),
+            ({"discovery_failed": [1, 0]}, ["finished", None], "invalid discovery failure position order"),
+            ({}, ["finished", 0], "invalid finished journal event"),
+            ({}, ["error", 0], "invalid error journal event"),
+        ):
+            with self.subTest(update=update, frame=frame):
+                path.write_text(json.dumps({**header, **update}) + "\n" + json.dumps(frame) + "\n",
+                                encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, diagnosis):
+                    python_tests._read_result_journal(path, interrupted=False)
 
     def test_test_command_matches_policy_runner_relative_to_the_root(self) -> None:
-        data = self.failed_report_path().parent
+        data = self.result_report_path().parent
         command, report = python_tests._test_command(
             GATE, ("{python}", "quality_gate/test_shards.py", "-s", "tests"), ["covered"], data,
         )
-        self.assertEqual(report, data / "failed-tests.json")
+        self.assertEqual(report, data / "test-results.json")
         self.assertEqual(command, [
-            "covered", "quality_gate/test_shards.py", "-s", "tests", "--failed-report", str(report),
+            "covered", "quality_gate/test_shards.py", "-s", "tests", "--result-report", str(report),
         ])
 
     def test_missing_or_unreadable_coverage_configuration_is_reported(self) -> None:
@@ -1317,7 +1337,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                 "command terminated by signal 15",
             ),
         )
-        report_path = self.failed_report_path()
+        report_path = self.result_report_path()
         context = mock.Mock(root=GATE, check=self.check, prefix="check: tests")
         for run_result, outcome, execution, reason in cases:
             with self.subTest(execution=run_result.execution):
@@ -1325,7 +1345,7 @@ class PythonTestsCheckHelperTests(unittest.TestCase):
                     mock.patch.object(python_tests, "_tests_setup", return_value=(report_path.parent, [])),
                     mock.patch.object(python_tests, "_test_command", return_value=([], report_path)),
                     mock.patch.object(python_tests, "run", return_value=run_result),
-                    mock.patch.object(python_tests, "_read_failed_report") as read_report,
+                    mock.patch.object(python_tests, "_read_result_report") as read_report,
                     contextlib.redirect_stderr(io.StringIO()),
                 ):
                     result = python_tests._run_python_tests(context)

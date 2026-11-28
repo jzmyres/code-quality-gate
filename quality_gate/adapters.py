@@ -1012,13 +1012,22 @@ def _affected_test_child(
     return result, _temporary_reason(temporary_paths)
 
 
-def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | None]:
-    if report["error"] is not None:
-        return "fail", report["error"]
+def _affected_failure_reason(report: dict, returncode: int) -> str | None:
+    from .checks import _combined_reason
+
     if returncode:
-        return "fail", f"command exited {returncode}"
-    if not report["finished"]:
-        return "fail", "unittest did not finish validating the discovery occurrences"
+        return _combined_reason(f"command exited {returncode}", report["error"])
+    if report["findings"]:
+        subjects = ", ".join(finding.subject for finding in report["findings"])
+        reason = f"command exited 0 with failing unittest evidence: {subjects}"
+        return _combined_reason(report["error"], reason)
+    return report["error"]
+
+
+def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | None]:
+    reason = _affected_failure_reason(report, returncode)
+    if reason is not None:
+        return "fail", reason
     if report["omitted"]:
         return "not_run", report["selection"]["reason"]
     if not report["executed"]:
@@ -1026,21 +1035,23 @@ def _affected_test_verdict(report: dict, returncode: int) -> tuple[str, str | No
     return "pass", None
 
 
-def _occurrence_labels(ids: list[str | None]) -> dict[int, str]:
-    counts = Counter(ids)
+def _occurrence_labels(ids: list[str], failed: list[int]) -> dict[int, str]:
+    failed_positions = set(failed)
+    names = {pos: name for pos, name in enumerate(ids) if pos not in failed_positions}
+    counts = Counter(names.values())
     reserved = set(counts)
-    labels = {}
-    for position, name in enumerate(ids):
-        if name is None:
-            continue
-        label = name
-        if counts[name] > 1:
-            label = f"{name} (discovery occurrence {len(labels) + 1})"
-            while label in reserved:
-                label += " (duplicate)"
-            reserved.add(label)
-        labels[position] = label
-    return labels
+    return {
+        pos: _duplicate_label(name, ordinal, reserved) if counts[name] > 1 else name
+        for ordinal, (pos, name) in enumerate(names.items(), 1)
+    }
+
+
+def _duplicate_label(name: str, ordinal: int, reserved: set[str]) -> str:
+    label = f"{name} (discovery occurrence {ordinal})"
+    while label in reserved:
+        label += " (duplicate)"
+    reserved.add(label)
+    return label
 
 
 def _affected_selection_report(labels: dict[int, str], full: str | None) -> dict:
@@ -1054,14 +1065,14 @@ def _affected_selection_report(labels: dict[int, str], full: str | None) -> dict
 
 
 def _affected_invocations(labels: dict[int, str], events: dict[str, list]) -> dict:
-    outcomes = {position: outcome for position, _, outcome, _ in events["terminal"]}
+    outcomes = {record[0]: record[2] for record in events["terminal"]}
     started = set(events["started"])
     executed, skipped, outstanding = [], [], {}
     for position, label in labels.items():
         outcome = outcomes.get(position)
         if outcome in (None, "blocked"):
             outstanding[label] = _outstanding_reason(outcome, position in started)
-        elif outcome in ("skipped", "fixture skipped"):
+        elif python_tests.FIXTURE_OUTCOMES.get(outcome, outcome) == "skipped":
             skipped.append(label)
         else:
             executed.append(label)
@@ -1076,54 +1087,64 @@ def _outstanding_reason(outcome: str | None, started: bool) -> str:
     return "the run did not invoke this selected test"
 
 
-def _affected_failures(labels: dict[int, str], events: dict[str, list]) -> list[str]:
-    failed = {"failure", "error", "unexpected success"}
-    return [
-        labels[pos] for pos, _, outcome, _ in events["terminal"] if pos in labels and outcome in failed
-    ] + [name for name, outcome, _ in events["fixture"] if outcome in failed]
+def _affected_report_error(path: Path, finished: bool, errors: list, events: list) -> str | None:
+    from .checks import _combined_reason
+
+    error = (errors[0].splitlines() or ["discovery failed"])[0] if errors else next(iter(events), None)
+    if finished:
+        return error
+    return _combined_reason(error, f"{path}: unittest did not finish validating the discovery occurrences")
 
 
-def _read_affected_report(path: Path) -> dict:
-    with path.open(encoding="utf-8") as journal:
-        header = load_json(journal.readline())
-        events = {name: [] for name in ("started", "terminal", "fixture", "error", "finished")}
-        for line in journal:
-            if line.endswith("\n"):
-                event, value = load_json(line)
-                events[event].append(value)
-    return _affected_journal_report(header, events)
+def _has_inflight_occurrence(events: dict) -> bool:
+    measured = sum(record[4] is not None for record in events["terminal"])
+    return len(events["started"]) > measured
 
 
-def _affected_journal_report(header: dict, events: dict[str, list]) -> dict:
-    labels = _occurrence_labels(header["ids"])
+def _affected_result_rows(events: dict, interrupted: bool, valid: bool) -> dict:
+    if valid and _has_result_evidence(events, interrupted):
+        return {"test_results": python_tests._result_rows(events["terminal"])}
+    return {}
+
+
+def _has_result_evidence(events: dict, interrupted: bool) -> bool:
+    if events["finished"]:
+        return True
+    return bool(events["terminal"]) and (interrupted or _has_inflight_occurrence(events))
+
+
+def _read_affected_report(path: Path, *, interrupted: bool = False) -> dict:
+    header, events, valid = python_tests._read_result_journal(path, interrupted=interrupted)
+    labels = _occurrence_labels(header["ids"], header["discovery_failed"])
     full, errors = header["full"], header["discovery_errors"]
-    error = errors[0].splitlines()[0] if errors else next(iter(events["error"]), None)
     return {
         "selection": _affected_selection_report(labels, full),
         "discovery_errors": errors,
         "omitted": full is None,
-        "finished": bool(events["finished"]),
-        "error": error,
-        "failed": _affected_failures(labels, events),
+        "error": _affected_report_error(path, bool(events["finished"]), errors, events["error"]),
+        "findings": python_tests._unittest_findings(events["terminal"], events["fixture"], labels),
+        **_affected_result_rows(events, interrupted, valid),
         **_affected_invocations(labels if full is not None else {}, events),
     }
 
 
 def _affected_test_report(context: AdapterContext, path: Path, child: Any, start: float) -> Any:
-    from .checks import _tests_result
+    from .checks import _combined_reason, _tests_result
 
     check, spec, prefix = context.check, context.check.spec, context.prefix
     diagnostics = child.diagnostics()
     failure = python_tests._tests_execution_failure(
         check, spec, child, diagnostics, child.combined_text, prefix, start,
     )
+    interrupted = failure is not None or bool(child.returncode)
     try:
-        report = _read_affected_report(path)
-    except (OSError, ValueError) as error:
+        report = _read_affected_report(path, interrupted=interrupted)
+    except ValueError as error:
         if failure is not None:
             return failure
+        exit_reason = f"command exited {child.returncode}" if child.returncode else None
         return _tests_result(
-            check, spec, start, prefix, f"unittest produced no discovery and execution report: {error}",
+            check, spec, start, prefix, _combined_reason(exit_reason, str(error)),
             diagnostics=diagnostics, report=False,
         )
     return _affected_test_check(check, start, child, report, failure)
@@ -1137,9 +1158,8 @@ def _affected_test_check(check: Any, start: float, child: Any, report: dict, fai
     )
     executed, skipped = len(report["executed"]), len(report["skipped"])
     report.pop("omitted")
-    report.pop("finished")
     report.pop("error")
-    findings = _unittest_findings(sorted(set(report.pop("failed"))))
+    findings = report.pop("findings")
     fields = {
         "reason": reason, "diagnostics": child.diagnostics(), "budget_seconds": check.spec.budget_seconds,
         "report_fields": report, "findings": findings,
@@ -1148,16 +1168,6 @@ def _affected_test_check(check: Any, start: float, child: Any, report: dict, fai
         return _check_result(check, start, outcome, execution="not_run", satisfied=True, **fields)
     return _check_result(check, start, outcome, execution=child.execution, measurement={"tests": executed},
                          tests_ran=executed + skipped, tests_skipped=skipped, **fields)
-
-
-def _unittest_findings(failed: list[str]) -> list[ratchet.FindingResult]:
-    return [
-        ratchet.FindingResult(
-            subject=name, value=1, bound=None, threshold=0, baseline_reason=None,
-            blocking=True, location="unittest",
-        )
-        for name in failed
-    ]
 
 
 def _affected_test_plan(context: AdapterContext, argv: tuple[str, ...]) -> Path:
@@ -1198,7 +1208,7 @@ def _finish_affected_unittest(context: AdapterContext, result: Any, data_dir: Pa
             result.tests_ran, result.tests_skipped, result.measurement["tests"], result.diagnostics,
         )
         evidence.report_fields = result.report_fields
-        return evidence
+        return _finish_test_result(evidence, None, prefix)
     return _finish_test_result(result, temporary_reason, prefix, child.combined_text)
 
 

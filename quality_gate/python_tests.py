@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import output_patterns, policy
+from . import output_patterns, policy, test_shards
 from .coverage_tool import (
     combine_coverage,
     coverage_config_path,
@@ -30,6 +30,7 @@ from .policy import (
 )
 from .ratchet import FindingResult
 from .runner import Diagnostics, RunResult, execution_outcome, mark_step, run
+from .test_shards import FIXTURE_OUTCOMES as FIXTURE_OUTCOMES
 from .tools import installed_tool
 
 
@@ -141,47 +142,158 @@ def _test_command(
     command = expand_run(argv, prefix)
     if not _uses_shard_runner(root, argv):
         return command, None
-    report = data_dir / "failed-tests.json"
-    return [*command, "--failed-report", str(report)], report
+    report = data_dir / "test-results.json"
+    return [*command, "--result-report", str(report)], report
 
 
-def _report_ids(document: Any, path: Path) -> list[str]:
-    if not isinstance(document, dict) or set(document) != {"failed"}:
-        raise ValueError(f"{path}: expected a JSON object with only the 'failed' key")
-    ids = document["failed"]
-    if not isinstance(ids, list) or not all(isinstance(test_id, str) for test_id in ids):
-        raise ValueError(f"{path}: expected 'failed' to be a list of strings")
-    return sorted(set(ids))
-
-
-def _read_failed_report(path: Path) -> list[str]:
+def _read_result_report(path: Path) -> dict:
     try:
         document = load_json(path.read_text(encoding="utf-8"))
+        _validate_result_document(document)
     except FileNotFoundError as error:
-        raise ValueError(f"{path}: failed test report is missing") from error
-    except OSError as error:
-        raise ValueError(f"{path}: cannot read failed test report: {error}") from error
-    except ValueError as error:
-        raise ValueError(f"{path}: invalid JSON in failed test report: {error}") from error
-    return _report_ids(document, path)
+        raise ValueError(f"{path}: test result report is missing") from error
+    except (OSError, ValueError, RecursionError, test_shards.ShardError) as error:
+        raise ValueError(f"{path}: invalid test result report: {error}") from error
+    return document
 
 
-def _attach_failed_report(result: Any, path: Path | None) -> Any:
-    if path is None:
-        return result
+def _validate_result_document(document: Any) -> None:
+    if not isinstance(document, dict) or set(document) != {"ids", "records", "fixtures"}:
+        raise ValueError("expected only the ids, records and fixtures keys")
+    ids = document["ids"]
+    if not test_shards._valid_ids(ids):
+        raise ValueError("expected a discovery ID list of strings")
+    test_shards._validate_records(ids, range(len(ids)), document["records"], document["fixtures"])
+
+
+def _journal_header(line: str) -> dict:
+    if not line.endswith("\n"):
+        raise ValueError("missing complete discovery header")
+    header = load_json(line)
+    _validate_journal_header(header)
+    return header
+
+
+def _validate_journal_header(header: Any) -> None:
+    _require_discovery_header(header)
+    ids = header["ids"]
+    if not all(map(test_shards._valid_ids, (ids, header["discovery_errors"]))):
+        raise ValueError("expected discovery IDs and errors as lists of strings")
+    _validate_discovery_failures(header["discovery_failed"], len(ids))
+    if type(header["full"]) not in (str, type(None)):
+        raise ValueError("invalid full-run reason")
+
+
+def _require_discovery_header(header: Any) -> None:
+    keys = {"ids", "discovery_failed", "full", "discovery_errors"}
+    if not isinstance(header, dict) or set(header) != keys:
+        raise ValueError("invalid discovery header")
+
+
+def _discovery_position(position: Any, size: int) -> bool:
+    return type(position) is int and 0 <= position < size
+
+
+def _validate_discovery_failures(failed: Any, size: int) -> None:
+    if not isinstance(failed, list) or not all(_discovery_position(pos, size) for pos in failed):
+        raise ValueError(f"invalid discovery failure positions: {failed!r}")
+    if failed != sorted(set(failed)):
+        raise ValueError(f"invalid discovery failure position order: {failed!r}")
+
+
+def _read_result_journal(path: Path, *, interrupted: bool) -> tuple[dict, dict, bool]:
     try:
-        ids = _read_failed_report(path)
-    except ValueError as error:
-        result.reason = f"{result.reason}; {error}"
-        return result
-    result.findings = [
+        with path.open(encoding="utf-8") as journal:
+            header, events = _read_journal_frames(journal, interrupted)
+        valid = _validate_journal_records(header, events)
+    except (OSError, ValueError, RecursionError, test_shards.ShardError) as error:
+        raise ValueError(f"{path}: invalid unittest result journal: {error}") from error
+    return header, events, valid
+
+
+def _validate_journal_records(header: dict, events: dict) -> bool:
+    ids = header["ids"]
+    selected = range(len(ids)) if header["full"] is not None else header["discovery_failed"]
+    try:
+        test_shards._validate_records(
+            ids, selected, events["terminal"], events["fixture"],
+            complete=bool(events["finished"]), started=events["started"],
+        )
+    except test_shards.ShardError:
+        if not events["error"]:
+            raise
+        _recover_journal_accounting(ids, selected, events)
+        return False
+    return True
+
+
+def _recover_journal_accounting(ids: list, selected: Any, events: dict) -> None:
+    """Keep invocation diagnostics when the runner reports a schedule defect."""
+    unique = {}
+    for record in events["terminal"]:
+        unique.setdefault(test_shards._record_position(record), record)
+    positions = sorted(unique.keys() & set(selected))
+    records = list(map(unique.__getitem__, positions))
+    test_shards._validate_records(ids, positions, records, events["fixture"])
+    events["terminal"] = records
+    if not all(map(test_shards._valid_position, events["started"])):
+        raise ValueError("invalid journal start positions")
+
+
+def _read_journal_frames(journal: Any, interrupted: bool) -> tuple[dict, dict]:
+    header = _journal_header(journal.readline())
+    events = {name: [] for name in ("started", "terminal", "fixture", "error", "finished")}
+    for line in journal:
+        if interrupted and not line.endswith("\n"):
+            break
+        _append_journal_frame(events, line)
+    return header, events
+
+
+def _append_journal_frame(events: dict, line: str) -> None:
+    event, value = test_shards._decode_journal_frame(line, load_json)
+    if event not in events or events["finished"] or events["error"]:
+        raise ValueError(f"unexpected journal event: {event!r}")
+    _validate_journal_marker(event, value)
+    events[event].append(value)
+
+
+def _validate_journal_marker(event: str, value: Any) -> None:
+    if event == "finished" and value is not None:
+        raise ValueError(f"invalid finished journal event: {value!r}")
+    if event == "error" and not isinstance(value, str):
+        raise ValueError(f"invalid error journal event: {value!r}")
+
+
+def _result_rows(records: list) -> list[dict]:
+    return [
+        {"position": position, "id": name, "outcome": outcome, "duration_seconds": duration}
+        for position, name, outcome, _, duration, _ in records
+    ]
+
+
+def _unittest_findings(records: list, fixtures: list, labels: dict | None = None) -> list[FindingResult]:
+    return [
         FindingResult(
-            subject=test_id, value=1, bound=None, threshold=0, baseline_reason=None,
+            subject=name, value=1, bound=None, threshold=0, baseline_reason=None,
             blocking=True, location="unittest",
         )
-        for test_id in ids
+        for name in test_shards.failed_subjects(records, fixtures, labels)
     ]
-    return result
+
+
+def _result_report(path: Path | None) -> tuple[dict, list[FindingResult], str | None]:
+    if path is None:
+        return {}, [], None
+    try:
+        report = _read_result_report(path)
+    except ValueError as error:
+        return {}, [], str(error)
+    return (
+        {"test_results": _result_rows(report["records"])},
+        _unittest_findings(report["records"], report["fixtures"]),
+        None,
+    )
 
 
 def _executed_tests(
@@ -275,7 +387,6 @@ def _tests_failed(
     prefix: str,
     start: float,
     deadline: float,
-    failed_report: Path | None,
 ) -> Any:
     from .checks import _tests_result
 
@@ -309,7 +420,7 @@ def _tests_failed(
             tests_skipped=skipped,
             report=False,
         )
-    return _attach_failed_report(result, failed_report)
+    return result
 
 
 def _test_environment(python_prefix: list[str]) -> dict[str, str]:
@@ -346,6 +457,7 @@ def _combine_tests_evidence(
             f"coverage combination failed: {error}",
             outcome="unsupported",
             diagnostics=diagnostics,
+            report=False,
         )
     return None
 
@@ -525,6 +637,7 @@ def _tests_evidence(
             execution="error",
             diagnostics=Diagnostics(error=problem),
             configuration_error=True,
+            report=False,
         )
     combined_file = evidence_dir / "combined" / ".coverage"
     config_file = coverage_config_path(data_dir)
@@ -564,10 +677,8 @@ def _run_python_tests(context: Any) -> Any:
     from .checks import (
         CheckResult,
         _finish_temporary,
-        _finish_test_result,
         _temporary_reason,
         _temporary_test_directory,
-        _tests_result,
     )
 
     root, check, prefix = context.root, context.check, context.prefix
@@ -580,7 +691,7 @@ def _run_python_tests(context: Any) -> Any:
         return setup
     data_dir, python_prefix = setup
 
-    command, failed_report = _test_command(root, spec.run, python_prefix, data_dir)
+    command, result_report = _test_command(root, spec.run, python_prefix, data_dir)
     environment = _test_environment(python_prefix)
     temporary = _temporary_test_directory()
     environment["TMPDIR"] = str(temporary)
@@ -596,61 +707,72 @@ def _run_python_tests(context: Any) -> Any:
         temporary_paths = _finish_temporary(temporary)
     temporary_reason = _temporary_reason(temporary_paths)
 
-    diagnostics = run_result.diagnostics()
-    combined = run_result.combined_text
-    failure = _tests_execution_failure(
-        check, spec, run_result, diagnostics, combined, prefix, start,
+    return _finish_python_tests(
+        context, run_result, start, deadline, data_dir, result_report, temporary_reason,
     )
-    if failure is not None:
-        return _finish_test_result(failure, temporary_reason, prefix, combined)
-    if run_result.returncode != 0:
-        result = _tests_failed(
-            check,
-            spec,
-            run_result,
-            diagnostics,
-            combined,
-            prefix,
-            start,
-            deadline,
-            failed_report,
-        )
-        return _finish_test_result(result, temporary_reason, prefix, combined)
 
-    counts, failure = _tests_counts(
-        check, spec, start, prefix, combined, diagnostics, deadline,
-    )
+
+def _finish_python_tests(context: Any, child: RunResult, start: float, deadline: float,
+                         data_dir: Path, report: Path | None, temporary_reason: str | None) -> Any:
+    from .checks import _finish_test_result
+
+    check, prefix = context.check, context.prefix
+    combined = child.combined_text
+    failure = _tests_execution_failure(check, check.spec, child, child.diagnostics(), combined, prefix, start)
     if failure is not None:
         return _finish_test_result(failure, temporary_reason, prefix, combined)
+    result = _python_result_with_evidence(context, child, start, deadline, data_dir, report, temporary_reason)
+    if result.outcome != "pass" or temporary_reason is not None:
+        return _finish_test_result(result, temporary_reason, prefix, combined)
+    return result
+
+
+def _python_result_with_evidence(context: Any, child: RunResult, start: float, deadline: float,
+                                 data_dir: Path, report: Path | None, temporary_reason: str | None) -> Any:
+    fields, findings, report_error = _result_report(report)
+    if child.returncode == 0 and findings:
+        subjects = ", ".join(finding.subject for finding in findings)
+        report_error = f"{report}: command exited 0 with failing unittest evidence: {subjects}"
+    reason = temporary_reason or report_error
+    result = _completed_python_tests(context, start, deadline, child, data_dir, reason)
+    result.report_fields.update(fields)
+    result.findings = findings
+    _attach_result_report_error(result, child, report, report_error)
+    return result
+
+
+def _attach_result_report_error(result: Any, child: RunResult, report: Path | None,
+                                error: str | None) -> None:
+    from .checks import _combined_reason, _merge_temporary_reason
+
+    if report is not None and child.returncode and not (result.reason or "").startswith("command exited"):
+        result.reason = _combined_reason(f"command exited {child.returncode}", result.reason)
+    _merge_temporary_reason(result, error)
+
+
+def _completed_python_tests(context: Any, start: float, deadline: float, child: RunResult,
+                            data_dir: Path, reason: str | None) -> Any:
+    from .checks import _check_result
+
+    check, prefix = context.check, context.prefix
+    spec = check.spec
+    diagnostics = child.diagnostics()
+    combined = child.combined_text
+    if child.returncode != 0:
+        return _tests_failed(check, spec, child, diagnostics, combined, prefix, start, deadline)
+
+    counts, failure = _tests_counts(check, spec, start, prefix, combined, diagnostics, deadline)
+    if failure is not None:
+        return failure
     assert counts is not None
     ran, skipped, executed = counts
-    if temporary_reason is not None:
-        result = _tests_result(
-            check,
-            spec,
-            start,
-            prefix,
-            "",
-            outcome="pass",
-            diagnostics=diagnostics,
-            measurement={"tests": executed},
-            tests_ran=ran,
-            tests_skipped=skipped,
-            report=False,
-        )
-        return _finish_test_result(
-            result, temporary_reason, prefix, combined
+    if reason is not None:
+        return _check_result(
+            check, start, "pass",
+            diagnostics=diagnostics, budget_seconds=spec.budget_seconds,
+            measurement={"tests": executed}, tests_ran=ran, tests_skipped=skipped,
         )
     return _tests_evidence(
-        check,
-        spec,
-        start,
-        prefix,
-        evidence_dir,
-        root,
-        data_dir,
-        ran,
-        skipped,
-        executed,
-        diagnostics,
+        check, spec, start, prefix, context.evidence_dir, context.root, data_dir,
+        ran, skipped, executed, diagnostics,
     )

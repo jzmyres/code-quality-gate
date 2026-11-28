@@ -1049,11 +1049,24 @@ Check keys:
   with `symbol`, repository-relative `file`,
   one-based character `position`, `stop_points` and `reached`. Lambda definitions have generated symbols.
   These counts are also retained as evidence for later checks.
+* `test_results` - optional native test results in ascending position order. Each row has a
+  zero-based `position` in unittest discovery or ERT selection, an `id`, a native `outcome`,
+  and `duration_seconds`. The duration is a finite, nonnegative number for an invoked test
+  (including a skip) and null for a unittest occurrence prevented from starting by a fixture.
+  Unittest outcomes are `passed`, `skipped`, `expected failure`, `unexpected success`,
+  `failure`, `error`, `blocked`, and `fixture skipped`. ERT outcomes are `ert-test-passed`,
+  `ert-test-failed`, `ert-test-skipped`, `ert-test-quit`, or `ert-test-aborted-with-non-local-exit`.
+  ERT rows also have boolean `expected` and include a string `condition` for unexpected results.
+  Native ERT totals exclude quits and non-local exits from the completed and skipped counts.
+  Positions distinguish repeated unittest IDs.
+  The affected unittest journal can retain the validated terminal prefix after an interruption.
+  An empty array represents a validated report with zero terminal occurrences. The field is
+  absent if evidence is unavailable or the adapter cannot supply native per-test evidence.
 
 A test check reports its `outcome` and `reason` and keeps the command's output tail in
 `diagnostics`; the executed count is in `measurement`. It records the executed and skipped counts
-for verification, which reports them as `tests:ID:executed` and `tests:ID:skipped`. Per-test
-outcomes are not reconstructed.
+for verification, which reports them as `tests:ID:executed` and `tests:ID:skipped`.
+Configured summary patterns supply the aggregate counts for ordinary Python and command suites.
 
 A finding has `subject`, its raw `value`, `bound` (or null), `threshold`,
 `baseline_reason` (or null), `covered_by_baseline`, `blocking`, `location`,
@@ -1198,6 +1211,8 @@ Returned rows also retain the enforcement setting, the result's
 `resolved_base` when available.
 `selection` carries the `selected` and `left_out` input or test identifiers
 when the check reports them, and is null otherwise.
+When check JSON includes `test_results`, its ledger row includes the same array with the
+same ordering and duration precision.
 
 The `findings` array carries reported subjects and structured evidence,
 including the paths and line ranges available from the result. A finding

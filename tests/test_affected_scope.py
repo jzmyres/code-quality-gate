@@ -656,6 +656,10 @@ def load_tests(loader, suite, pattern):
         self.assertEqual(suite["executed"], [])
         self.assertIn("ImportError: fixture discovery error", suite["discovery_errors"][0])
         self.assertIn("fixture discovery error", result.stderr)
+        name = "unittest.loader._FailedTest.test_other"
+        self.assertEqual([finding["subject"] for finding in suite["findings"]], [name])
+        self.assertEqual([(row["id"], row["outcome"]) for row in suite["test_results"]], [(name, "error")])
+        self.assertGreaterEqual(suite["test_results"][0]["duration_seconds"], 0)
 
     def test_clean_diff_runs_source_less_discoveries(self):
         self.write_test("other", "del __file__\n")
@@ -954,6 +958,12 @@ class Blocked(unittest.TestCase):
                 self.assertEqual(suite["executed"], [IMPORTING])
                 self.assertEqual(suite["measurement"], {"tests": 1})
                 self.assertIn("RuntimeError: fixture failure before interruption", result.stderr)
+                rows = suite["test_results"]
+                self.assertEqual([(row["position"], row["id"], row["outcome"]) for row in rows], [
+                    (0, blocked, "blocked"), (1, IMPORTING, "passed"),
+                ])
+                self.assertIsNone(rows[0]["duration_seconds"])
+                self.assertGreaterEqual(rows[1]["duration_seconds"], 0)
                 self.assertEqual([finding["subject"] for finding in suite["findings"]], [
                     "setUpModule (test_fixture)",
                 ])

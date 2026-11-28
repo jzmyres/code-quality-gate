@@ -594,13 +594,16 @@ The runner refuses suites that override `run` or `__call__`. Each worker uses th
 prefix. If a worker crashes or leaves test records missing, the runner lists the unrecorded tests
 and shows the last 50 lines of that worker's output.
 
-Pass `--failed-report PATH` to write a UTF-8 JSON object after the run. Its only key is
-`"failed"`, whose value is a sorted array of unique unittest IDs, empty when no tests fail.
-Failures, errors, and unexpected successes use the test's ID, ordinarily `module.Class.test_name`.
-Subtest failures use their parent test's ID. Fixture and import errors use unittest's IDs,
-such as `setUpClass (module.Class)` or `unittest.loader._FailedTest.module`.
-The runner exits nonzero and names the path if it cannot produce the requested report.
-Without the option, it writes no report.
+Pass `--result-report PATH` to write one UTF-8 JSON object after a completed run,
+including a run with test failures. `ids` lists the unittest discovery IDs in order.
+Each `records` entry contains the zero-based discovery position, ID, outcome, case events,
+duration in seconds, and the blocking fixture's ID (null for an invoked case).
+Case and fixture events are triples of unittest ID, outcome, and detail text.
+The separate `fixtures` array holds setup and teardown events. A fixture-blocked or
+fixture-skipped case has a null duration. An invoked case, including a skip, measures
+elapsed time between unittest's start and stop callbacks, excluding shared fixtures.
+Duplicate IDs have distinct discovery positions. The runner exits nonzero and names
+the path if it cannot produce the requested report.
 
 `python_tests` runs the consumer's own test command once from the repository root. The token `{python}`
 expands in place to a prefix that starts the current interpreter under coverage: `-I`, the gate's
@@ -632,11 +635,13 @@ digest are the authorized effective lock's, so the parent and the coverage runne
 authorized coverage upgrade.
 
 When `run` starts with `{python}` immediately followed by this gate installation's
-`test_shards.py` script, the adapter adds `--failed-report` with a path in the check's fresh
-data directory. On a completed failure, each reported test ID becomes one finding.
-If the report is missing or invalid, the check reason names the report path and the defect.
-Other commands produce no per-test findings. Timeouts, signals, and execution errors keep
-their existing reasons without reading the report.
+`test_shards.py` script, the adapter requests `--result-report` in the check's fresh
+data directory. The check validates the report even when the command exits zero.
+Failing occurrences and fixture errors produce findings, with subtest failures
+attributed to their parent case. A missing or invalid report fails the check and
+the reason names the report and any identifiable occurrence. The configured
+summary patterns still supply aggregate counts for verification and other consumers.
+Custom Python and command suites use their configured summary patterns.
 
 Every `python_tests` check runs its command with `TMPDIR` set to a fresh directory the gate creates
 directly in the caller's temporary directory with a short `qg-t-` prefix, so the caller's `TMPDIR`
@@ -728,8 +733,12 @@ The suite must load its tests and call `ert-run-tests-batch-and-exit` exactly on
 in `suite-guard-run` does. The helper intercepts that call and records ERT's statistics without exiting;
 the suite runs once, in that same child Emacs. Expected ERT results count as passed, unexpected results
 as failed, and skipped tests are counted separately. A passing check requires an exit status of zero,
-a valid result, at least one executed test (`selected - skipped`), and no unexpected results.
-Each unexpected result in the child report yields a finding whose subject is the ERT symbol name.
+a valid result, at least one executed test (`selected - skipped`), and a completed result or
+skip for every selected test. Unexpected results fail the check.
+The adapter reads the selected tests, native outcomes, expectedness, and durations from the
+child's ERT statistics. It checks the rows against the native selection order and totals,
+counting skips separately. Each unexpected result yields a finding whose subject is the ERT
+symbol name. An expected failure and an unexpected pass have distinct native outcomes.
 
 `elisp_tests` gives its suite the same temporary-directory rule as `python_tests`: `TMPDIR` is a
 fresh gate-owned directory created in the caller's temporary directory with the same short prefix,
@@ -1445,7 +1454,8 @@ that same union. Python shape reports which files it measured and treats untrack
 new files for added-helper analysis. Unittest reports selected discovery occurrences, any left out
 on an empty diff, and invocation results separately. The report preserves duplicate IDs as
 distinct occurrences, accounts for fixture blocks at their scheduled positions, and retains
-completed records and outstanding positions after a timeout or signal.
+completed records and outstanding positions after an interruption. The `test_results` rows
+use positions in the original discovery order, including when only discovery failures ran.
 
 Attempt consumers requiring full assurance must use an unscoped `check` result with decision
 `accepted` or `accepted_with_exceptions`.
@@ -1470,7 +1480,11 @@ before any check runs. Combining `--only` with `--prune` or `--policy-from` is a
 (exit 2) naming both options before any check runs.
 
 Add `--ledger PATH` to a `check` invocation to append a single JSON Lines record
-of the checks reached, their evidence, and the final decision. A relative path
+of the checks reached, their evidence, and the final decision. A check's validated `test_results`
+array appears identically in check JSON and the ledger. Each row gives `position`, `id`,
+`outcome`, and `duration_seconds`. ERT also reports `expected` and includes `condition` for
+unexpected results. An empty array means zero validated terminal occurrences. Checks with
+unavailable evidence or opaque test commands omit the field. A relative path
 is resolved from the directory where you invoke the gate, independently of
 `--repo`. Its parent directory must already exist. See the
 [check ledger schema](docs/SCHEMA.md#check-ledger-file) for record fields and
