@@ -1082,7 +1082,7 @@ The rule is decided from the policy and the results' `satisfied` status, never
 from message text.
 
 The stderr summary's `check: failed (...)` line lists only root failures, in
-the existing order. When consequences exist, the next line is
+the existing order. When consequences exist, the line before the verdict is
 `check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry
 is spelled as the summary spells it: a check id or `obligation CLASS tier
 TIER`. A consequence still rejects and still exits 1.
@@ -1109,6 +1109,86 @@ or gate file that changed during the run.
 outcome fail, and policy satisfaction then decides acceptance. A prune that is
 refused or fails makes the command exit 1 while `decision` still reports the
 gate evaluation.
+
+## Check ledger file
+
+With `check --ledger PATH`, the gate attempts one append of a compact JSON
+record with `schema: 1` when a check invocation returns or unwinds after engine
+preflight. Relative paths use the invocation's working directory, independently
+of `--repo`. The parent directory must exist. An existing destination must be a
+regular file. Without `--ledger`, the gate skips ledger collection, destination
+inspection, and endpoint sampling.
+
+The gate decides the verdict and exit status, writes the ledger, and flushes
+pending progress and forwarded tool output. It writes the JSON result when
+requested, prints final notices for unevaluated obligations and consequences
+when applicable, and prints the verdict as its last line. A trust block ends
+with `check: blocked: ...` after the protected-input details. A trust identity
+error ends with `check: error: ...` describing the drift. Text stdout and the
+schema-3 and schema-4 result documents keep their existing formats.
+
+| Field | Evidence recorded |
+|---|---|
+| `run_id` | A new UUID for each invocation that passes engine preflight. |
+| `start`, `end` | Consumer Git samples with `revision` (HEAD resolved as a commit) and `dirty` (a boolean), each nullable when unknown. |
+| `attribution_revision` | The common commit when both samples resolve to that commit and explicitly report clean. Otherwise null. |
+| `gate_version`, `policy_sha256` | The gate revision and the SHA-256 of the policy bytes decoded for this run. |
+| `scope`, `selected` | `full`, `partial` for `--only`, or `affected` for `--base`. `selected` lists the IDs from `--only` with their prerequisites, or is null. Built-ins run according to the effective policy. |
+| `base`, `resolved_base`, `changed_paths` | The requested `--base` spelling, the resolved shared diff base, and the affected path set, respectively. The resolved base for an affected run is the merge base. The ledger also records a valid `QG_DIFF_BASE` override once resolved. Unavailable or inapplicable values are null. |
+| `decision`, `exit_status` | The final decision and command status, including overrides from trusted-input checks. An unwind records `error` and the status when handled by the CLI, or null if no command status has been selected. |
+| `complete`, `termination` | A normal engine return has `complete: true`, including rejected, blocked, and errored decisions. An unwind has `complete: false` and the exception class in `termination`. Otherwise `termination` is null. |
+| `checks` | Rows in scheduler order, including inventory, hygiene, enabled module contracts, and any configured result or explicit skip. |
+| `exemptions` | Evaluated policy exemptions identified by `class` and `tier`, from the finalized obligations. |
+
+Each returned check contributes exactly one row with `id`, `adapter`,
+`metric_version`, `execution`, raw `outcome`, `duration_seconds`, and
+`satisfied`. Duration is the result's wall time with six decimal places
+of precision, including time spent on adapter discovery when its result is
+`not_run`. A scheduler skip without adapter work contributes zero seconds.
+Returned rows also retain the enforcement setting, the result's
+`location_coverage` and baseline resolution lists, and a per-check
+`resolved_base` when available.
+`selection` carries the `selected` and `left_out` input or test identifiers
+when the check reports them, and is null otherwise.
+
+The `findings` array carries reported subjects and structured evidence,
+including the paths and line ranges available from the result. A finding
+with a path and no line has null line bounds. A finding without structured
+ranges has `locations: null` and retains any available result location
+label, such as the known spans of a partially located clone. Ratchet findings
+retain `covered_by_baseline`, `blocking`, `expired` and the baseline expiry
+date in `baseline_expires` when available. The ledger leaves out command
+output, diagnostic arguments, free-form reasons, and comment text.
+
+If a dispatched check raises before producing its result, the last row
+has `execution: "interrupted"`, null outcome and satisfaction, the exception
+class in `termination`, and monotonic elapsed time from dispatch until the
+attempt unwound. Earlier results survive a failed run-directory cleanup.
+Checks the scheduler never reached have no row. A preflight refusal
+produces no ledger record. A process killed without unwinding may leave the
+file without one. A new destination receives its first complete record only when
+the gate publishes it without replacement. A dangling final symlink is refused.
+For an existing file, the gate validates the open descriptor and checks that any
+existing content ends in a newline before appending. A refusal before writing
+preserves existing records and leaves an absent destination absent. A failed
+write to an existing file can leave a partial tail. Later appends refuse that
+file until the incomplete tail is removed.
+
+A failed ledger append on normal return is a command error with exit status 2.
+The error names the supplied path and the underlying OS error and takes the
+place of the verdict. JSON mode emits one error document. When the command is
+already unwinding, the original exception and status take precedence, and the
+append failure is attached as an exception note.
+
+The two Git samples describe Git-visible state at the endpoints. Porcelain
+status includes untracked files and disables submodule ignore settings.
+Visible changes report `dirty: true`. A failed status probe or an otherwise
+clean status with a failed index probe or a change-hiding index flag, such
+as assume-unchanged or skip-worktree, reports `dirty: null`. Changes reverted
+between samples can escape detection. Ignored untracked files, external inputs,
+and recursive content verification are outside the scope of the endpoint
+claim. The effective policy digest is recorded separately. The schema-4 stdout
+document carries the trusted-input evidence for trusted runs.
 
 ## Result: `worklist --json`
 

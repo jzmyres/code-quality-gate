@@ -16,6 +16,7 @@ from unittest import mock
 from support import GATE, FixtureCase, baseline_text, stub_check_result, with_clones
 from test_python_tests import tests_config
 
+import hashlib
 import json
 import re
 
@@ -28,6 +29,7 @@ sys.path.insert(0, str(GATE))
 adapters = importlib.import_module("quality_gate.adapters")
 checks = importlib.import_module("quality_gate.checks")
 policy = importlib.import_module("quality_gate.policy")
+gate_result = importlib.import_module("quality_gate.gate_result")
 ratchet = importlib.import_module("quality_gate.ratchet")
 
 
@@ -548,6 +550,31 @@ requires = "python-suite"
             self.assert_debt_delegation(sha, revision_raw, f"{sha} ({sha}):quality-gate.toml",
                                         revision_names, [])
 
+    def test_effective_policy_keeps_the_digest_of_the_bytes_decoded(self):
+        trusted_raw = self.write_debt_policy("trusted source", {"floor": "./trusted//z.toml"})
+        self.add_file("tools.lock.toml", "")
+        self.commit_all()
+        source = self.trusted_directory("HEAD")
+        working_raw = self.write_debt_policy("working tree", {"floor": "./current//z.toml"})
+        decode = policy.decode_policy
+
+        def replace_after_decode(raw, label):
+            decoded = decode(raw, label)
+            self.config_path.write_bytes(working_raw + b"\n# changed after decoding\n")
+            return decoded
+
+        with mock.patch.dict(adapters.ADAPTERS, {FLOOR_STUB.name: FLOOR_STUB}):
+            with mock.patch.object(policy, "decode_policy", side_effect=replace_after_decode) as decoder:
+                config = policy.load_config(self.repo)
+            decoder.assert_called_once_with(working_raw, str(self.config_path))
+            self.assertEqual(config.policy_sha256, hashlib.sha256(working_raw).hexdigest())
+            self.config_path.write_bytes(working_raw)
+            for allowed, effective in (([], trusted_raw), (["quality-gate.toml"], working_raw)):
+                with self.subTest(allowed=allowed):
+                    prepared = trust.prepare_trust(self.repo, str(source), allowed)
+                    self.addCleanup(prepared.close)
+                    self.assertEqual(prepared.config.policy_sha256, hashlib.sha256(effective).hexdigest())
+
     def test_raw_baselines_leave_malformed_declarations_to_validation(self):
         names = {"floor": "./baselines//floor.toml"}
         raw = self.write_debt_policy("raw declarations", names)
@@ -913,6 +940,19 @@ description = "Other source"
                     else:
                         runner.assert_not_called()
                         self.assertEqual(result.execution, "not_run", check.id)
+
+    def test_selection_evidence_uses_the_scheduler_report(self):
+        descriptor = dataclasses.replace(STUB, file_selection="affected", run=self.run_selection_stub)
+        classes = {"a.py": "python", "b.py": "python"}
+        graph = (set(classes), {"a.py": "changed"}, {"a.py": "changed"})
+        with mock.patch.dict(adapters.ADAPTERS, {STUB.name: descriptor}):
+            config = self.config(STUB_CONFIG)
+            result = self.run_selection(config, config.checks["stub"], classes, {"a.py"}, graph)
+        selection = result.to_json()["selection"]
+        evidence = gate_result._ledger_check(result)["selection"]
+        self.assertEqual(evidence, {key: list(selection[key]) for key in ("selected", "left_out")})
+        self.assertEqual(evidence, {"selected": ["a.py"], "left_out": ["b.py"]})
+        self.assertNotIn("reason", evidence)
 
     def run_selection(self, config, check, classes, changed, graph):
         diff = DiffBaseOverride(changed_paths=None if changed is None else frozenset(changed))

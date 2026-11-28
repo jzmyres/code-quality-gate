@@ -1459,7 +1459,7 @@ check; a test-measuring check without `requires` depends on every earlier check 
 Chains resolve to their roots, and a consequence can name several, deduplicated in summary order:
 the order of the checks in the policy.
 The rule is decided from the policy and the results' satisfied status, never from message text.
-The summary line `check: failed (...)` names the roots in the usual order. When consequences exist, the next line is
+The final line `check: failed (...)` names the roots in the usual order. When consequences exist, the preceding line is
 `check: consequences (ENTRY because CAUSE[, CAUSE...]; ...)`, where each entry is spelled as the
 summary spells it and `CAUSE` is a root check id. A consequence still rejects and still exits 1.
 
@@ -1468,6 +1468,18 @@ selected checks and their requirements in policy order. Combine it with `--base`
 scope for those checks. An unknown or repeated check id is a usage error (exit 2) naming it,
 before any check runs. Combining `--only` with `--prune` or `--policy-from` is a usage error
 (exit 2) naming both options before any check runs.
+
+Add `--ledger PATH` to a `check` invocation to append a single JSON Lines record
+of the checks reached, their evidence, and the final decision. A relative path
+is resolved from the directory where you invoke the gate, independently of
+`--repo`. Its parent directory must already exist. See the
+[check ledger schema](docs/SCHEMA.md#check-ledger-file) for record fields and
+failure behavior.
+
+Gate-authored Git inspection suppresses optional Git writes, including index
+stat refreshes. This guarantee excludes the opted-in ledger append, explicit
+`--prune` writes, policy checks and their subprocesses, Git-configured external
+helpers, partial-clone lazy fetching, and concurrent writers.
 
 `QG_AGENT=1` marks an agent sandbox. `check` selects the whole policy by default, or the
 `--only` check IDs and their requirements. If any selected adapter declares `runs_suite`,

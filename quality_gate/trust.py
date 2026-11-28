@@ -68,13 +68,12 @@ def _not_applied(item: ProtectedInput) -> str:
     return "; not applied: " + ", ".join(item.ignored_entries)
 
 
-def _report_blocked_detail(item: ProtectedInput) -> None:
-    print(
+def _blocked_detail(item: ProtectedInput) -> str:
+    return (
         f"check: protected input {item.path}: REV "
         f"{_file_description(item.rev_sha256)}; candidate "
         f"{_file_description(item.candidate_sha256)}"
-        f"{_not_applied(item)}; {item.status}",
-        file=sys.stderr,
+        f"{_not_applied(item)}; {item.status}"
     )
 
 
@@ -98,11 +97,6 @@ class Trust:
     def activate(self):
         return tools_module.lock_override(self.lock_path, self.lock_tools)
 
-    @property
-    def policy_sha256(self) -> str | None:
-        assert self.identity_before is not None
-        return self.identity_before["effective_inputs"][f"policy {POLICY_NAME}"]
-
     def close(self) -> None:
         for directory in reversed(self.temporary):
             directory.cleanup()
@@ -116,22 +110,23 @@ class Trust:
             "identity_after": self.identity_after,
         }
 
-    def report_blocked(self) -> bool:
+    def blocked_notices(self) -> list[str]:
         blocked = _blocked_paths(self.protected)
         if not blocked:
-            return False
-        for item in self.protected:
-            if item.status == "blocked":
-                _report_blocked_detail(item)
-        print(
+            return []
+        return [
+            *(_blocked_detail(item) for item in self.protected if item.status == "blocked"),
             f"check: blocked: protected input changed without "
             f"--allow-protected: {', '.join(blocked)}",
-            file=sys.stderr,
-        )
-        return True
+        ]
+
+    def report_blocked(self) -> bool:
+        notices = self.blocked_notices()
+        self._report(notices, None)
+        return bool(notices)
 
     def finish(
-        self, code: int, document: dict[str, Any]
+        self, code: int, document: dict[str, Any], *, notices: list[str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         after = _capture_identity(self)
         problems = _identity_problems(self.identity_before or {}, after)
@@ -140,14 +135,24 @@ class Trust:
         document["trust"] = self.to_json()
         if problems:
             message = "; ".join(problems)
-            print(f"check: error: {message}", file=sys.stderr)
+            self._report([f"check: error: {message}"], notices)
             document["decision"] = "error"
             document["error"] = message
             return 2, document
-        if self.report_blocked():
+        blocked = self.blocked_notices()
+        if blocked:
+            self._report(blocked, notices)
             document["decision"] = "blocked"
             return 1, document
         return code, document
+
+    @staticmethod
+    def _report(lines: list[str], notices: list[str] | None) -> None:
+        if notices is not None:
+            notices.extend(lines)
+        else:
+            for line in lines:
+                print(line, file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -442,7 +447,7 @@ def _materialize(
     root: Path,
     source: _TrustedTree,
     raw_policy: bytes,
-) -> dict[str, Any]:
+) -> policy.DecodedPolicy:
     (policy_root / POLICY_NAME).write_bytes(raw_policy)
     data = policy.decode_policy(raw_policy, f"{root / POLICY_NAME} at {source.location}")
     for name, baseline in policy.raw_baselines(data).items():

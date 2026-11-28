@@ -19,7 +19,7 @@ from .files import (
     resolve_repo,
 )
 from .gate_result import error_document
-from .policy import CheckDef, Config, UsageError, load_config
+from .policy import CheckDef, Config, GateError, UsageError, load_config
 from .tools import (
     _default_lock_path,
     command_tools_fetch,
@@ -143,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     path.add_argument("name", metavar="NAME")
     check = commands.add_parser("check", help="run every configured check")
     check.add_argument("--base", metavar="REV", help="run checks over the scope affected since REV")
+    check.add_argument("--ledger", metavar="PATH", help="append per-check evidence to PATH")
     check.add_argument(
         "--json",
         action="store_true",
@@ -208,9 +209,10 @@ def _print_error_document(
     *,
     prune: dict[str, Any] | None = None,
     affected_base: str | None = None,
+    loaded_digest: str | None = None,
 ) -> None:
     policy = root / "quality-gate.toml" if root is not None else None
-    document = error_document(root, policy, message, prune=prune)
+    document = error_document(root, policy, message, prune=prune, loaded_digest=loaded_digest)
     if affected_base is not None:
         document.update(scope="affected", base=affected_base)
     print(
@@ -251,6 +253,7 @@ def _dispatch(root: Path, config: Any, args: Any) -> int:
         prune_ids=args.prune,
         only_ids=args.only,
         affected_base=args.base,
+        ledger_path=args.ledger,
     )
 
 
@@ -272,6 +275,7 @@ def _run_trusted_check(root: Path, args: Any) -> int:
             "qg.py: --prune: cannot be combined with --policy-from"
         )
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
+    args.loaded_digest = trust.config.policy_sha256
     try:
         _refuse_in_agent_sandbox(trust.config, args.only)
     except UsageError:
@@ -285,11 +289,13 @@ def _run_trusted_check(root: Path, args: Any) -> int:
         only_ids=args.only,
         trust=trust,
         affected_base=args.base,
+        ledger_path=args.ledger,
     )
 
 
 def _run_trusted_inventory(root: Path, args: Any) -> int:
     trust = prepare_trust(root, args.policy_from, args.allow_protected)
+    args.loaded_digest = trust.config.policy_sha256
     try:
         if trust.report_blocked():
             return 1
@@ -336,12 +342,26 @@ def _run_gate(root: Path, args: Any) -> int:
     if args.command == "debt":
         return command_debt(root, args.revision, args.json)
     config = load_config(root)
+    args.loaded_digest = config.policy_sha256
     load_tools(_default_lock_path())
     return _dispatch(root, config, args)
 
 
+def _report_cli_error(
+    error: GateError, root: Path | None, args: argparse.Namespace, raw: list[str],
+) -> int:
+    if "--json" in raw:
+        options = vars(args)
+        _print_error_document(
+            root or _repo_hint(raw), str(error), affected_base=options.get("base"),
+            loaded_digest=options.get("loaded_digest"),
+        )
+        sys.stdout.flush()
+    print(error, *getattr(error, "__notes__", ()), sep="\n", file=sys.stderr)
+    return error.exit_code
+
+
 def _main(raw: list[str]) -> int:
-    json_requested = "--json" in raw
     root: Path | None = None
     args = argparse.Namespace()
     try:
@@ -351,13 +371,10 @@ def _main(raw: list[str]) -> int:
             return _run_tools(args)
         root = resolve_repo(args.repo)
         return _run_gate(root, args)
-    except UsageError as error:
-        print(error, file=sys.stderr)
-        if json_requested:
-            if root is None:
-                root = _repo_hint(raw)
-            _print_error_document(root, str(error), affected_base=vars(args).get("base"))
-        return error.exit_code
+    except GateError as error:
+        if not isinstance(error, UsageError) and vars(args).get("command") != "check":
+            raise
+        return _report_cli_error(error, root, args, raw)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,6 +1,8 @@
 """Tests for the fixture's in-process gate command."""
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 import signal
@@ -82,6 +84,66 @@ class InProcessRunQGTests(FixtureCase):
                     os.environ.pop("QG_PYTHON", None)
                     process = self.run_qg_process("check")
                 self.assertEqual(comparable(in_process), comparable(process))
+
+
+    def test_check_ledger_agrees_between_entry_points(self) -> None:
+        failing = BASE_CONFIG.replace(
+            'run = ["python3", "-c", "print(1)"]',
+            'run = ["python3", "-c", "raise SystemExit(1)"]',
+        )
+        elapsed = re.compile(r", \d+\.\d+s\)")
+        ledger_path = self.base / "evidence.jsonl"
+
+        def read_ledger(result: subprocess.CompletedProcess[str], mode: str) -> tuple[str, dict]:
+            for stream in (result.stdout, result.stderr):
+                self.assertNotIn("qg-ledger: ", stream, mode)
+                self.assertNotIn('"run_id":', stream, mode)
+            lines = ledger_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1, f"{mode}: expected one ledger record")
+            ledger_path.unlink()
+            ledger = json.loads(lines[0])
+            run_id = ledger.pop("run_id")
+            self.assertTrue(run_id, mode)
+            self.assertTrue(ledger["checks"], mode)
+            for row in ledger["checks"]:
+                seconds = row.pop("duration_seconds")
+                self.assertTrue(
+                    0 <= seconds < math.inf, f"{mode}, {row['id']}: invalid duration {seconds!r}",
+                )
+            return run_id, ledger
+
+        def comparable(result: subprocess.CompletedProcess[str]) -> tuple[int, list[str]]:
+            streams = [elapsed.sub(", Ns)", stream) for stream in (result.stdout, result.stderr)]
+            return result.returncode, streams
+
+        self.commit_all()
+        for name, text, status in (("passing", BASE_CONFIG, 0), ("failing", failing, 1)):
+            with self.subTest(check=name):
+                self.write_config(text)
+                git_dir = self.repo / ".git"
+                entries = sorted(path.relative_to(git_dir) for path in git_dir.rglob("*"))
+                default = self.run_qg("check")
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("QG_PYTHON", None)
+                    plain = self.run_qg_process("check")
+                self.assertEqual(default.returncode, status, default.stderr)
+                self.assertEqual(comparable(default), comparable(plain))
+                self.assertEqual(sorted(path.relative_to(git_dir) for path in git_dir.rglob("*")), entries)
+                self.assertFalse((git_dir / "qg-ledger.jsonl").exists())
+                self.assertFalse(ledger_path.exists())
+
+                in_process = self.run_qg("check", "--ledger", str(ledger_path))
+                in_process_id, in_process_ledger = read_ledger(in_process, "in process")
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("QG_PYTHON", None)
+                    process = self.run_qg_process("check", "--ledger", str(ledger_path))
+                self.assertEqual(in_process.returncode, status, in_process.stderr)
+                self.assertEqual(in_process_ledger["exit_status"], status)
+                self.assertEqual(comparable(in_process), comparable(process))
+                self.assertEqual(comparable(default), comparable(in_process))
+                process_id, process_ledger = read_ledger(process, "subprocess")
+                self.assertNotEqual(in_process_id, process_id)
+                self.assertEqual(in_process_ledger, process_ledger)
 
 
 if __name__ == "__main__":

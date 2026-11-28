@@ -1,6 +1,7 @@
 """Configuration loading and the policy data types."""
 from __future__ import annotations
 
+import hashlib
 import math
 import operator
 import tomllib
@@ -126,6 +127,7 @@ class Config:
     modules: dict[str, ModuleDef]
     module_contracts: bool
     capabilities: dict[str, CapabilityDef]
+    policy_sha256: str
     protect_paths: tuple[str, ...] = ()
     module_dirs: tuple[str, ...] | None = None
     shared_base: str | None = None
@@ -733,6 +735,20 @@ def _validate_crap_before_verification(
             )
 
 
+def _reject_builtin_check(name: str, raw: Any, path: Path) -> None:
+    from .files import STANDALONE_BUILTINS
+
+    configured = f"configured check {name!r} conflicts with built-in check {name!r}"
+    if name in STANDALONE_BUILTINS:
+        raise ConfigError(f"{path}: checks.{name}: {configured}")
+    adapter = raw.get("adapter") if isinstance(raw, dict) else None
+    if name == MODULE_CONTRACTS_ID and adapter not in (None, "module_contracts"):
+        raise _config_error(
+            path, f"checks.{name}.adapter", "module_contracts for this reserved check id",
+            f"{adapter!r} ({configured})",
+        )
+
+
 def _parse_checks(
     data: dict[str, Any], root: Path, path: Path, *, validate_headers: bool = True,
     candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
@@ -743,6 +759,7 @@ def _parse_checks(
     checks: dict[str, CheckDef] = {}
     shared_base = None
     for name, raw in raw_checks.items():
+        _reject_builtin_check(name, raw, path)
         if name == MODULE_CONTRACTS_ID:
             shared_base = _validate_module_contract_check(raw_checks, path)
             continue
@@ -1035,9 +1052,10 @@ def _parse_python_import_roots(data: dict[str, Any], path: Path) -> tuple[str, .
 
 
 def _config_from_data(
-    root: Path, path: Path, data: dict[str, Any], *, validate_headers: bool = True,
+    root: Path, path: Path, decoded: DecodedPolicy, *, validate_headers: bool = True,
     candidate_root: Path | None = None, parse_candidate_inputs: bool = True,
 ) -> Config:
+    data = decoded.data
     _check_keys(data, TOP_LEVEL_KEYS, path, "")
     schema = _declared_schema(data, path)
 
@@ -1066,6 +1084,7 @@ def _config_from_data(
         path=path,
         root=root,
         schema=schema,
+        policy_sha256=decoded.sha256,
         code_patterns=patterns,
         code_shebangs=shebangs,
         classes=classes,
@@ -1084,17 +1103,24 @@ def _config_from_data(
     )
 
 
-def decode_policy(raw: bytes, label: str) -> dict[str, Any]:
+@dataclass(frozen=True)
+class DecodedPolicy:
+    data: dict[str, Any]
+    sha256: str
+
+
+def decode_policy(raw: bytes, label: str) -> DecodedPolicy:
     """Decode the policy bytes from the caller's selected source."""
     try:
-        return tomllib.loads(raw.decode("utf-8"))
+        data = tomllib.loads(raw.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise ConfigError(f"{label}: expected valid TOML, got {error}") from error
+    return DecodedPolicy(data, hashlib.sha256(raw).hexdigest())
 
 
-def raw_baselines(data: dict[str, Any]) -> dict[str, str]:
+def raw_baselines(decoded: DecodedPolicy) -> dict[str, str]:
     """Return string baseline declarations in their original order and spelling."""
-    checks = data.get("checks")
+    checks = decoded.data.get("checks")
     if not isinstance(checks, dict):
         return {}
     return {
@@ -1104,7 +1130,7 @@ def raw_baselines(data: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def read_policy(path: Path) -> dict[str, Any]:
+def read_policy(path: Path) -> DecodedPolicy:
     """Read a policy file from the working tree and decode its contents."""
     try:
         raw = path.read_bytes()

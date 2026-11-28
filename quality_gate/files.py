@@ -97,12 +97,20 @@ class HygieneResult:
     messages: list[str]
     summary: str
     execution: str = "completed"
+    argv: list[str] | None = None
+
+
+class GitInspectionError(GateError):
+    def __init__(self, message: str, argv: list[str]) -> None:
+        super().__init__(message)
+        self.argv = argv
 
 
 def git_argv(root: Path, *args: str) -> list[str]:
     """The one invocation policy for git commands on a candidate repository."""
     return [
         "git",
+        "--no-optional-locks",
         "--no-replace-objects",
         "-c",
         f"safe.directory={root}",
@@ -161,18 +169,18 @@ def resolve_repo(value: str | None) -> Path:
 
 
 def _git(root: Path, args: list[str], what: str) -> bytes:
-    result = run(
-        git_argv(root, *args), budget_seconds=600, capture_limit=None
-    )
+    argv = git_argv(root, *args)
+    result = run(argv, budget_seconds=600, capture_limit=None)
     outcome = execution_outcome(result.execution)
     if outcome.error:
-        raise GateError(f"{what} failed: {result.error}")
-    if not outcome.completed:
-        raise GateError(f"{what} failed: git {result.execution}")
-    if result.returncode != 0:
-        detail = result.stderr_text.strip()
-        raise GateError(f"{what} failed: {detail or f'git exited {result.returncode}'}")
-    return result.stdout
+        detail = result.error
+    elif not outcome.completed:
+        detail = f"git {result.execution}"
+    elif result.returncode != 0:
+        detail = result.stderr_text.strip() or f"git exited {result.returncode}"
+    else:
+        return result.stdout
+    raise GitInspectionError(f"{what} failed: {detail}", argv)
 
 
 @dataclass(frozen=True)
@@ -1002,6 +1010,7 @@ def hygiene_result(root: Path, config: Config) -> HygieneResult:
             [f"hygiene: {error}"],
             "",
             execution="error",
+            argv=error.argv if isinstance(error, GitInspectionError) else None,
         )
     if ignored:
         return HygieneResult(

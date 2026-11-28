@@ -558,7 +558,7 @@ def _revision_config(
     raw = _content(root, sha, POLICY_NAME, f"{label}:{POLICY_NAME}")
     data = policy.decode_policy(raw, f"{label}:{POLICY_NAME}")
     names = policy.raw_baselines(data)
-    checks = cast(dict[str, Any], data.get("checks", {}))
+    checks = cast(dict[str, Any], data.data.get("checks", {}))
     for name, baseline in names.items():
         checks[name]["baseline"] = _stage_baseline(
             root, sha, label, temporary, baseline

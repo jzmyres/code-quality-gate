@@ -109,6 +109,8 @@ class FindingResult:
     locations: tuple[Location, ...] | None = None
     direction: str = "max"
 
+    baseline_expires: datetime.date | None = None
+
     def to_json(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "subject": self.subject,
@@ -766,6 +768,7 @@ def _finding_result(
         bound=entry.bound if entry is not None else None,
         threshold=threshold,
         baseline_reason=entry.reason if entry is not None else None,
+        baseline_expires=entry.expires if entry is not None else None,
         blocking=blocking,
         location=finding.location,
         covered_by_baseline=valid_entry,

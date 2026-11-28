@@ -13,6 +13,7 @@ import signal
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -40,7 +41,6 @@ from .files import (
     _split_nul,
     affected_diff,
     changed_paths,
-    git_argv,
     hygiene_result,
     resolve_diff_base,
     validate_inventory,
@@ -125,6 +125,7 @@ class CheckResult:
     tool: dict[str, str] | None = None
     report_fields: dict[str, Any] = field(default_factory=dict)
     excluded_lines: dict[str, tuple[int, ...]] | None = None
+    resolved_base: str | None = None
 
     def is_satisfied(self) -> bool:
         if self.satisfied is not None:
@@ -225,7 +226,7 @@ def _baseline_entries(check: CheckDef) -> list[BaselineEntry]:
 
 def _check_result(
     check: CheckDef,
-    start: float,
+    start: float | None,
     outcome: str,
     *,
     execution: str = "completed",
@@ -242,7 +243,7 @@ def _check_result(
         metric_version=check.metric_version,
         outcome=outcome,
         execution=execution,
-        duration_seconds=time.monotonic() - start,
+        duration_seconds=time.monotonic() - start if start is not None else 0.0,
         budget_seconds=budget_seconds,
         threshold=check.threshold,
         baseline_path=check.baseline,
@@ -547,10 +548,12 @@ def run_check(
     _check_descriptor(check)
     start = time.monotonic()
     with check_deadline(check.id, start, _check_budget(check)):
-        return _adapter_runner(
+        result = _adapter_runner(
             root, config, check, files, classes, prefix, evidence_dir,
             prior or {}, base_override, selection,
         )
+    result.duration_seconds = time.monotonic() - start
+    return result
 
 
 def _check_budget(check: CheckDef) -> float:
@@ -634,21 +637,22 @@ def _builtin_result(
 
 def _run_inventory(
     root: Path, config: Config
-) -> tuple[int, list[str], dict[str, str], list[str], str, float]:
+) -> tuple[int, list[str], dict[str, str], list[str], str, float, list[str] | None]:
     start = time.monotonic()
     try:
         files, classes, violations = validate_inventory(root, config)
     except GateError as error:
         message = f"inventory: {error}"
         print(message, file=sys.stderr)
-        return 1, [], {}, [message], "error", time.monotonic() - start
+        argv = getattr(error, "argv", None)
+        return 1, [], {}, [message], "error", time.monotonic() - start, argv
     if violations:
         messages = [f"inventory: {violation}" for violation in violations]
         for message in messages:
             print(message, file=sys.stderr)
-        return 1, files, classes, messages, "completed", time.monotonic() - start
+        return 1, files, classes, messages, "completed", time.monotonic() - start, None
     print(f"inventory: {len(files)} files match {len(config.rules)} rules")
-    return 0, files, classes, [], "completed", time.monotonic() - start
+    return 0, files, classes, [], "completed", time.monotonic() - start, None
 
 
 def _prune_option_error(
@@ -659,6 +663,7 @@ def _prune_option_error(
         root,
         config.path,
         message,
+        loaded_digest=config.policy_sha256,
         prune={
             "requested": requested,
             "performed": False,
@@ -989,7 +994,7 @@ def _run_selected_check(
     planned_report = selection.report() if selection is not None and not selection.adapter_report else None
     if selection is not None and selection.skip:
         result = _check_result(
-            check, time.monotonic(), "not_run", execution="not_run",
+            check, None, "not_run", execution="not_run",
             reason=selection.reason, satisfied=True,
         )
         print(f"{prefix}: not run ({selection.reason})")
@@ -1107,15 +1112,17 @@ def _validate_protected_tree(root: Path, config: Config, base: DiffBase) -> None
             )
 
 
-def _shared_changed_paths(root: Path, config: Config, diff: DiffBaseOverride) -> set[str] | frozenset[str]:
+def _shared_changed_paths(
+    root: Path, config: Config, diff: DiffBaseOverride,
+) -> tuple[set[str] | frozenset[str], str | None]:
     if config.shared_base is None:
-        return frozenset()
+        return frozenset(), None
     try:
         base = diff.for_scope(root, config.shared_base)
         _validate_protected_tree(root, config, base)
         if diff.changed_paths is not None:
-            return diff.changed_paths
-        return changed_paths(root, base.commit, "changed-file selection")
+            return diff.changed_paths, base.commit
+        return changed_paths(root, base.commit, "changed-file selection"), base.commit
     except UsageError:
         raise
     except GateError as error:
@@ -1159,7 +1166,7 @@ def _run_module_contracts(
     graph = None
     budget = None
     messages = []
-    changed = _shared_changed_paths(root, config, diff)
+    changed, resolved_base = _shared_changed_paths(root, config, diff)
     if inventory_code != 0:
         execution = "error"
         message, owners = _inventory_blocked_contracts(config, files, classes, changed)
@@ -1182,41 +1189,112 @@ def _run_module_contracts(
     )
     result.findings = findings
     result.budget_seconds = budget
+    result.resolved_base = resolved_base
     return result, graph
+
+
+@dataclass
+class LedgerRun:
+    destination: Path
+    supplied: str
+    run_id: str | None = None
+    selected: list[str] | None = None
+    affected_base: str | None = None
+    diff: DiffBaseOverride = field(default_factory=DiffBaseOverride)
+    start: dict[str, Any] = field(default_factory=lambda: {"revision": None, "dirty": None})
+    interrupted: dict[str, Any] | None = None
+
+    @contextlib.contextmanager
+    def dispatch(self, identifier: str, check: CheckDef | None):
+        started = time.monotonic()
+        try:
+            yield
+        except BaseException as error:
+            self.interrupted = {
+                "id": identifier,
+                "adapter": check.adapter if check else identifier,
+                "metric_version": check.metric_version if check else f"{identifier}/1",
+                "execution": "interrupted",
+                "outcome": None,
+                "satisfied": None,
+                "duration_seconds": round(time.monotonic() - started, 6),
+                "termination": type(error).__name__,
+            }
+            raise
+
+
+def _begin_ledger(
+    ledger: LedgerRun, root: Path, selected: list[str] | None, affected_base: str | None,
+) -> None:
+    ledger.selected = selected
+    ledger.affected_base = affected_base
+    ledger.run_id = str(uuid.uuid4())
+    ledger.start = gate_result.consumer_identity(root, strict=True)
+
+
+def _dispatch_attempt(ledger: LedgerRun | None, identifier: str, check: CheckDef | None = None):
+    return ledger.dispatch(identifier, check) if ledger is not None else contextlib.nullcontext()
+
+
+def _dispatch_module_contracts(
+    root: Path, config: Config, files: list[str], classes: dict[str, str], inventory_code: int,
+    directory: Path, diff: DiffBaseOverride, ledger: LedgerRun | None, results: list[CheckResult],
+) -> GraphExtraction | None:
+    with _dispatch_attempt(ledger, "module-contracts"):
+        evidence_dir = directory / "module-contracts"
+        evidence_dir.mkdir()
+        result, graph = _run_module_contracts(
+            root, config, files, classes, inventory_code, evidence_dir, diff,
+        )
+        results.append(result)
+    if diff.changed_paths is not None:
+        result.report_fields["selection"] = _builtin_selection(files, inventory_code)
+    return graph
+
+
+def _run_configured_check(
+    root: Path, config: Config, check: CheckDef, files: list[str], classes: dict[str, str],
+    directory: Path, prior: dict[str, CheckResult], diff: DiffBaseOverride,
+    selection: CheckSelection | None, inventory_code: int,
+) -> CheckResult:
+    if inventory_code != 0:
+        return _run_inventory_blocked_check(check, selection)
+    evidence_dir = directory / check.id
+    evidence_dir.mkdir()
+    return _run_selected_check(
+        root, config, check, files, classes, evidence_dir, prior, diff, selection,
+    )
 
 
 def _policy_results(
     root: Path, config: Config, files: list[str], classes: dict[str, str], inventory_code: int,
     selected_checks: list[CheckDef], base_override: DiffBaseOverride | None,
     directory: Path, module_contracts: bool,
+    *, results: list[CheckResult] | None = None, ledger: LedgerRun | None = None,
 ) -> list[CheckResult]:
-    results: list[CheckResult] = []
+    if results is None:
+        results = []
     prior: dict[str, CheckResult] = {}
     contract_graph = None
     if base_override is None:
         base_override = resolve_diff_base(root)
+    if ledger is not None:
+        ledger.diff = base_override
     if module_contracts:
-        evidence_dir = directory / "module-contracts"
-        evidence_dir.mkdir()
-        result, contract_graph = _run_module_contracts(
-            root, config, files, classes, inventory_code, evidence_dir, base_override,
+        contract_graph = _dispatch_module_contracts(
+            root, config, files, classes, inventory_code, directory, base_override, ledger, results,
         )
-        results.append(result)
     selections = _scope_selections(
         root, config, files, classes, directory, base_override.changed_paths,
         selected_checks, inventory_code, contract_graph,
     )
     for check in selected_checks:
-        selection = selections.get(check.id)
-        if inventory_code != 0:
-            outcome = _run_inventory_blocked_check(check, selection)
-        else:
-            evidence_dir = directory / check.id
-            evidence_dir.mkdir()
-            outcome = _run_selected_check(
-                root, config, check, files, classes, evidence_dir, prior, base_override, selection,
+        with _dispatch_attempt(ledger, check.id, check):
+            outcome = _run_configured_check(
+                root, config, check, files, classes, directory, prior, base_override,
+                selections.get(check.id), inventory_code,
             )
-        results.append(outcome)
+            results.append(outcome)
         prior[check.id] = outcome
     return results
 
@@ -1231,6 +1309,8 @@ def _run_policy_checks(
     *,
     base_override: DiffBaseOverride | None = None,
     module_contracts: bool = False,
+    results: list[CheckResult] | None = None,
+    ledger: LedgerRun | None = None,
 ) -> list[CheckResult]:
     selected = list(config.checks) if selected_ids is None else selected_ids
     selected_checks = [config.checks[identifier] for identifier in selected]
@@ -1241,7 +1321,7 @@ def _run_policy_checks(
         try:
             results = _policy_results(
                 root, config, files, classes, inventory_code, selected_checks,
-                base_override, Path(run_directory.name), module_contracts,
+                base_override, Path(run_directory.name), module_contracts, results=results, ledger=ledger,
             )
         except BaseException:
             _remove_run_directory(run_directory, report=True)
@@ -1405,7 +1485,7 @@ def _failure_entries(
 def _rejection_lines(
     results: list[CheckResult], obligations: list[dict[str, Any]]
 ) -> list[str]:
-    """The rejection summary, then a consequences line when there is one."""
+    """A consequences line when there is one, then the rejection summary."""
     entries = _failure_entries(results, obligations)
     roots: list[str] = []
     consequences: list[str] = []
@@ -1414,9 +1494,10 @@ def _rejection_lines(
             roots.append(name)
         else:
             consequences.append(f"{name} because {', '.join(caused_by)}")
-    lines = [f"check: failed ({', '.join(roots)})"]
+    lines = []
     if consequences:
         lines.append(f"check: consequences ({'; '.join(consequences)})")
+    lines.append(f"check: failed ({', '.join(roots)})")
     return lines
 
 
@@ -1433,18 +1514,13 @@ def _result_document(
     results: list[CheckResult],
     obligations: list[dict[str, Any]],
     prune: dict[str, Any],
-    trust: Any = None,
     selected: list[str] | None = None,
 ) -> dict[str, Any]:
     document = {
         "schema": 3,
         "gate_version": gate_result.gate_version(),
-        "revision": gate_result.consumer_revision(root),
-        "dirty": gate_result.consumer_dirty(root),
-        "policy_sha256": (
-            trust.policy_sha256 if trust is not None
-            else gate_result.policy_sha256(config.path)
-        ),
+        **gate_result.consumer_identity(root),
+        "policy_sha256": config.policy_sha256,
         "decision": decision,
         "checks": [result.to_json() for result in results],
         "obligations": obligations,
@@ -1497,6 +1573,7 @@ def _inventory_check(root: Path, config: Config) -> tuple[CheckResult, list[str]
         inventory_messages,
         inventory_execution,
         inventory_duration,
+        argv,
     ) = _run_inventory(root, config)
     result = _builtin_result(
         "inventory",
@@ -1504,9 +1581,7 @@ def _inventory_check(root: Path, config: Config) -> tuple[CheckResult, list[str]
         duration_seconds=inventory_duration,
         messages=inventory_messages,
         execution=inventory_execution,
-        argv=git_argv(
-            root, "ls-files", "-s", "-z", "-co", "--exclude-standard"
-        ),
+        argv=argv,
     )
 
     return result, files, classes, inventory_code
@@ -1526,9 +1601,7 @@ def _hygiene_check(root: Path, config: Config) -> CheckResult:
         duration_seconds=time.monotonic() - hygiene_start,
         messages=hygiene.messages,
         execution=hygiene.execution,
-        argv=git_argv(
-            root, "ls-files", "-z", "-c", "-i", "--exclude-standard"
-        ),
+        argv=hygiene.argv,
     )
 
 DECISION_MESSAGES = {
@@ -1538,21 +1611,7 @@ DECISION_MESSAGES = {
 }
 
 
-def _print_decision(
-    decision: str, configuration_error: str | None,
-    results: list[CheckResult], obligations: list[dict[str, Any]],
-) -> None:
-    if decision == "error":
-        print(f"check: error: {configuration_error}", file=sys.stderr)
-    elif decision == "rejected":
-        print(
-            *_rejection_lines(results, obligations),
-            sep="\n",
-            file=sys.stderr,
-        )
-    else:
-        message = DECISION_MESSAGES.get(decision, "check: passed")
-        print(f"{message} ({len(results)} checks)", flush=True)
+def _print_unevaluated_obligations(obligations: list[dict[str, Any]]) -> None:
     unevaluated = [
         f"{json.dumps(item['class'])} tier {item['tier']}"
         for item in obligations
@@ -1561,6 +1620,21 @@ def _print_decision(
     if unevaluated:
         print(f"check: obligations not evaluated ({', '.join(unevaluated)})", flush=True)
 
+
+def _print_check_report(
+    document: dict[str, Any], results: list[CheckResult], notices: list[str],
+) -> None:
+    decision = document["decision"]
+    obligations = document["obligations"]
+    _print_unevaluated_obligations(obligations)
+    if notices:
+        print(*notices, sep="\n", file=sys.stderr)
+    elif decision == "error":
+        print(f"check: error: {document.get('error')}", file=sys.stderr)
+    elif decision == "rejected":
+        print(*_rejection_lines(results, obligations), sep="\n", file=sys.stderr)
+    else:
+        print(f"{DECISION_MESSAGES[decision]} ({len(results)} checks)", flush=True)
 
 
 def _decision_exit_code(decision: str, prune_ids: list[str], prune: dict[str, Any]) -> int:
@@ -1584,7 +1658,7 @@ def _check_decision(
 
 def _finalize_check(
     root: Path, config: Config, results: list[CheckResult],
-    prune_ids: list[str], trust: Any, selected: list[str] | None = None,
+    prune_ids: list[str], selected: list[str] | None = None,
     affected_base: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     partial = selected is not None or affected_base is not None
@@ -1592,11 +1666,9 @@ def _finalize_check(
     obligations = gate_result.obligations(config, results, partial=partial)
     prune_document = _perform_prune(config, prune_ids, results)
     decision, configuration_error = _check_decision(results, obligations, partial)
-    _print_decision(decision, configuration_error, results, obligations)
     exit_code = _decision_exit_code(decision, prune_ids, prune_document)
     document = _result_document(
-        root, config, decision, results, obligations, prune_document, trust,
-        selected,
+        root, config, decision, results, obligations, prune_document, selected,
     )
     if configuration_error is not None:
         document["error"] = configuration_error
@@ -1627,59 +1699,124 @@ def _selected_check_ids(config: Config, only_ids: list[str] | None) -> list[str]
     return selected
 
 
-def _report_affected_scope(
-    document: dict[str, Any], files: list[str], diff: DiffBaseOverride | None, inventory_code: int,
-) -> None:
-    if diff is None or diff.changed_paths is None:
-        return
+def _builtin_selection(files: list[str], inventory_code: int) -> dict[str, Any]:
     selected = dict.fromkeys(files, "full run") if inventory_code == 0 else {}
-    selection = CheckSelection(selected, {}, "full run").report()
-    for result in document["checks"]:
-        if result["kind"] in BUILTIN_RESULT_KINDS:
-            result["selection"] = selection
-    document["changed_paths"] = sorted(diff.changed_paths)
+    return CheckSelection(selected, {}, "full run").report()
+
+
+def _run_builtins(
+    root: Path, config: Config, affected: bool, results: list[CheckResult], ledger: LedgerRun | None,
+) -> tuple[list[str], dict[str, str], int]:
+    with _dispatch_attempt(ledger, "inventory"):
+        inventory, files, classes, code = _inventory_check(root, config)
+        results.append(inventory)
+    if affected:
+        inventory.report_fields["selection"] = _builtin_selection(files, code)
+    with _dispatch_attempt(ledger, "hygiene"):
+        hygiene = _hygiene_check(root, config)
+        results.append(hygiene)
+    if affected:
+        hygiene.report_fields["selection"] = inventory.report_fields["selection"]
+    return files, classes, code
 
 
 def _check_command(
-    root: Path,
-    config: Config,
-    prune_ids: list[str],
-    trust: Any = None,
-    only_ids: list[str] | None = None,
-    affected_base: str | None = None,
+    root: Path, config: Config, prune_ids: list[str], selected: list[str] | None,
+    affected_base: str | None, diff: DiffBaseOverride | None,
+    results: list[CheckResult], ledger: LedgerRun | None,
 ) -> tuple[int, dict[str, Any]]:
-    problem = _prune_request_problem(config, prune_ids)
-    if problem is not None:
-        return _prune_option_error(root, config, prune_ids, problem)
-    selected = _selected_check_ids(config, only_ids)
-    diff = affected_diff(root, affected_base) if affected_base is not None else None
-    inventory, files, classes, code = _inventory_check(root, config)
-    results = [inventory, _hygiene_check(root, config)]
+    files, classes, code = _run_builtins(root, config, diff is not None, results, ledger)
     configured = None if selected is None else [name for name in selected if name in config.checks]
-    results.extend(
-        _run_policy_checks(
-            root, config, files, classes, code, configured, base_override=diff,
-            module_contracts=config.module_contracts,
-        )
+    _run_policy_checks(
+        root, config, files, classes, code, configured, base_override=diff,
+        module_contracts=config.module_contracts, results=results, ledger=ledger,
     )
-    exit_code, document = _finalize_check(root, config, results, prune_ids, trust, selected, affected_base)
-    _report_affected_scope(document, files, diff, code)
+    exit_code, document = _finalize_check(root, config, results, prune_ids, selected, affected_base)
+    if diff is not None:
+        assert diff.changed_paths is not None
+        document["changed_paths"] = sorted(diff.changed_paths)
     return exit_code, document
 
 
-def _run_check_document(
-    root: Path,
-    config: Config,
-    prune_ids: list[str],
-    json_output: bool,
-    trust: Any = None,
-    only_ids: list[str] | None = None,
-    affected_base: str | None = None,
+@contextlib.contextmanager
+def _check_trust(trust: Any):
+    if trust is None:
+        yield
+        return
+    try:
+        yield
+    except BaseException as error:
+        try:
+            trust.close()
+        except Exception as cleanup_error:
+            error.add_note(str(cleanup_error))
+        raise
+    else:
+        trust.close()
+
+
+def _check_output(json_output: bool):
+    return contextlib.redirect_stdout(sys.stderr) if json_output else contextlib.nullcontext()
+
+
+def _run_check_engine(
+    root: Path, config: Config, requested: list[str], only_ids: list[str] | None,
+    affected_base: str | None, json_output: bool, trust: Any,
+    ledger: LedgerRun | None, results: list[CheckResult],
 ) -> tuple[int, dict[str, Any]]:
-    if not json_output:
-        return _check_command(root, config, prune_ids, trust, only_ids, affected_base)
-    with contextlib.redirect_stdout(sys.stderr):
-        return _check_command(root, config, prune_ids, trust, only_ids, affected_base)
+    problem = _prune_request_problem(config, requested)
+    if problem is not None:
+        return _prune_option_error(root, config, requested, problem)
+    selected = _selected_check_ids(config, only_ids)
+    diff = affected_diff(root, affected_base) if affected_base is not None else None
+    if ledger is not None:
+        if diff is not None:
+            ledger.diff = diff
+        _begin_ledger(ledger, root, selected, affected_base)
+    scope = trust.activate() if trust is not None else contextlib.nullcontext()
+    with scope, _check_output(json_output):
+        return _check_command(root, config, requested, selected, affected_base, diff, results, ledger)
+
+
+def _append_check_evidence(
+    root: Path, config: Config, ledger: LedgerRun | None, results: list[CheckResult],
+    document: dict[str, Any], status: int | None, termination: str | None = None,
+) -> None:
+    if ledger is None or ledger.run_id is None:
+        return
+    version = document["gate_version"] if "gate_version" in document else gate_result.gate_version()
+    record = gate_result.ledger_record(
+        run_id=ledger.run_id, start=ledger.start, end=gate_result.consumer_identity(root, strict=True),
+        version=version, digest=config.policy_sha256, selected=ledger.selected, base=ledger.affected_base,
+        diff=ledger.diff, results=results, interrupted=ledger.interrupted, document=document,
+        status=status, termination=termination,
+    )
+    gate_result.append_ledger(ledger.destination, ledger.supplied, record)
+
+
+def _append_during_unwind(
+    root: Path, config: Config, ledger: LedgerRun | None, results: list[CheckResult],
+    document: dict[str, Any], error: BaseException,
+) -> None:
+    if ledger is None:
+        return
+    status = error.exit_code if isinstance(error, GateError) else None
+    try:
+        _append_check_evidence(root, config, ledger, results, document, status, type(error).__name__)
+    except Exception as append_error:
+        error.add_note(str(append_error))
+
+
+def _publish_check(
+    document: dict[str, Any], results: list[CheckResult], notices: list[str], json_output: bool,
+) -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if json_output:
+        print(json.dumps(document, indent=2, allow_nan=False), flush=True)
+    if results:
+        with _check_output(json_output):
+            _print_check_report(document, results, notices)
 
 
 def command_check(
@@ -1691,24 +1828,22 @@ def command_check(
     only_ids: list[str] | None = None,
     trust: Any = None,
     affected_base: str | None = None,
+    ledger_path: str | None = None,
 ) -> int:
-    requested = prune_ids or []
-    if trust is None:
-        code, document = _run_check_document(
-            root, config, requested, json_output, only_ids=only_ids, affected_base=affected_base,
-        )
-    else:
-        try:
-            with trust.activate():
-                code, document = _run_check_document(
-                    root, config, requested, json_output, trust, only_ids, affected_base,
-                )
-            code, document = trust.finish(code, document)
-        finally:
-            trust.close()
-    if json_output:
-        print(
-            json.dumps(document, indent=2, allow_nan=False),
-            file=sys.stdout,
-        )
+    ledger = LedgerRun(Path.cwd() / ledger_path, ledger_path) if ledger_path is not None else None
+    results: list[CheckResult] = []
+    notices: list[str] = []
+    document: dict[str, Any] = {}
+    try:
+        with _check_trust(trust):
+            code, document = _run_check_engine(
+                root, config, prune_ids or [], only_ids, affected_base, json_output, trust, ledger, results,
+            )
+            if trust is not None:
+                code, document = trust.finish(code, document, notices=notices)
+    except BaseException as error:
+        _append_during_unwind(root, config, ledger, results, document, error)
+        raise
+    _append_check_evidence(root, config, ledger, results, document, code)
+    _publish_check(document, results, notices, json_output)
     return code
