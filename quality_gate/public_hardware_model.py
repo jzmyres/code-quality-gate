@@ -109,50 +109,14 @@ def _pinned_bytes(proof: Declaration, record: _Record) -> bool:
     return proof.decoded_sha256 == record.decoded_sha256 and proof.compressed_sha256 == compressed
 
 
-def _raw_row(row: dict[str, Any], path: str) -> bool:
-    return (
-        secrets._raw_provenance_match(row, path, python=False)
-        and secrets._direct_generic_match(row, path)
-        and row["Attributes"].get("confidence") in ("low", "medium", "high")
-    )
-
-
-def _value_span(row: dict[str, Any], record: secrets._Record, match: _Span) -> _Span | None:
-    bounds = secrets._finding_bounds(row, record)
-    prefix = secrets._match_prefix(row, python=False)
-    if bounds is None or prefix is None:
-        return None
-    start, line_end, width = bounds
-    value_width = width - len(prefix) - 1
-    if match != (start, start + width) or value_width <= 0:
-        return None
-    line_start = record.starts[row["StartLine"] - 1]
-    value_start = start + len(prefix)
-    if secrets._unique_value(record.data, prefix, line_start, line_end, value_width) != value_start:
-        return None
-    return value_start, start + width - 1
-
-
-def _bind_pointer(record: _Record, span: _Span, pointer: tuple[str, ...], label: str) -> bool:
-    """Bind the pointer by changing just the matched span to a different string of the same byte width."""
-    start, end = span
-    data = record.source.data
-    if data[start:end] != label.encode("utf-8") or secrets._pointer_value(record.original, pointer) != label:
-        return False
-    marker = (b"!" if data[start:start + 1] == b"~" else b"~") * (end - start)
-    try:
-        marked = load_json((data[:start] + marker + data[end:]).decode("utf-8"))
-    except (ValueError, RecursionError):
-        return False
-    return secrets._pointer_value(marked, pointer) == marker.decode("ascii")
-
-
 def _proves(row: dict[str, Any], record: _Record, proof: _Proof) -> bool:
     declaration = proof.declaration
     if not _pinned_bytes(declaration, record):
         return False
-    span = _value_span(row, record.source, declaration.match_span)
-    return span is not None and _bind_pointer(record, span, declaration.pointer, proof.label)
+    span = secrets._direct_value_span(row, record.source, declaration.match_span)
+    return span is not None and secrets._bind_json_pointer(
+        record.source.data, record.original, span, declaration.pointer, proof.label,
+    )
 
 
 def _one_proof(row: dict[str, Any], record: _Record, proofs: tuple[_Proof, ...]) -> bool:
@@ -165,7 +129,7 @@ def _declared_rows(
     rows = defaultdict(list)
     for index, row in enumerate(findings):
         path = row["File"]
-        if path in proofs and _raw_row(row, path):
+        if path in proofs and secrets._direct_assignment(row, path):
             rows[path].append((index, row))
     return rows
 
@@ -199,5 +163,5 @@ def verified_rows(
 def prepare_scan(
     declarations: tuple[Declaration, ...], paths: dict[str, bool], tracked: set[str],
     read_blob: secrets._ReadGitBlob,
-) -> secrets._VerifyModels:
+) -> secrets._VerifyRows:
     return partial(verified_rows, proofs=prepare(declarations, paths, tracked, read_blob))

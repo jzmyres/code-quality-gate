@@ -66,8 +66,8 @@ class GitPayload:
 
 
 _ReadGitBlob = Callable[[GitPayload], tuple[bytes, str] | None]
-_VerifyModels = Callable[[list[dict[str, Any]], Path, _ReportRun], set[int]]
-_PrepareModels = Callable[[dict[str, bool], set[str], _ReadGitBlob], _VerifyModels]
+_VerifyRows = Callable[[list[dict[str, Any]], Path, _ReportRun], set[int]]
+_PrepareRows = Callable[[dict[str, bool], set[str], _ReadGitBlob], _VerifyRows]
 
 
 @dataclass(frozen=True)
@@ -624,6 +624,47 @@ def _raw_provenance_match(finding: dict[str, Any], path: str, *, python: bool) -
     )
 
 
+def _direct_assignment(row: dict[str, Any], path: str) -> bool:
+    return (
+        _raw_provenance_match(row, path, python=False)
+        and _direct_generic_match(row, path)
+        and row["Attributes"].get("confidence") in ("low", "medium", "high")
+    )
+
+
+def _direct_value_span(
+    row: dict[str, Any], record: _Record, match: tuple[int, int],
+) -> tuple[int, int] | None:
+    bounds = _finding_bounds(row, record)
+    prefix = _match_prefix(row, python=False)
+    if bounds is None or prefix is None:
+        return None
+    start, line_end, width = bounds
+    value_width = width - len(prefix) - 1
+    if match != (start, start + width) or value_width <= 0:
+        return None
+    line_start = record.starts[row["StartLine"] - 1]
+    value_start = start + len(prefix)
+    if _unique_value(record.data, prefix, line_start, line_end, value_width) != value_start:
+        return None
+    return value_start, start + width - 1
+
+
+def _bind_json_pointer(
+    data: bytes, original: Any, span: tuple[int, int], pointer: tuple[str, ...], value: str,
+) -> bool:
+    """Bind the JSON pointer to this literal occurrence using an in-memory marker."""
+    start, end = span
+    if data[start:end] != value.encode("utf-8") or _pointer_value(original, pointer) != value:
+        return False
+    marker = (b"!" if data[start:start + 1] == b"~" else b"~") * (end - start)
+    try:
+        marked = load_json((data[:start] + marker + data[end:]).decode("utf-8"))
+    except (ValueError, RecursionError):
+        return False
+    return _pointer_value(marked, pointer) == marker.decode("ascii")
+
+
 def _candidate_span(finding: dict[str, Any], records: dict[str, _Record]) -> _DigestSpan | None:
     path = finding["File"]
     record = records.get(path)
@@ -953,6 +994,7 @@ class VerifiedScan:
     verified: int
     vocabulary: tuple[tuple[_Coordinate, ...], ...] = ()
     public_models: int = 0
+    public_git_revisions: tuple[_Coordinate, ...] = ()
 
 
 def _selected_vocabulary(
@@ -961,15 +1003,15 @@ def _selected_vocabulary(
     return {proof.path: proof for proof in proofs if paths.get(proof.path) and proof.path in tracked}
 
 
-def _prepare_model_scan(
-    prepare: _PrepareModels | None, paths: dict[str, bool], tracked: set[str], git: _GitPayloadReader | None,
-) -> _VerifyModels | None:
+def _prepare_row_proof(
+    prepare: _PrepareRows | None, paths: dict[str, bool], tracked: set[str], git: _GitPayloadReader | None,
+) -> _VerifyRows | None:
     return prepare(paths, tracked, git.read) if prepare is not None and git is not None else None
 
 
-def _verified_model_rows(
+def _verified_rows(
     findings: list[dict[str, Any]], directory: Path, run_report: _ReportRun,
-    verify: _VerifyModels | None,
+    verify: _VerifyRows | None,
 ) -> set[int]:
     return verify(findings, directory, run_report) if verify is not None else set()
 
@@ -980,7 +1022,8 @@ def scan_verified(
     tracked: set[str], open_parent: _OpenParent, run: Callable[..., Any],
     git_run: _ReportRun | None = None,
     public_vocabulary: tuple[public_vocab.PublishedVocabulary, ...] = (),
-    prepare_models: _PrepareModels | None = None,
+    prepare_models: _PrepareRows | None = None,
+    prepare_git_revisions: _PrepareRows | None = None,
 ) -> VerifiedScan:
     paths = _snapshot(root, directory, selected, open_parent)
     candidates = _selected_provenance(paths, tracked, declarations)
@@ -1000,34 +1043,45 @@ def scan_verified(
         )
 
     vocabulary = _selected_vocabulary(public_vocabulary, paths, tracked)
-    verify_models = _prepare_model_scan(prepare_models, paths, tracked, git)
-    return _scan_reports(directory, sorted(paths) or ["."], pinned, vocabulary, run_report, verify_models)
+    verify_models = _prepare_row_proof(prepare_models, paths, tracked, git)
+    verify_revisions = _prepare_row_proof(prepare_git_revisions, paths, tracked, git)
+    return _scan_reports(
+        directory, sorted(paths) or ["."], pinned, vocabulary, run_report, verify_models, verify_revisions,
+    )
 
 
 def _scan_reports(
     directory: Path, paths: list[str], pinned: dict[str, list[Provenance]],
     public_vocabulary: dict[str, public_vocab.PublishedVocabulary], run_report: _ReportRun,
-    verify_models: _VerifyModels | None = None,
+    verify_models: _VerifyRows | None = None, verify_revisions: _VerifyRows | None = None,
 ) -> VerifiedScan:
     unresolved = verified = models = 0
-    with_findings = None
+    reports_by_exit = {}
     vocabulary = []
+    revisions = []
     for targets in batched(paths, _MAX_FILES_PER_INVOCATION):
         child = run_report(targets)
         safe_child = replace(child, stdout=b"", stderr=b"", output_tail=b"", output_bytes=0)
         if child.execution != "completed":
-            return VerifiedScan(safe_child, unresolved, verified, tuple(sorted(vocabulary)), models)
+            return VerifiedScan(
+                safe_child, unresolved, verified, tuple(sorted(vocabulary)), models, tuple(sorted(revisions)),
+            )
         findings = _report(child)
         records = _verified_records(directory, targets, pinned)
         public_rows = _verified_vocabulary_rows(directory, findings, public_vocabulary, run_report)
-        model_rows = _verified_model_rows(findings, directory, run_report, verify_models)
+        model_rows = _verified_rows(findings, directory, run_report, verify_models)
+        revision_rows = _verified_rows(findings, directory, run_report, verify_revisions)
         batch_unresolved, batch_verified = _report_findings(
-            child, records, run_report, findings=findings, public_verified=public_rows.keys() | model_rows,
+            child, records, run_report, findings=findings,
+            public_verified=public_rows.keys() | model_rows | revision_rows,
         )
         unresolved += batch_unresolved
         verified += batch_verified
         models += len(model_rows)
         vocabulary.extend(_vocabulary_location(public_rows[index]) for index in sorted(public_rows))
-        if child.returncode == _FINDINGS_EXIT:
-            with_findings = safe_child
-    return VerifiedScan(with_findings or safe_child, unresolved, verified, tuple(sorted(vocabulary)), models)
+        revisions.extend(_coordinate(findings[index]) for index in revision_rows)
+        reports_by_exit[child.returncode] = safe_child
+    return VerifiedScan(
+        reports_by_exit.get(_FINDINGS_EXIT, safe_child), unresolved, verified,
+        tuple(sorted(vocabulary)), models, tuple(sorted(revisions)),
+    )

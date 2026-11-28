@@ -21,7 +21,8 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from . import (
     clones, command, comments, elisp_batch, elisp_crap, elisp_lint, elisp_tests, env_surface,
-    module_graph, public_hardware_model, public_vocab, python_crap, python_mutation, secrets, shell_syntax,
+    module_graph, public_git_revision, public_hardware_model, public_vocab, python_crap, python_mutation,
+    secrets, shell_syntax,
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import (
@@ -528,8 +529,13 @@ _PUBLIC_VOCABULARY_FIELDS = (
 )
 _PUBLIC_ARCHIVE_FIELDS = ("compressed_sha256", "compressed_size")
 _PUBLIC_MODEL_KEY = "public_hardware_model_v1"
-_PUBLIC_MODEL_FIELDS = (*_PROVENANCE_RECORD_FIELDS, "match_start", "match_end", "decoded_sha256", "catalogue")
+_POSITIONED_RECORD_FIELDS = (*_PROVENANCE_RECORD_FIELDS, "match_start", "match_end")
+_PUBLIC_MODEL_FIELDS = (*_POSITIONED_RECORD_FIELDS, "decoded_sha256", "catalogue")
 _MODEL_CATALOGUE_FIELDS = ("payload", "sha256", "literal_start", "literal_end")
+_PUBLIC_REVISION_KEY = "public_git_revision_v1"
+_PUBLIC_REVISION_FIELDS = (*_POSITIONED_RECORD_FIELDS, "record_sha256",
+                           "publication")
+_REVISION_PUBLICATION_FIELDS = ("repository_url", "revision", "commit", "tree")
 
 
 def _valid_python_pointer(parts: tuple[str, ...]) -> bool:
@@ -789,17 +795,86 @@ def _public_models(
     return tuple(declarations)
 
 
+def _public_object(row: dict[str, Any], field: str, path: Path, where: str) -> public_git_revision.ObjectBody:
+    key = f"{where}.{field}"
+    body = _read_value(row, field, path, key, _TABLE)
+    _check_keys(body, ("payload", "sha256"), path, key)
+    payload_key = f"{key}.payload"
+    source = _git_payload(_read_value(body, "payload", path, payload_key, _TABLE), path, payload_key)
+    if not 0 < source.size <= public_git_revision.MAX_OBJECT_BYTES:
+        raise _config_error(path, key, "a historical Git payload of 1 to 65536 bytes", "invalid size")
+    return public_git_revision.ObjectBody(source, _provenance_digest(body, "sha256", path, key))
+
+
+def _revision_publication(row: dict[str, Any], path: Path, where: str) -> public_git_revision.Publication:
+    key = f"{where}.publication"
+    published = _read_value(row, "publication", path, key, _TABLE)
+    _check_keys(published, _REVISION_PUBLICATION_FIELDS, path, key)
+    repo = _string(published, "repository_url", path, f"{key}.repository_url")
+    repository = public_git_revision.REPOSITORY_URL.fullmatch(repo)
+    if repository is None:
+        raise _config_error(
+            path, f"{key}.repository_url", "an HTTPS Hugging Face model repository URL", "invalid URL",
+        )
+    revision = _string(published, "revision", path, f"{key}.revision")
+    if not public_git_revision.REVISION.fullmatch(revision):
+        raise _config_error(path, f"{key}.revision", "40 lowercase hex digits", "invalid ID")
+    commit = _public_object(published, "commit", path, key)
+    tree = _public_object(published, "tree", path, key)
+    return public_git_revision.Publication(repository[1], revision, commit, tree)
+
+
+def _public_revision_spec(row: Any, path: Path, where: str) -> public_git_revision.Declaration:
+    _read_scalar(path, where, row, _TABLE)
+    _check_keys(row, _PUBLIC_REVISION_FIELDS, path, where)
+    record = _string(row, "record", path, f"{where}.record")
+    _validate_exact_path(path, f"{where}.record", record)
+    if not record.endswith((".json", ".md")):
+        raise _config_error(path, where, "a .json or .md record path", "invalid suffix")
+    pointer_text = _string(row, "pointer", path, f"{where}.pointer")
+    pointer = _read_pointer(pointer_text, path, f"{where}.pointer", python=False)
+    if pointer[-1] != "tokenizer_revision":
+        raise _config_error(
+            path, f"{where}.pointer", "a JSON Pointer ending in tokenizer_revision", "invalid value",
+        )
+    span = _byte_span(row, "match", path, where, secrets._MAX_RECORD_BYTES)
+    published = _revision_publication(row, path, where)
+    if len({record, published.commit.payload.path, published.tree.payload.path}) != 3:
+        raise _config_error(path, where, "separate record, commit and tree paths", "identical paths")
+    digest = _provenance_digest(row, "record_sha256", path, where)
+    return public_git_revision.Declaration(record, pointer, span, digest, published)
+
+
+def _public_revisions(
+    raw: dict[str, Any], path: Path, key: str,
+) -> tuple[public_git_revision.Declaration, ...]:
+    name = f"{key}.{_PUBLIC_REVISION_KEY}"
+    rows = raw.get(_PUBLIC_REVISION_KEY, [])
+    if not isinstance(rows, list) or len(rows) > public_git_revision.MAX_RECORDS:
+        limit = public_git_revision.MAX_RECORDS
+        raise _config_error(path, name, f"up to {limit} tables", "invalid value")
+    declarations = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        where = f"{name}[{index}]"
+        declaration = _public_revision_spec(row, path, where)
+        _unique(seen, declaration.record, path, where, "a unique record path", "duplicate", _config_error)
+        declarations.append(declaration)
+    return tuple(declarations)
+
+
 @dataclass(frozen=True)
 class _SecretsSpec:
     digests: tuple[secrets.Provenance, ...]
     vocabulary: tuple[public_vocab.PublishedVocabulary, ...]
     models: tuple[public_hardware_model.Declaration, ...]
+    revisions: tuple[public_git_revision.Declaration, ...]
 
 
 def _secrets_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -> ParsedSpec:
     return ParsedSpec(
         _SecretsSpec(_secrets_provenance(raw, path, key), _public_vocabulary(raw, path, key),
-                     _public_models(raw, path, key)),
+                     _public_models(raw, path, key), _public_revisions(raw, path, key)),
         "secrets/1", ("static",),
     )
 
@@ -815,16 +890,23 @@ def _secrets_result(context: AdapterContext, start: float, child: RunResult, bud
     )
 
 
+def _redacted_locations(coordinates: tuple[secrets._Coordinate, ...]) -> list[dict[str, str | int]]:
+    fields = ("path", "rule", "start_line", "end_line", "start_column", "end_column")
+    return [dict(zip(fields, coordinate, strict=True)) for coordinate in coordinates]
+
+
 def _scanner_measurement(scan: secrets.VerifiedScan, spec: _SecretsSpec) -> dict[str, Any]:
     measurement: dict[str, Any] = {"verified_sha256_provenance": scan.verified}
     if spec.vocabulary:
-        fields = ("path", "rule", "start_line", "end_line", "start_column", "end_column")
         measurement["verified_public_vocabulary"] = len(scan.vocabulary)
         measurement["public_vocabulary_locations"] = [
-            [dict(zip(fields, coordinate, strict=True)) for coordinate in row] for row in scan.vocabulary
+            _redacted_locations(row) for row in scan.vocabulary
         ]
     if spec.models:
         measurement["verified_public_hardware_models"] = scan.public_models
+    if spec.revisions:
+        measurement["verified_public_git_revisions"] = len(scan.public_git_revisions)
+        measurement["public_git_revision_locations"] = _redacted_locations(scan.public_git_revisions)
     return measurement
 
 
@@ -868,20 +950,20 @@ def _trusted_proof_spec(context: AdapterContext) -> _SecretsSpec:
     spec = context.check.spec
     if context.config.policy_from_trusted_directory:
         return spec
-    return _SecretsSpec(spec.digests, (), ())
+    return _SecretsSpec(spec.digests, (), (), ())
 
 
 def _scan_secrets(context: AdapterContext, binary: Path, directory: Path, start: float, budget: int) -> Any:
     root = context.root.resolve()
     selected, tracked = _secrets_paths(root)
     spec = _trusted_proof_spec(context)
-    if context.config.trusted_policy and (spec.digests or spec.vocabulary or spec.models):
-        prepare = partial(public_hardware_model.prepare_scan, spec.models) if spec.models else None
+    if context.config.trusted_policy and (spec.digests or spec.vocabulary or spec.models or spec.revisions):
         verified = secrets.scan_verified(
             binary, root, directory, selected, budget, spec.digests,
             tracked=tracked, open_parent=_parent_fd, run=run,
             git_run=partial(_secrets_git_command, root, budget), public_vocabulary=spec.vocabulary,
-            prepare_models=prepare,
+            prepare_models=partial(public_hardware_model.prepare_scan, spec.models),
+            prepare_git_revisions=partial(public_git_revision.prepare_scan, spec.revisions),
         )
         return _verified_secrets_result(context, start, verified, budget, spec)
     child = secrets.scan(binary, root, directory, selected, budget, open_parent=_parent_fd, run=run)
@@ -1337,7 +1419,7 @@ register_adapter(AdapterDescriptor(
 ))
 register_adapter(AdapterDescriptor(
     "secrets",
-    ("sha256_provenance", "public_vocabulary", _PUBLIC_MODEL_KEY),
+    ("sha256_provenance", "public_vocabulary", _PUBLIC_MODEL_KEY, _PUBLIC_REVISION_KEY),
     _secrets_spec,
     _run_secrets,
     runs_suite=False,

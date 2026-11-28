@@ -630,6 +630,54 @@ decoding and reads zero archive layers for raw JSON and one for gzip.
 the trusted policy enables this proof. Other findings retain normal
 enforcement, including adjacent findings in the same record.
 
+### Published tokenizer Git revisions
+
+Use `[[checks.secrets.public_git_revision_v1]]` in the trusted
+`--policy-from` directory. Each declaration covers one scanner occurrence
+in an exact Git-tracked regular `.json` or `.md` file. Declare up to 16
+distinct record paths. An authorized candidate policy replacement can supply
+these declarations after inclusion in a trusted directory for a subsequent run.
+
+| Field | Meaning |
+| --- | --- |
+| `record` | Exact repository-relative record path |
+| `record_sha256` | SHA-256 of the complete captured UTF-8 file |
+| `pointer` | JSON Pointer ending in `tokenizer_revision` |
+| `match_start`, `match_end` | Zero-based, half-open byte interval of the whole scanner match in the complete file |
+| `publication.repository_url` | Exact public Hugging Face model repository in the form `https://huggingface.co/owner/repository` |
+| `publication.revision` | Full 40-digit lowercase Git commit ID |
+| `publication.commit.payload`, `publication.tree.payload` | Historical Git payload tables, each with a separate literal path, full local commit and blob IDs, and exact byte size |
+| `publication.commit.sha256`, `publication.tree.sha256` | SHA-256 of the exact archived public commit and root tree object bodies |
+
+Before trusting the declaration, independently acquire the commit at the
+declared public repository and archive the raw commit and root tree bodies.
+Use the bodies returned by `git cat-file commit` and `git cat-file tree`.
+Public origin is a trusted-policy decision based on that acquisition. The
+gate uses the existing offline historical Git lookup to authenticate the
+two archive blobs, each bounded by 64 KiB. It recomputes the typed public
+Git object IDs, checks the commit's root tree link and verifies that the
+root tree contains regular `tokenizer.json` and `tokenizer_config.json`
+entries. The offline proof reads the two archived Git object bodies.
+
+The value at the pointer must be the exact unescaped revision. A sibling
+`tokenizer` string must exactly match the publication's repository name.
+Records are bounded by 16 MiB and parsed as strict JSON with unique keys.
+For Markdown, decode the JSON from a single unindented LF-delimited fence
+with exactly three backticks, the `json` info string and a bare closing
+fence. The opener must start the file or follow a blank line. A document
+with additional fence markers or raw HTML fails the proof. Coordinates
+apply to the complete file, and the match must lie inside the JSON body.
+
+The untransformed `fs.content` `generic-api-key` finding must match the
+declared bytes and the exact pointer. The standard scan and a replay with
+archive and secondary decoding disabled must return one identical row at
+that coordinate. The check reports the count in
+`measurement.verified_public_git_revisions` and redacted coordinates in
+`public_git_revision_locations`. Changed bytes, unknown or ambiguous
+documents, failed object proofs and failed or ambiguous replay leave the
+original finding unresolved. Adjacent and undeclared findings retain normal
+enforcement.
+
 ## Tool lock: `tools.lock.toml`
 
 Each top-level table names a pinned tool:
