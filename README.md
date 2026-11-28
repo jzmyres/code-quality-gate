@@ -2130,7 +2130,41 @@ This repository gates itself with `quality-gate.toml`:
   repository gates its Emacs Lisp helpers with the gate's own Elisp checks; the ERT suite
   `tests/elisp/qg-elisp-tests.el` exercises the complexity, child and lint helpers, `elisp-crap` scores
   every helper function from that run at or below CRAP 6 with no baseline entries, and the suite's
-  `elisp-suite` class lists only `elisp-compile` and `elisp-checkdoc`, so the suite is never instrumented;
+  `elisp-suite` class includes `elisp-compile` and `elisp-checkdoc`. The suite is never instrumented.
+* `module-graph` and `module-tree` measure the same 99 source files at tier 1 with no baseline.
+  Both are advisory because the first run found dependency cycles. Each check reports a raw `fail`
+  while its findings allow an otherwise passing gate run to succeed. The graph found one strongly
+  connected component of 23 Python files. Its shortest cycle witness is
+  `quality_gate/adapters.py → quality_gate/checks.py → quality_gate/adapters.py`.
+  The tree found 123 distinct cyclic file edges, all imports, and zero directory cycles.
+  The JSON report retains occurrence locations.
+
+  First-run cyclic file edges
+  ```text
+  quality_gate/adapters.py import quality_gate/checks.py quality_gate/clones.py quality_gate/command.py quality_gate/elisp_crap.py quality_gate/elisp_lint.py quality_gate/elisp_tests.py quality_gate/files.py quality_gate/policy.py quality_gate/python_crap.py quality_gate/python_mutation.py quality_gate/python_shape.py quality_gate/python_tests.py quality_gate/ratchet.py quality_gate/runner.py quality_gate/source_chars.py quality_gate/tools.py quality_gate/variant_dispatch.py quality_gate/verification.py
+  quality_gate/checks.py import quality_gate/adapters.py quality_gate/files.py quality_gate/gate_result.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py quality_gate/tools.py
+  quality_gate/clones.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py quality_gate/tools.py
+  quality_gate/command.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/output_patterns.py quality_gate/policy.py quality_gate/runner.py quality_gate/tools.py
+  quality_gate/coverage_tool.py import quality_gate/policy.py quality_gate/tools.py
+  quality_gate/elisp_crap.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/elisp_rules.py quality_gate/elisp_tests.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/elisp_lint.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/elisp_tests.py quality_gate/runner.py
+  quality_gate/elisp_rules.py import quality_gate/policy.py
+  quality_gate/elisp_tests.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/files.py import quality_gate/policy.py quality_gate/runner.py
+  quality_gate/gate_result.py import quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/output_patterns.py import quality_gate/policy.py quality_gate/runner.py
+  quality_gate/policy.py import quality_gate/adapters.py quality_gate/files.py quality_gate/ratchet.py
+  quality_gate/python_crap.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/coverage_tool.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/python_mutation.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/python_shape.py quality_gate/python_tests.py quality_gate/ratchet.py quality_gate/runner.py quality_gate/tools.py
+  quality_gate/python_shape.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/python_crap.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/python_tests.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/coverage_tool.py quality_gate/output_patterns.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py quality_gate/tools.py
+  quality_gate/ratchet.py import quality_gate/adapters.py quality_gate/policy.py
+  quality_gate/runner.py import quality_gate/policy.py
+  quality_gate/source_chars.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/tools.py import quality_gate/policy.py
+  quality_gate/variant_dispatch.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/python_crap.py quality_gate/python_shape.py quality_gate/ratchet.py quality_gate/runner.py
+  quality_gate/verification.py import quality_gate/adapters.py quality_gate/checks.py quality_gate/files.py quality_gate/policy.py quality_gate/ratchet.py quality_gate/runner.py
+  ```
 * `levels.required_tiers = [1]` makes tier 1 mandatory for every code class; the `tests` check
   provides the Python classes' required `tests` evidence, `elisp-tests` provides it for `elisp`, and the
   `elisp-suite` obligation is exempted because the suite is measured only by its own run.

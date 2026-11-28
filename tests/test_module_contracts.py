@@ -87,8 +87,6 @@ class ShippedCapabilityTests(unittest.TestCase):
             subprocess.run(["git", "add", "-A", "-f"], cwd=repo, check=True)
 
             config = load_config(repo)
-            configured = {check.adapter for check in config.checks.values()}
-            self.assertTrue({"module_tree", "module_graph"}.isdisjoint(configured))
             self.assertEqual(config.capabilities, {
                 "run-quality-gate": CapabilityDef(owner="core", entry_points=("qg.py",)),
                 "run-coverage-driver": CapabilityDef(

@@ -16,22 +16,22 @@ paths = ["ruff.toml"]
 [classes.python]
 code = true
 description = "Python programs: the gate command itself"
-checks = ["ruff", "clones", "tests", "crap", "shape", "variant-dispatch", "verification", "source-chars", "comments"]
+checks = ["ruff", "clones", "tests", "crap", "shape", "variant-dispatch", "verification", "source-chars", "comments", "module-graph"]
 
 [classes.test]
 code = true
 description = "Python tests that execute the gate on fixture repositories"
-checks = ["ruff", "clones", "tests", "verification", "source-chars", "comments"]
+checks = ["ruff", "clones", "tests", "verification", "source-chars", "comments", "module-graph"]
 
 [classes.elisp]
 code = true
 description = "Emacs Lisp measurement helpers, measured by the gate's own Elisp checks"
-checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars", "comments", "env_surface"]
+checks = ["elisp-tests", "elisp-crap", "elisp-compile", "elisp-checkdoc", "source-chars", "comments", "env_surface", "module-graph"]
 
 [classes.elisp-suite]
 code = true
 description = "The ERT suite that exercises the Emacs Lisp helpers"
-checks = ["elisp-compile", "elisp-checkdoc", "source-chars", "comments", "env_surface"]
+checks = ["elisp-compile", "elisp-checkdoc", "source-chars", "comments", "env_surface", "module-graph"]
 
 [classes.config]
 code = false
@@ -232,6 +232,17 @@ entry_points = ["quality_gate/covrun.py"]
 adapter = "module_contracts"
 tier = 1
 enforcement = "enforced"
+
+[checks.module-graph]
+adapter = "module_graph"
+tier = 1
+enforcement = "advisory"
+classes = ["python", "test", "elisp", "elisp-suite"]
+
+[checks.module-tree]
+adapter = "module_tree"
+tier = 1
+enforcement = "advisory"
 
 [checks.ruff]
 adapter = "command"
