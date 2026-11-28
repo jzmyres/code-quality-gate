@@ -26,9 +26,11 @@ from . import (
     python_shape, python_tests, ratchet, source_chars, variant_dispatch, verification,
 )
 from .files import (
-    DiffBaseOverride, InventoryClasses, _parent_fd, enumerate_entries, git_argv, source_languages,
+    SOURCE_LANGUAGE_BY_SUFFIX, DiffBaseOverride, InventoryClasses, _parent_fd, enumerate_entries,
+    git_argv, source_languages,
 )
 from .json_input import load_json
+from .module_graph import DependencyEvidence
 from .policy import (
     COMMON_CHECK_KEYS,
     DEFAULT_CRAP_THRESHOLD,
@@ -80,6 +82,7 @@ class AdapterContext:
     base_override: DiffBaseOverride | None = None
     selection: CheckSelection | None = None
     inventory_files: list[str] = field(kw_only=True)
+    graph_cache: GraphCache | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -189,6 +192,13 @@ def _module_graph_spec(raw: dict[str, Any], _root: Path, path: Path, key: str) -
     return ParsedSpec(spec, "module-graph/1", ("static",), threshold=0)
 
 
+def _module_tree_spec(raw: dict[str, Any], root: Path, path: Path, key: str) -> ParsedSpec:
+    if raw.get("direction") == "min":
+        raise _config_error(path, f"{key}.direction", "'max'", "'min'")
+    return ParsedSpec(None, "module-tree/1", ("static",), threshold=0,
+                      baseline=_baseline(raw, root, path, key))
+
+
 def _graph_finding(subject: str, edges: tuple[module_graph.Edge, ...], **measurement: Any) -> ratchet.Finding:
     locations = tuple(ratchet.Location(edge.source, edge.line, edge.line) for edge in edges)
     return ratchet.Finding(subject, 1, ", ".join(map(str, locations)), measurement, locations)
@@ -226,46 +236,64 @@ def _graph_findings(
     return findings
 
 
-def _graph_modules(
-    context: AdapterContext, spec: module_graph.GraphSpec, candidates: list[str],
-) -> tuple[list[str], list[str], list[str]]:
+def _graph_candidates(context: AdapterContext, spec: module_graph.GraphSpec) -> list[str]:
     unknown = sorted(set(spec.classes) - context.config.classes.keys())
     if unknown:
         key = f"checks.{context.check.id}.classes"
         known = ", ".join(sorted(context.config.classes))
         raise GateError(f"{key}: expected inventory classes from [{known}], got unknown classes {unknown}")
-    selected = sorted(path for path in candidates if context.classes.get(path) in spec.classes)
-    languages = source_languages(context.root, selected, context.config, context.classes)
-    modules: dict[str, list[str]] = {"python": [], "lisp": [], "bash": []}
-    for path, language in languages.items():
-        if language in modules:
-            modules[language].append(path)
-    return modules["python"], modules["lisp"], modules["bash"]
+    return sorted(path for path in context.inventory_files if context.classes.get(path) in spec.classes)
 
 
-def _valid_elisp_payload(record: dict, modules: set[str]) -> bool:
+GraphInputs = tuple[list[str], list[str], list[str]]
+_GRAPH_LANGUAGES = tuple(SOURCE_LANGUAGE_BY_SUFFIX[suffix] for suffix in (".py", ".el", ".sh"))
+
+
+def _graph_languages(context: AdapterContext, candidates: list[str]) -> dict[str, str | None]:
+    if context.graph_cache is not None:
+        errors = context.graph_cache.classification_errors
+        blocked = errors.keys() & candidates
+        if blocked:
+            raise errors[min(blocked)]
+    languages = source_languages(context.root, candidates, context.config, context.classes)
+    return {path: kind for path, kind in languages.items() if kind in _GRAPH_LANGUAGES}
+
+
+def _graph_modules(languages: dict[str, str | None]) -> GraphInputs:
+    partitions: dict[str | None, list[str]] = {kind: [] for kind in _GRAPH_LANGUAGES}
+    for path, kind in languages.items():
+        partitions[kind].append(path)
+    python, lisp, bash = _GRAPH_LANGUAGES
+    return partitions[python], partitions[lisp], partitions[bash]
+
+
+def _valid_elisp_payload(record: dict, modules: set[str], *, single: bool) -> bool:
     match record:
-        case {"kind": "require", "target": str() as target}:
+        case {"kind": "require" | "path-load", "target": str() as target}:
             return target in modules
-        case {"kind": "outside", "message": str()}:
+        case {"kind": "outside", "form": "require" | "provide" | "load" | "load-file",
+              "operand": str(), "reason": str(), "message": str()}:
+            return True
+        case {"kind": "provider", "feature": str()}:
             return True
         case {"kind": "reader-error", "message": str(), "stage": "preparation" | "reader"}:
-            return True
+            return single
     return False
 
 
-def _valid_elisp_record(record: Any, modules: set[str]) -> bool:
+def _valid_elisp_record(record: Any, modules: set[str], *, single: bool) -> bool:
     match record:
         case {"line": int() as line}:
-            return type(line) is int and line > 0 and _valid_elisp_payload(record, modules)
+            return type(line) is int and line > 0 and _valid_elisp_payload(record, modules, single=single)
     return False
 
 
 def _graph_elisp_records(records: Any, path: str, modules: set[str]) -> list[dict]:
     if not isinstance(records, list):
         raise ValueError(f"{path}: expected a list of Emacs reader records")
+    single = len(records) == 1
     for index, record in enumerate(records):
-        if not _valid_elisp_record(record, modules):
+        if not _valid_elisp_record(record, modules, single=single):
             raise ValueError(f"{path}: invalid Emacs reader record at index {index}")
     return records
 
@@ -298,33 +326,47 @@ def _read_graph_elisp(
         raise ValueError(f"cannot read Emacs Lisp module graph for {', '.join(files)}: {error}") from error
 
 
-GraphInputs = tuple[list[str], list[str], list[str]]
+GraphKey = tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]
 
 
-@dataclass(frozen=True)
-class GraphExtraction:
-    inputs: GraphInputs
-    modules: list[str]
-    edges: list[module_graph.Edge]
+@dataclass
+class GraphCache:
+    completed: dict[GraphKey, module_graph.Extraction] = field(default_factory=dict)
+    diagnosed: set[int] = field(default_factory=set)
+    classification_errors: dict[str, GateError] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.completed.clear()
+        self.diagnosed.clear()
+
+
+def _require_graph_budget() -> None:
+    if remaining_budget(_default_budget(None)) <= 0:
+        raise ValueError("module graph dependency extraction deadline exceeded")
 
 
 def _extract_graph(
-    context: AdapterContext, inputs: GraphInputs, reader_findings: list[dict] | None = None,
-) -> GraphExtraction:
+    context: AdapterContext, inputs: GraphInputs, partial: DependencyEvidence,
+) -> module_graph.Extraction:
     python, lisp, shell = inputs
+    roots = context.config.python_import_roots
+    key = tuple(python), tuple(lisp), tuple(shell), roots
+    _require_graph_budget()
+    cache = context.graph_cache
+    if cache is not None and key in cache.completed:
+        return cache.completed[key]
     elisp = _read_graph_elisp(context, lisp, [*python, *lisp, *shell]) if lisp else {}
-    if reader_findings is not None:
-        reader_findings.extend(
-            {"rule": "module-extraction", **row} for row in module_graph.elisp_reader_errors(elisp)
-        )
+    partial.reader_refusals.extend(module_graph.elisp_reader_errors(elisp))
     mark_step("module graph dependencies")
-    if remaining_budget(_default_budget(None)) <= 0:
-        raise ValueError("module graph dependency extraction deadline exceeded")
-    modules, edges, _ = module_graph.dependencies(
+    _require_graph_budget()
+    extraction = module_graph.dependencies(
         context.root, python, elisp=elisp, shell_modules=shell, parse_shell=GRAPH_SHELL_PARSER,
-        python_import_roots=context.config.python_import_roots,
+        python_import_roots=roots,
     )
-    return GraphExtraction(inputs, modules, edges)
+    _require_graph_budget()
+    if cache is not None and not extraction.evidence.reader_refusals:
+        cache.completed[key] = extraction
+    return extraction
 
 
 def module_ownership(
@@ -337,18 +379,17 @@ def module_ownership(
 
 def extract_contract_graph(
     root: Path, config: Any, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
-    reader_findings: list[dict], *, inventory_files: list[str],
-) -> GraphExtraction:
+    partial: DependencyEvidence, *, inventory_files: list[str], graph_cache: GraphCache | None,
+) -> module_graph.Extraction:
     context = AdapterContext(
-        root, config, None, list(owners), classes, "module-contracts", {}, evidence_dir,
-        inventory_files=inventory_files,
+        root, config, None, sorted(owners), classes, "module-contracts", {}, evidence_dir,
+        inventory_files=inventory_files, graph_cache=graph_cache,
     )
-    inputs = _graph_modules(context, module_graph.GraphSpec(tuple(config.classes), ()), context.files)
-    return _extract_graph(context, inputs, reader_findings)
+    return _extract_graph(context, _graph_modules(_graph_languages(context, context.files)), partial)
 
 
 def module_contract_findings(
-    config: Any, owners: dict[str, str], graph: GraphExtraction, tracked_code_paths: frozenset[str],
+    config: Any, owners: dict[str, str], graph: module_graph.Extraction, tracked_code_paths: frozenset[str],
 ) -> list[dict]:
     findings = module_graph.interface_findings(config.modules, owners, graph.edges)
     if config.capabilities:
@@ -360,46 +401,115 @@ def module_contract_findings(
 
 def affected_graph(
     root: Path, config: Any, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: set[str], contract_graph: GraphExtraction | None = None,
+    evidence_dir: Path, changed: set[str], graph_cache: GraphCache | None = None,
 ) -> tuple[set[str], dict[str, str], dict[str, str]]:
-    spec = module_graph.GraphSpec(tuple(config.classes), ())
     context = AdapterContext(
-        root, config, None, files, classes, "affected scope", {}, evidence_dir, inventory_files=files,
+        root, config, None, files, classes, "affected scope", {}, evidence_dir,
+        inventory_files=files, graph_cache=graph_cache,
     )
-    inputs = _graph_modules(context, spec, context.inventory_files)
-    graph = contract_graph if contract_graph is not None and contract_graph.inputs == inputs else (
-        _extract_graph(context, inputs)
-    )
+    partial = DependencyEvidence()
+    try:
+        graph = _extract_graph(context, _graph_modules(_graph_languages(context, sorted(files))), partial)
+    finally:
+        _print_graph_diagnostics(context, partial.reader_refusals)
+    if partial.reader_refusals:
+        raise ValueError("Emacs Lisp reader refused source")
     expanded, affected = module_graph.affected_paths(graph.modules, graph.edges, changed)
     return set(graph.modules), expanded, affected
 
 
+def _print_graph_diagnostics(context: AdapterContext, rows: list[dict]) -> None:
+    for row in rows:
+        print(f"{context.prefix}: {row['file']}:{row['line']}: {row['message']}", file=sys.stderr)
+
+
+def _report_graph_diagnostics(
+    context: AdapterContext, graph: module_graph.Extraction, report: dict,
+) -> None:
+    cache = context.graph_cache
+    if cache is None or id(graph) not in cache.diagnosed:
+        _print_graph_diagnostics(context, report.get("outside_extractor", []))
+        if cache is not None and not graph.evidence.reader_refusals:
+            cache.diagnosed.add(id(graph))
+
+
+def _graph_error(
+    context: AdapterContext, start: float, error: Exception, partial: DependencyEvidence,
+) -> Any:
+    from .checks import _ratchet_error
+
+    result = _ratchet_error(context.check, start, context.prefix, error)
+    if partial.reader_refusals:
+        result.measurement = partial.report()
+        _print_graph_diagnostics(context, partial.reader_refusals)
+    return result
+
+
 def _run_module_graph(context: AdapterContext) -> Any:
-    from .checks import _finish_ratchet, _ratchet_error
+    from .checks import _finish_ratchet
 
     start = time.monotonic()
     check = context.check
+    partial = DependencyEvidence(python_import_roots=context.config.python_import_roots)
     try:
-        python_modules, elisp_modules, shell_modules = _graph_modules(
-            context, check.spec, context.inventory_files,
+        languages = _graph_languages(context, _graph_candidates(context, check.spec))
+        graph = _extract_graph(context, _graph_modules(languages), partial)
+        test_sources = frozenset(path for path in graph.modules if python_shape._is_test_path(path))
+        measurement, cycles, suite_edges, program_edges = module_graph.measure_graph(
+            graph, check.spec, test_sources=test_sources,
         )
-        modules = [*python_modules, *elisp_modules, *shell_modules]
-        test_sources = frozenset(path for path in modules if python_shape._is_test_path(path))
-        elisp = _read_graph_elisp(context, elisp_modules, modules) if elisp_modules else {}
-        measurement, cycles, suite_edges, program_edges = module_graph.measure(
-            context.root, python_modules, check.spec, elisp=elisp, shell_modules=shell_modules,
-            parse_shell=GRAPH_SHELL_PARSER,
-            test_sources=test_sources,
-            python_import_roots=context.config.python_import_roots,
-        )
-    except (GateError, ValueError) as error:
-        return _ratchet_error(check, start, context.prefix, error)
-    for row in measurement.get("outside_extractor", ()):
-        print(f"{context.prefix}: {row['file']}:{row['line']}: {row['message']}", file=sys.stderr)
+    except (GateError, ValueError, RecursionError) as error:
+        return _graph_error(context, start, error, partial)
+    _report_graph_diagnostics(context, graph, measurement)
     findings = _graph_findings(cycles, suite_edges, program_edges)
     return _finish_ratchet(
         check, findings, [], context.prefix, start, ratchet.Domain.all(),
-        f"{len(measurement['modules'])} modules measured", measurement=measurement,
+        f"{len(graph.modules)} modules measured", measurement=measurement,
+    )
+
+
+def _run_module_tree(context: AdapterContext) -> Any:
+    from .checks import CheckSelection, _baseline_entries
+
+    start = time.monotonic()
+    partial = DependencyEvidence(python_import_roots=context.config.python_import_roots)
+    languages = {}
+    try:
+        languages = _graph_languages(context, sorted(context.inventory_files))
+        mark_step("baseline loading")
+        entries = _baseline_entries(context.check)
+        graph = _extract_graph(context, _graph_modules(languages), partial)
+        measurement, cycles = module_graph.measure_tree(graph, languages)
+    except (GateError, ValueError, RecursionError) as error:
+        result = _graph_error(context, start, error, partial)
+    else:
+        _report_graph_diagnostics(context, graph, measurement)
+        result = _finish_module_tree(context, start, graph, measurement, cycles, entries)
+    reason = context.selection.reason if context.selection is not None else "full run"
+    result.report_fields["selection"] = CheckSelection(dict.fromkeys(languages, reason), {}, reason).report()
+    return result
+
+
+def _tree_cycle_finding(edges: tuple[module_graph.Edge, ...]) -> ratchet.Finding:
+    edge = edges[0]
+    subject = json.dumps(["file-cycle", None, edge.source, edge.target, edge.kind], separators=(",", ":"))
+    return _graph_finding(
+        subject, edges, rule="file-cycle", boundary=None, occurrences=[edge.to_json() for edge in edges],
+    )
+
+
+def _finish_module_tree(
+    context: AdapterContext, start: float, graph: module_graph.Extraction, measurement: dict,
+    cycles: list[tuple[module_graph.Edge, ...]], entries: list[ratchet.BaselineEntry],
+) -> Any:
+    from .checks import _finish_ratchet
+
+    findings = [_tree_cycle_finding(edges) for edges in cycles]
+    domain = (ratchet.Domain.of_subjects([finding.subject for finding in findings])
+              if graph.evidence.reader_refusals else ratchet.Domain.all())
+    return _finish_ratchet(
+        context.check, findings, entries, context.prefix, start, domain,
+        f"{len(graph.modules)} modules measured", measurement=measurement,
     )
 
 
@@ -1408,6 +1518,15 @@ register_adapter(AdapterDescriptor(
     ("classes", "suites", "programs"),
     _module_graph_spec,
     _run_module_graph,
+    location_coverage="complete",
+    default_direction="max",
+    runs_suite=False,
+))
+register_adapter(AdapterDescriptor(
+    "module_tree",
+    ("baseline",),
+    _module_tree_spec,
+    _run_module_tree,
     location_coverage="complete",
     default_direction="max",
     runs_suite=False,

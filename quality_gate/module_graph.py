@@ -11,6 +11,7 @@ from fnmatch import fnmatchcase
 from importlib.machinery import ModuleSpec, PathFinder, all_suffixes
 from importlib.util import spec_from_file_location
 from inspect import signature
+from operator import itemgetter
 from pathlib import Path
 from runpy import run_path
 from tokenize import open as open_source
@@ -29,7 +30,7 @@ class Edge:
     source: str
     target: str
     line: int
-    kind: str = field(default="import", compare=False)
+    kind: str = "import"
 
     def to_json(self) -> dict[str, str | int]:
         return {"source": self.source, "target": self.target, "line": self.line, "kind": self.kind}
@@ -486,6 +487,13 @@ def _loader_reference_refusal(
     return None
 
 
+def _unresolved(
+    file: str, line: int, kind: str, operand: str | None, reason: str, message: str,
+) -> dict:
+    return {"file": file, "line": line, "kind": kind, "operand": operand,
+            "reason": reason, "message": message}
+
+
 def _path_loads(
     imports: PythonImports, source: str, paths: dict[str, str], tree: ast.Module,
     binding_refusals: dict[str, str], shadow_modules: dict[str, str], outside: list[dict],
@@ -501,11 +509,10 @@ def _path_loads(
             if module is not None:
                 yield Edge(source, module, reference.node.lineno, "path-load")
                 continue
-        outside.append({
-            "file": source,
-            "line": reference.node.end_lineno,
-            "message": f"unresolved path load {target}: {reason}",
-        })
+        outside.append(_unresolved(
+            source, reference.node.end_lineno, "path-load", target, reason,
+            f"unresolved path load {target}: {reason}",
+        ))
 
 
 def _parse_source(root: Path, source: str) -> tuple[ast.Module, symtable.SymbolTable]:
@@ -520,12 +527,10 @@ def _parse_source(root: Path, source: str) -> tuple[ast.Module, symtable.SymbolT
 
 
 def _from_loader_diagnostics(source: str, imports: list[ast.Import | ast.ImportFrom]) -> Iterator[dict]:
+    reason = "a from import does not bind the loader module"
     return (
-        {
-            "file": source,
-            "line": node.lineno,
-            "message": f"unresolved path load {alias.name}: a from import does not bind the loader module",
-        }
+        _unresolved(source, node.lineno, "path-load", alias.name, reason,
+                    f"unresolved path load {alias.name}: {reason}")
         for node in imports if isinstance(node, ast.ImportFrom)
         for alias in node.names if alias.name in _LOADER_NAMES
     )
@@ -538,12 +543,12 @@ def _source_edges(
     tree, table = _parse_source(python_imports.root, source)
     nodes = list(ast.walk(tree))
     imports = [node for node in nodes if isinstance(node, _IMPORTS)]
-    yield from {
+    yield from (
         Edge(source, paths[origin], node.lineno)
         for node in imports
         for origin in _import_origins(python_imports, source, node, paths)
         if origin in paths
-    }
+    )
     outside.extend(_from_loader_diagnostics(source, imports))
     binding_refusals = _loader_binding_refusals(table, nodes, imports)
     yield from _path_loads(
@@ -559,6 +564,11 @@ def _python_edges(
     paths = {str(imports.root / module): module for module in python_modules}
     for module in sorted(python_modules):
         yield from _source_edges(imports, module, paths, literal_paths, shadow_modules, outside)
+
+
+_SHELL_LITERAL = "Lit"
+_SHELL_SINGLE_QUOTE = "SglQuoted"
+_SHELL_DOUBLE_QUOTE = "DblQuoted"
 
 
 _SHELL_SCHEMA = {
@@ -578,7 +588,7 @@ _SHELL_SCHEMA = {
     "BinaryCmd": {"X": "Stmt", "Y": "Stmt"},
     "FuncDecl": {"Body": "Stmt"},
     "Word": {"Parts": [""]},
-    "DblQuoted": {"Parts": [""]},
+    _SHELL_DOUBLE_QUOTE: {"Parts": [""]},
     "CmdSubst": {"Stmts": ["Stmt"]},
     "ProcSubst": {"Stmts": ["Stmt"]},
     "ParamExp": {"Index": "", "Slice": "Slice", "Repl": "Replace", "Exp": "Expansion"},
@@ -603,8 +613,8 @@ _SHELL_SCHEMA = {
     "CoprocClause": {"Name": "Word", "Stmt": "Stmt"},
     "LetClause": {"Exprs": [""]},
     "TestDecl": {"Description": "Word", "Body": "Stmt"},
-    "Lit": {"Value": str},
-    "SglQuoted": {},
+    _SHELL_LITERAL: {"Value": str},
+    _SHELL_SINGLE_QUOTE: {},
     "ExtGlob": {},
 }
 
@@ -627,7 +637,10 @@ _SHELL_OPTIONAL_FIELDS = {
     ("CStyleLoop", "Init"): None,
     ("CStyleLoop", "Cond"): None,
     ("CStyleLoop", "Post"): None,
-    ("DblQuoted", "Parts"): [],
+    (_SHELL_DOUBLE_QUOTE, "Parts"): [],
+    (_SHELL_DOUBLE_QUOTE, "Dollar"): False,
+    (_SHELL_SINGLE_QUOTE, "Dollar"): False,
+    (_SHELL_SINGLE_QUOTE, "Value"): "",
     ("CmdSubst", "Stmts"): [],
     ("ProcSubst", "Stmts"): [],
     ("ParamExp", "Index"): None,
@@ -692,7 +705,7 @@ _SHELL_DIRECTORY_PREFIXES = {
 _SHELL_DIRECTORY_PATH = re.compile(
     rb"(" + rb"|".join(map(re.escape, _SHELL_DIRECTORY_PREFIXES)) + rb")(/" + _SHELL_PATH_CHARS + rb")"
 )
-_SHELL_ARGUMENT_COMMANDS = {b"source": "source", b".": "source", b"bash": "execute", b"sh": "execute"}
+_SHELL_INTERPRETERS = {b"bash", b"sh"}
 _ShellWord = tuple[list[dict], bytes]
 
 
@@ -720,7 +733,10 @@ def _shell_word(word: dict, fields: _ShellFields) -> _ShellWord:
 
 
 def _shell_literal(part: dict, spelling: bytes, fields: _ShellFields) -> bool:
-    return fields.read(part, "Type", str) == "Lit" and spelling == fields.read(part, "Value", str).encode()
+    return (
+        fields.read(part, "Type", str) == _SHELL_LITERAL
+        and spelling == fields.read(part, "Value", str).encode()
+    )
 
 
 def _shell_plain_word(word: _ShellWord, fields: _ShellFields) -> bool:
@@ -745,9 +761,10 @@ def _shell_directory_target(
     if len(parts) != 2:
         return None
     quote, literal = parts
-    if fields.read(quote, "Type", str) == "DblQuoted" and _shell_directory_part(quote, prefix, fields):
-        if _shell_literal(literal, tail, fields):
-            return "." + tail.decode("ascii")
+    if fields.read(quote, "Type", str) != _SHELL_DOUBLE_QUOTE:
+        return None
+    if _shell_directory_part(quote, prefix, fields) and _shell_literal(literal, tail, fields):
+        return "." + tail.decode("ascii")
     return None
 
 
@@ -767,15 +784,172 @@ def _shell_argument_target(word: _ShellWord, fields: _ShellFields) -> str | None
     return _shell_target(word, fields)
 
 
-def _shell_dependency(words: list[_ShellWord], fields: _ShellFields) -> tuple[str, str | None] | None:
-    if not words:
+_SHELL_ASSIGNMENT_PREFIX = re.compile(rb"[A-Za-z_][A-Za-z_0-9]*\+?=")
+_SHELL_ACTIVE_LITERAL = b" \t\r\n\\'\x22`$*?[]{};|&<>()"
+
+
+@dataclass
+class _SourceWordProof:
+    spelling: bytes
+    allow_continuation: bool
+    assignment_prefix: bool
+    offset: int = 0
+
+    def take(self, value: bytes, *, continuations: bool = False) -> bool:
+        if not self.spelling.startswith(value, self.offset):
+            return False
+        self.offset += len(value)
+        if continuations:
+            self.skip_continuations()
+        return True
+
+    def skip_continuations(self) -> None:
+        if self.allow_continuation:
+            while self.take(b"\\\n"):
+                pass
+
+    def literal(self, value: bytes, *, quoted: bool) -> bool:
+        for index, byte in enumerate(value):
+            active = _unproved_quoted_byte(value, index, byte) if quoted else self.active(byte)
+            if active or not self.take(bytes((byte,)), continuations=True):
+                return False
+        return True
+
+    def active(self, byte: int) -> bool:
+        if byte in _SHELL_ACTIVE_LITERAL:
+            return True
+        if byte != ord("~"):
+            return False
+        if self.offset == 0:
+            return True
+        return self.assignment_prefix and self.spelling[self.offset - 1] in b"=:"
+
+
+def _unproved_quoted_byte(value: bytes, index: int, byte: int) -> bool:
+    if byte == ord("\\"):
+        return index + 1 == len(value) or value[index + 1] in b'\\`"$\n'
+    return byte in b'`"$'
+
+
+def _source_literal(part: dict, proof: _SourceWordProof, fields: _ShellFields) -> bytes | None:
+    value = fields.read(part, "Value", str).encode()
+    return value if proof.literal(value, quoted=False) else None
+
+
+def _source_single_quote(part: dict, proof: _SourceWordProof, fields: _ShellFields) -> bytes | None:
+    if fields.read(part, "Dollar", bool, _SHELL_SINGLE_QUOTE):
         return None
+    value = fields.read(part, "Value", str, _SHELL_SINGLE_QUOTE).encode()
+    if b"'" not in value and proof.take(b"'" + value + b"'", continuations=True):
+        return value
+    return None
+
+
+def _source_quoted_literals(parts: list[dict], proof: _SourceWordProof, fields: _ShellFields) -> bytes | None:
+    values = []
+    for part in parts:
+        if fields.read(part, "Type", str) != _SHELL_LITERAL:
+            return None
+        value = fields.read(part, "Value", str).encode()
+        if not proof.literal(value, quoted=True):
+            return None
+        values.append(value)
+    return b"".join(values)
+
+
+def _source_double_quote(part: dict, proof: _SourceWordProof, fields: _ShellFields) -> bytes | None:
+    if fields.read(part, "Dollar", bool, _SHELL_DOUBLE_QUOTE) or not proof.take(b'"', continuations=True):
+        return None
+    value = _source_quoted_literals(fields.read(part, "Parts", list, _SHELL_DOUBLE_QUOTE), proof, fields)
+    if value is not None and proof.take(b'"', continuations=True):
+        return value
+    return None
+
+
+def _source_word_part(part: dict, proof: _SourceWordProof, fields: _ShellFields) -> bytes | None:
+    kind = fields.read(part, "Type", str)
+    if kind == _SHELL_LITERAL:
+        return _source_literal(part, proof, fields)
+    if kind == _SHELL_SINGLE_QUOTE:
+        return _source_single_quote(part, proof, fields)
+    if kind == _SHELL_DOUBLE_QUOTE:
+        return _source_double_quote(part, proof, fields)
+    return None
+
+
+def _source_word_bytes(parts: list[dict], proof: _SourceWordProof, fields: _ShellFields) -> bytes | None:
+    values = []
+    for part in parts:
+        value = _source_word_part(part, proof, fields)
+        if value is None:
+            return None
+        values.append(value)
+    if values and proof.offset == len(proof.spelling):
+        return b"".join(values)
+    return None
+
+
+def _source_word(word: _ShellWord, fields: _ShellFields, *, head: bool = False) -> bytes | None:
+    parts, spelling = word
+    if not head and b"\\\n" in spelling:
+        return None
+    proof = _SourceWordProof(spelling, head, _SHELL_ASSIGNMENT_PREFIX.match(spelling) is not None)
+    proof.skip_continuations()
+    return _source_word_bytes(parts, proof, fields)
+
+
+_UNVERIFIED_SOURCE_WORD = "path word is computed or cannot be verified"
+
+
+def _decoded_source_operand(decoded: bytes | None) -> tuple[str | None, str | None]:
+    if decoded is None:
+        return None, _UNVERIFIED_SOURCE_WORD
+    if decoded.startswith((b"-", b"+")):
+        return None, "path operand is an option"
+    if not decoded or b"\0" in decoded:
+        return None, _UNVERIFIED_SOURCE_WORD
+    return decoded.decode("utf-8"), None
+
+
+def _source_operand(word: _ShellWord, fields: _ShellFields) -> tuple[str | None, str | None]:
+    if _SHELL_DIRECTORY_PATH.fullmatch(word[1]):
+        if (target := _shell_target(word, fields)) is not None:
+            return target, None
+    return _decoded_source_operand(_source_word(word, fields))
+
+
+@dataclass(frozen=True)
+class _ShellDependency:
+    kind: str
+    path: str | None
+    operand: str | None
+    reason: str | None = None
+
+
+def _shell_source_call(words: list[_ShellWord], fields: _ShellFields) -> _ShellDependency:
+    if len(words) == 1:
+        return _ShellDependency("source", None, None, "path operand is missing")
+    target, reason = _source_operand(words[1], fields)
+    return _ShellDependency("source", target, words[1][1].decode(errors="replace"), reason)
+
+
+def _shell_execute_call(words: list[_ShellWord], fields: _ShellFields) -> _ShellDependency | None:
     head = words[0][1]
     if not _shell_plain_word(words[0], fields) or _SHELL_POSSIBLE_RUN.search(head):
-        return "execute", _shell_target(words[0], fields)
-    if len(words) > 1 and head in _SHELL_ARGUMENT_COMMANDS:
-        return _SHELL_ARGUMENT_COMMANDS[head], _shell_argument_target(words[1], fields)
+        return _ShellDependency("execute", _shell_target(words[0], fields), head.decode(errors="replace"))
+    if len(words) > 1 and head in _SHELL_INTERPRETERS:
+        return _ShellDependency(
+            "execute", _shell_argument_target(words[1], fields), words[1][1].decode(errors="replace"),
+        )
     return None
+
+
+def _shell_dependency(words: list[_ShellWord], fields: _ShellFields) -> _ShellDependency | None:
+    if not words:
+        return None
+    if _source_word(words[0], fields, head=True) in {b"source", b"."}:
+        return _shell_source_call(words, fields)
+    return _shell_execute_call(words, fields)
 
 
 def _shell_children(
@@ -790,11 +964,11 @@ def _shell_children(
             yield child, role
 
 
-def _shell_call(node: dict, fields: _ShellFields) -> Iterator[tuple[str, int, str, str | None]]:
+def _shell_call(node: dict, fields: _ShellFields) -> Iterator[tuple[str, int, _ShellDependency]]:
     line = fields.read(node, "Pos.Line", int)
     args = fields.read(node, "Args", list, "CallExpr")
     if dependency := _shell_dependency([_shell_word(word, fields) for word in args], fields):
-        yield fields.source, line, *dependency
+        yield fields.source, line, dependency
 
 
 def _shell_nodes(tree: dict, fields: _ShellFields) -> Iterator[tuple[dict, str]]:
@@ -810,7 +984,7 @@ def _shell_nodes(tree: dict, fields: _ShellFields) -> Iterator[tuple[dict, str]]
 
 def _shell_dependencies(
     shell: dict[str, tuple[_ShellFields, dict]],
-) -> Iterator[tuple[str, int, str, str | None]]:
+) -> Iterator[tuple[str, int, _ShellDependency]]:
     for fields, tree in shell.values():
         for node, kind in _shell_nodes(tree, fields):
             if kind == "CallExpr":
@@ -820,13 +994,21 @@ def _shell_dependencies(
 def _shell_edges(
     root: Path, shell: dict[str, tuple[_ShellFields, dict]], paths: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
-    for source, line, kind, operand in _shell_dependencies(shell):
-        target = _measured_path(root, source, paths, operand) if operand else None
+    for source, line, call in _shell_dependencies(shell):
+        path = call.path
+        target = _measured_path(root, source, paths, path) if path else None
         if target is not None:
-            yield Edge(source, target, line, kind)
+            yield Edge(source, target, line, call.kind)
             continue
-        detail = ("target is outside the parser" if operand is None else f"unresolved path {operand!r}")
-        outside.append({"file": source, "line": line, "message": f"shell {kind}: {detail}"})
+        if path is None:
+            detail = "target is outside the parser"
+            reason = call.reason or _UNVERIFIED_SOURCE_WORD
+        else:
+            detail = f"unresolved path {path!r}"
+            reason = "path has no measured target"
+        outside.append(_unresolved(
+            source, line, call.kind, call.operand, reason, f"shell {call.kind}: {detail}",
+        ))
 
 
 def _elisp_records(elisp: dict[str, list[dict]], kind: str) -> Iterator[tuple[str, dict]]:
@@ -841,15 +1023,15 @@ def _graph_edges(
 ) -> list[Edge]:
     resolved_root = imports.root.resolve()
     paths = {str(resolved_root / module): module for module in modules}
-    require_edges = {
-        Edge(source, row["target"], row["line"], "require")
-        for source, row in _elisp_records(elisp, "require")
-    }
-    return sorted([
+    elisp_edges = (
+        Edge(source, row["target"], row["line"], row["kind"])
+        for kind in ("require", "path-load") for source, row in _elisp_records(elisp, kind)
+    )
+    return [
         *_python_edges(imports, python_modules, paths, _measured_loader_shadows(modules), outside),
-        *require_edges,
+        *elisp_edges,
         *_shell_edges(imports.root, shell, paths, outside),
-    ])
+    ]
 
 
 Outgoing = dict[str, dict[str, Edge]]
@@ -951,31 +1133,66 @@ def _program_dependencies(edges: list[Edge], programs: set[str], test_sources: f
     return [edge for edge in edges if edge.target in programs and edge.source not in exempt_sources]
 
 
-def _graph_report(
-    modules: list[str], edges: list[Edge], outgoing: Outgoing, incoming: Incoming, findings: int,
-    outside: list[dict],
-) -> dict:
-    report = {
-        "modules": modules,
-        "edges": [edge.to_json() for edge in edges],
-        "fan_in": {module: len(incoming[module]) for module in modules},
-        "fan_out": {module: len(outgoing[module]) for module in modules},
+_LOCATED_ORDER = itemgetter("file", "line")
+
+
+def _outside_diagnostics(rows: list[dict]) -> list[dict]:
+    return [
+        {key: row[key] for key in ("file", "line", "message")}
+        for row in sorted(rows, key=_LOCATED_ORDER)
+    ]
+
+
+@dataclass
+class DependencyEvidence:
+    unresolved: list[dict] = field(default_factory=list)
+    reader_refusals: list[dict] = field(default_factory=list)
+    providers: list[dict] = field(default_factory=list)
+    python_import_roots: tuple[str, ...] = (".",)
+
+    def report(self) -> dict:
+        roots = list(self.python_import_roots) if self.python_import_roots != (".",) else []
+        report = {
+            "unresolved": [row.copy() for row in sorted(self.unresolved, key=_LOCATED_ORDER)],
+            "reader_refusals": [row.copy() for row in self.reader_refusals],
+            "providers": [row.copy() for row in self.providers],
+            "python_import_roots": roots,
+        }
+        outside = _outside_diagnostics([*self.unresolved, *self.reader_refusals])
+        if outside:
+            report["outside_extractor"] = outside
+        return report
+
+
+@dataclass(frozen=True)
+class Extraction:
+    """Extracted evidence in occurrence order, before report and finding projections."""
+
+    modules: list[str]
+    edges: list[Edge]
+    evidence: DependencyEvidence
+
+    def report(self) -> dict:
+        return {
+            "modules": self.modules.copy(),
+            "edges": [edge.to_json() for edge in sorted(self.edges)],
+            **self.evidence.report(),
+        }
+
+
+def _graph_report(extraction: Extraction, outgoing: Outgoing, incoming: Incoming, findings: int) -> dict:
+    return {
+        **extraction.report(),
+        "fan_in": {module: len(incoming[module]) for module in extraction.modules},
+        "fan_out": {module: len(outgoing[module]) for module in extraction.modules},
         "value": findings,
         "threshold": 0,
     }
-    if outside:
-        projected = [
-            {"file": row["file"], "line": row["line"], "message": row["message"]}
-            for row in outside
-        ]
-        report["outside_extractor"] = sorted(projected, key=lambda row: (row["file"], row["line"]))
-    return report
 
 
 def elisp_reader_errors(elisp: dict[str, list[dict]]) -> list[dict]:
     return [
-        {"file": source, "line": row["line"], "message": row["message"], "kind": "reader-error",
-         "stage": row["stage"]}
+        {"file": source, **{key: row[key] for key in ("line", "kind", "stage", "message")}}
         for source, row in _elisp_records(elisp, "reader-error")
     ]
 
@@ -985,19 +1202,24 @@ def dependencies(
     elisp: dict[str, list[dict]] | None = None, shell_modules: Sequence[str] = (),
     parse_shell: Callable[[bytes, str], dict] | None = None,
     python_import_roots: tuple[str, ...] = (".",),
-) -> tuple[list[str], list[Edge], list[dict]]:
+) -> Extraction:
     root = root.absolute()
     elisp = elisp or {}
     shell = _read_shell(root, shell_modules, parse_shell)
     modules = sorted([*python_modules, *elisp, *shell])
-    outside = [
-        {"file": source, "line": row["line"], "message": row["message"]}
+    unresolved = [
+        _unresolved(source, row["line"], row["form"], row["operand"], row["reason"], row["message"])
         for source, row in _elisp_records(elisp, "outside")
     ]
-    outside.extend(elisp_reader_errors(elisp))
     imports = PythonImports.from_repository(root, python_import_roots)
-    edges = _graph_edges(imports, modules, python_modules, elisp, shell, outside)
-    return modules, edges, outside
+    edges = _graph_edges(imports, modules, python_modules, elisp, shell, unresolved)
+    evidence = DependencyEvidence(
+        unresolved, elisp_reader_errors(elisp),
+        [{"file": source, "line": row["line"], "feature": row["feature"]}
+         for source, row in _elisp_records(elisp, "provider")],
+        python_import_roots,
+    )
+    return Extraction(modules, edges, evidence)
 
 
 def _affected_seeds(modules: list[str], changed: set[str]) -> dict[str, str]:
@@ -1033,19 +1255,121 @@ def measure(
     test_sources: frozenset[str] = frozenset(),
     python_import_roots: tuple[str, ...] = (".",),
 ) -> tuple[dict, list[Cycle], list[Edge], list[Edge]]:
-    modules, edges, outside = dependencies(
+    extraction = dependencies(
         root, python_modules, elisp=elisp, shell_modules=shell_modules, parse_shell=parse_shell,
         python_import_roots=python_import_roots,
     )
+    return measure_graph(extraction, spec, test_sources=test_sources)
+
+
+def measure_graph(
+    extraction: Extraction, spec: GraphSpec, *, test_sources: frozenset[str] = frozenset(),
+) -> tuple[dict, list[Cycle], list[Edge], list[Edge]]:
+    edges = _legacy_edges(extraction.edges)
+    modules = extraction.modules
     outgoing, incoming = _adjacency(modules, edges)
     cycles = [
         (component, _shortest_cycle(component, outgoing))
         for component in _components(outgoing, incoming)
     ]
-    unique_edges = list(dict.fromkeys(edges))
-    suite_edges = _suite_imports(unique_edges, _matched_paths(modules, spec.suites))
+    suite_edges = _suite_imports(edges, _matched_paths(modules, spec.suites))
     programs = _matched_paths(modules, spec.programs)
-    program_edges = _program_dependencies(unique_edges, programs, test_sources)
+    program_edges = _program_dependencies(edges, programs, test_sources)
     findings = len(cycles) + len(suite_edges) + len(program_edges)
-    measurement = _graph_report(modules, edges, outgoing, incoming, findings, outside)
-    return measurement, cycles, suite_edges, program_edges
+    return _graph_report(extraction, outgoing, incoming, findings), cycles, suite_edges, program_edges
+
+
+def _legacy_edges(edges: list[Edge]) -> list[Edge]:
+    """Keep the first established kind at a coordinate, ahead of any path load."""
+    representatives: dict[tuple[str, str, int], Edge] = {}
+    for edge in edges:
+        coordinate = edge.source, edge.target, edge.line
+        existing = representatives.get(coordinate)
+        if existing is None or existing.kind == "path-load":
+            representatives[coordinate] = edge
+    return [representatives[coordinate] for coordinate in sorted(representatives)]
+
+
+def _directory(path: str) -> dict:
+    return {"path": path, "directories": [], "files": []}
+
+
+def _module_tree(modules: list[str], languages: dict[str, str | None]) -> dict:
+    root = _directory(".")
+    directories = {".": root}
+    for file in sorted(modules):
+        paths = Path(file)
+        for parent in reversed(paths.parents):
+            path = parent.as_posix()
+            if path not in directories:
+                node = _directory(path)
+                directories[parent.parent.as_posix()]["directories"].append(node)
+                directories[path] = node
+        directories[paths.parent.as_posix()]["files"].append({"path": file, "language": languages[file]})
+    for node in directories.values():
+        node["directories"].sort(key=lambda row: row["path"])
+    return root
+
+
+def _cycle_membership(components: list[list[str]]) -> dict[str, int]:
+    return {path: index for index, component in enumerate(components) for path in component}
+
+
+def _internal_group(source: str, target: str, membership: dict[str, int]) -> bool:
+    return source in membership and membership[source] == membership.get(target)
+
+
+def _directory_groups(pairs: list[tuple[str, str, Edge]]) -> dict[tuple[str, str], list[dict]]:
+    groups = defaultdict(list)
+    for source, target, edge in pairs:
+        groups[source, target].append(edge.to_json())
+    return groups
+
+
+def _directory_cycles(components: list[list[str]], pairs: list[tuple[str, str, Edge]]) -> list[dict]:
+    membership = _cycle_membership(components)
+    cycles = [{"component": component, "edges": []} for component in components]
+    for source, target, edge in pairs:
+        if source != target and _internal_group(source, target, membership):
+            cycles[membership[source]]["edges"].append(edge.to_json())
+    return cycles
+
+
+def _directory_rollup(depth: int, parents: dict[str, tuple[str, ...]], edges: list[Edge]) -> dict:
+    ancestors = {path: Path(*parts[:depth]).as_posix() for path, parts in parents.items()}
+    directories = sorted(set(ancestors.values()))
+    pairs = [(ancestors[edge.source], ancestors[edge.target], edge) for edge in edges]
+    groups = _directory_groups(pairs)
+    cross = [Edge(source, target, 0) for source, target in groups if source != target]
+    components = _components(*_adjacency(directories, cross))
+    return {
+        "depth": depth, "directories": directories, "cycles": _directory_cycles(components, pairs),
+        "edges": [{"source": source, "target": target, "edges": groups[source, target]}
+                  for source, target in sorted(groups)],
+    }
+
+
+def _file_cycles(edges: list[Edge], components: list[list[str]]) -> list[tuple[Edge, ...]]:
+    membership = _cycle_membership(components)
+    groups = defaultdict(list)
+    for edge in edges:
+        if edge.source == edge.target or _internal_group(edge.source, edge.target, membership):
+            groups[edge.source, edge.target, edge.kind].append(edge)
+    return [tuple(groups[key]) for key in sorted(groups)]
+
+
+def measure_tree(
+    extraction: Extraction, languages: dict[str, str | None],
+) -> tuple[dict, list[tuple[Edge, ...]]]:
+    modules = extraction.modules
+    edges = sorted(extraction.edges)
+    outgoing, incoming = _adjacency(modules, edges)
+    cycles = _file_cycles(edges, _components(outgoing, incoming))
+    report = _graph_report(extraction, outgoing, incoming, len(cycles))
+    parents = {path: Path(path).parts[:-1] for path in modules}
+    report["tree"] = _module_tree(modules, languages)
+    report["directory_rollups"] = [
+        _directory_rollup(depth, parents, edges)
+        for depth in range(max(map(len, parents.values()), default=-1) + 1)
+    ]
+    return report, cycles

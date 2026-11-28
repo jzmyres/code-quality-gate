@@ -24,7 +24,8 @@ from . import gate_result
 from .adapters import (
     AdapterContext,
     AdapterDescriptor,
-    GraphExtraction,
+    DependencyEvidence,
+    GraphCache,
     adapter_for,
     affected_graph,
     extract_contract_graph,
@@ -43,6 +44,7 @@ from .files import (
     changed_paths,
     hygiene_result,
     resolve_diff_base,
+    source_languages,
     validate_inventory,
 )
 from .policy import (
@@ -64,6 +66,7 @@ from .ratchet import (
     write_baseline,
 )
 from .runner import (
+    CheckDeadline,
     Diagnostics,
     RunTimeout,
     check_deadline,
@@ -524,10 +527,12 @@ def _adapter_runner(
     prior: dict[str, CheckResult],
     base_override: DiffBaseOverride | None = None,
     selection: CheckSelection | None = None,
+    graph_cache: GraphCache | None = None,
 ) -> CheckResult:
     context = AdapterContext(
         root, config, check, files if selection is None else selection.files,
         classes, prefix, prior, evidence_dir, base_override, selection, inventory_files=files,
+        graph_cache=graph_cache,
     )
     return _check_descriptor(check).run(context)
 
@@ -544,13 +549,14 @@ def run_check(
     prior: dict[str, CheckResult] | None = None,
     base_override: DiffBaseOverride | None = None,
     selection: CheckSelection | None = None,
+    graph_cache: GraphCache | None = None,
 ) -> CheckResult:
     _check_descriptor(check)
     start = time.monotonic()
     with check_deadline(check.id, start, _check_budget(check)):
         result = _adapter_runner(
             root, config, check, files, classes, prefix, evidence_dir,
-            prior or {}, base_override, selection,
+            prior or {}, base_override, selection, graph_cache,
         )
     result.duration_seconds = time.monotonic() - start
     return result
@@ -884,16 +890,17 @@ def _global_input(config: Config, classes: dict[str, str], changed: frozenset[st
 
 def _selection_inputs(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    evidence_dir: Path, changed: frozenset[str], contract_graph: GraphExtraction | None,
+    evidence_dir: Path, changed: frozenset[str], graph_cache: GraphCache,
 ) -> tuple[dict[str, str], dict[str, str], str | None]:
     full = _global_input(config, classes, changed)
     if full or not changed:
         return {}, {}, full
     try:
-        nodes, expanded, affected = affected_graph(
-            root, config, files, classes, evidence_dir, set(changed), contract_graph,
-        )
-    except (GateError, ValueError) as error:
+        with check_deadline("affected scope", time.monotonic(), RATCHET_BUDGET_SECONDS):
+            nodes, expanded, affected = affected_graph(
+                root, config, files, classes, evidence_dir, set(changed), graph_cache,
+            )
+    except (GateError, ValueError, RecursionError) as error:
         return {}, {}, f"full run: module graph unavailable ({error})"
     unplaced = sorted(changed - nodes)
     return expanded, affected, f"full run: unplaced file {unplaced[0]}" if unplaced else None
@@ -917,7 +924,7 @@ def _file_scope(
         reason = full or "full run"
         return CheckSelection(
             dict.fromkeys(files, reason), {}, reason, files=files,
-            adapter_report=check.adapter == "python_shape",
+            adapter_report=check.adapter in {"python_shape", "module_tree"},
         )
     if full is not None:
         reason = full if files else f"{full} (no files in the input class)"
@@ -960,10 +967,10 @@ def _check_selection(
 def _affected_selection(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: frozenset[str], checks: list[CheckDef],
-    contract_graph: GraphExtraction | None,
+    graph_cache: GraphCache,
 ) -> dict[str, CheckSelection]:
     expanded, affected, full = _selection_inputs(
-        root, config, files, classes, evidence_dir, changed, contract_graph,
+        root, config, files, classes, evidence_dir, changed, graph_cache,
     )
     forced = _forced_inputs(config, checks)
     runtime_reason = RUNTIME_SUITE_REASON if changed else None
@@ -988,7 +995,7 @@ def _record_check_selection(
 def _run_selected_check(
     root: Path, config: Config, check: CheckDef, files: list[str],
     classes: dict[str, str], evidence_dir: Path, prior: dict[str, CheckResult],
-    base_override: DiffBaseOverride, selection: CheckSelection | None,
+    base_override: DiffBaseOverride, selection: CheckSelection | None, graph_cache: GraphCache,
 ) -> CheckResult:
     prefix = f"check: {check.id}"
     planned_report = selection.report() if selection is not None and not selection.adapter_report else None
@@ -1002,7 +1009,7 @@ def _run_selected_check(
         print(f"{prefix} ({check.adapter})", flush=True)
         result = run_check(
             root, config, check, files, classes, prefix=prefix, evidence_dir=evidence_dir,
-            prior=prior, base_override=base_override, selection=selection,
+            prior=prior, base_override=base_override, selection=selection, graph_cache=graph_cache,
         )
     _record_check_selection(result, selection, planned_report)
     return result
@@ -1011,20 +1018,22 @@ def _run_selected_check(
 def _scope_selections(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
     evidence_dir: Path, changed: frozenset[str] | None, checks: list[CheckDef], inventory_code: int,
-    contract_graph: GraphExtraction | None,
+    graph_cache: GraphCache,
 ) -> dict[str, CheckSelection]:
     if changed is None or not checks:
         return {}
     if inventory_code != 0:
         return {check.id: CheckSelection({}, {}, "inventory failed") for check in checks}
     return _affected_selection(
-        root, config, files, classes, evidence_dir, changed, checks, contract_graph,
+        root, config, files, classes, evidence_dir, changed, checks, graph_cache,
     )
 
 
 def _run_inventory_blocked_check(check: CheckDef, selection: CheckSelection | None) -> CheckResult:
     result = _skipped(check)
     print(f"check: {check.id}: {result.reason}", file=sys.stderr)
+    if selection is None and check.adapter == "module_tree":
+        selection = CheckSelection({}, {}, "inventory failed")
     if selection is not None:
         result.report_fields["selection"] = selection.report()
     return result
@@ -1049,35 +1058,44 @@ def _require_contract_budget() -> None:
         raise TimeoutError("module contract budget exceeded")
 
 
+def _contract_extraction_error(
+    error: Exception, deadline: CheckDeadline, partial: DependencyEvidence, findings: list[dict],
+) -> tuple[dict | None, str]:
+    message = str(error)
+    execution = "error"
+    if remaining_budget(deadline.seconds) <= 0:
+        message = _budget_detail(f"{deadline.step}: {message}", deadline.started, deadline.seconds)
+        execution = "budget"
+    findings.append({"rule": "module-extraction", "stage": deadline.step, "message": message})
+    return (partial.report() if partial.reader_refusals else None), execution
+
+
 def _extract_module_contracts(
     root: Path, config: Config, owners: dict[str, str], classes: InventoryClasses, evidence_dir: Path,
-    findings: list[dict], *, inventory_files: list[str],
-) -> tuple[GraphExtraction | None, str]:
+    findings: list[dict], *, inventory_files: list[str], graph_cache: GraphCache | None,
+) -> tuple[dict | None, str]:
     start = time.monotonic()
     budget = RATCHET_BUDGET_SECONDS
+    partial = DependencyEvidence(python_import_roots=config.python_import_roots)
     with check_deadline("module-contracts", start, budget) as deadline:
         try:
             mark_step("module graph inputs")
             _require_contract_budget()
             graph = extract_contract_graph(
-                root, config, owners, classes, evidence_dir, findings, inventory_files=inventory_files,
+                root, config, owners, classes, evidence_dir, partial,
+                inventory_files=inventory_files, graph_cache=graph_cache,
             )
             _require_contract_budget()
-            reader_failed = bool(findings)
             mark_step("module interface evaluation")
             findings.extend(module_contract_findings(config, owners, graph, classes.tracked_code_paths))
             _require_contract_budget()
-            return (None if reader_failed else graph), "completed"
         except RunTimeout:
             raise
         except (GateError, ValueError, TimeoutError, RecursionError) as error:
-            message = str(error)
-            execution = "error"
-            if remaining_budget(budget) <= 0:
-                message = _budget_detail(f"{deadline.step}: {message}", start, budget)
-                execution = "budget"
-            findings.append({"rule": "module-extraction", "stage": deadline.step, "message": message})
-            return None, execution
+            return _contract_extraction_error(error, deadline, partial, findings)
+        finally:
+            findings[:0] = [{"rule": "module-extraction", **row} for row in partial.reader_refusals]
+    return graph.report(), "completed"
 
 
 def _tree_entry_modes(root: Path, commit: str, paths: Iterable[str]) -> dict[str, str]:
@@ -1157,13 +1175,13 @@ def _inventory_blocked_contracts(
 
 def _run_module_contracts(
     root: Path, config: Config, files: list[str], classes: dict[str, str],
-    inventory_code: int, evidence_dir: Path, diff: DiffBaseOverride,
-) -> tuple[CheckResult, GraphExtraction | None]:
+    inventory_code: int, evidence_dir: Path, diff: DiffBaseOverride, graph_cache: GraphCache | None = None,
+) -> CheckResult:
     print("check: module-contracts", flush=True)
     start = time.monotonic()
     findings: list[dict] = []
     execution = "completed"
-    graph = None
+    measurement = None
     budget = None
     messages = []
     changed, resolved_base = _shared_changed_paths(root, config, diff)
@@ -1176,8 +1194,9 @@ def _run_module_contracts(
         owners, findings = module_ownership(config, files, classes)
         if not findings and len(config.modules) >= 2:
             budget = RATCHET_BUDGET_SECONDS
-            graph, execution = _extract_module_contracts(
+            measurement, execution = _extract_module_contracts(
                 root, config, owners, classes, evidence_dir, findings, inventory_files=files,
+                graph_cache=graph_cache,
             )
     findings.extend(_shared_entry_point_findings(config, owners, changed))
     messages.extend(f"module-contracts: {_contract_message(row)}" for row in findings)
@@ -1190,7 +1209,8 @@ def _run_module_contracts(
     result.findings = findings
     result.budget_seconds = budget
     result.resolved_base = resolved_base
-    return result, graph
+    result.measurement = measurement
+    return result
 
 
 @dataclass
@@ -1239,31 +1259,79 @@ def _dispatch_attempt(ledger: LedgerRun | None, identifier: str, check: CheckDef
 def _dispatch_module_contracts(
     root: Path, config: Config, files: list[str], classes: dict[str, str], inventory_code: int,
     directory: Path, diff: DiffBaseOverride, ledger: LedgerRun | None, results: list[CheckResult],
-) -> GraphExtraction | None:
+    graph_cache: GraphCache,
+) -> None:
     with _dispatch_attempt(ledger, "module-contracts"):
         evidence_dir = directory / "module-contracts"
         evidence_dir.mkdir()
-        result, graph = _run_module_contracts(
-            root, config, files, classes, inventory_code, evidence_dir, diff,
+        result = _run_module_contracts(
+            root, config, files, classes, inventory_code, evidence_dir, diff, graph_cache,
         )
         results.append(result)
     if diff.changed_paths is not None:
         result.report_fields["selection"] = _builtin_selection(files, inventory_code)
-    return graph
 
 
 def _run_configured_check(
     root: Path, config: Config, check: CheckDef, files: list[str], classes: dict[str, str],
     directory: Path, prior: dict[str, CheckResult], diff: DiffBaseOverride,
-    selection: CheckSelection | None, inventory_code: int,
+    selection: CheckSelection | None, inventory_code: int, graph_cache: GraphCache,
 ) -> CheckResult:
     if inventory_code != 0:
         return _run_inventory_blocked_check(check, selection)
     evidence_dir = directory / check.id
     evidence_dir.mkdir()
     return _run_selected_check(
-        root, config, check, files, classes, evidence_dir, prior, diff, selection,
+        root, config, check, files, classes, evidence_dir, prior, diff, selection, graph_cache,
     )
+
+
+def _read_only_graph_check(check: CheckDef) -> bool:
+    return check.adapter in {"module_graph", "module_tree"}
+
+
+def _snapshot_graph_languages(root: Path, config: Config, classes: dict[str, str], cache: GraphCache) -> None:
+    """Resolve deferred inventory languages before a check can change the checkout."""
+    if not isinstance(classes, InventoryClasses):
+        return
+    for path in sorted(classes.deferred_links):
+        try:
+            source_languages(root, [path], config, classes)
+        except GateError as error:
+            cache.classification_errors[path] = error
+
+
+def _policy_graph_cache(
+    root: Path, config: Config, classes: dict[str, str], inventory_code: int,
+    checks: list[CheckDef], diff: DiffBaseOverride, module_contracts: bool,
+) -> GraphCache:
+    cache = GraphCache()
+    if inventory_code != 0:
+        return cache
+    if module_contracts or diff.changed_paths is not None or any(map(_read_only_graph_check, checks)):
+        _snapshot_graph_languages(root, config, classes, cache)
+    return cache
+
+
+def _dispatch_configured_checks(
+    root: Path, config: Config, files: list[str], classes: dict[str, str], inventory_code: int,
+    checks: list[CheckDef], diff: DiffBaseOverride, directory: Path, graph_cache: GraphCache,
+    results: list[CheckResult], ledger: LedgerRun | None,
+) -> None:
+    selections = _scope_selections(
+        root, config, files, classes, directory, diff.changed_paths, checks, inventory_code, graph_cache,
+    )
+    prior: dict[str, CheckResult] = {}
+    for check in checks:
+        with _dispatch_attempt(ledger, check.id, check):
+            outcome = _run_configured_check(
+                root, config, check, files, classes, directory, prior, diff,
+                selections.get(check.id), inventory_code, graph_cache,
+            )
+            results.append(outcome)
+        if not _read_only_graph_check(check):
+            graph_cache.clear()
+        prior[check.id] = outcome
 
 
 def _policy_results(
@@ -1274,28 +1342,22 @@ def _policy_results(
 ) -> list[CheckResult]:
     if results is None:
         results = []
-    prior: dict[str, CheckResult] = {}
-    contract_graph = None
     if base_override is None:
         base_override = resolve_diff_base(root)
     if ledger is not None:
         ledger.diff = base_override
-    if module_contracts:
-        contract_graph = _dispatch_module_contracts(
-            root, config, files, classes, inventory_code, directory, base_override, ledger, results,
-        )
-    selections = _scope_selections(
-        root, config, files, classes, directory, base_override.changed_paths,
-        selected_checks, inventory_code, contract_graph,
+    graph_cache = _policy_graph_cache(
+        root, config, classes, inventory_code, selected_checks, base_override, module_contracts,
     )
-    for check in selected_checks:
-        with _dispatch_attempt(ledger, check.id, check):
-            outcome = _run_configured_check(
-                root, config, check, files, classes, directory, prior, base_override,
-                selections.get(check.id), inventory_code,
-            )
-            results.append(outcome)
-        prior[check.id] = outcome
+    if module_contracts:
+        _dispatch_module_contracts(
+            root, config, files, classes, inventory_code, directory, base_override, ledger,
+            results, graph_cache,
+        )
+    _dispatch_configured_checks(
+        root, config, files, classes, inventory_code, selected_checks, base_override, directory,
+        graph_cache, results, ledger,
+    )
     return results
 
 

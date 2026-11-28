@@ -48,6 +48,27 @@ NO_ALLOWANCE = CONTRACT_CONFIG.replace('allowed_dependencies = ["library"]', "al
 ENTRY_POINTS = ["library/api.py", "library/z.py"]
 
 
+GRAPH_CHECKS = """[checks.graph]
+adapter = "module_graph"
+tier = 1
+enforcement = "advisory"
+classes = ["python"]
+
+[checks.tree]
+adapter = "module_tree"
+tier = 1
+enforcement = "advisory"
+
+"""
+SCAN_CHECK = """[checks.scan]
+adapter = "command"
+tier = 1
+enforcement = "enforced"
+run = ["true", "{files}"]
+
+"""
+
+
 def capability(*paths: str, name: str = "run-library", owner: str = "library") -> str:
     return f'\n[capabilities.{name}]\nowner = "{owner}"\nentry_points = {json.dumps(paths)}\n'
 
@@ -66,6 +87,8 @@ class ShippedCapabilityTests(unittest.TestCase):
             subprocess.run(["git", "add", "-A", "-f"], cwd=repo, check=True)
 
             config = load_config(repo)
+            configured = {check.adapter for check in config.checks.values()}
+            self.assertTrue({"module_tree", "module_graph"}.isdisjoint(configured))
             self.assertEqual(config.capabilities, {
                 "run-quality-gate": CapabilityDef(owner="core", entry_points=("qg.py",)),
                 "run-coverage-driver": CapabilityDef(
@@ -229,7 +252,7 @@ class ModuleContractTests(FixtureCase):
             mock.patch.object(adapters, "_extract_graph", wraps=adapters._extract_graph) as extract,
             mock.patch.object(adapters, "source_languages", wraps=adapters.source_languages) as languages,
         ):
-            result, graph = checks._run_module_contracts(
+            result = checks._run_module_contracts(
                 self.repo, config, files, classes, 0, self.base, DiffBaseOverride(),
             )
         context = extract.call_args.args[0]
@@ -237,7 +260,7 @@ class ModuleContractTests(FixtureCase):
         self.assertCountEqual(context.files, owners)
         languages.assert_called_once_with(self.repo, sorted(owners), config, classes)
         self.assertEqual(result.findings, [])
-        self.assertEqual(graph.modules, sorted(owners))
+        self.assertEqual(result.measurement["modules"], sorted(owners))
 
     def test_edge_kind_is_part_of_deduplication_and_ordering(self) -> None:
         config = load_config(self.repo)
@@ -811,6 +834,159 @@ reason = "Lisp source"
         contract, affected = [call.args[1] for call in extract.call_args_list]
         self.assertEqual(sorted([*contract, "data.py"]), affected)
         self.assertEqual(document["changed_paths"], ["data.py"])
+
+
+    def add_scan_check(self) -> None:
+        config = self.read_file("quality-gate.toml").replace(
+            'checks = ["smoke"]', 'checks = ["smoke", "scan"]',
+        )
+        self.write_config(config + SCAN_CHECK)
+
+    def test_shell_word_decoding_with_pinned_parser(self) -> None:
+        self.configure_shell(
+            "sou\"rc\"e $'../library/priv\\x61te.sh'\n"
+            "source ../library/pri\\\nvate.sh\n"
+            "source ../library/priv\\ate.sh\n"
+            ". '../library/'private.sh\n"
+            '"source" "../library/pri"vate.sh\n'
+            "source $'../library/priv\\u0061te.sh'\n"
+            "source $'../library/priv\\u00e9te.sh'\n"
+            "source $'../library/priv\\141te.sh'\n"
+            "source $'../library/private.sh\\0suffix'\n"
+            "source '../library/literal\\8.sh'\n"
+            'source "../library/literal\\8.sh"\n'
+        )
+        literal = r"library/literal\8.sh"
+        self.add_file(literal, "")
+        _, _, check = self.contract(1, env=self.default_tool_env())
+        resolved = {5: "library/private.sh", 6: "library/private.sh", 11: literal, 12: literal}
+        self.assertEqual(
+            [row["edge"] for row in check["findings"]],
+            [{"source": "app/use.sh", "target": target, "line": line, "kind": "source"}
+             for line, target in resolved.items()],
+        )
+        self.assertEqual(
+            [(row["file"], row["line"], row["kind"]) for row in check["measurement"]["unresolved"]],
+            [("app/use.sh", line, "source") for line in (1, 2, 4, 7, 8, 9, 10)],
+        )
+
+    def test_resolved_elisp_load_enforces_capability_ownership(self) -> None:
+        target = "library/fixture.el"
+        for contents in ('(load "library/fixture")', '(load-file "../library/fixture.el")'):
+            with self.subTest(contents=contents):
+                self.configure_elisp("\n" + contents + "\n")
+                self.allow_library_target(target)
+                result, _, check = self.contract(1)
+                finding, = check["findings"]
+                self.assert_capability_finding(
+                    result, finding, source="app/use.el", line=2, target=target, kind="path-load",
+                )
+                self.assertIn(finding["edge"], check["measurement"]["edges"])
+
+    def test_refused_or_failed_extraction_is_retried(self) -> None:
+        self.configure_elisp("(\n")
+        self.write_config(self.read_file("quality-gate.toml") + GRAPH_CHECKS)
+        self.add_scan_check()
+        self.commit_all()
+        self.add_file("library/api.py", "value = 3\n")
+        args = ("--base", "HEAD", "--only", "graph", "tree", "scan")
+        with mock.patch.object(module_graph, "dependencies", wraps=module_graph.dependencies) as extract:
+            result, document, contract = self.contract(1, *args)
+        self.assertEqual(extract.call_count, 4, result.stderr)
+        refusal, = contract["measurement"]["reader_refusals"]
+        for call in extract.call_args_list:
+            self.assertEqual(list(call.kwargs["elisp"]), ["app/use.el", "library/fixture.el"])
+            self.assertEqual(call.kwargs["elisp"]["app/use.el"][0]["kind"], "reader-error")
+        for identifier in ("graph", "tree"):
+            check = self.check_by_id(document, identifier)
+            self.assertTrue(check["satisfied"])
+            self.assertEqual(check["measurement"]["reader_refusals"], [refusal])
+        self.assertIn("affected scope: app/use.el:", result.stderr)
+        eligible = ["app/helper.py", "app/main.py", "app/use.el", "library/api.py",
+                    "library/fixture.el", "library/private.py", "library/z.py"]
+        scan = self.check_by_id(document, "scan")
+        reason = "full run: module graph unavailable (Emacs Lisp reader refused source)"
+        self.assertEqual(scan["selection"], {"reason": reason, "selected": dict.fromkeys(eligible, reason),
+                                            "left_out": {}})
+        self.assertEqual(scan["diagnostics"]["argv"][1:], eligible)
+
+        self.add_file("app/use.el", "")
+        self.add_file("app/main.py", "run_path\n")
+        self.commit_all()
+        self.add_file("library/api.py", "value = 4\n")
+        original = module_graph.dependencies
+        with mock.patch.object(module_graph, "dependencies") as extract:
+            def fail_once(*args, **kwargs):
+                if extract.call_count == 1:
+                    raise ValueError("injected extraction failure")
+                return original(*args, **kwargs)
+
+            extract.side_effect = fail_once
+            result, document, contract = self.contract(1, *args)
+        self.assertEqual(extract.call_count, 2, result.stderr)
+        self.assertEqual(contract["execution"], "error")
+        self.assertIn("injected extraction failure", contract["findings"][-1]["message"])
+        self.assertNotIn("measurement", contract)
+        scan = self.check_by_id(document, "scan")
+        self.assertEqual(scan["selection"], {
+            "reason": "affected files", "selected": {"library/api.py": "changed"},
+            "left_out": dict.fromkeys(
+                set(eligible) - {"library/api.py"}, "no changed file affects this input",
+            ),
+        })
+        self.assertEqual(scan["diagnostics"]["argv"][1:], ["library/api.py"])
+        reports = []
+        for identifier in ("graph", "tree"):
+            check = self.check_by_id(document, identifier)
+            unresolved, = check["measurement"]["unresolved"]
+            self.assertEqual(unresolved["operand"], "run_path")
+            reports.append(check["measurement"])
+        for key in ("modules", "edges", "unresolved", "reader_refusals", "providers"):
+            self.assertEqual(reports[0][key], reports[1][key], key)
+        location = "app/main.py:1: unresolved path load run_path"
+        diagnostics = [line for line in result.stderr.splitlines() if location in line]
+        self.assertEqual(len(diagnostics), 1)
+
+    def test_complete_extraction_is_shared_by_all_four_consumers(self) -> None:
+        self.configure_elisp('(load-file "../library/api.py")\n')
+        self.write_config(self.read_file("quality-gate.toml") + GRAPH_CHECKS)
+        self.add_scan_check()
+        self.commit_all()
+        self.add_file("library/api.py", "value = 3\n")
+        with mock.patch.object(module_graph, "dependencies", wraps=module_graph.dependencies) as extract:
+            _, document, contract = self.contract(0, "--base", "HEAD", "--only", "graph", "tree", "scan")
+        extract.assert_called_once()
+        scan = self.check_by_id(document, "scan")
+        self.assertEqual(scan["selection"]["selected"], {
+            "library/api.py": "changed", "app/main.py": "depends on library/api.py",
+            "app/use.el": "depends on library/api.py",
+        })
+        self.assertEqual(scan["diagnostics"]["argv"][1:], ["app/main.py", "app/use.el", "library/api.py"])
+        for identifier in ("graph", "tree"):
+            report = self.check_by_id(document, identifier)["measurement"]
+            for key, value in contract["measurement"].items():
+                self.assertEqual(report[key], value, f"{identifier}.{key}")
+
+    def test_validated_refusal_survives_failure_and_next_consumer_retries(self) -> None:
+        self.configure_elisp("(\n")
+        self.write_config(self.read_file("quality-gate.toml") + GRAPH_CHECKS)
+        self.add_scan_check()
+        self.commit_all()
+        self.add_file("library/api.py", "import (\n")
+        with mock.patch.object(module_graph, "dependencies", wraps=module_graph.dependencies) as extract:
+            result, document, contract = self.contract(1, "--base", "HEAD", "--only", "graph", "tree", "scan")
+        self.assertEqual(extract.call_count, 4, result.stderr)
+        self.assertEqual(contract["execution"], "error")
+        refusal, = contract["measurement"]["reader_refusals"]
+        self.assertEqual((refusal["file"], refusal["line"], refusal["stage"]), ("app/use.el", 2, "reader"))
+        self.assertIn("library/api.py", contract["findings"][-1]["message"])
+        self.assertIn("affected scope: app/use.el:2:", result.stderr)
+        for identifier in ("graph", "tree"):
+            check = self.check_by_id(document, identifier)
+            self.assertEqual(check["outcome"], "error")
+            self.assertEqual(check["measurement"]["reader_refusals"], [refusal])
+            self.assertNotIn("edges", check["measurement"])
+            self.assertEqual(check["resolved_baseline_entries"], [])
 
 
 class SharedSurfaceTests(FixtureCase):

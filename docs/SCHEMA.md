@@ -257,7 +257,7 @@ Set the top-level key `python_import_roots = ["src"]` when `src/pkg/mod.py` is i
 paths. Use `.` for the repository root. It defaults to `["."]`. Roots must exist as directories
 without symlink components when the analysis runs.
 
-The module graph, module contracts, and affected dependency selection search those directories
+The module graph, module tree, module contracts, and affected selection search those directories
 in order for absolute imports and then search the importing file's directory. A relative import
 starts from the package containing the importing file under its most specific configured root.
 Python mutation uses names relative to the same roots to associate test imports with changed
@@ -269,15 +269,56 @@ A file can also have multiple dotted names when configured roots overlap. Graph 
 mutation fail when two files in their inputs provide the same dotted name. If affected selection
 cannot extract the graph, it selects full inputs according to the affected-scope rules.
 
-### Python module graph policy
+### Module graph policy
 
-The `module_graph` adapter requires `classes`, a nonempty array of inventory class
-names. It reads the Python files in those classes. The optional `suites` array
-contains case-sensitive `fnmatch` patterns for repository-relative paths. It defaults
-to an empty array. The adapter uses a fixed maximum threshold of zero findings.
+The `module_graph` adapter requires `classes`, a nonempty array of inventory class names.
+It reads supported Python, Emacs Lisp, and Bash files in those classes. The optional
+`suites` and `programs` arrays contain case-sensitive `fnmatch` patterns for
+repository-relative paths and default to empty arrays. The fixed maximum threshold is zero.
 
-A `from P import N` edge points to `P.N` when that module is in scope and otherwise points to
-`P` when it is in scope. Only edges between measured files are recorded.
+A Python `from P import N` edge points to `P.N` when that module is in scope and
+otherwise points to `P` when it is in scope. Each measured alias uses the import
+statement's start line. The graph measures only edges between measured files.
+
+### Module tree policy
+
+The `module_tree` adapter measures the entire supported inventory, including files in
+classes whose `checks` array omits it. It measures those paths whenever selected,
+including with `--base` or `--only`. It reports static evidence with complete finding
+locations, metric version `module-tree/1`, and a fixed maximum threshold of zero. The
+optional `baseline` path uses the standard baseline format. Only the common check
+fields and `baseline` are accepted. Specify `direction = "max"` or omit it.
+
+A tree finding represents a distinct cyclic file edge, including a self-loop.
+Directory cycles and ordinary unresolved evidence are advisory. Module interfaces,
+allowed dependencies, and capabilities are configured through module contracts.
+
+### Static dependency extraction
+
+Graph, tree, module contracts, and affected selection share extraction when their
+sorted Python, Lisp, and Bash partitions and effective Python roots match. Inventory
+supplies membership and language classification. Configured graph uses its policy
+classes, module contracts use resolved ownership paths, and tree and affected selection
+use the whole supported inventory. Dispatching a configured check other than graph or
+tree invalidates completed extraction and diagnostic reuse. Later consumers reread source
+bytes from the same inventory. Inventory or language changes require a new invocation.
+
+The supported dependency forms and their operands are described in the [module graph
+guide](../README.md#module-graph). Each recognized occurrence produces an edge or
+located unresolved evidence within the measured scope. Measured Python imports preserve
+aliases. Bash source words are proved against pinned shfmt output and the original bytes.
+Positioned Emacs forms use static, measured-name lookup with lexical path normalization
+for `load` and `load-file`. Runtime dispatch and expansion, runtime search paths and
+working directories, arbitrary Lisp evaluation, unrecognized forms, and endpoints
+outside the measured inventory are outside static resolution.
+
+A valid Emacs preparation or reader refusal replaces a file's outgoing evidence and
+providers with one located refusal. Incoming literal path edges may still resolve.
+Refusals block module contracts, limit the tree's measured baseline domain, and make
+affected selection use the full-input path before reverse closure. Hard parser and
+extraction errors use the same full-input path for affected selection. Inventory or policy
+failure blocks extraction for the affected check. Only successful, refusal-free extractions
+are eligible for reuse.
 
 ### Environment access policy
 
@@ -372,6 +413,7 @@ The same `tests` evidence identifies producers for verification and its
 | `python_crap` | `crap` |
 | `python_shape` | `duplication` |
 | `module_graph` | `static` |
+| `module_tree` | `static` |
 | `env_surface` | `static` |
 | `comments` | `static` |
 | `python_mutation` | `static` |
@@ -794,6 +836,29 @@ deleted from the repository resolves. A baseline whose entries all resolve
 keeps its header and no entries, and prune reports that it is now empty; the
 policy's `baseline` key and the file are then deleted by hand.
 
+### Module tree baselines
+
+A module-tree baseline identifies each cyclic file edge with the compact ASCII-escaped JSON
+array `["file-cycle",null,source,target,kind]`. The second element is reserved and always
+JSON `null`. Each subject has value `1`. Line moves, repeated occurrences, changes in
+the legacy cycle witness, and directory rollup depth leave the subject unchanged.
+
+```toml
+check = "module-tree"
+metric_version = "module-tree/1"
+
+[[entry]]
+subject = '["file-cycle",null,"pkg/a.py","pkg/b.py","import"]'
+bound = 1
+reason = "These modules share initialization during the migration"
+```
+
+A complete extraction measures the entire subject domain, so absent subjects resolve
+and are eligible for prune. A reader refusal limits the domain to observed subjects.
+Observed cycles still use the ordinary baseline rules. Absent entries appear as
+unmeasured in the result and worklist and are retained by prune. Hard errors evaluate no
+baseline. Directory cycles have no baseline subjects.
+
 ### Module contracts and consumer cutover
 
 `module-contracts` assigns each inventoried code file exactly one module. It uses present tracked
@@ -1112,16 +1177,58 @@ Each `shared-entry-point` finding has the feature `file`, its `module`, the
 then protected path. Each `multi-module-file` finding has the target `file`, sorted
 dependent `modules` and a diagnostic `message`. Findings are ordered by target path.
 
-A completed `module_graph` check reports `measurement.modules` as sorted
-repository-relative paths and `measurement.edges` as objects with `source`, `target`
-and one-based `line`, sorted by those fields. Each distinct source, target and
-line is included. The `fan_in` and `fan_out` objects map each module path to its
-number of distinct importing or imported modules, respectively. The `value`
-is the total number of findings and `threshold` is zero. The adapter has no baseline.
-Cycle findings include their sorted `component` and a shortest witness `cycle`
-as an ordered array of edges. When several shortest cycles exist, the adapter
-chooses the lexicographically first edge sequence. Suite findings include the
-offending `edge`. Both findings use the import lines as their locations.
+Graph, tree, and module contracts share these fields in `measurement` when extraction
+is available.
+
+| Field | Contents |
+|---|---|
+| `modules` | Sorted repository-relative measured paths. |
+| `edges` | One row per resolved occurrence with `source`, `target`, one-based `line`, and `kind`. Sorted by those fields, with identical rows retained. |
+| `unresolved` | Rows with `file`, one-based `line`, `kind`, `operand`, `reason`, and `message`; a missing shell operand is null. Sorted by file and line, in occurrence order within a line. |
+| `reader_refusals` | Located Emacs refusals with `file`, `line`, `message`, `kind = "reader-error"`, and `stage` (`preparation` or `reader`). |
+| `providers` | Accepted one-argument `provide` occurrences with `file`, `line`, and `feature`, in file and reader order. Accepted declarations with subfeatures still participate in lookup. |
+| `python_import_roots` | Non-default effective roots in policy order, or an empty array for the implicit root. |
+| `outside_extractor` | The located `file`, `line`, and `message` projection of unresolved rows and refusals. Omitted when empty. |
+
+A hard failure after a validated refusal can report refusal evidence without a completed
+edge report. Graph and tree emit ordinary diagnostics once per completed extraction
+per reuse segment, including repeats within that emission. Affected selection reports
+refusals with the `affected scope` prefix. Contract findings keep their own diagnostics.
+
+Graph and tree also report `fan_in` and `fan_out` as counts of distinct source and
+target neighbors, along with `value` and `threshold`. Graph `value` counts legacy
+findings. Those findings use one edge per source, target and line, preferring `import`
+or `require` over a coincident `path-load`. Cycle findings contain their sorted
+`component` and the shortest witness `cycle`, with lexicographically first edge
+sequence breaking ties. They apply to components with at least two files. Suite and
+program findings include their offending `edge`.
+
+#### Module tree measurement
+
+`tree` is rooted at `.`. Each directory node has `path`, `directories`, and `files`.
+Each file node has `path` and the inventory `language` (`python`, `lisp`, or `bash`).
+Sibling arrays sort by path and only directories needed by measured files appear.
+
+For a nonempty inventory, `directory_rollups` contains one row at each `depth` from zero
+through the deepest file parent. Each file maps to its ancestor at that depth, or to its
+own parent if shallower. A row lists sorted `directories` and `edges` grouped by ordered
+directory `source` and `target`, including same-directory groups. Each group's `edges`
+array preserves the file-edge ordering and occurrence count. The row's `cycles` array
+lists sorted strongly connected `component` arrays in component order. Each cycle's
+`edges` includes all its internal cross-directory occurrences in file-edge order.
+An empty inventory gives an empty root and no rollups.
+
+A file edge is cyclic when the target can reach the source. Tree findings group all
+such occurrences by source, target and kind, including self-loops, chords and parallel
+kinds. Findings sort by that key. Each has `value = 1`, a
+[module-tree baseline subject](#module-tree-baselines), and `measurement` with
+`rule = "file-cycle"`, `boundary = null`, and the full `occurrences` array.
+There is one source line range per occurrence, in the same order. The tree's
+`measurement.value` counts groups before the baseline is applied.
+
+Tree `selection` lists all measured supported inventory paths with the run reason and
+an empty `left_out`. Extraction errors after input selection retain that selection.
+On inventory failure the result is unsupported with empty selection and no measurement.
 
 An `env_surface` check reports `measurement.findings`, an array sorted by
 repository-relative `path` and one-based `line`. Each row has `name`, `path`,
@@ -1237,7 +1344,9 @@ with a path and no line has null line bounds. A finding without structured
 ranges has `locations: null` and retains any available result location
 label, such as the known spans of a partially located clone. Ratchet findings
 retain `covered_by_baseline`, `blocking`, `expired` and the baseline expiry
-date in `baseline_expires` when available. The ledger leaves out command
+date in `baseline_expires` when available. Tree `file-cycle` findings retain the reserved
+`measurement.boundary` and each occurrence's `source`, `target`, `line`, and `kind`.
+Their locations and occurrences preserve duplicates and result ordering. The ledger leaves out command
 output, diagnostic arguments, free-form reasons, and comment text.
 
 If a dispatched check raises before producing its result, the last row

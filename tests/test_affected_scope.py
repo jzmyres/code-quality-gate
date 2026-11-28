@@ -1058,6 +1058,49 @@ reason = "External package consumer"
         _, _, affected = affected_graph(self.repo, config, files, classes, self.base, {"pkg/source.sh"})
         self.assertEqual(affected["pkg/consumer.sh"], "depends on pkg/source.sh")
 
+    def test_elisp_path_load_reverse_closure_and_reader_refusal_full_scope(self):
+        self.write_config(CONFIG.replace(
+            'patterns = ["*.py", "*.sh"]', 'patterns = ["*.py", "*.sh", "*.el"]',
+        ))
+        self.add_file("pkg/loader.el", '(load-file "a.py")\n')
+        self.add_file("pkg/dependent.el", '(load "pkg/loader")\n')
+        self.add_file("pkg/unused.el", "")
+        self.change("pkg/a.py", "value = 2\n")
+        result, document = self.affected("--only", "lint")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["changed_paths"], ["pkg/a.py"])
+        expected = {
+            "pkg/a.py": "changed",
+            "pkg/b.py": "depends on pkg/a.py",
+            "pkg/loader.el": "depends on pkg/a.py",
+            "pkg/dependent.el": "depends on pkg/loader.el",
+        }
+        lint = self.checked(document, "lint")
+        self.assertEqual(lint["selection"], {
+            "reason": "affected files", "selected": expected,
+            "left_out": dict.fromkeys(
+                ("pkg/__init__.py", "pkg/unused.el"), "no changed file affects this input",
+            ),
+        })
+        self.assertEqual(lint["diagnostics"]["argv"][-len(expected):], sorted(expected))
+        self.assertIn(repr(sorted(expected)), lint["diagnostics"]["output_tail"])
+
+        self.add_file("pkg/loader.el", '(load-file "a.py")\n(')
+        self.change("pkg/a.py", "value = 3\n")
+        result, document = self.affected("--only", "lint")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual(document["changed_paths"], ["pkg/a.py"])
+        self.assertIn("affected scope: pkg/loader.el:2:", result.stderr)
+        eligible = [
+            "pkg/__init__.py", "pkg/a.py", "pkg/b.py", "pkg/dependent.el", "pkg/loader.el", "pkg/unused.el",
+        ]
+        reason = "full run: module graph unavailable (Emacs Lisp reader refused source)"
+        lint = self.checked(document, "lint")
+        self.assertEqual(lint["selection"], {"reason": reason, "selected": dict.fromkeys(eligible, reason),
+                                            "left_out": {}})
+        self.assertEqual(lint["diagnostics"]["argv"][-len(eligible):], eligible)
+        self.assertIn(repr(eligible), lint["diagnostics"]["output_tail"])
+
     def test_initializer_change_seeds_every_package_module(self):
         from quality_gate.module_graph import Edge, affected_paths
 

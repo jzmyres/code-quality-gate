@@ -438,49 +438,48 @@ or a literal script argument to `bash` or `sh` gives an `execute` edge.
 Relative paths resolve from the calling script's directory and can identify a measured
 module in any language.
 
-A literal target must be a single unquoted shfmt literal that matches the original source
-bytes and the character class `[A-Za-z0-9._/+-]+`. It cannot start with `-`.
-The exact script-directory prefixes `"$(dirname "$0")"` and `"${BASH_SOURCE%/*}"`
-are also accepted when followed by a slash and an unquoted suffix in the same character class.
-The graph reports other quoted, expanded, globbed, or unsupported targets as outside the parser.
-It reports the same diagnostic for `source` and `.` with a first operand starting with
-`-` or `+` and for `bash` and `sh` with such an option before the script. These diagnostics appear in
-`outside_extractor` with the calling file and line. A literal path without a measured target
-is reported there as unresolved and includes the path. The pinned shfmt prints the JSON tree
-with `--from-json` and formats the original source. The check fails and names the file if the
-two outputs differ byte for byte. Missing required fields and mistyped fields fail the check
-and identify the file and field. Empty files, assignment-only commands, and redirect-only
-statements are valid. Shell syntax errors fail the check and identify the file.
+For `source` and `.`, the extractor reconciles the shfmt word parts with the original
+bytes. It accepts static concatenations of literal and quoted parts, including quoted spaces.
+A continuation in the command head is accepted when shell quoting removes it. Operand
+continuations, unproved escapes and expansions are reported as unresolved. An operand that
+decodes to a word beginning with `-` or `+` is treated as an option.
 
-The batch Emacs reader uses Emacs's load-time coding and line-ending detection and applies
-file-local `read-symbol-shorthands`. Emacs's load loop determines when the file ends
-cleanly. The extractor reads each top-level form once in sequence and
-extracts `(require 'FEATURE)` at the top level or directly inside a top-level
-`eval-when-compile`. Locations use the positions of the `require` and `provide` head
-symbols from that read. With an omitted filename or explicit `nil`, Emacs matches
-interned feature symbols by identity. The target is the unique measured file with a
-matching literal `(provide 'FEATURE)` at the top level or directly inside a top-level
-`progn`. With no measured provider, the feature is treated as external and produces
-neither an edge nor a report entry.
+Direct execution and interpreter script arguments retain the single unquoted literal rule.
+They accept the character class `[A-Za-z0-9._/+-]+`, with option handling for interpreter
+arguments. Source and execution both accept the exact script-directory prefixes
+`"$(dirname "$0")"` and `"${BASH_SOURCE%/*}"` when followed by a slash and an unquoted
+suffix in the same character class. The pinned shfmt prints the JSON tree and formats the
+original source. Those outputs must match byte for byte. Shell syntax, parser protocol, and
+reproduction failures are check errors.
 
-In `(require 'FEATURE "FILE")`, every slash-delimited component of `FILE` must be
-nonempty, differ from `.` and `..`, and contain only ASCII letters, digits, `.`, `_`,
-`+`, and `-`. The graph compares `FILE.el` and `FILE` exactly against the measured
-repository-relative paths. One match produces an edge. Zero or two matches produce
-one `outside_extractor` entry with the require's file and line.
+The batch Emacs reader uses load-time coding and line-ending detection and applies file-local
+`read-symbol-shorthands`. It reads the file without evaluating its forms. Dependency calls
+`require`, `load`, and `load-file` resolve at the top level and directly inside a top-level
+`eval-when-compile`. Locations use the position of the head symbol. The expression walker
+reports recognized calls in other visited evaluation positions as unresolved, including active
+quasiquote unquotes. It skips ordinary quoted data, binding names, and opaque forms.
 
-Multiple measured providers, computed require operands, and literal filenames
-outside the allowlist also produce one located `outside_extractor` entry per require.
-Uninterned features in requires or providers are reported there as well.
-The Emacs reader refuses reader labels (`#N=` and `#N#`) so each positioned head
-identifies a single source occurrence. An error in coding or file-local variable
-processing, a reader label, or any other reader error, including EOF inside a form,
-refuses the whole file. The graph reports one `outside_extractor` entry naming the file
-and the line where Emacs reported the error. It discards the file's outgoing edges and
-feature providers and continues measuring the other files.
-Requires nested elsewhere, including in functions or quasiquote unquotes, give no edge.
-`load` and `load-file` also give no edge. An Emacs launch failure or a Python
-syntax error produces a check error that names the affected file.
+With an omitted or nil filename, `require` matches a quoted, interned feature against
+the unique measured provider file. Providers are literal `provide` declarations at top
+level or directly inside a top-level `progn`. They may include literal nil or a quoted list
+of subfeatures. The optional `require` NOERROR argument leaves lookup unchanged.
+An explicit filename uses nonempty slash components made of ASCII letters, digits, `.`,
+`_`, `+`, and `-`, excluding `.` and `..` components. The extractor checks that exact
+repository-relative filename and its `.el` variant against measured paths.
+
+`load` looks up a literal path from the repository root and checks the exact name and
+its `.el` variant. Literal NOSUFFIX disables appending, and literal MUST-SUFFIX requires
+an `.el` candidate. `load-file` uses the exact name relative to the caller's directory.
+Both normalize slash components lexically and refuse paths that escape the repository,
+need runtime or platform-specific expansion, or contain control characters. These calls
+produce `path-load` edges and can reach measured files in any of the supported languages.
+Missing or ambiguous targets and unsupported arguments produce one located unresolved row
+per occurrence.
+
+Reader labels, malformed forms, and file preparation errors can cause Emacs to refuse a
+whole file. One located refusal replaces its outgoing evidence and provider declarations.
+Incoming literal path loads can still resolve to that file. Launch, protocol, extraction,
+and Python syntax failures are hard errors.
 
 The graph reports one finding per strongly connected component with at least two modules
 and shows a shortest cycle with its edge locations. It also reports dependencies between
@@ -512,11 +511,44 @@ python3 -I qg.py check --only module-graph
 ```
 
 The check allows zero findings, so any finding fails the gate under this policy.
-The JSON result includes the sorted modules and edges, each edge's kind
-(`import`, `path-load`, `require`, `source`, or `execute`),
-and fan-in and fan-out for each module.
+The JSON result includes all sorted edge occurrences with kind
+(`import`, `path-load`, `require`, `source`, or `execute`) and fan-in and fan-out
+counts of distinct neighboring files. Legacy findings use one representative per source,
+target, and line. Located unresolved rows are advisory.
 
-Subprocess dependencies are tracked in `GATE-MODULE-GRAPH-SUBPROCESS`.
+Subprocess dependency discovery is tracked in `GATE-MODULE-GRAPH-SUBPROCESS`.
+
+### Module tree
+
+Add a `module_tree` check to measure the full inventory of Python, Emacs Lisp, and Bash files.
+It measures that inventory whenever selected, including on affected runs and when no
+inventory class lists the check.
+
+```toml
+[checks.module-tree]
+adapter = "module_tree"
+tier = 1
+enforcement = "enforced"
+# baseline = "module-tree-baseline.toml"
+```
+
+Run it with `python3 -I qg.py check --only module-tree --json`. Its fixed maximum threshold
+is zero. The report contains a directory tree, dependency occurrences and fan counts, and
+directory rollups with advisory cycles. Each file edge on a cycle, including a self-loop,
+has one finding per source, target, and kind. All occurrences of that edge contribute
+locations. Use the optional baseline to accept existing cyclic edges by subject.
+
+A complete extraction resolves absent baseline subjects. With an Emacs reader refusal,
+observed cycles still enforce the baseline and absent subjects remain unmeasured in the
+result and worklist. Prune retains unmeasured entries. Module contracts enforce interface
+and capability rules on the same dependency kinds. They measure resolved owners, while
+the configured graph measures its selected inventory classes. The graph, tree, contracts,
+and affected selection reuse completed extraction when their language partitions and
+Python roots match. A configured check other than graph or tree ends that reuse segment,
+so later graph consumers reread inventoried paths.
+
+See the [module tree schema](docs/SCHEMA.md#module-tree-policy) and
+[baseline format](docs/SCHEMA.md#module-tree-baselines).
 
 ### Source-character checks
 
@@ -1436,7 +1468,10 @@ hygiene and any enabled module contracts run in full. For every per-file check, 
 deleted package initializer counts as a change to every module in its package. Lint and compilation
 also receive the transitive module graph dependents of those inputs. Any changed path outside the
 module graph expands every per-file check to its full input class, including changes to
-configuration, tool pins, data, and documentation.
+configuration, tool pins, data, and documentation. Complete dependency evidence gives
+reverse closure across language boundaries, including literal Lisp path loads. A reader
+refusal or hard extraction error selects each per-file check's full inputs. The tree
+measures all supported paths in either case and records its selection reason.
 
 Every selected suite that reaches execution runs in full on a nonempty affected diff. The module
 graph records extractable dependencies and cannot account for test runtime inputs such as files read as

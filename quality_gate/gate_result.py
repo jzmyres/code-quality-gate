@@ -439,14 +439,20 @@ _MEASUREMENT_SEQUENCES = {
 
 
 def _measurement_sequences(data: dict[str, Any]) -> dict[str, Any]:
+    sequences = _MEASUREMENT_SEQUENCES
+    if data.get("rule") == "file-cycle":
+        sequences = {**sequences, "occurrences": _EDGE_FIELDS}
     return {
         key: [_fields(row, fields) for row in data[key]]
-        for key, fields in _MEASUREMENT_SEQUENCES.items() if key in data
+        for key, fields in sequences.items() if key in data
     }
 
 
 def _measurement_values(data: dict[str, Any]) -> dict[str, Any]:
-    projected = _fields(data, _MEASUREMENT_FIELDS)
+    fields = _MEASUREMENT_FIELDS
+    if data.get("rule") == "file-cycle":
+        fields = (*fields, "boundary")
+    projected = _fields(data, fields)
     if "edge" in data:
         projected["edge"] = _fields(data["edge"], _EDGE_FIELDS)
     if "limit" in data:

@@ -1148,6 +1148,46 @@ enforcement = "enforced"
         self.assertEqual(finding, {"locations": [{"path": "a.py", "start_line": 2, "end_line": 2}]})
         self.assertNotIn("private fixture marker", json.dumps(record))
 
+    def test_module_tree_ledger_preserves_occurrences_and_locations_by_subject(self):
+        self.write_config(BASE_CONFIG + """
+[checks.module-tree]
+adapter = "module_tree"
+tier = 1
+enforcement = "enforced"
+""")
+        self.add_file("a.py", (
+            "import runpy\n"
+            "import b, b; runpy.run_path('b.py'); runpy.run_path('b.py')\n"
+            "runpy.run_path('b.py')\n"
+        ))
+        self.add_file("b.py", "import a\n")
+        self.commit_all()
+        trusted = self.trusted_directory("HEAD")
+        result, document = self.run_json("--policy-from", str(trusted))
+        self.assertEqual(result.returncode, 1, output(result))
+        self.assertEqual(document["schema"], 4)
+        record = self.read_ledger(result.stdout, result.stderr)
+        reported = self.check_by_id(document, "module-tree")["findings"]
+        persisted = self.check_by_id(record, "module-tree")["findings"]
+        groups = {("a.py", "b.py", "import"): (2, 2), ("a.py", "b.py", "path-load"): (2, 2, 3),
+                  ("b.py", "a.py", "import"): (1,)}
+        expected = {}
+        for (source, target, kind), lines in groups.items():
+            identity = json.dumps(["file-cycle", None, source, target, kind], separators=(",", ":"))
+            expected[identity] = {
+                "measurement": {
+                    "rule": "file-cycle", "boundary": None,
+                    "occurrences": [{"source": source, "target": target, "line": line, "kind": kind}
+                                    for line in lines],
+                },
+                "locations": [{"path": source, "start_line": line, "end_line": line} for line in lines],
+            }
+        for findings in (reported, persisted):
+            self.assertEqual([row["subject"] for row in findings], list(expected))
+            for finding in findings:
+                self.assertEqual({key: finding[key] for key in ("measurement", "locations")},
+                                 expected[finding["subject"]], finding["subject"])
+
     def test_shared_override_is_taken_from_the_scheduler(self):
         self.write_config(BASE_CONFIG + self.module_policy)
         self.commit_all()
