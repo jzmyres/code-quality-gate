@@ -8,7 +8,9 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from importlib.machinery import ModuleSpec, PathFinder, all_suffixes
+from functools import cache
+from importlib._bootstrap_external import _get_supported_file_loaders
+from importlib.machinery import FileFinder, ModuleSpec, PathFinder, all_suffixes
 from importlib.util import spec_from_file_location
 from inspect import signature
 from operator import itemgetter
@@ -178,23 +180,6 @@ def multi_module_findings(
     ]
 
 
-def _import_spec(name: str, directories: Sequence[str] | None) -> ModuleSpec | None:
-    spec = None
-    for part in name.split("."):
-        if not directories or not part:
-            return None
-        spec = PathFinder.find_spec(part, directories)
-        if spec is None:
-            return None
-        directories = spec.submodule_search_locations
-    return spec
-
-
-def _origin(name: str, directories: Sequence[str]) -> str | None:
-    spec = _import_spec(name, directories)
-    return spec.origin if spec is not None else None
-
-
 def _import_names(path: Path) -> Iterator[str]:
     parts = path.with_suffix("").parts
     if not all(part.isidentifier() for part in parts):
@@ -255,37 +240,75 @@ class PythonImports:
         return identities
 
 
-def _from_base(imports: PythonImports, source: Path, node: ast.ImportFrom) -> str | None:
-    package = imports.package(source) if node.level else ()
+def _repository_finder() -> Callable[[str, Sequence[str]], ModuleSpec]:
+    """Use CPython's ordered lookup with a directory cache for this extraction.
+
+    The returned finder collects fixed namespace portions from the supplied paths.
+    """
+    loaders = _get_supported_file_loaders()
+
+    class RepositoryFinder(PathFinder):
+        _path_importer_cache = staticmethod(cache(
+            lambda path: FileFinder(path, *loaders)
+        ))
+
+    return RepositoryFinder._get_spec
+
+
+@dataclass(frozen=True)
+class _PythonDiscovery:
+    imports: PythonImports
+    find: Callable[[str, Sequence[str]], ModuleSpec]
+
+    def spec(self, name: str, directories: Sequence[str] | None) -> ModuleSpec | None:
+        for part in name.split("."):
+            if not directories:
+                return None
+            spec = self.find(part, directories)
+            directories = spec.submodule_search_locations
+        return spec if spec.loader is not None or directories else None
+
+    def origin(self, name: str, directories: Sequence[str] | None) -> str | None:
+        if name == "*" or (spec := self.spec(name, directories)) is None:
+            return None
+        return spec.origin
+
+
+def _from_base(
+    imports: PythonImports, source: Path, node: ast.ImportFrom,
+) -> tuple[str, list[str]] | None:
+    if not node.level:
+        assert node.module is not None
+        return node.module, imports.directories(source)
+    package = imports.package(source)
     if node.level > len(package):
         return None
-    prefix = package[:len(package) - node.level + 1] if node.level else ()
-    return ".".join((*prefix, node.module) if node.module else prefix)
+    prefix = package[:len(package) - node.level + 1]
+    root = source.parents[len(package)]
+    return ".".join((*prefix, node.module) if node.module else prefix), [str(imports.root / root)]
 
 
 def _from_origins(
-    imports: PythonImports, path: Path, node: ast.ImportFrom, paths: dict[str, str]
+    discovery: _PythonDiscovery, path: Path, node: ast.ImportFrom, paths: dict[str, str],
 ) -> Iterator[str | None]:
-    base = _from_base(imports, path, node)
-    if base is None:
+    base = _from_base(discovery.imports, path, node)
+    if base is None or (parent := discovery.spec(*base)) is None:
         return
-    directories = imports.directories(None if node.level else path)
-    parent = _origin(base, directories)
     for alias in node.names:
-        child = None if alias.name == "*" else _origin(f"{base}.{alias.name}", directories)
-        yield child if child in paths else parent
+        child = discovery.origin(alias.name, parent.submodule_search_locations)
+        yield child if child in paths else parent.origin
 
 
 def _import_origins(
-    imports: PythonImports, source: str, node: ast.Import | ast.ImportFrom, paths: dict[str, str]
+    discovery: _PythonDiscovery, source: str, node: ast.Import | ast.ImportFrom, paths: dict[str, str],
 ) -> Iterator[str | None]:
     path = Path(source)
     if isinstance(node, ast.ImportFrom):
-        yield from _from_origins(imports, path, node, paths)
+        yield from _from_origins(discovery, path, node, paths)
     else:
-        directories = imports.directories(path)
+        directories = discovery.imports.directories(path)
         for alias in node.names:
-            yield _origin(alias.name, directories)
+            yield discovery.origin(alias.name, directories)
 
 
 _PATH_LOADERS = {
@@ -387,10 +410,13 @@ def _measured_loader_shadows(modules: list[str]) -> dict[str, str]:
     return shadows
 
 
-def _loader_shadow(imports: PythonImports, source: str, head: str, measured: dict[str, str]) -> str | None:
+def _loader_shadow(
+    discovery: _PythonDiscovery, source: str, head: str, measured: dict[str, str],
+) -> str | None:
     if head in measured:
         return measured[head]
-    spec = _import_spec(head, imports.directories(Path(source)))
+    imports = discovery.imports
+    spec = discovery.spec(head, imports.directories(Path(source)))
     if spec is None:
         return None
     if spec.origin is not None:
@@ -425,8 +451,8 @@ def _resolve_path_load(
 
 
 def _loader_import_refusals(
-    imports: PythonImports, source: str, binding_refusals: dict[str, str], shadow_modules: dict[str, str],
-    positions: dict[str, int],
+    discovery: _PythonDiscovery, source: str, binding_refusals: dict[str, str],
+    shadow_modules: dict[str, str], positions: dict[str, int],
 ) -> dict[str, str]:
     refusals = {}
     for module in sorted(_LOADER_MODULES):
@@ -435,7 +461,7 @@ def _loader_import_refusals(
             refusals[module] = binding_refusals[head]
         elif module not in positions:
             refusals[module] = f"requires a direct, unaliased top-level import {module}"
-        elif (shadow := _loader_shadow(imports, source, head, shadow_modules)) is not None:
+        elif (shadow := _loader_shadow(discovery, source, head, shadow_modules)) is not None:
             refusals[module] = f"repository module or package {shadow!r} provides {head!r}"
     return refusals
 
@@ -495,17 +521,17 @@ def _unresolved(
 
 
 def _path_loads(
-    imports: PythonImports, source: str, paths: dict[str, str], tree: ast.Module,
+    discovery: _PythonDiscovery, source: str, paths: dict[str, str], tree: ast.Module,
     binding_refusals: dict[str, str], shadow_modules: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
     positions = _loader_import_positions(tree)
-    import_refusals = _loader_import_refusals(imports, source, binding_refusals, shadow_modules, positions)
+    import_refusals = _loader_import_refusals(discovery, source, binding_refusals, shadow_modules, positions)
     for reference in _loader_references(tree):
         target = reference.target
         reason = _loader_reference_refusal(reference, positions, import_refusals)
         if reason is None:
             assert reference.call is not None
-            module, reason = _resolve_path_load(imports.root, source, paths, reference.call, target)
+            module, reason = _resolve_path_load(discovery.imports.root, source, paths, reference.call, target)
             if module is not None:
                 yield Edge(source, module, reference.node.lineno, "path-load")
                 continue
@@ -537,22 +563,22 @@ def _from_loader_diagnostics(source: str, imports: list[ast.Import | ast.ImportF
 
 
 def _source_edges(
-    python_imports: PythonImports, source: str, paths: dict[str, str], literal_paths: dict[str, str],
+    discovery: _PythonDiscovery, source: str, paths: dict[str, str], literal_paths: dict[str, str],
     shadow_modules: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
-    tree, table = _parse_source(python_imports.root, source)
+    tree, table = _parse_source(discovery.imports.root, source)
     nodes = list(ast.walk(tree))
     imports = [node for node in nodes if isinstance(node, _IMPORTS)]
     yield from (
         Edge(source, paths[origin], node.lineno)
         for node in imports
-        for origin in _import_origins(python_imports, source, node, paths)
+        for origin in _import_origins(discovery, source, node, paths)
         if origin in paths
     )
     outside.extend(_from_loader_diagnostics(source, imports))
     binding_refusals = _loader_binding_refusals(table, nodes, imports)
     yield from _path_loads(
-        python_imports, source, literal_paths, tree, binding_refusals, shadow_modules, outside,
+        discovery, source, literal_paths, tree, binding_refusals, shadow_modules, outside,
     )
 
 
@@ -561,9 +587,10 @@ def _python_edges(
     shadow_modules: dict[str, str], outside: list[dict],
 ) -> Iterator[Edge]:
     imports.identities(python_modules)
+    discovery = _PythonDiscovery(imports, _repository_finder())
     paths = {str(imports.root / module): module for module in python_modules}
     for module in sorted(python_modules):
-        yield from _source_edges(imports, module, paths, literal_paths, shadow_modules, outside)
+        yield from _source_edges(discovery, module, paths, literal_paths, shadow_modules, outside)
 
 
 _SHELL_LITERAL = "Lit"
@@ -696,15 +723,29 @@ class _ShellFields:
 
 
 _SHELL_PATH_CHARS = rb"[A-Za-z0-9._/+-]+"
-_SHELL_PATH = re.compile(rb"(?!-)" + _SHELL_PATH_CHARS)
+_SHELL_PATH = re.compile(_SHELL_PATH_CHARS)
 _SHELL_POSSIBLE_RUN = re.compile(rb"[/{}*?\[]|^~|=~")
-_SHELL_DIRECTORY_PREFIXES = {
-    b'"$(dirname "$0")"': ("CmdSubst", None),
-    b'"${BASH_SOURCE%/*}"': ("ParamExp", "%"),
+_SHELL_DIRECTORY_PARTS = {
+    b'"$(dirname "$0")"': {
+        "Type": "CmdSubst",
+        "Stmts": [{"Cmd": {"Type": "CallExpr", "Args": [
+            {"Parts": [{"Type": _SHELL_LITERAL, "Value": "dirname"}]},
+            {"Parts": [{"Type": _SHELL_DOUBLE_QUOTE, "Parts": [
+                {"Type": "ParamExp", "Short": True, "Param": {"Value": "0"}},
+            ]}]},
+        ]}}],
+    },
+    b'"${BASH_SOURCE%/*}"': {
+        "Type": "ParamExp",
+        "Param": {"Value": "BASH_SOURCE"},
+        "Exp": {"Op": "%", "Word": {"Parts": [{"Type": _SHELL_LITERAL, "Value": "/*"}]}},
+    },
 }
 _SHELL_DIRECTORY_PATH = re.compile(
-    rb"(" + rb"|".join(map(re.escape, _SHELL_DIRECTORY_PREFIXES)) + rb")(/" + _SHELL_PATH_CHARS + rb")"
+    rb"(" + rb"|".join(map(re.escape, _SHELL_DIRECTORY_PARTS)) + rb")(/" + _SHELL_PATH_CHARS + rb")"
 )
+_SHELL_LITERAL_LOCATIONS = {"Pos", "End", "ValuePos", "ValueEnd"}
+_SHELL_SUBTREE_LOCATIONS = _SHELL_LITERAL_LOCATIONS | {"Position", "Left", "Right", "Rbrace"}
 _SHELL_INTERPRETERS = {b"bash", b"sh"}
 _ShellWord = tuple[list[dict], bytes]
 
@@ -735,6 +776,7 @@ def _shell_word(word: dict, fields: _ShellFields) -> _ShellWord:
 def _shell_literal(part: dict, spelling: bytes, fields: _ShellFields) -> bool:
     return (
         fields.read(part, "Type", str) == _SHELL_LITERAL
+        and not part.keys() - _SHELL_LITERAL_LOCATIONS - {"Type", "Value"}
         and spelling == fields.read(part, "Value", str).encode()
     )
 
@@ -744,14 +786,22 @@ def _shell_plain_word(word: _ShellWord, fields: _ShellFields) -> bool:
     return len(parts) == 1 and _shell_literal(parts[0], spelling, fields)
 
 
-def _shell_directory_part(quote: dict, prefix: bytes, fields: _ShellFields) -> bool:
-    parts = fields.read(quote, "Parts", list)
-    if len(parts) != 1:
-        return False
-    part, = parts
-    kind, operator = _SHELL_DIRECTORY_PREFIXES[prefix]
-    return fields.read(part, "Type", str) == kind and (
-        operator is None or fields.read(part, "Exp.Op", str) == operator
+def _shell_subtree_value(actual: Any, expected: Any, fields: _ShellFields) -> bool:
+    if isinstance(expected, dict):
+        return _shell_subtree(actual, expected, fields)
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _shell_subtree(node, shape, fields) for node, shape in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
+def _shell_subtree(actual: dict, expected: dict, fields: _ShellFields) -> bool:
+    """Match syntax fields, treating Dollar as a location only on ParamExp."""
+    locations = _SHELL_SUBTREE_LOCATIONS | ({"Dollar"} if "Param" in expected else set())
+    return actual.keys() - locations == expected.keys() and all(
+        _shell_subtree_value(fields.read(actual, key, type(value)), value, fields)
+        for key, value in expected.items()
     )
 
 
@@ -761,9 +811,8 @@ def _shell_directory_target(
     if len(parts) != 2:
         return None
     quote, literal = parts
-    if fields.read(quote, "Type", str) != _SHELL_DOUBLE_QUOTE:
-        return None
-    if _shell_directory_part(quote, prefix, fields) and _shell_literal(literal, tail, fields):
+    expected = {"Type": _SHELL_DOUBLE_QUOTE, "Parts": [_SHELL_DIRECTORY_PARTS[prefix]]}
+    if _shell_subtree(quote, expected, fields) and _shell_literal(literal, tail, fields):
         return "." + tail.decode("ascii")
     return None
 
@@ -913,8 +962,8 @@ def _decoded_source_operand(decoded: bytes | None) -> tuple[str | None, str | No
 
 def _source_operand(word: _ShellWord, fields: _ShellFields) -> tuple[str | None, str | None]:
     if _SHELL_DIRECTORY_PATH.fullmatch(word[1]):
-        if (target := _shell_target(word, fields)) is not None:
-            return target, None
+        target = _shell_target(word, fields)
+        return target, None if target is not None else _UNVERIFIED_SOURCE_WORD
     return _decoded_source_operand(_source_word(word, fields))
 
 
@@ -934,10 +983,13 @@ def _shell_source_call(words: list[_ShellWord], fields: _ShellFields) -> _ShellD
 
 
 def _shell_execute_call(words: list[_ShellWord], fields: _ShellFields) -> _ShellDependency | None:
-    head = words[0][1]
-    if not _shell_plain_word(words[0], fields) or _SHELL_POSSIBLE_RUN.search(head):
-        return _ShellDependency("execute", _shell_target(words[0], fields), head.decode(errors="replace"))
-    if len(words) > 1 and head in _SHELL_INTERPRETERS:
+    command = words[0]
+    _, head = command
+    if b"/" in head:
+        return _ShellDependency("execute", _shell_target(command, fields), head.decode(errors="replace"))
+    if not _shell_plain_word(command, fields) or _SHELL_POSSIBLE_RUN.search(head):
+        return _ShellDependency("execute", None, head.decode(errors="replace"))
+    if head in _SHELL_INTERPRETERS and len(words) > 1:
         return _ShellDependency(
             "execute", _shell_argument_target(words[1], fields), words[1][1].decode(errors="replace"),
         )

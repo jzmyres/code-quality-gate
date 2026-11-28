@@ -56,6 +56,18 @@ def shell_tree(*statements: dict) -> runner.RunResult:
     return shell_json({"Type": "File", "Stmts": statements})
 
 
+def shell_dirname(line: int, script: str) -> dict:
+    zero = {"Type": "ParamExp", "Short": True, "Param": {"Value": "0"}}
+    call = shell_call(line, "dirname", ('"$0"', [shell_quote(zero)]), script=script)
+    return {"Type": "CmdSubst", "Stmts": [call]}
+
+
+def shell_bash_source() -> dict:
+    return {"Type": "ParamExp", "Param": {"Value": "BASH_SOURCE"}, "Exp": {
+        "Op": "%", "Word": {"Parts": [shell_literal("/*")]},
+    }}
+
+
 def shell_json(tree: dict) -> runner.RunResult:
     return runner.RunResult((), "completed", 0, stdout=json.dumps(tree).encode())
 
@@ -106,6 +118,48 @@ class ModuleGraphTests(FixtureCase):
         check = self.graph(1)
         self.assertIn("ambiguous Python module 'pkg.api': src/pkg/api.py, vendor/pkg/api/__init__.py",
                       check["reason"])
+
+    def test_python_origin_uses_current_checkout(self) -> None:
+        caller = "low/pkg/caller.py"
+        parent, child, target = "low/pkg/__init__.py", "low/pkg/child.py", "low/pkg/target.py"
+        namespace_child = "low/shared/child.py"
+        declarations = (
+            ("import pkg.child", (child,), ()),
+            ("from pkg import child, outside, absent", (child, parent, parent), ()),
+            ("from . import child, outside, absent", (child, parent, parent), (child, parent, parent)),
+            ("import shared.child", (namespace_child,), (namespace_child,)),
+            ("import runpy", (), ()),
+            ("runpy.run_path('target.py')", (target,), ()),
+        )
+        self.add_file(caller, "\n".join(statement for statement, *_ in declarations) + "\n")
+        for path in (parent, child, target, namespace_child, "high/shared/marker", "low/pkg/outside.py"):
+            self.add_file(path, "")
+        high = self.repo / "high"
+        stamp = high.stat()
+
+        for state in ("initial", "timestamp restored", "timestamp advanced"):
+            with self.subTest(state=state):
+                if state == "timestamp restored":
+                    self.add_file("high/pkg.py", "")
+                    self.add_file("high/runpy.py", "")
+                    os.utime(high, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                    self.assertEqual(high.stat().st_mtime_ns, stamp.st_mtime_ns)
+                if state == "timestamp advanced":
+                    os.utime(high, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
+                shadowed = state != "initial"
+                report = module_graph.dependencies(
+                    self.repo, [caller, parent, child, target, namespace_child],
+                    python_import_roots=("high", "low", "."),
+                ).report()
+                expected = [
+                    edge(caller, dependency, line, "path-load" if dependency == target else "import")
+                    for line, declaration in enumerate(declarations, 1)
+                    for dependency in declaration[2 if shadowed else 1]
+                ]
+                self.assertCountEqual(report["edges"], expected)
+                self.assert_unresolved_path_loads(
+                    report, (len(declarations),) if shadowed else (), "high/runpy.py", source=caller,
+                )
 
     def test_graph_rejects_unusable_import_root(self) -> None:
         self.configure_graph()
@@ -644,11 +698,10 @@ sh
 """
         self.add_file("scripts/main.sh", script)
         self.add_file("scripts/sibling.sh", "")
-        dirname = {"Type": "CmdSubst"}
-        bash_source = {"Type": "ParamExp", "Exp": {"Op": "%"}}
-        dirname_word = ('"$(dirname "$0")"/sibling.sh', [shell_quote(dirname), shell_literal("/sibling.sh")])
+        dirname_word = '"$(dirname "$0")"/sibling.sh'
+        tail = shell_literal("/sibling.sh")
         source_word = (
-            '"${BASH_SOURCE%/*}"/sibling.sh', [shell_quote(bash_source), shell_literal("/sibling.sh")],
+            '"${BASH_SOURCE%/*}"/sibling.sh', [shell_quote(shell_bash_source()), tail],
         )
         assignment_end = {"Offset": len("value=café".encode())}
         measurement = self.shell_graph(0, {
@@ -657,13 +710,14 @@ sh
                          "Assigns": [{"End": assignment_end}]}},
                 shell_call(2, "source", "sibling.sh", script=script),
                 shell_call(3, ".", "./sibling.sh", script=script),
-                shell_call(4, "source", dirname_word, script=script),
+                shell_call(4, "source", (dirname_word, [shell_quote(shell_dirname(4, script)), tail]),
+                           script=script),
                 shell_call(5, ".", source_word, script=script),
                 shell_call(6, "bash", "./sibling.sh", script=script),
                 {"Cmd": {"Type": "IfClause", "Cond": [shell_call(7, "true", script=script)],
                          "Then": [shell_call(7, "sh", "./sibling.sh", script=script)]}},
                 shell_call(8, "./sibling.sh", script=script),
-                shell_call(9, dirname_word, script=script),
+                shell_call(9, (dirname_word, [shell_quote(shell_dirname(9, script)), tail]), script=script),
                 shell_call(10, "sh", script=script),
             ),
             "scripts/sibling.sh": shell_tree(),
@@ -676,6 +730,120 @@ sh
             )
         ])
         self.assertNotIn("outside_extractor", measurement)
+
+    def shell_fixture_report(self, commands, targets, edit_tree=None) -> dict:
+        source = "main.sh"
+        self.add_file(source, "\n".join(commands) + "\n")
+        for target in targets:
+            self.add_file(target, "")
+
+        def parse(content, filename):
+            tree = adapters.GRAPH_SHELL_PARSER(content, filename)
+            if filename == source and edit_tree is not None:
+                edit_tree(tree)
+            return tree
+
+        with mock.patch.dict(os.environ, self.default_tool_env()):
+            return module_graph.dependencies(
+                self.repo, [], shell_modules=[source, *targets], parse_shell=parse,
+            ).report()
+
+    def assert_shell_fixture(self, report, declarations, *, nested_heads=()) -> None:
+        for line, (field, kind, operand, target, reason) in enumerate(declarations, 1):
+            with self.subTest(line=line, field=field):
+                unresolved = [(kind, operand, reason)] if reason else []
+                if line in nested_heads:
+                    unresolved.append(("execute", "dirname", reason))
+                self.assertEqual(
+                    [row for row in report["edges"] if row["line"] == line],
+                    [edge("main.sh", target, line, kind)] if target else [],
+                )
+                self.assertCountEqual(
+                    [row for row in report["unresolved"] if row["line"] == line],
+                    [{
+                        "file": "main.sh", "line": line, "kind": kind, "operand": operand, "reason": reason,
+                        "message": f"shell {kind}: target is outside the parser",
+                    } for kind, operand, reason in unresolved],
+                )
+        for key in ("edges", "unresolved"):
+            self.assertTrue(all(1 <= row["line"] <= len(declarations) for row in report[key]), report[key])
+
+    def test_shell_script_directory_requires_matching_subtree(self) -> None:
+        target = "sibling.sh"
+        dirname_head = ("Parts", 0, "Stmts", 0, "Cmd", "Args", 0, "Parts", 0, "Value")
+        forms = (
+            ('"$(dirname "$0")"', (
+                (("Dollar",), True),
+                (("Parts", 0, "Stmts", 0, "Negated"), True),
+                (dirname_head, "printf"),
+                (("Parts", 0, "Stmts", 0, "Cmd", "Args", 1, "Parts", 0, "Parts", 0, "Param", "Value"), "1"),
+            )),
+            ('"${BASH_SOURCE%/*}"', (
+                (("Parts", 0, "Param", "Value"), "OTHER_SOURCE"),
+                (("Parts", 0, "Index"), shell_literal("0")),
+                (("Parts", 0, "Exp", "Op"), "%%"),
+                (("Parts", 0, "Exp", "Word", "Parts", 0, "Value"), "/*.sh"),
+            )),
+        )
+        fixtures = [
+            (head, kind, f"{prefix}/{target}", field, value)
+            for prefix, changes in forms
+            for head, kind in (("source ", "source"), ("", "execute"), ("bash ", "execute"))
+            for field, value in (*changes, (("tail", "Value"), "/elsewhere.sh"))
+        ]
+        commands = [head + operand for head, _, operand, _, _ in fixtures]
+
+        def edit_tree(tree):
+            for statement, (head, _, _, field, value) in zip(tree["Stmts"], fixtures, strict=True):
+                word = statement["Cmd"]["Args"][bool(head)]
+                quote, tail = word["Parts"]
+                node, keys = (tail, field[1:]) if field[0] == "tail" else (quote, field)
+                for key in keys[:-1]:
+                    node = node[key]
+                node[keys[-1]] = value
+
+        positive = self.shell_fixture_report(commands, [target])
+        self.assert_shell_fixture(positive, [
+            (field, kind, operand, target, None) for _, kind, operand, field, _ in fixtures
+        ])
+        contradicted = self.shell_fixture_report(commands, [target], edit_tree)
+        self.assert_shell_fixture(contradicted, [
+            (field, kind, operand, None, "path word is computed or cannot be verified")
+            for _, kind, operand, field, _ in fixtures
+        ], nested_heads={line for line, fixture in enumerate(fixtures, 1) if fixture[3] == dirname_head})
+
+    def test_shell_execute_uses_proved_command_role(self) -> None:
+        hyphen, plus, target = "-tools/run.sh", "+tools/run.sh", "sibling.sh"
+        computed = "path word is computed or cannot be verified"
+        declarations = (
+            (hyphen, "execute", hyphen, hyphen, None, None),
+            (plus, "execute", plus, plus, None, None),
+            (f"bash {hyphen}", "execute", hyphen, None, computed, None),
+            (f"sh {plus}", "execute", plus, None, computed, None),
+            (f'source "{hyphen}"', "source", f'"{hyphen}"', None, "path operand is an option", None),
+            (f'"bash" ./{target}', "execute", '"bash"', None, computed, None),
+            (f's"h" ./{target}', "execute", 's"h"', None, computed, None),
+            (f"bash ./{target}", "execute", f"./{target}", target, None, "sh"),
+            (f"./{target}", "execute", f"./{target}", target, None, "./elsewhere.sh"),
+            (f'sou"rc"e ./{target}', "source", f"./{target}", target, None, None),
+        )
+        commands = [command for command, *_ in declarations]
+        targets = [hyphen, plus, target]
+
+        def edit_tree(tree):
+            for statement, (*_, head) in zip(tree["Stmts"], declarations, strict=True):
+                if head is not None:
+                    statement["Cmd"]["Args"][0]["Parts"][0]["Value"] = head
+
+        self.assert_shell_fixture(self.shell_fixture_report(commands, targets), [
+            (None, kind, operand, dependency, reason)
+            for _, kind, operand, dependency, reason, _ in declarations
+        ])
+        self.assert_shell_fixture(self.shell_fixture_report(commands, targets, edit_tree), [
+            ("head.Value", kind, command.split()[0], None, computed) if head is not None
+            else (None, kind, operand, dependency, reason)
+            for command, kind, operand, dependency, reason, head in declarations
+        ])
 
     def test_module_graph_shell_uses_shared_parser_for_inventory_shell_files(self) -> None:
         self.configure_graph(shell=True)
@@ -846,7 +1014,7 @@ reason = "Shell option lookalike measured by the graph"
             ([word, {**operand, "Parts": [shell_quote({})]}], "missing field Type"),
             ([word, {**operand, "Parts": [
                 shell_quote({"Type": "ParamExp", "Exp": {}}), shell_literal("/sibling.sh"),
-            ]}], "missing field Exp.Op"),
+            ]}], "missing field Op"),
         ):
             with self.subTest(detail=detail):
                 tree = {key: value for key, value in call.items() if key != "Args"}
@@ -888,14 +1056,15 @@ reason = "Shell option lookalike measured by the graph"
             (source + " >out\n", redirected, ("Stmts", 0, "Cmd"), b">out\n"),
             (assigned_script, assigned, ("Stmts", 0, "Cmd", "Args"), b"value=1\n"),
         ]
-        for kind, prefix, expansion, field in (
-            ("CmdSubst", '"$(dirname "$0")"', {"Stmts": []}, ("Parts",)),
-            ("ParamExp", '"${BASH_SOURCE%/*}"', {"Exp": {"Op": "%"}}, ("Parts", 0, "Exp")),
-            ("ParamExp", '"${BASH_SOURCE%/*}"', {"Exp": {"Op": "%"}}, ("Parts", 0, "Exp", "Op")),
+        for prefix, field in (
+            ('"$(dirname "$0")"', ("Parts",)),
+            ('"${BASH_SOURCE%/*}"', ("Parts", 0, "Exp")),
+            ('"${BASH_SOURCE%/*}"', ("Parts", 0, "Exp", "Op")),
         ):
             operand = prefix + "/sibling.sh"
             script = f"source {operand}\n"
-            word = operand, [shell_quote({"Type": kind, **expansion}), shell_literal("/sibling.sh")]
+            expansion = shell_dirname(1, script) if field == ("Parts",) else shell_bash_source()
+            word = operand, [shell_quote(expansion), shell_literal("/sibling.sh")]
             fixtures.append((
                 script, shell_call(1, "source", word, script=script),
                 ("Stmts", 0, "Cmd", "Args", 1, "Parts", 0, *field), b'source ""/sibling.sh\n',
