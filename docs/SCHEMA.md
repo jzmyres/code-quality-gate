@@ -657,16 +657,32 @@ gate uses the existing offline historical Git lookup to authenticate the
 two archive blobs, each bounded by 64 KiB. It recomputes the typed public
 Git object IDs, checks the commit's root tree link and verifies that the
 root tree contains regular `tokenizer.json` and `tokenizer_config.json`
-entries. The offline proof reads the two archived Git object bodies.
+entries. The commit must have exactly one `author` and one `committer`
+header. Each raw header value must fully match `name <email> timestamp
+timezone`, with ASCII space separators. The name must contain a nonblank
+byte and may contain non-ASCII bytes. The email field must be nonempty
+and contain no ASCII whitespace. Name and email cannot contain angle
+brackets. Neither identity can contain CR, NUL, or trailing bytes. The
+Unix timestamp is `0` or an unsigned ASCII decimal without leading zeros.
+The timezone is `+` or `-` followed by exactly four ASCII digits.
 
 The value at the pointer must be the exact unescaped revision. A sibling
 `tokenizer` string must exactly match the publication's repository name.
 Records are bounded by 16 MiB and parsed as strict JSON with unique keys.
-For Markdown, decode the JSON from a single unindented LF-delimited fence
-with exactly three backticks, the `json` info string and a bare closing
-fence. The opener must start the file or follow a blank line. A document
-with additional fence markers or raw HTML fails the proof. Coordinates
-apply to the complete file, and the match must lie inside the JSON body.
+A `.json` record uses the complete file as its JSON region. A Markdown
+record uses a single unindented fence with an exact ` ```json ` opener
+and an exact ` ``` ` closer. The opener starts at byte zero or immediately
+after two consecutive LF bytes. The opener must end with an LF line break.
+The closer must follow an LF line break and end with LF or end of file.
+
+The gate checks the whole Markdown record for marker lines at byte zero
+and after every LF, bare CR, or CRLF line break. CRLF counts as one break.
+A marker line starts, after any ASCII spaces or tabs, with three or more
+backticks, three or more tildes, or `<`. The opener and closer must be the
+only marker lines. The JSON region spans the bytes after the opener's LF
+up to the start of the closer. The scanner uses LF-based coordinates in
+the original file, and the declared half-open byte interval must lie inside
+the JSON region.
 
 The untransformed `fs.content` `generic-api-key` finding must match the
 declared bytes and the exact pointer. The standard scan and a replay with
@@ -674,9 +690,10 @@ archive and secondary decoding disabled must return one identical row at
 that coordinate. The check reports the count in
 `measurement.verified_public_git_revisions` and redacted coordinates in
 `public_git_revision_locations`. Changed bytes, unknown or ambiguous
-documents, failed object proofs and failed or ambiguous replay leave the
-original finding unresolved. Adjacent and undeclared findings retain normal
-enforcement.
+documents, failed object proofs and failed or ambiguous replay make the
+occurrence ineligible for this revision proof. The original finding remains
+unresolved unless another proof verifies it. Adjacent and undeclared
+findings retain normal enforcement.
 
 ## Tool lock: `tools.lock.toml`
 

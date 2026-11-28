@@ -5,11 +5,11 @@ import json
 import subprocess
 from dataclasses import asdict, replace
 from functools import partial
+from itertools import product
 from pathlib import Path
 from unittest import mock
 
 from support import BASE_CONFIG, GATE, FixtureCase
-
 from quality_gate import adapters, public_git_revision as revision, runner, secrets, tools
 from quality_gate.policy import ConfigError
 from test_public_hardware_model import _toml
@@ -20,6 +20,9 @@ REPOSITORY = "synthetic-owner/SyntheticModel"
 REPOSITORY_URL = "https://huggingface.co/" + REPOSITORY
 MATCH_PREFIX = b'tokenizer_revision": "'
 POINTER = ("receipt", "tokenizer_revision")
+IDENTITY = b"Synthetic Author <fixture@example.invalid> 1690000000 +0000"
+LINE_BREAKS = {"LF": b"\n", "CR": b"\r", "CRLF": b"\r\n"}
+FENCE_MARKERS = [b"```json", b"```"]
 RULE = """
 [[rule]]
 pattern = "*.json"
@@ -55,6 +58,10 @@ def _scanner_row(path: str, data: bytes, span: tuple[int, int]) -> dict:
         "Description": "Synthetic scanner report", "Entropy": 3.5,
         "Commit": "", "Author": "", "Email": "", "Date": "", "Message": "",
     }
+
+
+def _markdown_markers(data: bytes) -> list[bytes]:
+    return [line for line in data.splitlines() if line.lstrip(b" \t").startswith((b"```", b"~~~", b"<"))]
 
 
 def _settings(declaration: revision.Declaration) -> dict:
@@ -103,9 +110,8 @@ class PublicGitRevisionTests(FixtureCase):
     def _archive(
         self, tree: bytes, *, headers: bytes | None = None, tree_key: bytes = b"tree",
     ) -> revision.Publication:
-        identity = b"Synthetic Author <fixture@example.invalid> 1690000000 +0000\n"
         if headers is None:
-            headers = b"author " + identity + b"committer " + identity
+            headers = b"author " + IDENTITY + b"\ncommitter " + IDENTITY + b"\n"
         tree_line = tree_key + b" " + self._git_oid("tree", tree).encode()
         commit = tree_line + b"\n" + headers + b"\nSynthetic release\n"
         bodies = {"evidence/commit.body": commit, "evidence/tree.body": tree}
@@ -145,6 +151,11 @@ class PublicGitRevisionTests(FixtureCase):
     def _prepare(self, *declarations: revision.Declaration):
         paths = dict.fromkeys((item.record for item in declarations), True)
         return revision.prepare_scan(declarations, paths, set(paths), self.reader.read)
+
+    def _assert_no_proof(self, declaration: revision.Declaration, row: dict) -> None:
+        replay = mock.Mock(return_value=_report([row]))
+        self.assertEqual(self._prepare(declaration)([row], self.directory, replay), set())
+        replay.assert_not_called()
 
     def test_synthetic_json_and_fenced_json_prove_only_the_declared_occurrences(self) -> None:
         raw, first = self._record()
@@ -200,6 +211,56 @@ class PublicGitRevisionTests(FixtureCase):
         declaration, row = self._record(duplicate_key)
         self.assertEqual(self._prepare(declaration)([row], self.directory, mock.Mock()), set())
 
+    def test_disallowed_markers_at_every_markdown_line_boundary(self) -> None:
+        block = b"```json\n" + self._json() + b"```\n"
+        markers = {"backtick": b"\t````text", "tilde": b" ~~~~", "HTML": b"  <em>"}
+        for boundary, surrounding, kind, placement in product(
+            LINE_BREAKS, LINE_BREAKS, markers, ("before", "after"),
+        ):
+            with self.subTest(boundary=boundary, surrounding=surrounding, marker=kind, placement=placement):
+                ending = LINE_BREAKS[surrounding]
+                marker = markers[kind]
+                prose = b"Ordinary prose" + ending + b"More prose" + LINE_BREAKS[boundary] + marker + ending
+                markdown = prose + b"\n\n" + block if placement == "before" else block + prose
+                expected = [marker, *FENCE_MARKERS] if placement == "before" else [*FENCE_MARKERS, marker]
+                self.assertEqual(_markdown_markers(markdown), expected)
+                self._assert_no_proof(*self._record(markdown, path="probe.md"))
+
+    def test_html_comment_after_bare_cr_invalidates_a_fence_inside_it(self) -> None:
+        markdown = b"Ordinary prose\r<!--\n\n```json\n" + self._json() + b"```\n-->\n"
+        self.assertEqual(_markdown_markers(markdown), [b"<!--", *FENCE_MARKERS])
+        self._assert_no_proof(*self._record(markdown, path="probe.md"))
+
+    def test_mixed_markdown_prose_preserves_the_fenced_byte_occurrence(self) -> None:
+        prose = "Café <em>inline HTML</em>".encode() + b"\rMore prose\r\nFinal line\n\n"
+        body = self._json()
+        for ending in (b"", b"\nTail\rFurther prose\r\n"):
+            with self.subTest(ending=ending):
+                prefix = prose + b"```json\n"
+                markdown = prefix + body + b"```" + ending
+                self.assertEqual(_markdown_markers(markdown), FENCE_MARKERS)
+                declaration, row = self._record(markdown, path="probe.md")
+                document = revision._Document.read(self.directory, declaration)
+                self.assertIsNotNone(document)
+                self.assertEqual(document.region, (len(prefix), len(prefix) + len(body)))
+                replay = mock.Mock(return_value=_report([row]))
+                self.assertEqual(self._prepare(declaration)([row], self.directory, replay), {0})
+                replay.assert_called_once_with(["probe.md"], "--max-archive-depth=0", "--max-decode-depth=0")
+
+    def test_markdown_fence_delimiters_require_lf(self) -> None:
+        parts = (b"```json", self._json().removesuffix(b"\n"), b"```")
+        positions = ("after opener", "before closer", "after closer")
+        for boundary, position in product(("CR", "CRLF"), positions):
+            with self.subTest(boundary=boundary, position=position):
+                endings = dict.fromkeys(positions, b"\n")
+                endings[position] = LINE_BREAKS[boundary]
+                markdown = b"".join(
+                    part + ending for part, ending in zip(parts, endings.values(), strict=True)
+                )
+                markdown += b"Ordinary prose\n"
+                self.assertEqual(_markdown_markers(markdown), FENCE_MARKERS)
+                self._assert_no_proof(*self._record(markdown, path="probe.md"))
+
     def test_archive_proof_validates_commit_and_regular_tree_assets(self) -> None:
         original = self.publication
         self.assertTrue(original.verified(self.reader.read))
@@ -227,6 +288,55 @@ class PublicGitRevisionTests(FixtureCase):
         ).stdout.strip()
         unreachable_object = replace(original.commit, payload=replace(operand, commit=unreachable))
         self.assertFalse(replace(original, commit=unreachable_object).verified(self.reader.read))
+
+    def test_archive_accepts_non_ascii_names_and_zero_timestamp(self) -> None:
+        headers = (
+            b"author Caf\xc3\xa9 <fixture@example.invalid> 0 -0430\n"
+            b"committer " + IDENTITY + b"\n"
+        )
+        publication = self._archive(self.tree, headers=headers)
+        declaration, row = self._record(publication=publication)
+        replay = mock.Mock(return_value=_report([row]))
+        self.assertEqual(self._prepare(declaration)([row], self.directory, replay), {0})
+        replay.assert_called_once_with(["probe.json"], "--max-archive-depth=0", "--max-decode-depth=0")
+
+    def test_archive_requires_well_formed_author_and_committer_identities(self) -> None:
+        malformed = {
+            "missing name": IDENTITY.replace(b"Synthetic Author", b""),
+            "blank name": IDENTITY.replace(b"Synthetic Author", b" \t"),
+            "angle bracket in name": IDENTITY.replace(b"Author", b"<Author"),
+            "empty email": IDENTITY.replace(b"fixture@example.invalid", b""),
+            "missing email brackets": IDENTITY.replace(b"<", b"").replace(b">", b""),
+            "angle bracket in email": IDENTITY.replace(b"fixture", b"fixture<"),
+            "whitespace in email": IDENTITY.replace(b"fixture", b"fix\tture"),
+            "name separator": IDENTITY.replace(b" <", b"\t<"),
+            "email separator": IDENTITY.replace(b"> ", b">\t"),
+            "timestamp separator": IDENTITY.replace(b" +", b"\t+"),
+            "missing timestamp": IDENTITY.replace(b"1690000000", b""),
+            "signed timestamp": IDENTITY.replace(b"1690000000", b"-1690000000"),
+            "timestamp leading zero": IDENTITY.replace(b"1690000000", b"01690000000"),
+            "non-ASCII timestamp digit": IDENTITY.replace(b"1690000000", "１".encode()),
+            "timezone sign": IDENTITY.removesuffix(b"+0000") + b"0000",
+            "timezone width": IDENTITY + b"0",
+            "timezone digit": IDENTITY.removesuffix(b"0") + b"Z",
+            "carriage return": IDENTITY.replace(b"Synthetic", b"Syn\rthetic"),
+            "NUL": IDENTITY.replace(b"Synthetic", b"Syn\0thetic"),
+            "trailing bytes": IDENTITY + b" extra",
+        }
+        tree_id = self._git_oid("tree", self.tree)
+        self.assertTrue(self.publication.verified(self.reader.read))
+        for key, component in product((b"author", b"committer"), malformed):
+            with self.subTest(key=key, component=component):
+                identities = dict.fromkeys((b"author", b"committer"), IDENTITY)
+                identities[key] = malformed[component]
+                headers = b"".join(name + b" " + value + b"\n" for name, value in identities.items())
+                publication = self._archive(self.tree, headers=headers)
+                self.reader = self._reader()
+                read_blob = self.reader.read
+                self.assertIsNotNone(publication.commit.read(read_blob, "commit", publication.revision))
+                self.assertIsNotNone(publication.tree.read(read_blob, "tree", tree_id))
+                self.assertFalse(publication.verified(read_blob))
+                self._assert_no_proof(*self._record(publication=publication))
 
     def test_document_binds_only_the_occurrence_inside_the_fence(self) -> None:
         spelling = MATCH_PREFIX + self.publication.revision.encode() + b'"'

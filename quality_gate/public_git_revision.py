@@ -21,7 +21,12 @@ REPOSITORY_URL = re.compile(
 REVISION = re.compile(r"[0-9a-f]{40}")
 _TREE_HEADER = re.compile(rb"tree ([0-9a-f]{40})")
 _TREE_ENTRY = re.compile(rb"(100644|100755|120000|160000|40000) ([^/\0]+)\0(.{20})", re.DOTALL)
-_BLOCK_MARKER = re.compile(rb"(?m)^[ \t]*(?:`{3,}|~{3,}|<)[^\n]*")
+_IDENTITY = re.compile(
+    rb"[ \t\v\f]*[^<>\s\0][^<>\r\n\0]*"
+    rb" <[^<>\s\0]+> (?:0|[1-9][0-9]*) [+-][0-9]{4}",
+)
+_IDENTITY_KEYS = (b"author", b"committer")
+_BLOCK_MARKER = re.compile(rb"(?:\A|\r\n?|\n)([ \t]*(?:`{3,}|~{3,}|<)[^\r\n]*)")
 
 
 @dataclass(frozen=True)
@@ -44,15 +49,22 @@ def _git_oid(kind: str, body: bytes) -> str:
     return digest.hexdigest()
 
 
+def _valid_commit_headers(headers: bytes) -> bool:
+    fields = [line.partition(b" ") for line in headers.split(b"\n")]
+    keys = [key for key, _, _ in fields]
+    counts = (keys.count(b"tree"), keys.count(b"author"), keys.count(b"committer"))
+    return counts == (0, 1, 1) and all(
+        _IDENTITY.fullmatch(value) for key, _, value in fields if key in _IDENTITY_KEYS
+    )
+
+
 def _commit_tree(body: bytes) -> str | None:
     headers, separator, _message = body.partition(b"\n\n")
     first, _, rest = headers.partition(b"\n")
     tree = _TREE_HEADER.fullmatch(first)
-    if not separator or tree is None:
+    if not separator or tree is None or b"\0" in body or not _valid_commit_headers(rest):
         return None
-    keys = [line.partition(b" ")[0] for line in rest.split(b"\n")]
-    counts = (keys.count(b"tree"), keys.count(b"author"), keys.count(b"committer"))
-    return tree[1].decode("ascii") if counts == (0, 1, 1) and b"\0" not in body else None
+    return tree[1].decode("ascii")
 
 
 def _tree_modes(body: bytes) -> dict[bytes, bytes]:
@@ -103,13 +115,17 @@ def _json_region(data: bytes, markdown: bool) -> tuple[int, int] | None:
     if not markdown:
         return 0, len(data)
     markers = list(islice(_BLOCK_MARKER.finditer(data), 3))
-    if [marker.group() for marker in markers] != [b"```json", b"```"]:
+    if len(markers) != 2:
         return None
     opening, closing = markers
-    start = opening.start()
+    start = opening.start(1)
     if start and data[start - 2:start] != b"\n\n":
         return None
-    return opening.end() + 1, closing.start()
+    opener = data[start:opening.end() + 1]
+    closer = data[closing.start():closing.end() + 1]
+    if (opener, closer) not in ((b"```json\n", b"\n```\n"), (b"```json\n", b"\n```")):
+        return None
+    return opening.end() + 1, closing.start(1)
 
 
 @dataclass(frozen=True)
